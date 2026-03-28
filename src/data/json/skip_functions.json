@@ -1,0 +1,4 @@
+{
+  "_comment": "Functions to skip during C emission. PLT/external functions are already filtered by is_external_function. This list is intentionally empty to match IDA/angr/ghidra behavior of emitting all statically-linked code.",
+  "skip_prefixes": []
+}

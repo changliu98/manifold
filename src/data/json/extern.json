@@ -1,0 +1,2726 @@
+{
+  "functions": [
+    {
+      "name": "signal",
+      "sig_args": [
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        1
+      ]
+    },
+    {
+      "name": "sigaction",
+      "sig_args": [
+        "Xint",
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        1,
+        2
+      ]
+    },
+    {
+      "name": "sigprocmask",
+      "sig_args": [
+        "Xint",
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        1,
+        2
+      ]
+    },
+    {
+      "name": "sigemptyset",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "sigaddset",
+      "sig_args": [
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "sigdelset",
+      "sig_args": [
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "sigfillset",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "sigismember",
+      "sig_args": [
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "raise",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "localtime_r",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "gmtime_r",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "localtime",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "gmtime",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "mktime",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "strftime",
+      "sig_args": [
+        "Xptr",
+        "Xlong",
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        2,
+        3
+      ]
+    },
+    {
+      "name": "time",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "clock_gettime",
+      "sig_args": [
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        1
+      ]
+    },
+    {
+      "name": "gettimeofday",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "nanosleep",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "opendir",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "readdir",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "closedir",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "rewinddir",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "seekdir",
+      "sig_args": [
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "telldir",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "fdopendir",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": []
+    },
+    {
+      "name": "dirfd",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "scandir",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "name": "getcwd",
+      "sig_args": [
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "chdir",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "fchdir",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "mkdir",
+      "sig_args": [
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "rmdir",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "getpwuid",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": []
+    },
+    {
+      "name": "getpwnam",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "getgrgid",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": []
+    },
+    {
+      "name": "getgrnam",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "getuid",
+      "sig_args": [],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "geteuid",
+      "sig_args": [],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "getgid",
+      "sig_args": [],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "getegid",
+      "sig_args": [],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "getgroups",
+      "sig_args": [
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        1
+      ]
+    },
+    {
+      "name": "getlogin",
+      "sig_args": [],
+      "sig_res": "Xptr",
+      "ptr_params": []
+    },
+    {
+      "name": "getxattr",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "name": "lgetxattr",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "name": "fgetxattr",
+      "sig_args": [
+        "Xint",
+        "Xptr",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        1,
+        2
+      ]
+    },
+    {
+      "name": "listxattr",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "llistxattr",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "flistxattr",
+      "sig_args": [
+        "Xint",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        1
+      ]
+    },
+    {
+      "name": "setxattr",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xptr",
+        "Xlong",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "name": "stat",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "lstat",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "fstat",
+      "sig_args": [
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        1
+      ]
+    },
+    {
+      "name": "fstatat",
+      "sig_args": [
+        "Xint",
+        "Xptr",
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        1,
+        2
+      ]
+    },
+    {
+      "name": "statx",
+      "sig_args": [
+        "Xint",
+        "Xptr",
+        "Xint",
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        1,
+        4
+      ]
+    },
+    {
+      "name": "readlink",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "readlinkat",
+      "sig_args": [
+        "Xint",
+        "Xptr",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        1,
+        2
+      ]
+    },
+    {
+      "name": "realpath",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "access",
+      "sig_args": [
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "faccessat",
+      "sig_args": [
+        "Xint",
+        "Xptr",
+        "Xint",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        1
+      ]
+    },
+    {
+      "name": "chmod",
+      "sig_args": [
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "fchmod",
+      "sig_args": [
+        "Xint",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "chown",
+      "sig_args": [
+        "Xptr",
+        "Xint",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "lchown",
+      "sig_args": [
+        "Xptr",
+        "Xint",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "fchown",
+      "sig_args": [
+        "Xint",
+        "Xint",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "link",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "symlink",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "unlink",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "rename",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "remove",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "truncate",
+      "sig_args": [
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "ftruncate",
+      "sig_args": [
+        "Xint",
+        "Xlong"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "gettext",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "dgettext",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "dcgettext",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "ngettext",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "dngettext",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "name": "dcngettext",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xptr",
+        "Xlong",
+        "Xint"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "name": "bindtextdomain",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "textdomain",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "error",
+      "sig_args": [
+        "Xint",
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": [
+        2
+      ]
+    },
+    {
+      "name": "error_at_line",
+      "sig_args": [
+        "Xint",
+        "Xint",
+        "Xptr",
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": [
+        2,
+        4
+      ]
+    },
+    {
+      "name": "mbrtowc",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xlong",
+        "Xptr"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        1,
+        3
+      ]
+    },
+    {
+      "name": "wcrtomb",
+      "sig_args": [
+        "Xptr",
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "wcwidth",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "wcswidth",
+      "sig_args": [
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "iswprint",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "iswspace",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "iswcntrl",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "towlower",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "towupper",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "setlocale",
+      "sig_args": [
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        1
+      ]
+    },
+    {
+      "name": "localeconv",
+      "sig_args": [],
+      "sig_res": "Xptr",
+      "ptr_params": []
+    },
+    {
+      "name": "nl_langinfo",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": []
+    },
+    {
+      "name": "isatty",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "ttyname",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": []
+    },
+    {
+      "name": "tcgetattr",
+      "sig_args": [
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        1
+      ]
+    },
+    {
+      "name": "tcsetattr",
+      "sig_args": [
+        "Xint",
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        2
+      ]
+    },
+    {
+      "name": "ioctl",
+      "sig_args": [
+        "Xint",
+        "Xlong",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        2
+      ]
+    },
+    {
+      "name": "getopt",
+      "sig_args": [
+        "Xint",
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        1,
+        2
+      ]
+    },
+    {
+      "name": "getopt_long",
+      "sig_args": [
+        "Xint",
+        "Xptr",
+        "Xptr",
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    {
+      "name": "strtol",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "strtoul",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "strtoll",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "strtoull",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "strtod",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xfloat",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "strtof",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xsingle",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "atoi",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "atol",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "atoll",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "qsort",
+      "sig_args": [
+        "Xptr",
+        "Xlong",
+        "Xlong",
+        "Xptr"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": [
+        0,
+        3
+      ]
+    },
+    {
+      "name": "bsearch",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xlong",
+        "Xlong",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1,
+        4
+      ]
+    },
+    {
+      "name": "setvbuf",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xint",
+        "Xlong"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "setbuf",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "fflush",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "ferror",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "feof",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "clearerr",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "fileno",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "fdopen",
+      "sig_args": [
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        1
+      ]
+    },
+    {
+      "name": "freopen",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "name": "popen",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "pclose",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "getline",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "name": "getdelim",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        1,
+        3
+      ]
+    },
+    {
+      "name": "dup",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "dup2",
+      "sig_args": [
+        "Xint",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "pipe",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "fcntl",
+      "sig_args": [
+        "Xint",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "fork",
+      "sig_args": [],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "vfork",
+      "sig_args": [],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "execv",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "execve",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "name": "execvp",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "execl",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "execlp",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "wait",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "waitpid",
+      "sig_args": [
+        "Xint",
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        1
+      ]
+    },
+    {
+      "name": "_exit",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": []
+    },
+    {
+      "name": "getpid",
+      "sig_args": [],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "getppid",
+      "sig_args": [],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "strerror",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xcharptr",
+      "ptr_params": []
+    },
+    {
+      "name": "perror",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "mmap",
+      "sig_args": [
+        "Xptr",
+        "Xlong",
+        "Xint",
+        "Xint",
+        "Xint",
+        "Xlong"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "munmap",
+      "sig_args": [
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "mprotect",
+      "sig_args": [
+        "Xptr",
+        "Xlong",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "sysconf",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": []
+    },
+    {
+      "name": "pathconf",
+      "sig_args": [
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "fpathconf",
+      "sig_args": [
+        "Xint",
+        "Xint"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": []
+    },
+    {
+      "name": "confstr",
+      "sig_args": [
+        "Xint",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        1
+      ]
+    },
+    {
+      "name": "getrusage",
+      "sig_args": [
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        1
+      ]
+    },
+    {
+      "name": "uname",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "__errno_location",
+      "sig_args": [],
+      "sig_res": "Xptr",
+      "ptr_params": []
+    },
+    {
+      "name": "__ctype_b_loc",
+      "sig_args": [],
+      "sig_res": "Xptr",
+      "ptr_params": []
+    },
+    {
+      "name": "__ctype_tolower_loc",
+      "sig_args": [],
+      "sig_res": "Xptr",
+      "ptr_params": []
+    },
+    {
+      "name": "__ctype_toupper_loc",
+      "sig_args": [],
+      "sig_res": "Xptr",
+      "ptr_params": []
+    },
+    {
+      "name": "__stack_chk_fail",
+      "sig_args": [],
+      "sig_res": "Xvoid",
+      "ptr_params": []
+    },
+    {
+      "name": "__assert_fail",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": [
+        0,
+        1,
+        3
+      ]
+    },
+    {
+      "name": "gnu_get_libc_version",
+      "sig_args": [],
+      "sig_res": "Xptr",
+      "ptr_params": []
+    },
+    {
+      "name": "gnu_dev_major",
+      "sig_args": [
+        "Xlong"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "gnu_dev_minor",
+      "sig_args": [
+        "Xlong"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "gnu_dev_makedev",
+      "sig_args": [
+        "Xint",
+        "Xint"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": []
+    },
+    {
+      "name": "mempcpy",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "memrchr",
+      "sig_args": [
+        "Xptr",
+        "Xint",
+        "Xlong"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "rawmemchr",
+      "sig_args": [
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "stpcpy",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "stpncpy",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "strnlen",
+      "sig_args": [
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "strndup",
+      "sig_args": [
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "strverscmp",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "strcasecmp",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "strncasecmp",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "strcoll",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "strxfrm",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "strsep",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "strpbrk",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "strspn",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "strcspn",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "human_readable",
+      "sig_args": [
+        "Xlong",
+        "Xptr",
+        "Xint",
+        "Xlong",
+        "Xlong"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        1
+      ]
+    },
+    {
+      "name": "quotearg_style",
+      "sig_args": [
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        1
+      ]
+    },
+    {
+      "name": "quotearg_n_style",
+      "sig_args": [
+        "Xint",
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        2
+      ]
+    },
+    {
+      "name": "quotearg_char",
+      "sig_args": [
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "quote",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "quote_n",
+      "sig_args": [
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        1
+      ]
+    },
+    {
+      "name": "file_type_to_char",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "filemodestring",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "getfilecon",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "lgetfilecon",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "freecon",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "acl_get_file",
+      "sig_args": [
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "acl_get_fd",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": []
+    },
+    {
+      "name": "acl_free",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "file_has_acl",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "version_etc",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "name": "version_etc_ar",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xptr",
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    {
+      "name": "set_program_name",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "close_stdout",
+      "sig_args": [],
+      "sig_res": "Xvoid",
+      "ptr_params": []
+    },
+    {
+      "name": "fclose_nothrow",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ]
+    },
+    {
+      "name": "strcmp",
+      "sig_args": [
+        "Xcharptr",
+        "Xcharptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "strncmp",
+      "sig_args": [
+        "Xcharptr",
+        "Xcharptr",
+        "Xlong"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "strlen",
+      "sig_args": [
+        "Xcharptr"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0
+      ],
+      "builtin": false
+    },
+    {
+      "name": "strcpy",
+      "sig_args": [
+        "Xcharptr",
+        "Xcharptr"
+      ],
+      "sig_res": "Xcharptr",
+      "ptr_params": [
+        0,
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "strncpy",
+      "sig_args": [
+        "Xcharptr",
+        "Xcharptr",
+        "Xlong"
+      ],
+      "sig_res": "Xcharptr",
+      "ptr_params": [
+        0,
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "strcat",
+      "sig_args": [
+        "Xcharptr",
+        "Xcharptr"
+      ],
+      "sig_res": "Xcharptr",
+      "ptr_params": [
+        0,
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "strchr",
+      "sig_args": [
+        "Xcharptr",
+        "Xint"
+      ],
+      "sig_res": "Xcharptr",
+      "ptr_params": [
+        0
+      ],
+      "builtin": false
+    },
+    {
+      "name": "strrchr",
+      "sig_args": [
+        "Xcharptr",
+        "Xint"
+      ],
+      "sig_res": "Xcharptr",
+      "ptr_params": [
+        0
+      ],
+      "builtin": false
+    },
+    {
+      "name": "strstr",
+      "sig_args": [
+        "Xcharptr",
+        "Xcharptr"
+      ],
+      "sig_res": "Xcharptr",
+      "ptr_params": [
+        0,
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "strerror_r",
+      "sig_args": [
+        "Xint",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "malloc",
+      "sig_args": [
+        "Xlong"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [],
+      "builtin": false
+    },
+    {
+      "name": "calloc",
+      "sig_args": [
+        "Xlong",
+        "Xlong"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [],
+      "builtin": false
+    },
+    {
+      "name": "realloc",
+      "sig_args": [
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ],
+      "builtin": false
+    },
+    {
+      "name": "rpl_reallocarray",
+      "sig_args": [
+        "Xptr",
+        "Xlong",
+        "Xlong"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ],
+      "builtin": false
+    },
+    {
+      "name": "free",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": [
+        0
+      ],
+      "builtin": false
+    },
+    {
+      "name": "memcpy",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "memmove",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0,
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "memset",
+      "sig_args": [
+        "Xptr",
+        "Xint",
+        "Xlong"
+      ],
+      "sig_res": "Xptr",
+      "ptr_params": [
+        0
+      ],
+      "builtin": false
+    },
+    {
+      "name": "memcmp",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xlong"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "printf",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ],
+      "builtin": false
+    },
+    {
+      "name": "fprintf",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "sprintf",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "snprintf",
+      "sig_args": [
+        "Xptr",
+        "Xlong",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        2
+      ],
+      "builtin": false
+    },
+    {
+      "name": "vfprintf",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1,
+        2
+      ],
+      "builtin": false
+    },
+    {
+      "name": "fputs_unlocked",
+      "sig_args": [
+        "Xptr",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "fputc_unlocked",
+      "sig_args": [
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "putchar_unlocked",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [],
+      "builtin": false
+    },
+    {
+      "name": "putc_unlocked",
+      "sig_args": [
+        "Xint",
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "fwrite_unlocked",
+      "sig_args": [
+        "Xptr",
+        "Xlong",
+        "Xlong",
+        "Xptr"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        3
+      ],
+      "builtin": false
+    },
+    {
+      "name": "fclose",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ],
+      "builtin": false
+    },
+    {
+      "name": "fflush_unlocked",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ],
+      "builtin": false
+    },
+    {
+      "name": "fseeko",
+      "sig_args": [
+        "Xptr",
+        "Xlong",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ],
+      "builtin": false
+    },
+    {
+      "name": "ferror_unlocked",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ],
+      "builtin": false
+    },
+    {
+      "name": "getenv",
+      "sig_args": [
+        "Xcharptr"
+      ],
+      "sig_res": "Xcharptr",
+      "ptr_params": [
+        0
+      ],
+      "builtin": false
+    },
+    {
+      "name": "setenv",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "unsetenv",
+      "sig_args": [
+        "Xptr"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0
+      ],
+      "builtin": false
+    },
+    {
+      "name": "tzset",
+      "sig_args": [],
+      "sig_res": "Xvoid",
+      "ptr_params": [],
+      "builtin": false
+    },
+    {
+      "name": "exit",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xvoid",
+      "ptr_params": [],
+      "builtin": false
+    },
+    {
+      "name": "abort",
+      "sig_args": [],
+      "sig_res": "Xvoid",
+      "ptr_params": [],
+      "builtin": false
+    },
+    {
+      "name": "strtoumax",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [
+        0,
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "tolower",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [],
+      "builtin": false
+    },
+    {
+      "name": "toupper",
+      "sig_args": [
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [],
+      "builtin": false
+    },
+    {
+      "name": "fnmatch",
+      "sig_args": [
+        "Xptr",
+        "Xptr",
+        "Xint"
+      ],
+      "sig_res": "Xint",
+      "ptr_params": [
+        0,
+        1
+      ],
+      "builtin": false
+    },
+    {
+      "name": "lseek",
+      "sig_args": [
+        "Xint",
+        "Xlong",
+        "Xint"
+      ],
+      "sig_res": "Xlong",
+      "ptr_params": [],
+      "builtin": false
+    },
+    {
+      "name": "__fprintf_chk",
+      "sig_args": ["Xptr", "Xint", "Xcharptr"],
+      "sig_res": "Xint"
+    },
+    {
+      "name": "__printf_chk",
+      "sig_args": ["Xint", "Xcharptr"],
+      "sig_res": "Xint"
+    },
+    {
+      "name": "__vfprintf_chk",
+      "sig_args": ["Xptr", "Xint"],
+      "sig_res": "Xint"
+    },
+    {
+      "name": "__snprintf_chk",
+      "sig_args": ["Xcharptr", "Xlong", "Xint", "Xlong", "Xcharptr"],
+      "sig_res": "Xint"
+    },
+    {
+      "name": "__sprintf_chk",
+      "sig_args": ["Xcharptr", "Xint", "Xlong", "Xcharptr"],
+      "sig_res": "Xint"
+    },
+    {
+      "name": "__memcpy_chk",
+      "sig_args": ["Xptr", "Xptr", "Xlong", "Xlong"],
+      "sig_res": "Xptr"
+    },
+    {
+      "name": "__memmove_chk",
+      "sig_args": ["Xptr", "Xptr", "Xlong", "Xlong"],
+      "sig_res": "Xptr"
+    }
+  ]
+}

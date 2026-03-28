@@ -1,0 +1,370 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CompCert Clight IR",
+  "description": "JSON schema for CompCert Clight IR as emitted by CompCert-Ascent and consumed by clight_loader.py",
+  "type": "object",
+  "properties": {
+    "functions": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/Function" }
+    },
+    "types": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/TypeDecl" }
+    },
+    "globals": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/GlobalVar" }
+    }
+  },
+  "required": ["functions"],
+  "definitions": {
+    "Function": {
+      "type": "object",
+      "properties": {
+        "ident": { "type": "integer" },
+        "name": { "type": "string" },
+        "params": { "$ref": "#/definitions/BindingList" },
+        "locals": { "$ref": "#/definitions/BindingList" },
+        "temps": { "$ref": "#/definitions/BindingList" },
+        "body": {
+          "oneOf": [
+            { "$ref": "#/definitions/Statement" },
+            { "type": "array", "items": { "$ref": "#/definitions/Statement" } }
+          ]
+        },
+        "ret": { "type": "string" },
+        "external": { "type": "string" }
+      },
+      "required": ["ident", "name", "params", "locals", "temps", "ret"]
+    },
+    "BindingList": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": [
+          { "type": "integer" },
+          { "type": "string" }
+        ],
+        "minItems": 2,
+        "maxItems": 2
+      }
+    },
+    "TypeDecl": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer" },
+        "su": { "type": "string", "enum": ["Struct", "Union"] },
+        "members": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "integer" },
+              "ty": { "type": "string" },
+              "name": { "type": "string" }
+            },
+            "required": ["id", "ty", "name"]
+          }
+        }
+      },
+      "required": ["id", "su", "members"]
+    },
+    "GlobalVar": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "ty": { "type": "string" },
+        "init": { "type": "array" },
+        "readonly": { "type": "boolean" },
+        "storage": { "type": "string" }
+      },
+      "required": ["name", "ty"]
+    },
+    "Statement": {
+      "oneOf": [
+        { "type": "integer", "description": "Shorthand for sskip or legacy placeholder" },
+        {
+          "type": "object",
+          "properties": {
+            "tag": { "type": "string" }
+          },
+          "required": ["tag"],
+          "allOf": [
+            {
+              "if": { "properties": { "tag": { "const": "sskip" } } },
+              "then": { "properties": {} }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "sset" } } },
+              "then": {
+                "properties": {
+                  "lhs": { "oneOf": [{ "$ref": "#/definitions/Expression" }, { "type": "integer" }] },
+                  "rhs": { "$ref": "#/definitions/Expression" },
+                  "id": { "type": "integer" }
+                },
+                "required": ["rhs"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "sassign" } } },
+              "then": {
+                "properties": {
+                  "lhs": { "oneOf": [{ "$ref": "#/definitions/Expression" }, { "type": "integer" }] },
+                  "rhs": { "$ref": "#/definitions/Expression" },
+                  "id": { "type": "integer" }
+                },
+                "required": ["rhs"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "sreturn" } } },
+              "then": {
+                "properties": {
+                  "expr": { "$ref": "#/definitions/Expression" }
+                }
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "sif" } } },
+              "then": {
+                "properties": {
+                  "cond": { "$ref": "#/definitions/Expression" },
+                  "then": { "$ref": "#/definitions/Statement" },
+                  "else": { "$ref": "#/definitions/Statement" }
+                },
+                "required": ["cond"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "sifthenelse" } } },
+              "then": {
+                "properties": {
+                  "cond": { "$ref": "#/definitions/Expression" },
+                  "then_branch": { "$ref": "#/definitions/Statement" },
+                  "else_branch": { "$ref": "#/definitions/Statement" }
+                },
+                "required": ["cond", "then_branch", "else_branch"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "sloop" } } },
+              "then": {
+                "properties": {
+                  "body": { "$ref": "#/definitions/Statement" }
+                },
+                "required": ["body"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "scall" } } },
+              "then": {
+                "properties": {
+                  "dst": { "$ref": "#/definitions/Expression" },
+                  "lhs": { "$ref": "#/definitions/Expression" },
+                  "func": { "$ref": "#/definitions/Expression" },
+                  "args": {
+                    "type": "array",
+                    "items": { "$ref": "#/definitions/Expression" }
+                  }
+                },
+                "required": ["func", "args"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "sswitch" } } },
+              "then": {
+                "properties": {
+                  "expr": { "$ref": "#/definitions/Expression" },
+                  "cases": {
+                    "type": "array",
+                    "items": { "$ref": "#/definitions/SwitchCase" }
+                  }
+                },
+                "required": ["expr", "cases"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "sseq" } } },
+              "then": {
+                "properties": {
+                  "first": { "$ref": "#/definitions/Statement" },
+                  "second": { "$ref": "#/definitions/Statement" }
+                },
+                "required": ["first", "second"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "ssequence" } } },
+              "then": {
+                "properties": {
+                  "s1": { "$ref": "#/definitions/Statement" },
+                  "s2": { "$ref": "#/definitions/Statement" }
+                },
+                "required": ["s1", "s2"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "sblock" } } },
+              "then": {
+                "properties": {
+                  "body": {
+                    "oneOf": [
+                      { "$ref": "#/definitions/Statement" },
+                      { "type": "array", "items": { "$ref": "#/definitions/Statement" } }
+                    ]
+                  }
+                },
+                "required": ["body"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "slabel" } } },
+              "then": {
+                "properties": {
+                  "label": { "type": "integer" },
+                  "stmt": { "$ref": "#/definitions/Statement" }
+                },
+                "required": ["label", "stmt"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "sgoto" } } },
+              "then": {
+                "properties": {
+                  "label": { "type": "integer" }
+                },
+                "required": ["label"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "enum": ["sbreak", "scontinue"] } } },
+              "then": {
+                "properties": {}
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "SwitchCase": {
+      "type": "object",
+      "properties": {
+        "label": { "oneOf": [{ "type": "integer" }, { "const": "default" }] },
+        "stmt": { "$ref": "#/definitions/Statement" }
+      },
+      "required": ["label", "stmt"]
+    },
+    "Expression": {
+      "oneOf": [
+        { "type": "integer", "description": "Shorthand for econst_int" },
+        {
+          "type": "object",
+          "properties": {
+            "tag": { "type": "string" },
+            "ty": { "type": "string" }
+          },
+          "required": ["tag"],
+          "allOf": [
+            {
+              "if": { "properties": { "tag": { "const": "econst_int" } } },
+              "then": {
+                "properties": {
+                  "value": { "type": "integer" }
+                },
+                "required": ["value"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "econst_long" } } },
+              "then": {
+                "properties": {
+                  "value": { "type": "integer" }
+                },
+                "required": ["value"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "evar" } } },
+              "then": {
+                "properties": {
+                  "id": { "type": "integer" }
+                },
+                "required": ["id"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "etempvar" } } },
+              "then": {
+                "properties": {
+                  "id": { "type": "integer" }
+                },
+                "required": ["id"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "eaddrof" } } },
+              "then": {
+                "properties": {
+                  "expr": { "$ref": "#/definitions/Expression" }
+                },
+                "required": ["expr"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "ederef" } } },
+              "then": {
+                "properties": {
+                  "expr": { "$ref": "#/definitions/Expression" }
+                },
+                "required": ["expr"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "ecast" } } },
+              "then": {
+                "properties": {
+                  "expr": { "$ref": "#/definitions/Expression" }
+                },
+                "required": ["expr"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "eunop" } } },
+              "then": {
+                "properties": {
+                  "op": { "type": "string" },
+                  "expr": { "$ref": "#/definitions/Expression" }
+                },
+                "required": ["op", "expr"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "ebinop" } } },
+              "then": {
+                "properties": {
+                  "op": { "type": "string" },
+                  "lhs": { "$ref": "#/definitions/Expression" },
+                  "rhs": { "$ref": "#/definitions/Expression" },
+                  "left": { "$ref": "#/definitions/Expression" },
+                  "right": { "$ref": "#/definitions/Expression" }
+                },
+                "required": ["op"]
+              }
+            },
+            {
+              "if": { "properties": { "tag": { "const": "efield" } } },
+              "then": {
+                "properties": {
+                  "base": { "$ref": "#/definitions/Expression" },
+                  "field": { "type": "string" }
+                },
+                "required": ["base", "field"]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
