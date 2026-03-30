@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::decompile::passes::cminor_pass::*;
 
 use crate::x86::mach::Mreg;
-use crate::x86::op::Condition;
+use crate::x86::op::{Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
 
@@ -148,6 +148,35 @@ ascent_par! {
     csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, expr)),
         if let Some(converted) = csharp_expr_from_cminor_sized(expr, true),
+        let stmt = CsharpminorStmt::Sset(*dst, converted);
+
+    // Divergence: shlimm -> mulimm (CompCert compiles mul-by-power-of-2 as shl)
+    csharp_stmt_candidate(node, stmt) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, expr)),
+        if let CminorExpr::Eop(op, args) = expr,
+        if args.len() == 1,
+        if let Operation::Oshlimm(n) = op,
+        if (1..=3).contains(n),
+        let mul_val = 1i64 << *n,
+        let converted = CsharpminorExpr::Ebinop(
+            CminorBinop::Omul,
+            Box::new(CsharpminorExpr::Evar(args[0])),
+            Box::new(CsharpminorExpr::Econst(Constant::Ointconst(mul_val))),
+        ),
+        let stmt = CsharpminorStmt::Sset(*dst, converted);
+
+    csharp_stmt_candidate(node, stmt) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, expr)),
+        if let CminorExpr::Eop(op, args) = expr,
+        if args.len() == 1,
+        if let Operation::Oshllimm(n) = op,
+        if (1..=3).contains(n),
+        let mul_val = 1i64 << *n,
+        let converted = CsharpminorExpr::Ebinop(
+            CminorBinop::Omull,
+            Box::new(CsharpminorExpr::Evar(args[0])),
+            Box::new(CsharpminorExpr::Econst(Constant::Olongconst(mul_val))),
+        ),
         let stmt = CsharpminorStmt::Sset(*dst, converted);
 
     csharp_stmt_candidate(node, CsharpminorStmt::Snop) <--

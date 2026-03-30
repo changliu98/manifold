@@ -121,6 +121,32 @@ ascent_par! {
     relation sseq_head(Node);
     relation valid_next(Node);
 
+    // Sstore type divergence: primary type + sign-flipped variants for ambiguous chunks
+    relation sstore_clight_type(Node, ClightType);
+
+    sstore_clight_type(node, clight_type_from_chunk(&chunk)) <--
+        csharp_stmt(node, ?CsharpminorStmt::Sstore(chunk, _, _));
+
+    sstore_clight_type(node, ClightType::Tint(ClightIntSize::I8, ClightSignedness::Unsigned, default_attr())) <--
+        csharp_stmt(node, ?CsharpminorStmt::Sstore(chunk, _, _)),
+        if let MemoryChunk::MInt8Signed = chunk;
+
+    sstore_clight_type(node, ClightType::Tint(ClightIntSize::I8, ClightSignedness::Signed, default_attr())) <--
+        csharp_stmt(node, ?CsharpminorStmt::Sstore(chunk, _, _)),
+        if let MemoryChunk::MInt8Unsigned = chunk;
+
+    sstore_clight_type(node, ClightType::Tint(ClightIntSize::I16, ClightSignedness::Unsigned, default_attr())) <--
+        csharp_stmt(node, ?CsharpminorStmt::Sstore(chunk, _, _)),
+        if let MemoryChunk::MInt16Signed = chunk;
+
+    sstore_clight_type(node, ClightType::Tint(ClightIntSize::I16, ClightSignedness::Signed, default_attr())) <--
+        csharp_stmt(node, ?CsharpminorStmt::Sstore(chunk, _, _)),
+        if let MemoryChunk::MInt16Unsigned = chunk;
+
+    sstore_clight_type(node, ClightType::Tint(ClightIntSize::I32, ClightSignedness::Unsigned, default_attr())) <--
+        csharp_stmt(node, ?CsharpminorStmt::Sstore(chunk, _, _)),
+        if matches!(chunk, MemoryChunk::MInt32 | MemoryChunk::MAny32);
+
 
     clight_stmt_raw(node, stmt) <--
         clight_stmt_without_field(node, s),
@@ -182,6 +208,7 @@ ascent_par! {
 
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sstore(chunk, addr, value)),
+        sstore_clight_type(node, ty),
         agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
         let mut all_exprs = vec![addr.clone()],
         let _ = all_exprs.push(value.clone()),
@@ -190,13 +217,12 @@ ascent_par! {
         for var_types in var_type_variants.iter(),
         let addr_expr = clight_expr_from_csharp_with_multi_types(&addr, var_types),
         if !matches!(addr_expr, ClightExpr::EconstInt(0, _) | ClightExpr::EconstLong(0, _)),
-        let ty = clight_type_from_chunk(&chunk),
         let pointer_ty = pointer_to(ty.clone()),
         let lhs_addr = rewrite_expr_as_pointer(addr_expr.clone(), pointer_ty),
         if !matches!(&lhs_addr, ClightExpr::Ecast(inner, _) if matches!(inner.as_ref(), ClightExpr::EconstInt(0, _) | ClightExpr::EconstLong(0, _))),
         let lhs = ClightExpr::Ederef(Box::new(lhs_addr), ty.clone()),
         let rhs = clight_expr_from_csharp_with_multi_types(&value, var_types),
-        let rhs_casted = cast_expr_to_type(rhs, ty),
+        let rhs_casted = cast_expr_to_type(rhs, ty.clone()),
         let stmt = ClightStmt::Sassign(lhs.clone(), rhs_casted.clone());
 
     clight_stmt_without_field(node, stmt) <--

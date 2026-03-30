@@ -1440,6 +1440,26 @@ ascent_par! {
         flags_and_jump_pair(addr0, addr1, _),
         pucomiss(addr0, _, _);
 
+    // TestCond -> Condition divergence: CondE/CondNe are ZF-based (signedness-agnostic),
+    // so they map to both signed and unsigned comparison conditions.
+    #[local] relation testcond_to_cond(TestCond, Condition);
+    #[local] relation testcond_to_cond_64(TestCond, Condition);
+
+    testcond_to_cond(test_cond.clone(), condition_for_testcond_sized(*test_cond, false)) <--
+        pjcc(_, test_cond, _);
+    testcond_to_cond_64(test_cond.clone(), condition_for_testcond_sized(*test_cond, true)) <--
+        pjcc(_, test_cond, _);
+
+    testcond_to_cond(TestCond::CondE, Condition::Ccompu(Comparison::Ceq)) <--
+        pjcc(_, test_cond, _), if let TestCond::CondE = test_cond;
+    testcond_to_cond_64(TestCond::CondE, Condition::Ccomplu(Comparison::Ceq)) <--
+        pjcc(_, test_cond, _), if let TestCond::CondE = test_cond;
+
+    testcond_to_cond(TestCond::CondNe, Condition::Ccompu(Comparison::Cne)) <--
+        pjcc(_, test_cond, _), if let TestCond::CondNe = test_cond;
+    testcond_to_cond_64(TestCond::CondNe, Condition::Ccomplu(Comparison::Cne)) <--
+        pjcc(_, test_cond, _), if let TestCond::CondNe = test_cond;
+
 
     mach_inst(addr0, MachInst::Mcond(condition, Arc::new(vec![*arg1]), lbl)) <--
         pcmp(addr0, r1, r2),
@@ -1450,11 +1470,11 @@ ascent_par! {
         preg_of(arg1, preg_of_r1),
         cmp_jcc_link(addr0, addr1),
         pjcc(addr1, test_cond, lbl),
-        let base_cond = condition_for_testcond_sized(*test_cond, true),
+        testcond_to_cond_64(*test_cond, base_cond),
         let condition = match base_cond {
-            Condition::Ccomp(cmp) | Condition::Ccompl(cmp) => Condition::Ccomplimm(cmp, *imm_val),
-            Condition::Ccompu(cmp) | Condition::Ccomplu(cmp) => Condition::Ccompluimm(cmp, *imm_val),
-            other => other,
+            Condition::Ccomp(cmp) | Condition::Ccompl(cmp) => Condition::Ccomplimm(*cmp, *imm_val),
+            Condition::Ccompu(cmp) | Condition::Ccomplu(cmp) => Condition::Ccompluimm(*cmp, *imm_val),
+            other => other.clone(),
         };
 
     mach_inst(addr0, MachInst::Mcond(condition, Arc::new(vec![*arg1]), lbl)) <--
@@ -1466,14 +1486,14 @@ ascent_par! {
         preg_of(arg1, preg_of_r1),
         cmp_jcc_link(addr0, addr1),
         pjcc(addr1, test_cond, lbl),
-        let base_cond = condition_for_testcond_sized(*test_cond, false),
+        testcond_to_cond(*test_cond, base_cond),
         let condition = match base_cond {
-            Condition::Ccomp(cmp) => Condition::Ccompimm(cmp, *imm_val),
-            Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, *imm_val),
-            other => other,
+            Condition::Ccomp(cmp) => Condition::Ccompimm(*cmp, *imm_val),
+            Condition::Ccompu(cmp) => Condition::Ccompuimm(*cmp, *imm_val),
+            other => other.clone(),
         };
 
-    mach_inst(addr0, MachInst::Mcond(condition, Arc::new(vec![*arg1, *arg2]), lbl)) <--
+    mach_inst(addr0, MachInst::Mcond(condition.clone(), Arc::new(vec![*arg1, *arg2]), lbl)) <--
         pcmp(addr0, r1, r2),
         op_register(r1, reg_str1),
         op_register(r2, reg_str2),
@@ -1484,9 +1504,9 @@ ascent_par! {
         preg_of(arg2, preg_of_r2),
         cmp_jcc_link(addr0, addr1),
         pjcc(addr1, test_cond, lbl),
-        let condition = condition_for_testcond_sized(*test_cond, true);
+        testcond_to_cond_64(*test_cond, condition);
 
-    mach_inst(addr0, MachInst::Mcond(condition, Arc::new(vec![*arg1, *arg2]), lbl)) <--
+    mach_inst(addr0, MachInst::Mcond(condition.clone(), Arc::new(vec![*arg1, *arg2]), lbl)) <--
         pcmp(addr0, r1, r2),
         op_register(r1, reg_str1),
         op_register(r2, reg_str2),
@@ -1497,7 +1517,7 @@ ascent_par! {
         preg_of(arg2, preg_of_r2),
         cmp_jcc_link(addr0, addr1),
         pjcc(addr1, test_cond, lbl),
-        let condition = condition_for_testcond_sized(*test_cond, false);
+        testcond_to_cond(*test_cond, condition);
 
 
     mach_inst(addr0, MachInst::Mcond(condition, Arc::new(vec![*arg1]), lbl)) <--
@@ -2113,6 +2133,27 @@ ascent_par! {
         preg_of(res, preg_of_r),
         let args = vec![];
 
+    // Divergence: XOR r,r can also be a genuine self-XOR (Asmgen.v: Oxor compiles to Pxorl_rr)
+    mach_inst(address, MachInst::Mop(Operation::Oxor, Arc::new(args), *res)) <--
+        pxor(address, r, r0),
+        if r == r0,
+        op_register(r, res_str),
+        !reg_64(res_str),
+        let res_ireg = Ireg::from(res_str),
+        ireg_of(preg_of_r, res_ireg),
+        preg_of(res, preg_of_r),
+        let args = vec![*res, *res];
+
+    mach_inst(address, MachInst::Mop(Operation::Oxorl, Arc::new(args), *res)) <--
+        pxor(address, r, r0),
+        if r == r0,
+        op_register(r, res_str),
+        reg_64(res_str),
+        let res_ireg = Ireg::from(res_str),
+        ireg_of(preg_of_r, res_ireg),
+        preg_of(res, preg_of_r),
+        let args = vec![*res, *res];
+
     mach_inst(address, MachInst::Mop(Operation::Oindirectsymbol(*imm_str as usize), Arc::new(args), *res)) <--
         pmov(address, r, symid),
         op_immediate(symid, imm_str, _),
@@ -2285,6 +2326,25 @@ ascent_par! {
             Operation::Oadd
         } else {
             Operation::Oaddl
+        };
+
+    // Divergence: ADD reg,reg can also be Olea(Aindexed2(0)) — CompCert has no Oadd for x86,
+    // register addition is Olea(Aindexed2 0) which compiles to LEA r,[r1+r2].
+    mach_inst(address, MachInst::Mop(op, Arc::new(args), *res)) <--
+        padd(address, r, r2),
+        instruction(address, _, mnem, _, _, _, _, _, _, _),
+        op_register(r, r_str),
+        op_register(r2, r2_str),
+        ireg_of(preg_of_r, Ireg::from(r_str)),
+        preg_of(res, preg_of_r),
+        ireg_of(preg_of_r2, Ireg::from(r2_str)),
+        preg_of(a2, preg_of_r2),
+        let args = vec![*res, *a2],
+        let mnem_upper = mnem.to_ascii_uppercase(),
+        let op = if mnem_upper.ends_with("L") || mnem_upper.contains("ADDL") {
+            Operation::Olea(Addressing::Aindexed2(0))
+        } else {
+            Operation::Oleal(Addressing::Aindexed2(0))
         };
 
     mach_inst(address, MachInst::Mop(Operation::Olea(addressing), Arc::new(empty_args), *res)) <--
