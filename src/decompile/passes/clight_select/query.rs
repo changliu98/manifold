@@ -25,6 +25,7 @@ fn xtype_to_string(xtype: &XType) -> String {
         XType::Xsingle => "float_F32".to_string(),
         XType::Xptr => "ptr_I64".to_string(),
         XType::Xcharptr => "ptr_char".to_string(),
+        XType::Xcharptrptr => "ptr_ptr_char".to_string(),
         XType::Xintptr => "ptr_int".to_string(),
         XType::Xfloatptr => "ptr_double".to_string(),
         XType::Xsingleptr => "ptr_float".to_string(),
@@ -39,8 +40,8 @@ fn xtype_priority(xtype: &XType) -> u8 {
         XType::Xvoid => 0,
         XType::Xbool => 1,
         XType::Xany32 => 2,
-        XType::Xany64 => 3,
         XType::Xint => 4,
+        XType::Xany64 => 5,
         XType::Xintunsigned => 5,
         XType::Xlong => 6,
         XType::Xlongunsigned => 7,
@@ -50,7 +51,7 @@ fn xtype_priority(xtype: &XType) -> u8 {
         XType::Xsingle => 11,
         XType::Xptr => 12,
         XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr => 12,
-        XType::Xcharptr => 13,
+        XType::Xcharptr | XType::Xcharptrptr => 13,
         XType::Xfuncptr => 14,
         XType::XstructPtr(_) => 15,
         _ => 0,
@@ -227,6 +228,11 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
             })
             .or_insert_with(|| name_str);
     }
+    // ELF symbols are authoritative: override ident_to_symbol entries.
+    for (addr, name, _) in db.rel_iter::<(Address, Symbol, Symbol)>("symbols") {
+        let id = *addr as usize;
+        id_to_name.insert(id, name.to_string());
+    }
 
     let mut func_params: HashMap<Address, Vec<RTLReg>> = HashMap::new();
     for (addr, reg) in db.rel_iter::<(Address, RTLReg)>("emit_function_param") {
@@ -280,7 +286,7 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
             .map(|(pos, reg)| {
                 if let Some(xtype) = param_xtypes.get(&(*addr, *reg)) {
                     if !matches!(xtype,
-                        XType::Xptr | XType::Xcharptr | XType::Xintptr |
+                        XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr |
                         XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::Xlong |
                         XType::Xlongunsigned | XType::Xany64)
                     {
@@ -381,6 +387,14 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
                     .or_insert_with(Vec::new)
                     .push(*to_node);
             }
+        }
+    }
+    // Sort successor lists for determinism (emit_next iteration order from
+    // parallel Ascent evaluation is not guaranteed).
+    for func in func_map.values_mut() {
+        for succs in func.successors.values_mut() {
+            succs.sort();
+            succs.dedup();
         }
     }
 
@@ -535,8 +549,6 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
             }
         }
     }
-
-    // No post-hoc type patching; statement candidates from clight_pass already have context-sensitive types from Phase 1+2.
 
     for (addr, reg, id) in db.rel_iter::<(Address, RTLReg, usize)>("reg_to_struct_id") {
         if let Some(func) = func_map.get_mut(addr) {
@@ -737,11 +749,12 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
     for (id, name) in db.rel_iter::<(Ident, Symbol)>("ident_to_symbol") {
         id_to_name.insert(*id, name.to_string());
     }
+    // ELF symbols are authoritative: override ident_to_symbol entries.
     for (addr, name, _) in db.rel_iter::<(Address, Symbol, Symbol)>("symbols") {
         let id = *addr as usize;
-        id_to_name.entry(id).or_insert_with(|| name.to_string());
+        id_to_name.insert(id, name.to_string());
     }
-    
+
     let global_ptr_ids: std::collections::HashSet<usize> = db.rel_iter::<(Ident,)>("emit_global_is_ptr")
         .map(|(id,)| *id)
         .collect();
@@ -904,43 +917,6 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
     Ok(globals)
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct IfThenElseInfo {
-    pub if_branch_nodes: Vec<Node>,
-    pub else_branch_nodes: Vec<Node>,
-    pub merge_node: Node,
-}
-
-pub fn extract_ifthenelse_bodies(
-    db: &DecompileDB,
-) -> HashMap<Address, HashMap<Node, IfThenElseInfo>> {
-    let mut result: HashMap<Address, HashMap<Node, IfThenElseInfo>> = HashMap::new();
-
-    for (func, branch, node, is_if) in db.rel_iter::<(Address, Node, Node, bool)>("emit_ifthenelse_body") {
-        let info = result
-            .entry(*func)
-            .or_default()
-            .entry(*branch)
-            .or_insert_with(IfThenElseInfo::default);
-
-        if *is_if {
-            info.if_branch_nodes.push(*node);
-        } else {
-            info.else_branch_nodes.push(*node);
-        }
-    }
-
-    for (func, branch, merge) in db.rel_iter::<(Address, Node, Node)>("ifthenelse_merge_point") {
-        if let Some(func_map) = result.get_mut(func) {
-            if let Some(info) = func_map.get_mut(branch) {
-                info.merge_node = *merge;
-            }
-        }
-    }
-
-    result
-}
-
 use crate::decompile::passes::c_pass::types::{CType, IntSize, Signedness, StructDef, StructField, TypeQualifiers};
 use crate::x86::types::FieldType;
 use crate::x86::op::Condition;
@@ -992,7 +968,7 @@ pub fn extract_loop_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, Loo
             .exit_node = Some(*exit_node);
     }
 
-    for (func_addr, loop_header, step_node) in db.rel_iter::<(Address, Node, Node)>("suppress_step") {
+    for (func_addr, loop_header, step_node) in db.rel_iter::<(Address, Node, Node)>("trim_step") {
         let info = result
             .entry(*func_addr)
             .or_default()
@@ -1233,51 +1209,6 @@ pub fn extract_struct_definitions(db: &DecompileDB) -> Vec<ExtractedStruct> {
         }
     }
 
-    if structs.is_empty() {
-        let canonical_ids: HashSet<usize> = db
-            .rel_iter::<(u64, usize)>("emit_canonical_struct_id")
-            .map(|(_hash, id)| *id)
-            .collect();
-
-        let mut seen_hashes = HashSet::new();
-        for (struct_id, fields) in db.rel_iter::<(usize, Arc<Vec<(i64, usize, MemoryChunk)>>)>("emit_inferred_struct_layout") {
-            let layout_hash = crate::decompile::analysis::struct_recovery_pass::compute_layout_hash_from_tuples(fields);
-            
-            let is_canonical = canonical_ids.contains(struct_id);
-            if !is_canonical {
-                continue;
-            }
-
-            if seen_hashes.contains(&layout_hash) {
-                continue;
-            }
-            seen_hashes.insert(layout_hash);
-
-            let struct_name = format!("struct_{:x}", struct_id);
-            let struct_fields: Vec<StructField> = fields
-                .iter()
-                .map(|(offset, size, chunk)| {
-                    let field_name = db.rel_iter::<(u64, i64, String, MemoryChunk)>("struct_field")
-                        .find(|(sid, off, _, _)| *sid == (*struct_id as u64) && *off == *offset)
-                        .map(|(_, _, name, _)| name.clone())
-                        .unwrap_or_else(|| format!("field_{:x}", offset));
-
-                    let field_type = chunk_to_ctype(*chunk, *size);
-                    StructField::new(field_name, field_type)
-                })
-                .collect();
-
-            let definition = StructDef::new_struct(struct_name, struct_fields);
-
-            structs.push(ExtractedStruct {
-                struct_id: *struct_id,
-                layout_hash,
-                is_canonical: true,
-                definition,
-            });
-        }
-    }
-
     // Generate struct definitions from emit_struct_fields for efield-detected structs not matched to canonical struct_recovery IDs (register-based IDs from ClightFieldPass).
     for (struct_id, field_map) in &efield_extra_fields {
         if seen_struct_ids.contains(struct_id) {
@@ -1331,21 +1262,6 @@ pub fn extract_struct_layout_map(db: &DecompileDB) -> HashMap<usize, Vec<(i64, S
     let canonical_ids: HashSet<usize> = db.rel_iter::<(u64, usize)>("emit_canonical_struct_id")
         .map(|(_hash, id)| *id)
         .collect();
-    
-    for (struct_id, fields) in db.rel_iter::<(usize, Arc<Vec<(i64, usize, MemoryChunk)>>)>("emit_inferred_struct_layout") {
-        if !canonical_ids.is_empty() && !canonical_ids.contains(struct_id) {
-            continue;
-        }
-        let mapped_fields = fields.iter().map(|(offset, _size, chunk)| {
-             let field_name = db.rel_iter::<(u64, i64, String, MemoryChunk)>("struct_field")
-                    .find(|(sid, off, _, _)| *sid == (*struct_id as u64) && *off == *offset)
-                    .map(|(_, _, name, _)| name.clone())
-                    .unwrap_or_else(|| format!("field_{:x}", offset));
-             
-             (*offset, field_name, *chunk)
-        }).collect();
-        layouts.insert(*struct_id, mapped_fields);
-    }
     
     for (global_ident, struct_id, fields) in db.rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_global_struct_fields") {
         let _global_name = id_to_name

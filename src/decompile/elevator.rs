@@ -85,35 +85,33 @@ impl RelationEntry {
         self.sizer.map(|f| f(self.data.as_ref()))
     }
 }
-use crate::decompile::passes::linear_pass::init_op_immediate_map;
 use crate::decompile::passes::c_pass::types::{CType, TranslationUnit};
 use crate::decompile::passes::clight_select::select::SelectedFunction;
 use crate::decompile::passes::clight_select::query::GlobalData;
 
-// Escape raw bytes into C string literal format.
-fn escape_string_content(bytes: &[u8]) -> String {
-    let mut result = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        match b {
-            b'\n' => result.push_str("\\n"),
-            b'\r' => result.push_str("\\r"),
-            b'\t' => result.push_str("\\t"),
-            b'\\' => result.push_str("\\\\"),
-            b'"' => result.push_str("\\\""),
-            0x20..=0x7E => result.push(b as char),
-            _ => {
-                result.push_str(&format!("\\x{:02x}", b));
-            }
-        }
-    }
-    result
-}
 use crate::util::leak;
 use crate::x86::mach::Mreg;
 use crate::x86::types::*;
 use either::Either;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+
+// Strip GCC/Clang optimizer clone suffixes (_constprop_N, _isra_N, etc.) from symbol names.
+fn strip_clone_suffix(name: &str) -> Option<&str> {
+    // Order matters: check longer suffixes first to avoid partial matches.
+    for pattern in &["_constprop_", "_isra_", "_part_", "_lto_priv_"] {
+        if let Some(pos) = name.find(pattern) {
+            return Some(&name[..pos]);
+        }
+    }
+    // _cold has no trailing number
+    if let Some(pos) = name.rfind("_cold") {
+        if pos + 5 == name.len() {
+            return Some(&name[..pos]);
+        }
+    }
+    None
+}
 
 // External function definition parsed from extern.json.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -142,6 +140,7 @@ fn xtype_from_string(s: &str) -> Option<XType> {
         "Xsingle" => Some(XType::Xsingle),
         "Xptr" => Some(XType::Xptr),
         "Xcharptr" => Some(XType::Xcharptr),
+        "Xcharptrptr" => Some(XType::Xcharptrptr),
         "Xintptr" => Some(XType::Xintptr),
         "Xfloatptr" => Some(XType::Xfloatptr),
         "Xsingleptr" => Some(XType::Xsingleptr),
@@ -378,10 +377,19 @@ impl DecompileDB {
             self.skip_function_names.len(), self.skip_function_prefixes.len());
     }
 
-    // Check if a function should be skipped (exact match or prefix match).
+    // Check if a function should be skipped (exact, prefix, or base-name after stripping clone suffixes).
     pub fn should_skip_function(&self, name: &str) -> bool {
-        self.skip_function_names.contains(name)
+        if self.skip_function_names.contains(name)
             || self.skip_function_prefixes.iter().any(|p| name.starts_with(p))
+        {
+            return true;
+        }
+        // Strip sanitized optimizer clone suffixes and check the base name.
+        if let Some(base) = strip_clone_suffix(name) {
+            return self.skip_function_names.contains(base)
+                || self.skip_function_prefixes.iter().any(|p| base.starts_with(p));
+        }
+        false
     }
 
     // Load external function type signatures from extern.json into known_extern_signature and related relations.
@@ -421,7 +429,7 @@ impl DecompileDB {
             // Derive ptr_params from sig_args: any param with a pointer type
             for (idx, arg_str) in func.sig_args.iter().enumerate() {
                 if matches!(arg_str.as_str(),
-                    "Xptr" | "Xcharptr" | "Xintptr" | "Xfloatptr" | "Xsingleptr" | "Xfuncptr"
+                    "Xptr" | "Xcharptr" | "Xcharptrptr" | "Xintptr" | "Xfloatptr" | "Xsingleptr" | "Xfuncptr"
                 ) {
                     self.rel_push("known_func_param_is_ptr", (name_sym, idx));
                 }
@@ -505,10 +513,10 @@ impl DecompileDB {
                 let pass = &passes[idx];
                 let start = std::time::Instant::now();
                 let rss_before = if measure_mem { get_rss_mb() } else { 0.0 };
-                // eprintln!("Running pass: {}", pass.name());
+                eprintln!("[PASS] Starting {}", pass.name());
                 pass.run(self);
                 let elapsed = start.elapsed();
-                // eprintln!("  Pass {} completed in {:?}", pass.name(), elapsed);
+                eprintln!("[PASS] {} completed in {:?}", pass.name(), elapsed);
                 if measure_mem {
                     let rss_after = get_rss_mb();
                     let delta = rss_after - rss_before;
@@ -545,6 +553,7 @@ impl DecompileDB {
 
                 if let Some(mut sub_dbs) = sub_dbs {
                     log::info!("Running parallel stage: [{}]", pass_names.join(", "));
+                    eprintln!("[STAGE] Starting parallel stage: [{}]", pass_names.join(", "));
                     let stage_start = std::time::Instant::now();
 
                     rayon::scope(|s| {
@@ -552,10 +561,11 @@ impl DecompileDB {
                             let idx = stage.passes[i];
                             let pass = &passes[idx];
                             s.spawn(move |_| {
-                                // eprintln!("  Running pass: {}", pass.name());
+                                eprintln!("[PASS] Starting {} (parallel)", pass.name());
                                 let start = std::time::Instant::now();
                                 pass.run(sub_db);
-                                let _ = start.elapsed();
+                                let elapsed = start.elapsed();
+                                eprintln!("[PASS] {} completed in {:?} (parallel)", pass.name(), elapsed);
                             });
                         }
                     });
@@ -583,10 +593,10 @@ impl DecompileDB {
                         let pass = &passes[idx];
                         let start = std::time::Instant::now();
                         let rss_before = if measure_mem { get_rss_mb() } else { 0.0 };
-                        // eprintln!("Running pass: {}", pass.name());
+                        eprintln!("[PASS] Starting {}", pass.name());
                         pass.run(self);
                         let elapsed = start.elapsed();
-                        // eprintln!("  Pass {} completed in {:?}", pass.name(), elapsed);
+                        eprintln!("[PASS] {} completed in {:?}", pass.name(), elapsed);
                         if measure_mem {
                             let rss_after = get_rss_mb();
                             let delta = rss_after - rss_before;
@@ -745,18 +755,6 @@ impl DecompileDB {
             for (_, stmt) in &raw {
                 eprintln!("[TRACE] clight_stmt_raw({}) = {:?}", node, stmt);
             }
-        }
-
-        let sup_loop: Vec<_> = self.rel_iter::<(Address, Node, Node)>("suppress_node_in_loop")
-            .filter(|(_, _, n)| *n == node).collect();
-        for (addr, head, _) in &sup_loop {
-            eprintln!("[TRACE] suppress_node_in_loop(func=0x{:x}, head={}, node={})", addr, head, node);
-        }
-
-        let sup_ite: Vec<_> = self.rel_iter::<(Address, Node, Node)>("suppress_node_in_ifthenelse")
-            .filter(|(_, _, n)| *n == node).collect();
-        for (addr, branch, _) in &sup_ite {
-            eprintln!("[TRACE] suppress_node_in_ifthenelse(func=0x{:x}, branch={}, node={})", addr, branch, node);
         }
 
         let owned_loop: Vec<_> = self.rel_iter::<(Address, Node, Node)>("node_owned_by_loop")

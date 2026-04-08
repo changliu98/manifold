@@ -273,7 +273,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         .collect();
 
     let known_internal_sigs: HashMap<&str, (usize, XType, Vec<XType>)> = [
-        ("main", (2, XType::Xint, vec![XType::Xint, XType::Xptr])),
+        ("main", (2, XType::Xint, vec![XType::Xint, XType::Xcharptrptr])),
     ].into_iter().collect();
 
     // Detect param registers used as load/store base addresses in RTL, catching pointers missed by Datalog type inference, and struct-like multi-offset access patterns.
@@ -308,9 +308,25 @@ fn reconcile_signatures(db: &mut DecompileDB) {
 
     let mut prototypes: Vec<FunctionPrototype> = Vec::new();
 
+    // Only force known extern sigs for variadic functions; non-variadic may be custom implementations.
+    let varargs_names: HashSet<&str> = db.rel_iter::<(Symbol, usize)>("known_varargs_function")
+        .map(|(name, _)| *name)
+        .collect();
+
     for (&func_addr, &func_name) in &functions {
-        if extern_sigs.contains_key(func_name) {
-            continue;
+        if varargs_names.contains(func_name) {
+            if let Some((param_count, ret_type, param_types)) = extern_sigs.get(func_name) {
+                // Variadic internal function: force known param count to avoid materializing register dumps.
+                prototypes.push(FunctionPrototype {
+                    address: func_addr,
+                    name: func_name,
+                    param_count: *param_count,
+                    param_types: (**param_types).clone(),
+                    return_type: *ret_type,
+                    confidence: SignatureConfidence::KnownExtern,
+                });
+                continue;
+            }
         }
 
         if let Some((param_count, ret_type, param_types)) = known_internal_sigs.get(func_name) {
@@ -417,7 +433,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                             // Pick the most specific type from candidates (prefer struct ptr > ptr > specific int > generic int)
                             let best = xtypes.iter().max_by_key(|t| match t {
                                 XType::XstructPtr(_) => 5,
-                                XType::Xcharptr | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr => 4,
+                                XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr => 4,
                                 XType::Xptr => 3,
                                 XType::Xint8signed | XType::Xint8unsigned | XType::Xint16signed | XType::Xint16unsigned => 2,
                                 XType::Xfloat | XType::Xsingle => 2,
@@ -472,6 +488,20 @@ fn reconcile_signatures(db: &mut DecompileDB) {
             }
 
             param_types.push(resolved_type.unwrap_or(XType::Xint));
+        }
+
+        // C++ method detection: mangled names starting with "_ZN" are class member
+        // functions whose first parameter (position 0) is the implicit `this` pointer.
+        // Force it to Xptr unless a more specific pointer type was already resolved.
+        if func_name.starts_with("_ZN") && !param_types.is_empty() {
+            let needs_upgrade = matches!(
+                param_types[0],
+                XType::Xint | XType::Xintunsigned | XType::Xlong | XType::Xlongunsigned |
+                XType::Xany32 | XType::Xany64 | XType::Xvoid
+            );
+            if needs_upgrade {
+                param_types[0] = XType::Xptr;
+            }
         }
 
         let has_any_return_evidence = def_has_return.contains(&func_addr);

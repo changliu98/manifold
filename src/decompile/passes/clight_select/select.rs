@@ -2,15 +2,15 @@
 
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::clight_select::query::{
-    extract_functions, extract_ifthenelse_bodies, extract_loop_info,
-    FunctionData, IfThenElseInfo, LoopInfo,
+    extract_functions, extract_loop_info,
+    FunctionData, LoopInfo,
 };
 use crate::decompile::passes::c_pass::convert::from_relations::{convert_stmt, ConversionContext};
 use crate::decompile::passes::c_pass::helpers::{xtype_string_to_ctype, convert_param_type_from_param, param_name_for_reg};
 use crate::decompile::passes::c_pass::print;
 use crate::decompile::passes::csh_pass::ident_from_node;
 use crate::x86::types::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_uint;
 
@@ -32,9 +32,9 @@ struct SelectionState {
 
 /// Precomputed metadata about refinable nodes in a function.
 struct RefinableMetadata {
-    refinable_set: HashSet<Node>,
-    decl_node_to_reg: HashMap<Node, RTLReg>,
-    param_node_to_pos: HashMap<Node, usize>,
+    refinable_set: BTreeSet<Node>,
+    decl_node_to_reg: BTreeMap<Node, RTLReg>,
+    param_node_to_pos: BTreeMap<Node, usize>,
 }
 
 // Program-level (whole-program) selection types
@@ -81,12 +81,22 @@ pub struct SelectedFunction {
     pub reg_struct_ids: HashMap<RTLReg, usize>,
 
     pub loop_info: HashMap<Node, LoopInfo>,
-    pub ifthenelse_info: HashMap<Node, IfThenElseInfo>,
 }
 
 
 pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, String> {
-    let (functions, _id_to_name) = extract_functions(db)?;
+    let (mut functions, _id_to_name) = extract_functions(db)?;
+
+    // Sort candidates deterministically: hash each ClightStmt, sort by hash.
+    // Ascent parallel evaluation can produce candidates in arbitrary order;
+    // this ensures the candidate index is stable across runs.
+    for func in &mut functions {
+        for candidates in func.node_statements.values_mut() {
+            if candidates.len() > 1 {
+                candidates.sort_by_key(|s| stmt_deterministic_hash(s));
+            }
+        }
+    }
 
     // Dump candidate distribution stats when CANDIDATE_STATS_OUT is set
     if let Ok(out_path) = std::env::var("CANDIDATE_STATS_OUT") {
@@ -110,7 +120,6 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
     }
 
     let loop_info_all = extract_loop_info(db);
-    let ifthenelse_bodies_all = extract_ifthenelse_bodies(db);
 
     // Build global struct fields map from all functions' emit_struct_fields
     let mut global_struct_fields: HashMap<i64, Vec<(i64, Ident, MemoryChunk)>> = HashMap::new();
@@ -144,7 +153,7 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
         .iter()
         .map(|func| {
             build_selected_function_from_program_state(
-                func, &best_state, &loop_info_all, &ifthenelse_bodies_all,
+                func, &best_state, &loop_info_all,
             )
         })
         .collect();
@@ -157,7 +166,6 @@ fn build_selected_function_from_program_state(
     func: &FunctionData,
     program_state: &ProgramSelectionState,
     loop_info_all: &HashMap<Address, HashMap<Node, LoopInfo>>,
-    ifthenelse_bodies_all: &HashMap<Address, HashMap<Node, IfThenElseInfo>>,
 ) -> SelectedFunction {
     let addr = func.address;
 
@@ -187,9 +195,7 @@ fn build_selected_function_from_program_state(
     let mut statements = materialize_statements(&per_func_state, func);
 
     let func_loop_info = loop_info_all.get(&func.address).cloned().unwrap_or_default();
-    let func_ite_info = ifthenelse_bodies_all.get(&func.address).cloned().unwrap_or_default();
 
-    assemble_ifthenelse(&mut statements, &func_ite_info);
     assemble_loops(&mut statements, &func_loop_info);
 
     // sseq grouping
@@ -239,12 +245,9 @@ fn build_selected_function_from_program_state(
         switch_heads: func.switch_heads.clone(),
         reg_struct_ids: func.reg_struct_ids.clone(),
         loop_info: func_loop_info,
-        ifthenelse_info: func_ite_info,
     }
 }
 
-
-// Backtracking search infrastructure
 
 #[derive(Debug)]
 struct ClangError {
@@ -317,14 +320,8 @@ fn build_program_initial_state(functions: &[FunctionData]) -> ProgramSelectionSt
 
     for func in functions {
         let addr = func.address;
-        for (node, candidates) in &func.node_statements {
-            let consistent_idx = candidates
-                .iter()
-                .enumerate()
-                .find(|(_, s)| is_edge_consistent(s, *node, &func.successors))
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            candidate_idx.insert((addr, *node), Some(consistent_idx));
+        for (node, _candidates) in &func.node_statements {
+            candidate_idx.insert((addr, *node), Some(0));
         }
         for (reg, idx) in &func.var_decl_idx {
             var_decl_idx.insert((addr, *reg), *idx);
@@ -340,34 +337,28 @@ fn build_program_initial_state(functions: &[FunctionData]) -> ProgramSelectionSt
 /// Per-function selection state for hybrid search.
 #[derive(Clone, Debug)]
 struct HybridFunctionState {
-    candidate_idx: HashMap<Node, Option<usize>>,
-    var_decl_idx: HashMap<RTLReg, usize>,
-    struct_field_type_idx: HashMap<(String, String), usize>,
+    candidate_idx: BTreeMap<Node, Option<usize>>,
+    var_decl_idx: BTreeMap<RTLReg, usize>,
+    struct_field_type_idx: BTreeMap<(String, String), usize>,
 }
 
 fn build_hybrid_initial_state(func: &FunctionData) -> HybridFunctionState {
-    let mut candidate_idx = HashMap::new();
-    for (node, candidates) in &func.node_statements {
-        let consistent_idx = candidates
-            .iter()
-            .enumerate()
-            .find(|(_, s)| is_edge_consistent(s, *node, &func.successors))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        candidate_idx.insert(*node, Some(consistent_idx));
+    let mut candidate_idx = BTreeMap::new();
+    for (node, _candidates) in &func.node_statements {
+        candidate_idx.insert(*node, Some(0));
     }
     HybridFunctionState {
         candidate_idx,
-        var_decl_idx: func.var_decl_idx.clone(),
-        struct_field_type_idx: func.struct_field_type_idx.clone(),
+        var_decl_idx: func.var_decl_idx.iter().map(|(k, v)| (*k, *v)).collect(),
+        struct_field_type_idx: func.struct_field_type_idx.iter().map(|(k, v)| (k.clone(), *v)).collect(),
     }
 }
 
 fn build_hybrid_refinable_metadata(func: &FunctionData) -> RefinableMetadata {
     let param_reg_set: HashSet<RTLReg> = func.param_regs.iter().copied().collect();
-    let mut refinable_set = HashSet::new();
-    let mut decl_node_to_reg = HashMap::new();
-    let mut param_node_to_pos = HashMap::new();
+    let mut refinable_set = BTreeSet::new();
+    let mut decl_node_to_reg = BTreeMap::new();
+    let mut param_node_to_pos = BTreeMap::new();
 
     for (node, cands) in &func.node_statements {
         if cands.len() > 1 {
@@ -389,6 +380,198 @@ fn build_hybrid_refinable_metadata(func: &FunctionData) -> RefinableMetadata {
         }
     }
     RefinableMetadata { refinable_set, decl_node_to_reg, param_node_to_pos }
+}
+
+/// Scan a ClightExpr for Ederef operand registers; needs_struct_ptr=true when deref is inside an Efield.
+fn scan_deref_regs_expr(expr: &ClightExpr) -> Vec<(RTLReg, bool)> {
+    let mut out = Vec::new();
+    match expr {
+        ClightExpr::Efield(inner, _, _) => {
+            // The inner should be Ederef(Etempvar(reg, _), Tstruct(...))
+            if let ClightExpr::Ederef(ptr_expr, _) = inner.as_ref() {
+                match ptr_expr.as_ref() {
+                    ClightExpr::Etempvar(id, _) => out.push((*id as RTLReg, true)),
+                    ClightExpr::Ecast(inner2, _) => {
+                        if let ClightExpr::Etempvar(id, _) = inner2.as_ref() {
+                            out.push((*id as RTLReg, true));
+                        }
+                    }
+                    _ => {}
+                }
+                out.extend(scan_deref_regs_expr(ptr_expr));
+            } else {
+                out.extend(scan_deref_regs_expr(inner));
+            }
+        }
+        ClightExpr::Ederef(inner, _) => {
+            match inner.as_ref() {
+                ClightExpr::Etempvar(id, _) => out.push((*id as RTLReg, false)),
+                ClightExpr::Ecast(inner2, _) => {
+                    if let ClightExpr::Etempvar(id, _) = inner2.as_ref() {
+                        out.push((*id as RTLReg, false));
+                    }
+                }
+                _ => {}
+            }
+            out.extend(scan_deref_regs_expr(inner));
+        }
+        ClightExpr::Eunop(_, inner, _) => out.extend(scan_deref_regs_expr(inner)),
+        ClightExpr::Ebinop(_, l, r, _) => {
+            out.extend(scan_deref_regs_expr(l));
+            out.extend(scan_deref_regs_expr(r));
+        }
+        ClightExpr::Ecast(inner, _) => out.extend(scan_deref_regs_expr(inner)),
+        ClightExpr::Eaddrof(inner, _) => out.extend(scan_deref_regs_expr(inner)),
+        ClightExpr::Econdition(c, t, f, _) => {
+            out.extend(scan_deref_regs_expr(c));
+            out.extend(scan_deref_regs_expr(t));
+            out.extend(scan_deref_regs_expr(f));
+        }
+        _ => {}
+    }
+    out
+}
+
+fn scan_deref_regs_stmt(stmt: &ClightStmt) -> Vec<(RTLReg, bool)> {
+    let mut out = Vec::new();
+    match stmt {
+        ClightStmt::Sassign(lhs, rhs) => {
+            out.extend(scan_deref_regs_expr(lhs));
+            out.extend(scan_deref_regs_expr(rhs));
+        }
+        ClightStmt::Sset(_, expr) => out.extend(scan_deref_regs_expr(expr)),
+        ClightStmt::Scall(_, f, args) => {
+            out.extend(scan_deref_regs_expr(f));
+            for a in args { out.extend(scan_deref_regs_expr(a)); }
+        }
+        ClightStmt::Sreturn(Some(e)) => out.extend(scan_deref_regs_expr(e)),
+        ClightStmt::Sifthenelse(c, t, e) => {
+            out.extend(scan_deref_regs_expr(c));
+            out.extend(scan_deref_regs_stmt(t));
+            out.extend(scan_deref_regs_stmt(e));
+        }
+        ClightStmt::Ssequence(ss) => {
+            for s in ss { out.extend(scan_deref_regs_stmt(s)); }
+        }
+        ClightStmt::Slabel(_, inner) => out.extend(scan_deref_regs_stmt(inner)),
+        _ => {}
+    }
+    out
+}
+
+/// Pre-search constraint propagation: force pointer types for registers that all candidates agree must be dereferenced.
+fn propagate_type_constraints(
+    state: &mut HybridFunctionState,
+    func: &FunctionData,
+    _meta: &RefinableMetadata,
+) {
+    // For each register, track: does every candidate that mentions it deref it?
+    // reg -> (all_deref, any_non_deref, needs_struct_ptr)
+    let mut reg_deref_info: BTreeMap<RTLReg, (bool, bool, Option<usize>)> = BTreeMap::new();
+
+    for (_node, candidates) in &func.node_statements {
+        // Collect deref regs across ALL candidates for this node
+        let mut regs_in_any_candidate: BTreeSet<RTLReg> = BTreeSet::new();
+        let mut regs_derefed_in_all: Option<BTreeSet<RTLReg>> = None;
+        let mut struct_ptr_regs: BTreeMap<RTLReg, usize> = BTreeMap::new();
+
+        for stmt in candidates {
+            let deref_regs: BTreeSet<RTLReg> = scan_deref_regs_stmt(stmt)
+                .into_iter()
+                .map(|(reg, needs_struct)| {
+                    if needs_struct {
+                        if let Some(&sid) = func.reg_struct_ids.get(&reg) {
+                            struct_ptr_regs.insert(reg, sid);
+                        }
+                    }
+                    reg
+                })
+                .collect();
+
+            // Collect all regs mentioned in any deref across any candidate
+            regs_in_any_candidate.extend(&deref_regs);
+
+            // Intersect to find regs derefed in ALL candidates
+            regs_derefed_in_all = Some(match regs_derefed_in_all {
+                None => deref_regs,
+                Some(prev) => prev.intersection(&deref_regs).copied().collect(),
+            });
+        }
+
+        // Only mark a register as needing pointer if it's derefed in ALL candidates
+        if let Some(universal_deref_regs) = regs_derefed_in_all {
+            for reg in &universal_deref_regs {
+                let entry = reg_deref_info.entry(*reg).or_insert((true, false, None));
+                // Still universally derefed across all nodes so far
+                if let Some(&sid) = struct_ptr_regs.get(reg) {
+                    entry.2 = Some(sid);
+                }
+            }
+            // Regs derefed in some but not all candidates: mark as ambiguous
+            for reg in regs_in_any_candidate.difference(&universal_deref_regs) {
+                let entry = reg_deref_info.entry(*reg).or_insert((true, false, None));
+                entry.1 = true; // has a non-deref path
+            }
+        }
+    }
+
+    // Only force pointer for registers that are universally derefed and never ambiguous
+    let reg_needs_ptr: BTreeSet<RTLReg> = reg_deref_info.iter()
+        .filter(|(_, (all_deref, any_non_deref, _))| *all_deref && !*any_non_deref)
+        .map(|(reg, _)| *reg)
+        .collect();
+    let reg_needs_struct_ptr: BTreeMap<RTLReg, usize> = reg_deref_info.iter()
+        .filter(|(_, (all_deref, any_non_deref, sid))| *all_deref && !*any_non_deref && sid.is_some())
+        .map(|(reg, (_, _, sid))| (*reg, sid.unwrap()))
+        .collect();
+
+    // Force pointer types for registers that need them
+    for reg in &reg_needs_ptr {
+        if let Some(candidates) = func.var_type_candidates.get(reg) {
+            let current_idx = state.var_decl_idx.get(reg).copied().unwrap_or(0);
+            let current_is_ptr = candidates.get(current_idx)
+                .map(|s| s.starts_with("ptr_"))
+                .unwrap_or(false);
+            if current_is_ptr { continue; }
+
+            // Find a struct pointer candidate first if needed
+            if let Some(&sid) = reg_needs_struct_ptr.get(reg) {
+                let target = format!("ptr_struct_{:x}", sid);
+                if let Some(idx) = candidates.iter().position(|s| *s == target) {
+                    state.var_decl_idx.insert(*reg, idx);
+                    continue;
+                }
+            }
+            // Otherwise find any pointer candidate
+            if let Some(idx) = candidates.iter().position(|s| s.starts_with("ptr_")) {
+                state.var_decl_idx.insert(*reg, idx);
+            }
+        }
+    }
+}
+
+/// Deterministic hash of a single ClightStmt for candidate sorting.
+fn stmt_deterministic_hash(stmt: &ClightStmt) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    stmt.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Deterministic hash of a HybridFunctionState for beam tie-breaking.
+fn state_deterministic_hash(state: &HybridFunctionState) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // BTreeMap iterates in sorted order, so hash is deterministic
+    for (node, idx) in &state.candidate_idx {
+        node.hash(&mut hasher);
+        idx.hash(&mut hasher);
+    }
+    for (reg, idx) in &state.var_decl_idx {
+        reg.hash(&mut hasher);
+        idx.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn build_hybrid_alternatives(
@@ -460,7 +643,7 @@ fn function_based_parallel_search(
     let step_budget: usize = std::env::var("CLIGHT_SELECT_STEPS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(32);
+        .unwrap_or(64);
 
     let max_per_node: usize = std::env::var("CLIGHT_SELECT_PER_NODE")
         .ok()
@@ -520,12 +703,15 @@ fn function_standalone_search(
     global_struct_fields: &HashMap<i64, Vec<(i64, Ident, MemoryChunk)>>,
     global_canonical_to_reg_key: &HashMap<i64, Vec<i64>>,
     step_budget: usize,
-    max_per_node: usize,
+    _max_per_node: usize,
 ) -> HybridFunctionState {
     let mut state = build_hybrid_initial_state(func);
     let mut func_view = func.clone();
 
-    // Evaluate: emit single function -> clang
+    // Constraint propagation: force logically required types before any clang call
+    propagate_type_constraints(&mut state, func, meta);
+
+    // Evaluate: emit single function -> clang, return (error_count, sorted_error_nodes, node_errors)
     let evaluate = |state: &HybridFunctionState, func_view: &mut FunctionData|
         -> (usize, Vec<Node>, HashMap<Node, Vec<String>>) {
         // Apply state to view
@@ -584,38 +770,22 @@ fn function_standalone_search(
                 }
             }
         }
+        // Sort for deterministic processing order
+        error_nodes.sort();
         (errors.len(), error_nodes, node_errors)
     };
 
     let (mut current_errors, mut error_nodes, mut node_errors) = evaluate(&state, &mut func_view);
     if current_errors == 0 { return state; }
 
-    let start_errors = current_errors;
-    let mut node_attempts: HashMap<Node, usize> = HashMap::new();
     let mut steps = 0usize;
-    let mut improved_count = 0usize;
 
-    loop {
-        if steps >= step_budget { break; }
-
-        let target_node = error_nodes.iter()
-            .filter(|n| {
-                let attempts = node_attempts.get(n).copied().unwrap_or(0);
-                attempts < max_per_node
-                    && !build_hybrid_alternatives(**n, &state, func, meta).is_empty()
-            })
-            .next()
-            .copied();
-
-        let node = match target_node {
-            Some(n) => n,
-            None => break,
-        };
-
-        let attempt_idx = node_attempts.get(&node).copied().unwrap_or(0);
-
-        // Error-directed choice on first attempt
-        let choice = if attempt_idx == 0 {
+    // Wave 1: Batch error-directed fixes.
+    // Apply all directed type fixes in one batch, then evaluate once.
+    {
+        let mut batch = state.clone();
+        let mut any_fix = false;
+        for &node in &error_nodes {
             let directed = node_errors.get(&node).and_then(|msgs| {
                 for msg in msgs {
                     let want_ptr = error_wants_ptr(msg)?;
@@ -625,136 +795,136 @@ fn function_standalone_search(
                         Some(r)
                     } else { None };
                     if let Some(reg) = reg {
-                        let current = state.var_decl_idx.get(&reg).copied().unwrap_or(0);
+                        let current = batch.var_decl_idx.get(&reg).copied().unwrap_or(0);
                         if let Some(new_idx) = find_directed_type_idx(reg, want_ptr, current, func) {
-                            return Some(Some(new_idx));
+                            return Some((reg, new_idx));
                         }
                     }
                 }
                 None
             });
-            directed.unwrap_or_else(|| {
-                let alts = build_hybrid_alternatives(node, &state, func, meta);
-                if alts.is_empty() { None } else { alts[0] }
-            })
-        } else {
-            let alts = build_hybrid_alternatives(node, &state, func, meta);
-            if attempt_idx >= alts.len() {
-                *node_attempts.entry(node).or_insert(0) = max_per_node;
-                continue;
+            if let Some((reg, new_idx)) = directed {
+                batch.var_decl_idx.insert(reg, new_idx);
+                any_fix = true;
             }
-            alts[attempt_idx]
-        };
-
-        *node_attempts.entry(node).or_insert(0) += 1;
-
-        let mut trial = state.clone();
-        apply_hybrid_choice(&mut trial, node, choice, func, meta);
-
-        steps += 1;
-        let (trial_errors, trial_en, trial_ne) = evaluate(&trial, &mut func_view);
-
-        if trial_errors < current_errors {
-            improved_count += 1;
-            state = trial;
-            current_errors = trial_errors;
-            error_nodes = trial_en;
-            node_errors = trial_ne;
-            node_attempts.clear();
-            if current_errors == 0 { break; }
+        }
+        if any_fix {
+            steps += 1;
+            let (batch_errors, batch_en, batch_ne) = evaluate(&batch, &mut func_view);
+            if batch_errors <= current_errors {
+                state = batch;
+                current_errors = batch_errors;
+                error_nodes = batch_en;
+                node_errors = batch_ne;
+                if current_errors == 0 { return state; }
+            }
         }
     }
 
-    // eprintln!("    {} | {}->{} errors, {} steps, {} improved",
-    //     func.name, start_errors, current_errors, steps, improved_count);
+    // Wave 2: Per-node exhaustive search.
+    // For each error node (sorted), try ALL alternatives and pick the best.
+    let wave2_budget = step_budget * 3 / 4;
+    {
+        let sorted_errors: Vec<Node> = error_nodes.clone();
+        for node in &sorted_errors {
+            if steps >= wave2_budget { break; }
+
+            let alts = build_hybrid_alternatives(*node, &state, func, meta);
+            if alts.is_empty() { continue; }
+
+            let mut best_state: Option<HybridFunctionState> = None;
+            let mut best_errors = current_errors;
+            let mut best_en = error_nodes.clone();
+            let mut best_ne = node_errors.clone();
+
+            for alt in &alts {
+                if steps >= wave2_budget { break; }
+                let mut trial = state.clone();
+                apply_hybrid_choice(&mut trial, *node, *alt, func, meta);
+                steps += 1;
+                let (trial_errors, trial_en, trial_ne) = evaluate(&trial, &mut func_view);
+                if trial_errors < best_errors {
+                    best_errors = trial_errors;
+                    best_state = Some(trial);
+                    best_en = trial_en;
+                    best_ne = trial_ne;
+                }
+            }
+
+            if let Some(new_state) = best_state {
+                state = new_state;
+                current_errors = best_errors;
+                error_nodes = best_en;
+                node_errors = best_ne;
+                if current_errors == 0 { return state; }
+            }
+        }
+    }
+
+    // Wave 3: Beam search for combinatorial exploration.
+    // Maintain a beam of K states; for each remaining error node, expand all
+    // beam entries and keep the top K by error count (ties broken by hash).
+    let beam_width: usize = 3;
+    if steps < step_budget && current_errors > 0 {
+        let remaining_errors: Vec<Node> = error_nodes.iter()
+            .filter(|n| !build_hybrid_alternatives(**n, &state, func, meta).is_empty())
+            .copied()
+            .collect();
+
+        if !remaining_errors.is_empty() {
+            let mut beam: Vec<(HybridFunctionState, usize, Vec<Node>, HashMap<Node, Vec<String>>)> =
+                vec![(state.clone(), current_errors, error_nodes.clone(), node_errors.clone())];
+
+            for &node in &remaining_errors {
+                if steps >= step_budget { break; }
+
+                let mut next_beam: Vec<(HybridFunctionState, usize, Vec<Node>, HashMap<Node, Vec<String>>)> = Vec::new();
+
+                for (beam_state, beam_errors, beam_en, beam_ne) in &beam {
+                    let alts = build_hybrid_alternatives(node, beam_state, func, meta);
+                    if alts.is_empty() {
+                        next_beam.push((beam_state.clone(), *beam_errors, beam_en.clone(), beam_ne.clone()));
+                        continue;
+                    }
+
+                    // Keep current choice as an option too
+                    next_beam.push((beam_state.clone(), *beam_errors, beam_en.clone(), beam_ne.clone()));
+
+                    for alt in &alts {
+                        if steps >= step_budget { break; }
+                        let mut trial = beam_state.clone();
+                        apply_hybrid_choice(&mut trial, node, *alt, func, meta);
+                        steps += 1;
+                        let (trial_errors, trial_en, trial_ne) = evaluate(&trial, &mut func_view);
+                        next_beam.push((trial, trial_errors, trial_en, trial_ne));
+                    }
+                }
+
+                // Sort by (error_count, deterministic_hash) and keep top K
+                next_beam.sort_by(|a, b| {
+                    a.1.cmp(&b.1)
+                        .then_with(|| state_deterministic_hash(&a.0).cmp(&state_deterministic_hash(&b.0)))
+                });
+                next_beam.truncate(beam_width);
+                // Dedup identical states
+                next_beam.dedup_by(|a, b| state_deterministic_hash(&a.0) == state_deterministic_hash(&b.0));
+                beam = next_beam;
+
+                if beam.first().map_or(false, |b| b.1 == 0) { break; }
+            }
+
+            // Take the best from the beam
+            if let Some((best, best_err, _, _)) = beam.into_iter().next() {
+                if best_err <= current_errors {
+                    state = best;
+                }
+            }
+        }
+    }
 
     state
 }
 
-// Phase 3a/3b: Compound assembly from body-node lists
-
-/// Assemble if-then-else compounds by collecting body-node statements into Ssequence branches and absorbing them from the top-level map.
-fn assemble_ifthenelse(
-    statements: &mut HashMap<Node, ClightStmt>,
-    ite_info: &HashMap<Node, IfThenElseInfo>,
-) {
-    // Process smallest bodies first so inner if-then-else are assembled before outer ones.
-    let mut branches: Vec<(&Node, &IfThenElseInfo)> = ite_info.iter().collect();
-    branches.sort_by_key(|(_, info)| info.if_branch_nodes.len() + info.else_branch_nodes.len());
-
-    for (&branch_node, info) in &branches {
-        // Extract condition from the branch node's Sifthenelse statement.
-        let condition = match statements.get(&branch_node) {
-            Some(ClightStmt::Sifthenelse(cond, _, _)) => cond.clone(),
-            // Might be wrapped in a label
-            Some(ClightStmt::Slabel(_, inner)) => {
-                if let ClightStmt::Sifthenelse(cond, _, _) = inner.as_ref() {
-                    cond.clone()
-                } else {
-                    continue;
-                }
-            }
-            _ => continue,
-        };
-
-        // Collect if-branch body
-        let mut if_body: Vec<ClightStmt> = Vec::new();
-        for &node in &info.if_branch_nodes {
-            if let Some(stmt) = statements.get(&node) {
-                if is_nonempty_assembled_stmt(stmt) {
-                    if_body.push(strip_label(stmt.clone()));
-                }
-            }
-        }
-
-        // Collect else-branch body
-        let mut else_body: Vec<ClightStmt> = Vec::new();
-        for &node in &info.else_branch_nodes {
-            if let Some(stmt) = statements.get(&node) {
-                if is_nonempty_assembled_stmt(stmt) {
-                    else_body.push(strip_label(stmt.clone()));
-                }
-            }
-        }
-
-        let then_stmt = match if_body.len() {
-            0 => ClightStmt::Sskip,
-            1 => if_body.into_iter().next().unwrap(),
-            _ => ClightStmt::Ssequence(flatten_sequence(if_body)),
-        };
-        let else_stmt = match else_body.len() {
-            0 => ClightStmt::Sskip,
-            1 => else_body.into_iter().next().unwrap(),
-            _ => ClightStmt::Ssequence(flatten_sequence(else_body)),
-        };
-
-        let compound = ClightStmt::Sifthenelse(condition, Box::new(then_stmt), Box::new(else_stmt));
-
-        // Check if the branch node was labeled; preserve the label.
-        let final_stmt = match statements.get(&branch_node) {
-            Some(ClightStmt::Slabel(lbl, _)) => {
-                ClightStmt::Slabel(*lbl, Box::new(compound))
-            }
-            _ => compound,
-        };
-
-        statements.insert(branch_node, final_stmt);
-
-        // Remove body nodes from top-level (they are now inlined into the compound)
-        for &node in &info.if_branch_nodes {
-            if node != branch_node {
-                statements.remove(&node);
-            }
-        }
-        for &node in &info.else_branch_nodes {
-            if node != branch_node {
-                statements.remove(&node);
-            }
-        }
-    }
-}
-
-/// Assemble loop compounds: collect body-node statements, convert header-targeting gotos to Scontinue and exit gotos to Sbreak.
 fn assemble_loops(
     statements: &mut HashMap<Node, ClightStmt>,
     loop_info: &HashMap<Node, LoopInfo>,
@@ -789,8 +959,16 @@ fn assemble_loops(
 
             // Convert gotos: header_label->Scontinue, outside loop->Sbreak, recurse into branches.
             let converted = convert_loop_gotos(&stmt, header_label, &body_node_set, &exit_target_label);
-            if is_nonempty_assembled_stmt(&converted) {
-                body_stmts.push(strip_label(converted));
+            // Check nonempty: peel through Slabel wrappers to see if innermost is Sskip
+            let mut s = &converted;
+            while let ClightStmt::Slabel(_, inner) = s { s = inner; }
+            if !matches!(s, ClightStmt::Sskip) {
+                // Strip one outer label
+                let stripped = match converted {
+                    ClightStmt::Slabel(_, inner) => *inner,
+                    other => other,
+                };
+                body_stmts.push(stripped);
             }
         }
 
@@ -864,23 +1042,6 @@ fn convert_loop_gotos(
             ClightStmt::Slabel(*lbl, Box::new(new_inner))
         }
         _ => stmt.clone(),
-    }
-}
-
-/// Check if a statement is non-empty for compound body assembly.
-fn is_nonempty_assembled_stmt(stmt: &ClightStmt) -> bool {
-    match stmt {
-        ClightStmt::Sskip => false,
-        ClightStmt::Slabel(_, inner) => is_nonempty_assembled_stmt(inner),
-        _ => true,
-    }
-}
-
-/// Strip outer label from a statement (for embedding in compound bodies).
-fn strip_label(stmt: ClightStmt) -> ClightStmt {
-    match stmt {
-        ClightStmt::Slabel(_, inner) => *inner,
-        other => other,
     }
 }
 
@@ -1006,7 +1167,6 @@ fn emit_function_c(
     let mut out = String::new();
     let mut line_map: HashMap<usize, Node> = HashMap::new();
 
-    // Phase A: Fix ptr/int cast mismatches then convert all statements to CStmt.
     let mut ctx = ConversionContext::new(HashMap::new());
     let mut all_cstmts: Vec<(Node, CStmt)> = Vec::new();
     {
@@ -1044,26 +1204,29 @@ fn emit_function_c(
         }
     }
 
-    // -- Phase B: Collect all variable and function names from CStmts ------
     let mut all_var_refs: HashSet<String> = HashSet::new();
     let mut all_func_calls: HashSet<String> = HashSet::new();
     for (_, cstmt) in &all_cstmts {
         collect_cstmt_names(cstmt, &mut all_var_refs, &mut all_func_calls);
     }
 
-    // -- Preamble: standard types -----------------------------------------
     out.push_str("#include <stddef.h>\n");
     out.push_str("#include <stdint.h>\n");
 
-    // Collect field usage types from Efield expressions to build type candidates per (struct, field) pair.
     let mut field_usage_types: HashMap<(String, String), Vec<String>> = HashMap::new();
-    for (_, clight_stmt) in statements {
-        collect_field_usage_types(clight_stmt, &mut field_usage_types);
+    {
+        let mut sorted_stmt_nodes: Vec<Node> = statements.keys().copied().collect();
+        sorted_stmt_nodes.sort();
+        for node in &sorted_stmt_nodes {
+            let clight_stmt = &statements[node];
+            collect_field_usage_types(clight_stmt, &mut field_usage_types);
+        }
     }
 
-    // -- Struct definitions (with bodies where known) -------------------------
     let mut struct_names: HashSet<String> = HashSet::new();
-    for (_reg, sid) in &func.reg_struct_ids {
+    let mut sorted_reg_sids: Vec<(&RTLReg, &usize)> = func.reg_struct_ids.iter().collect();
+    sorted_reg_sids.sort_by_key(|(reg, _)| **reg);
+    for (_reg, sid) in sorted_reg_sids {
         struct_names.insert(format!("struct_{:x}", sid));
     }
     for var_type in ctx.var_types.values() {
@@ -1146,7 +1309,7 @@ fn emit_function_c(
         }
     }
 
-    // -- Forward-declare called functions -----------------------------------
+    // Forward-declare called functions.
     all_func_calls.remove(&func.name);
     let mut sorted_funcs: Vec<&String> = all_func_calls.iter().collect();
     sorted_funcs.sort();
@@ -1156,7 +1319,7 @@ fn emit_function_c(
 
     out.push('\n');
 
-    // -- Function signature -------------------------------------------------
+    // Function signature.
     let ret_type = convert_clight_return_type(&func.return_type);
     out.push_str(&ret_type);
     out.push(' ');
@@ -1195,12 +1358,14 @@ fn emit_function_c(
     }
     out.push_str(")\n{\n");
 
-    // -- Local variable declarations ----------------------------------------
+    // Local variable declarations.
     let mut declared_vars: HashSet<String> = param_names.clone();
 
     // Declare used registers, using var_decl_idx to select among type candidates for clang-driven refinement.
     let mut decl_line_start = out.lines().count() + 1; // track line numbers for decl nodes
-    for reg in &func.used_regs {
+    let mut sorted_used_regs: Vec<RTLReg> = func.used_regs.iter().copied().collect();
+    sorted_used_regs.sort();
+    for reg in &sorted_used_regs {
         let name = format!("var_{}", reg);
         if declared_vars.insert(name.clone()) {
             let ty = if let Some(candidates) = func.var_type_candidates.get(reg) {
@@ -1231,7 +1396,9 @@ fn emit_function_c(
     }
 
     // Declare variables discovered by conversion context
-    for (var_name, var_type) in &ctx.var_types {
+    let mut sorted_ctx_vars: Vec<(&String, &crate::decompile::passes::c_pass::types::CType)> = ctx.var_types.iter().collect();
+    sorted_ctx_vars.sort_by_key(|(name, _)| (*name).clone());
+    for (var_name, var_type) in sorted_ctx_vars {
         if declared_vars.insert(var_name.clone()) {
             let ty_str = ctype_to_c_string(var_type);
             out.push_str(&format!("    {} {};\n", ty_str, var_name));
@@ -1239,7 +1406,9 @@ fn emit_function_c(
     }
 
     // Declare any remaining referenced variables as `long`
-    for var_name in &all_var_refs {
+    let mut sorted_var_refs: Vec<&String> = all_var_refs.iter().collect();
+    sorted_var_refs.sort();
+    for var_name in sorted_var_refs {
         if !all_func_calls.contains(var_name) && declared_vars.insert(var_name.clone()) {
             out.push_str(&format!("    long {};\n", var_name));
         }
@@ -1247,7 +1416,7 @@ fn emit_function_c(
 
     out.push('\n');
 
-    // -- Statements (track line numbers) ------------------------------------
+    // Statements (track line numbers).
     let preamble_lines = out.lines().count();
     let mut current_line = preamble_lines + 1; // 1-indexed
 
@@ -1827,62 +1996,6 @@ fn ctype_to_c_string(ty: &crate::decompile::passes::c_pass::types::CType) -> Str
 
 // Edge consistency
 
-fn extract_goto_target(stmt: &ClightStmt) -> Option<Node> {
-    match stmt {
-        ClightStmt::Sgoto(ident) => Some(*ident as Node),
-        ClightStmt::Slabel(_, inner) => extract_goto_target(inner),
-        _ => None,
-    }
-}
-
-pub(crate) fn extract_branch_targets(stmt: &ClightStmt) -> Option<Vec<Node>> {
-    match stmt {
-        ClightStmt::Sgoto(ident) => Some(vec![*ident as Node]),
-        ClightStmt::Sifthenelse(_, then_br, else_br) => {
-            match (extract_goto_target(then_br), extract_goto_target(else_br)) {
-                (Some(t), Some(e)) => {
-                    let mut targets = vec![t, e];
-                    targets.sort();
-                    targets.dedup();
-                    Some(targets)
-                }
-                _ => None,
-            }
-        }
-        ClightStmt::Sswitch(_, cases) => {
-            let targets: Vec<Node> = cases
-                .iter()
-                .filter_map(|(_, s)| extract_goto_target(s))
-                .collect();
-            if targets.is_empty() {
-                None
-            } else {
-                let mut t = targets;
-                t.sort();
-                t.dedup();
-                Some(t)
-            }
-        }
-        ClightStmt::Slabel(_, inner) => extract_branch_targets(inner),
-        ClightStmt::Ssequence(stmts) => stmts.last().and_then(extract_branch_targets),
-        _ => None,
-    }
-}
-
-pub(crate) fn is_edge_consistent(stmt: &ClightStmt, node: Node, successors: &HashMap<Node, Vec<Node>>) -> bool {
-    let targets = match extract_branch_targets(stmt) {
-        Some(t) => t,
-        None => return true,
-    };
-    let succs = match successors.get(&node) {
-        Some(s) => s,
-        None => return targets.is_empty(),
-    };
-    let succ_set: HashSet<Node> = succs.iter().copied().collect();
-    targets.iter().all(|t| succ_set.contains(t))
-}
-
-
 // Post-processing helpers
 
 fn flatten_sequence(stmts: Vec<ClightStmt>) -> Vec<ClightStmt> {
@@ -2000,7 +2113,8 @@ fn deduplicate_identical_blocks(statements: &mut HashMap<Node, ClightStmt>) {
 
     log::debug!("Deduplicating {} identical blocks", redirect_map.len());
 
-    let nodes_to_update: Vec<Node> = statements.keys().copied().collect();
+    let mut nodes_to_update: Vec<Node> = statements.keys().copied().collect();
+    nodes_to_update.sort();
     for node in nodes_to_update {
         if let Some(stmt) = statements.get(&node).cloned() {
             let updated = redirect_gotos_in_stmt(&stmt, &redirect_map);
@@ -2064,14 +2178,15 @@ fn inline_control_flow_bodies(
 ) {
     let preds = count_predecessors(successors);
     let mut inlined_nodes: HashSet<Node> = HashSet::new();
-    let nodes_to_process: Vec<Node> = statements.keys().copied().collect();
+    let mut nodes_to_process: Vec<Node> = statements.keys().copied().collect();
+    nodes_to_process.sort();
 
     for node in nodes_to_process {
         if let Some(stmt) = statements.get(&node).cloned() {
             let mut visiting = HashSet::new();
             visiting.insert(node);
             let (inlined, newly_inlined) =
-                inline_stmt_recursive_track(&stmt, statements, &preds, 0, &mut visiting, 0);
+                inline_stmt_recursive_track(&stmt, statements, &preds, &mut visiting, 0);
             inlined_nodes.extend(newly_inlined);
             if inlined != stmt {
                 statements.insert(node, inlined);
@@ -2100,7 +2215,8 @@ fn inline_control_flow_bodies(
 }
 
 fn flatten_cascading_ifthenelse_all(statements: &mut HashMap<Node, ClightStmt>) {
-    let nodes: Vec<Node> = statements.keys().copied().collect();
+    let mut nodes: Vec<Node> = statements.keys().copied().collect();
+    nodes.sort();
     for node in nodes {
         if let Some(stmt) = statements.get(&node).cloned() {
             let flattened = flatten_cascading_ifthenelse(&stmt);
@@ -2214,31 +2330,26 @@ fn inline_stmt_recursive_track(
     stmt: &ClightStmt,
     statements: &HashMap<Node, ClightStmt>,
     preds: &HashMap<Node, usize>,
-    depth: usize,
     visiting: &mut HashSet<Node>,
     inline_count: usize,
 ) -> (ClightStmt, Vec<Node>) {
-    if depth > 100 {
-        return (stmt.clone(), vec![]);
-    }
-
     let mut inlined = Vec::new();
 
     let result = match stmt {
         ClightStmt::Sifthenelse(cond, then_box, else_box) => {
             let (then_stmt, then_inlined) =
-                inline_body_if_local_track(&**then_box, statements, preds, depth, visiting, inline_count);
+                inline_body_if_local_track(&**then_box, statements, preds, visiting, inline_count);
             let (else_stmt, else_inlined) =
-                inline_body_if_local_track(&**else_box, statements, preds, depth, visiting, inline_count);
+                inline_body_if_local_track(&**else_box, statements, preds, visiting, inline_count);
             inlined.extend(then_inlined);
             inlined.extend(else_inlined);
             ClightStmt::Sifthenelse(cond.clone(), Box::new(then_stmt), Box::new(else_stmt))
         }
         ClightStmt::Sloop(body_box, incr_box) => {
             let (body_stmt, body_inlined) =
-                inline_body_if_local_track(&**body_box, statements, preds, depth, visiting, inline_count);
+                inline_body_if_local_track(&**body_box, statements, preds, visiting, inline_count);
             let (incr_stmt, incr_inlined) =
-                inline_body_if_local_track(&**incr_box, statements, preds, depth, visiting, inline_count);
+                inline_body_if_local_track(&**incr_box, statements, preds, visiting, inline_count);
             inlined.extend(body_inlined);
             inlined.extend(incr_inlined);
             ClightStmt::Sloop(Box::new(body_stmt), Box::new(incr_stmt))
@@ -2247,7 +2358,7 @@ fn inline_stmt_recursive_track(
             let mut result_stmts = Vec::new();
             for s in stmts {
                 let (inlined_s, s_inlined) =
-                    inline_stmt_recursive_track(s, statements, preds, depth + 1, visiting, inline_count);
+                    inline_stmt_recursive_track(s, statements, preds, visiting, inline_count);
                 result_stmts.push(inlined_s);
                 inlined.extend(s_inlined);
             }
@@ -2255,7 +2366,7 @@ fn inline_stmt_recursive_track(
         }
         ClightStmt::Slabel(lbl, inner) => {
             let (inner_inlined, inner_nodes) =
-                inline_stmt_recursive_track(&**inner, statements, preds, depth + 1, visiting, inline_count);
+                inline_stmt_recursive_track(&**inner, statements, preds, visiting, inline_count);
             inlined.extend(inner_nodes);
             ClightStmt::Slabel(*lbl, Box::new(inner_inlined))
         }
@@ -2263,7 +2374,7 @@ fn inline_stmt_recursive_track(
             let mut new_cases = Vec::new();
             for (label, case_stmt) in cases {
                 let (inlined_case, case_inlined) =
-                    inline_body_if_local_track(case_stmt, statements, preds, depth, visiting, inline_count);
+                    inline_body_if_local_track(case_stmt, statements, preds, visiting, inline_count);
                 inlined.extend(case_inlined);
                 new_cases.push((label.clone(), inlined_case));
             }
@@ -2279,7 +2390,6 @@ fn inline_body_if_local_track(
     stmt: &ClightStmt,
     statements: &HashMap<Node, ClightStmt>,
     preds: &HashMap<Node, usize>,
-    depth: usize,
     visiting: &mut HashSet<Node>,
     inline_count: usize,
 ) -> (ClightStmt, Vec<Node>) {
@@ -2299,7 +2409,7 @@ fn inline_body_if_local_track(
 
                     visiting.insert(target_node);
                     let (recursed_stmt, mut recursed_nodes) = inline_stmt_recursive_track(
-                        target_stmt, statements, preds, depth + 1, visiting, inline_count + 1,
+                        target_stmt, statements, preds, visiting, inline_count + 1,
                     );
                     recursed_nodes.push(target_node);
                     return (recursed_stmt, recursed_nodes);
@@ -2308,7 +2418,7 @@ fn inline_body_if_local_track(
 
             (stmt.clone(), vec![])
         }
-        _ => inline_stmt_recursive_track(stmt, statements, preds, depth, visiting, inline_count),
+        _ => inline_stmt_recursive_track(stmt, statements, preds, visiting, inline_count),
     }
 }
 

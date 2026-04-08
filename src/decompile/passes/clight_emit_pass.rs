@@ -1,4 +1,3 @@
-
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
 use crate::decompile::passes::c_pass::helpers::{
@@ -7,11 +6,454 @@ use crate::decompile::passes::c_pass::helpers::{
     param_name_for_reg, xtype_string_to_ctype,
 };
 use crate::decompile::passes::c_pass::types::{
-    CExpr, CStmt, CType, FloatLiteral, FloatLiteralSuffix, IntLiteral, IntLiteralBase, IntLiteralSuffix,
+    CExpr, CStmt, CType, FloatLiteral, FloatLiteralSuffix, IntLiteral, IntLiteralBase,
+    IntLiteralSuffix, TopLevelDecl, TypeQualifiers,
 };
 use crate::x86::types::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// Known libc functions that take opaque struct pointer parameters.
+/// Maps function_name -> Vec<(param_position, typedef_name)>.
+fn known_opaque_struct_params() -> HashMap<&'static str, Vec<(usize, &'static str)>> {
+    let mut m: HashMap<&str, Vec<(usize, &str)>> = HashMap::new();
+    // FILE* at position 0
+    for &func in &[
+        "fclose", "fflush", "fgetc",
+        "fseek", "fseeko", "ftell", "ftello", "rewind", "feof",
+        "ferror", "clearerr", "fileno", "setbuf", "setvbuf",
+        "fprintf", "fscanf", "vfprintf",
+        "clearerr_unlocked",
+        "feof_unlocked", "ferror_unlocked", "fileno_unlocked",
+        "fgetc_unlocked", "getc_unlocked",
+        "__freading", "__fpending", "__fwriting",
+        "__freadable", "__fwritable", "__fsetlocking",
+        "__overflow", "__uflow", "fclose_nothrow",
+        "fflush_unlocked",
+        "rpl_fclose", "rpl_fflush", "rpl_fseek", "rpl_fseeko",
+        "rpl_ftell", "rpl_ftello", "rpl_fopen", "rpl_freopen",
+    ] {
+        m.entry(func).or_default().push((0, "FILE"));
+    }
+    // FILE* at position 1: int fputc(int, FILE*), int fputs(const char*, FILE*), etc.
+    for &func in &["fputc", "fputs", "fputc_unlocked", "fputs_unlocked", "putc_unlocked"] {
+        m.entry(func).or_default().push((1, "FILE"));
+    }
+    // FILE* at position 2: char* fgets(char*, int, FILE*)
+    for &func in &["fgets", "fgets_unlocked"] {
+        m.entry(func).or_default().push((2, "FILE"));
+    }
+    // fread/fwrite: FILE* at position 3
+    for &func in &["fread", "fwrite", "fread_unlocked", "fwrite_unlocked"] {
+        m.entry(func).or_default().push((3, "FILE"));
+    }
+    // DIR* at position 0
+    for &func in &["closedir", "readdir", "readdir_r", "rewinddir", "seekdir", "telldir"] {
+        m.entry(func).or_default().push((0, "DIR"));
+    }
+    m
+}
+
+/// Scan a CExpr to find struct names that appear in calls to known opaque-pointer functions.
+fn collect_struct_names_from_expr(
+    expr: &CExpr,
+    opaque_params: &HashMap<&str, Vec<(usize, &str)>>,
+    result: &mut HashMap<String, HashSet<String>>,
+) {
+    match expr {
+        CExpr::Call(func_expr, args) => {
+            // Get the function name from the call expression
+            let func_name = match func_expr.as_ref() {
+                CExpr::Var(name) => Some(name.as_str()),
+                _ => None,
+            };
+            if let Some(name) = func_name {
+                if let Some(param_info) = opaque_params.get(name) {
+                    for &(pos, typedef_name) in param_info {
+                        if pos < args.len() {
+                            // Extract struct names from the argument expression
+                            collect_struct_types_in_expr(&args[pos], typedef_name, result);
+                        }
+                    }
+                }
+            }
+            // Recurse into subexpressions
+            collect_struct_names_from_expr(func_expr, opaque_params, result);
+            for arg in args {
+                collect_struct_names_from_expr(arg, opaque_params, result);
+            }
+        }
+        CExpr::Unary(_, inner) => collect_struct_names_from_expr(inner, opaque_params, result),
+        CExpr::Binary(_, l, r) | CExpr::Assign(_, l, r) => {
+            collect_struct_names_from_expr(l, opaque_params, result);
+            collect_struct_names_from_expr(r, opaque_params, result);
+        }
+        CExpr::Ternary(c, t, e) => {
+            collect_struct_names_from_expr(c, opaque_params, result);
+            collect_struct_names_from_expr(t, opaque_params, result);
+            collect_struct_names_from_expr(e, opaque_params, result);
+        }
+        CExpr::Cast(_, inner) => collect_struct_names_from_expr(inner, opaque_params, result),
+        CExpr::Member(inner, _) | CExpr::MemberPtr(inner, _) => {
+            collect_struct_names_from_expr(inner, opaque_params, result);
+        }
+        CExpr::Index(arr, idx) => {
+            collect_struct_names_from_expr(arr, opaque_params, result);
+            collect_struct_names_from_expr(idx, opaque_params, result);
+        }
+        CExpr::SizeofExpr(inner) | CExpr::Paren(inner) => {
+            collect_struct_names_from_expr(inner, opaque_params, result);
+        }
+        _ => {}
+    }
+}
+
+/// Extract struct type names from an expression that is passed to an opaque-pointer parameter.
+fn collect_struct_types_in_expr(
+    expr: &CExpr,
+    typedef_name: &str,
+    result: &mut HashMap<String, HashSet<String>>,
+) {
+    match expr {
+        CExpr::Cast(CType::Pointer(inner, _), inner_expr) => {
+            if let CType::Struct(name) = inner.as_ref() {
+                result.entry(name.clone()).or_default().insert(typedef_name.to_string());
+            }
+            // Also recurse into the inner expression for nested casts
+            collect_struct_types_in_expr(inner_expr, typedef_name, result);
+        }
+        CExpr::Var(_) => {
+            // The variable itself might be typed as struct pointer; handled via var_types below
+        }
+        CExpr::Unary(_, inner) => collect_struct_types_in_expr(inner, typedef_name, result),
+        CExpr::Paren(inner) => collect_struct_types_in_expr(inner, typedef_name, result),
+        CExpr::Ternary(_, t, e) => {
+            collect_struct_types_in_expr(t, typedef_name, result);
+            collect_struct_types_in_expr(e, typedef_name, result);
+        }
+        _ => {}
+    }
+}
+
+fn collect_struct_names_from_stmt(
+    stmt: &CStmt,
+    opaque_params: &HashMap<&str, Vec<(usize, &str)>>,
+    result: &mut HashMap<String, HashSet<String>>,
+) {
+    match stmt {
+        CStmt::Expr(e) => collect_struct_names_from_expr(e, opaque_params, result),
+        CStmt::Block(items) => {
+            for item in items {
+                if let crate::decompile::passes::c_pass::types::CBlockItem::Stmt(s) = item {
+                    collect_struct_names_from_stmt(s, opaque_params, result);
+                }
+            }
+        }
+        CStmt::If(c, t, e) => {
+            collect_struct_names_from_expr(c, opaque_params, result);
+            collect_struct_names_from_stmt(t, opaque_params, result);
+            if let Some(e) = e { collect_struct_names_from_stmt(e, opaque_params, result); }
+        }
+        CStmt::Switch(e, body) => {
+            collect_struct_names_from_expr(e, opaque_params, result);
+            collect_struct_names_from_stmt(body, opaque_params, result);
+        }
+        CStmt::While(c, body) | CStmt::DoWhile(body, c) => {
+            collect_struct_names_from_expr(c, opaque_params, result);
+            collect_struct_names_from_stmt(body, opaque_params, result);
+        }
+        CStmt::For(_, cond, update, body) => {
+            if let Some(c) = cond { collect_struct_names_from_expr(c, opaque_params, result); }
+            if let Some(u) = update { collect_struct_names_from_expr(u, opaque_params, result); }
+            collect_struct_names_from_stmt(body, opaque_params, result);
+        }
+        CStmt::Return(Some(e)) => collect_struct_names_from_expr(e, opaque_params, result),
+        CStmt::Labeled(_, body) => collect_struct_names_from_stmt(body, opaque_params, result),
+        CStmt::Sequence(stmts) => {
+            for s in stmts { collect_struct_names_from_stmt(s, opaque_params, result); }
+        }
+        _ => {}
+    }
+}
+
+/// Identify opaque libc struct types (FILE, DIR) from call args and function signatures.
+fn identify_opaque_libc_structs_from_tu(
+    tu: &crate::decompile::passes::c_pass::types::TranslationUnit,
+) -> HashMap<String, String> {
+    let opaque_params = known_opaque_struct_params();
+    // Map from struct_name -> set of typedef_names it was identified as
+    let mut struct_to_typedef: HashMap<String, HashSet<String>> = HashMap::new();
+
+    // (1) Scan function bodies for calls to known opaque-pointer functions
+    for decl in &tu.decls {
+        if let TopLevelDecl::FuncDef(f) = decl {
+            collect_struct_names_from_stmt(&f.body, &opaque_params, &mut struct_to_typedef);
+        }
+    }
+
+    // (2) Check function signatures of known opaque-pointer functions for struct params.
+    for decl in &tu.decls {
+        let (name, params) = match decl {
+            TopLevelDecl::FuncDef(f) => (f.name.as_str(), &f.params),
+            TopLevelDecl::FuncDecl(f) => (f.name.as_str(), &f.params),
+            _ => continue,
+        };
+        if let Some(param_info) = opaque_params.get(name) {
+            for &(pos, typedef_name) in param_info {
+                if pos < params.len() {
+                    if let CType::Pointer(inner, _) = &params[pos].ty {
+                        if let CType::Struct(sname) = inner.as_ref() {
+                            struct_to_typedef
+                                .entry(sname.clone())
+                                .or_default()
+                                .insert(typedef_name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Only keep mappings where all votes agree on the same typedef name
+    let mut result = HashMap::new();
+    for (struct_name, typedef_names) in &struct_to_typedef {
+        if typedef_names.len() == 1 {
+            let typedef_name = typedef_names.iter().next().unwrap();
+            result.insert(struct_name.clone(), typedef_name.clone());
+        }
+    }
+
+    result
+}
+
+/// Rewrite a single CType, replacing opaque struct references with typedef names or void.
+fn rewrite_ctype(ty: &CType, opaque_map: &HashMap<String, String>) -> CType {
+    match ty {
+        CType::Struct(name) => {
+            if let Some(typedef_name) = opaque_map.get(name.as_str()) {
+                if typedef_name == "void" {
+                    CType::Void
+                } else {
+                    CType::TypedefName(typedef_name.clone())
+                }
+            } else {
+                ty.clone()
+            }
+        }
+        CType::Pointer(inner, quals) => {
+            let new_inner = rewrite_ctype(inner, opaque_map);
+            CType::Pointer(Box::new(new_inner), *quals)
+        }
+        CType::Array(inner, size) => {
+            let new_inner = rewrite_ctype(inner, opaque_map);
+            CType::Array(Box::new(new_inner), *size)
+        }
+        CType::Function(ret, params, variadic) => {
+            let new_ret = rewrite_ctype(ret, opaque_map);
+            let new_params: Vec<CType> = params.iter().map(|p| rewrite_ctype(p, opaque_map)).collect();
+            CType::Function(Box::new(new_ret), new_params, *variadic)
+        }
+        CType::Qualified(inner, quals) => {
+            let new_inner = rewrite_ctype(inner, opaque_map);
+            CType::Qualified(Box::new(new_inner), *quals)
+        }
+        _ => ty.clone(),
+    }
+}
+
+fn rewrite_ctype_in_expr(expr: &mut CExpr, opaque_map: &HashMap<String, String>) {
+    match expr {
+        CExpr::Cast(ty, inner) => {
+            *ty = rewrite_ctype(ty, opaque_map);
+            rewrite_ctype_in_expr(inner, opaque_map);
+        }
+        CExpr::SizeofType(ty) | CExpr::AlignofType(ty) => {
+            *ty = rewrite_ctype(ty, opaque_map);
+        }
+        CExpr::Unary(_, inner) => rewrite_ctype_in_expr(inner, opaque_map),
+        CExpr::Binary(_, l, r) | CExpr::Assign(_, l, r) => {
+            rewrite_ctype_in_expr(l, opaque_map);
+            rewrite_ctype_in_expr(r, opaque_map);
+        }
+        CExpr::Ternary(c, t, e) => {
+            rewrite_ctype_in_expr(c, opaque_map);
+            rewrite_ctype_in_expr(t, opaque_map);
+            rewrite_ctype_in_expr(e, opaque_map);
+        }
+        CExpr::Call(f, args) => {
+            rewrite_ctype_in_expr(f, opaque_map);
+            for a in args { rewrite_ctype_in_expr(a, opaque_map); }
+        }
+        CExpr::Member(inner, _) | CExpr::MemberPtr(inner, _) => {
+            rewrite_ctype_in_expr(inner, opaque_map);
+        }
+        CExpr::Index(arr, idx) => {
+            rewrite_ctype_in_expr(arr, opaque_map);
+            rewrite_ctype_in_expr(idx, opaque_map);
+        }
+        CExpr::SizeofExpr(inner) | CExpr::Paren(inner) => {
+            rewrite_ctype_in_expr(inner, opaque_map);
+        }
+        CExpr::CompoundLit(ty, _) => {
+            *ty = rewrite_ctype(ty, opaque_map);
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_ctype_in_stmt(stmt: &mut CStmt, opaque_map: &HashMap<String, String>) {
+    match stmt {
+        CStmt::Expr(e) => rewrite_ctype_in_expr(e, opaque_map),
+        CStmt::Block(items) => {
+            for item in items {
+                match item {
+                    crate::decompile::passes::c_pass::types::CBlockItem::Stmt(s) => {
+                        rewrite_ctype_in_stmt(s, opaque_map);
+                    }
+                    crate::decompile::passes::c_pass::types::CBlockItem::Decl(decls) => {
+                        for d in decls { d.ty = rewrite_ctype(&d.ty, opaque_map); }
+                    }
+                }
+            }
+        }
+        CStmt::If(c, t, e) => {
+            rewrite_ctype_in_expr(c, opaque_map);
+            rewrite_ctype_in_stmt(t, opaque_map);
+            if let Some(e) = e { rewrite_ctype_in_stmt(e, opaque_map); }
+        }
+        CStmt::Switch(e, body) => {
+            rewrite_ctype_in_expr(e, opaque_map);
+            rewrite_ctype_in_stmt(body, opaque_map);
+        }
+        CStmt::While(c, body) => {
+            rewrite_ctype_in_expr(c, opaque_map);
+            rewrite_ctype_in_stmt(body, opaque_map);
+        }
+        CStmt::DoWhile(body, c) => {
+            rewrite_ctype_in_stmt(body, opaque_map);
+            rewrite_ctype_in_expr(c, opaque_map);
+        }
+        CStmt::For(init, cond, update, body) => {
+            if let Some(init) = init {
+                match init {
+                    crate::decompile::passes::c_pass::types::ForInit::Expr(e) => {
+                        rewrite_ctype_in_expr(e, opaque_map);
+                    }
+                    crate::decompile::passes::c_pass::types::ForInit::Decl(decls) => {
+                        for d in decls { d.ty = rewrite_ctype(&d.ty, opaque_map); }
+                    }
+                }
+            }
+            if let Some(c) = cond { rewrite_ctype_in_expr(c, opaque_map); }
+            if let Some(u) = update { rewrite_ctype_in_expr(u, opaque_map); }
+            rewrite_ctype_in_stmt(body, opaque_map);
+        }
+        CStmt::Return(Some(e)) => rewrite_ctype_in_expr(e, opaque_map),
+        CStmt::Labeled(label, body) => {
+            if let crate::decompile::passes::c_pass::types::Label::Case(e) = label {
+                rewrite_ctype_in_expr(e, opaque_map);
+            }
+            rewrite_ctype_in_stmt(body, opaque_map);
+        }
+        CStmt::Decl(decls) => {
+            for d in decls { d.ty = rewrite_ctype(&d.ty, opaque_map); }
+        }
+        CStmt::Sequence(stmts) => {
+            for s in stmts { rewrite_ctype_in_stmt(s, opaque_map); }
+        }
+        _ => {}
+    }
+}
+
+/// Rewrite CType::Struct references matching opaque libc types to CType::TypedefName in the TU.
+fn rewrite_opaque_types_in_tu(
+    tu: &mut crate::decompile::passes::c_pass::types::TranslationUnit,
+    opaque_map: &HashMap<String, String>,
+) {
+    if opaque_map.is_empty() {
+        return;
+    }
+    for decl in &mut tu.decls {
+        match decl {
+            TopLevelDecl::FuncDef(f) => {
+                f.return_type = rewrite_ctype(&f.return_type, opaque_map);
+                for p in &mut f.params { p.ty = rewrite_ctype(&p.ty, opaque_map); }
+                for v in &mut f.local_vars { v.ty = rewrite_ctype(&v.ty, opaque_map); }
+                rewrite_ctype_in_stmt(&mut f.body, opaque_map);
+            }
+            TopLevelDecl::FuncDecl(f) => {
+                f.return_type = rewrite_ctype(&f.return_type, opaque_map);
+                for p in &mut f.params { p.ty = rewrite_ctype(&p.ty, opaque_map); }
+            }
+            TopLevelDecl::VarDecl(v) => {
+                v.ty = rewrite_ctype(&v.ty, opaque_map);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Check if all fields have auto-generated names (ofs_N, _pad_N, i_N, s_N, uc_N, field_N).
+fn all_fields_autogenerated(def: &crate::decompile::passes::c_pass::types::StructDef) -> bool {
+    if def.fields.is_empty() {
+        return true;
+    }
+    def.fields.iter().all(|f| {
+        match &f.name {
+            Some(name) => {
+                name.starts_with("ofs_")
+                    || name.starts_with("_pad_")
+                    || name.starts_with("i_")
+                    || name.starts_with("s_")
+                    || name.starts_with("uc_")
+                    || name.starts_with("field_")
+            }
+            None => true,
+        }
+    })
+}
+
+/// Collect struct names used by value (directly as CType::Struct, not behind a pointer).
+fn collect_all_referenced_structs(
+    tu: &crate::decompile::passes::c_pass::types::TranslationUnit,
+) -> HashSet<String> {
+    let mut referenced = HashSet::new();
+
+    // Collect ALL struct names referenced in types (both by-value and via pointers)
+    fn collect_struct_refs(ty: &CType, result: &mut HashSet<String>) {
+        match ty {
+            CType::Struct(name) => { result.insert(name.clone()); }
+            CType::Pointer(inner, _) => collect_struct_refs(inner, result),
+            CType::Array(inner, _) => collect_struct_refs(inner, result),
+            CType::Function(ret, params, _) => {
+                collect_struct_refs(ret, result);
+                for p in params { collect_struct_refs(p, result); }
+            }
+            CType::Qualified(inner, _) => collect_struct_refs(inner, result),
+            _ => {}
+        }
+    }
+
+    for decl in &tu.decls {
+        match decl {
+            TopLevelDecl::FuncDef(f) => {
+                collect_struct_refs(&f.return_type, &mut referenced);
+                for p in &f.params { collect_struct_refs(&p.ty, &mut referenced); }
+                for v in &f.local_vars { collect_struct_refs(&v.ty, &mut referenced); }
+            }
+            TopLevelDecl::FuncDecl(f) => {
+                collect_struct_refs(&f.return_type, &mut referenced);
+                for p in &f.params { collect_struct_refs(&p.ty, &mut referenced); }
+            }
+            TopLevelDecl::VarDecl(v) => {
+                collect_struct_refs(&v.ty, &mut referenced);
+            }
+            _ => {}
+        }
+    }
+
+    referenced
+}
 
 pub struct ClightEmitPass;
 
@@ -46,9 +488,10 @@ impl IRPass for ClightEmitPass {
                 })
                 .or_insert_with(|| name_str);
         }
+        // ELF symbols override ident_to_symbol.
         for (addr, name, _) in db.rel_iter::<(Address, Symbol, Symbol)>("symbols") {
             let id = *addr as usize;
-            id_to_name.entry(id).or_insert_with(|| name.to_string());
+            id_to_name.insert(id, name.to_string());
         }
         for func in &selected_functions {
             id_to_name
@@ -73,6 +516,12 @@ impl IRPass for ClightEmitPass {
                 n.strip_prefix("L_")
                     .map_or(false, |h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
             };
+
+            // Collect jump table target addresses to prevent label-to-function-name resolution
+            let jump_table_target_addrs: HashSet<u64> = db
+                .rel_iter::<(Node, usize, Node)>("jump_table_target")
+                .map(|(_, _, target)| *target)
+                .collect();
 
             let mut raw: Vec<(u64, u64, String)> = db
                 .rel_iter::<(Address, Address, Symbol, u64)>("func_stacksz")
@@ -103,6 +552,10 @@ impl IRPass for ClightEmitPass {
                     Ok(a) => a,
                     Err(_) => continue,
                 };
+                // Don't rename labels that are jump table targets (internal labels needed by switch/case gotos)
+                if jump_table_target_addrs.contains(&addr) {
+                    continue;
+                }
                 let idx = match func_ranges.binary_search_by_key(&addr, |(s, _, _)| *s) {
                     Ok(i) => i,
                     Err(i) => i,
@@ -291,24 +744,29 @@ impl IRPass for ClightEmitPass {
                 let struct_type_name = format!("struct_{:x}", struct_id);
                 let ptr_type = CType::Pointer(
                     Box::new(CType::Struct(struct_type_name)),
-                    crate::decompile::passes::c_pass::types::TypeQualifiers::none(),
+                    TypeQualifiers::none(),
                 );
                 var_types_for_emission.insert(name, ptr_type);
             }
 
-            for (node, clight_stmt) in &func.statements {
-                let cstmt = crate::decompile::passes::c_pass::convert::from_relations::convert_stmt(
-                    clight_stmt,
-                    &mut ctx,
-                );
-                let cstmt = crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&cstmt, &|e| {
-                    inline_string_literals(e, &string_map)
-                });
-                let cstmt = crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&cstmt, &|e| {
-                    inline_rodata_constants(e, &rodata_const_map)
-                });
-                let cstmt = crate::decompile::passes::c_pass::convert::from_relations::narrow_varargs_in_stmt(&cstmt);
-                statements.push((*node, cstmt));
+            {
+                let mut sorted_stmt_nodes: Vec<Node> = func.statements.keys().copied().collect();
+                sorted_stmt_nodes.sort();
+                for node in sorted_stmt_nodes {
+                    let clight_stmt = &func.statements[&node];
+                    let cstmt = crate::decompile::passes::c_pass::convert::from_relations::convert_stmt(
+                        clight_stmt,
+                        &mut ctx,
+                    );
+                    let cstmt = crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&cstmt, &|e| {
+                        inline_string_literals(e, &string_map)
+                    });
+                    let cstmt = crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&cstmt, &|e| {
+                        inline_rodata_constants(e, &rodata_const_map)
+                    });
+                    let cstmt = crate::decompile::passes::c_pass::convert::from_relations::narrow_varargs_in_stmt(&cstmt);
+                    statements.push((node, cstmt));
+                }
             }
 
             for (node, succs) in &func.successors {
@@ -397,12 +855,70 @@ impl IRPass for ClightEmitPass {
             &node_to_func_addr,
         );
 
-        let mut struct_decls: Vec<crate::decompile::passes::c_pass::types::TopLevelDecl> = struct_defs
-            .into_iter()
-            .map(|extracted| crate::decompile::passes::c_pass::types::TopLevelDecl::StructDef(extracted.definition))
-            .collect();
-        struct_decls.append(&mut tu.decls);
-        tu.decls = struct_decls;
+        // Identify opaque libc structs (FILE, DIR) via C AST scan and RTL-level analysis.
+        let mut opaque_map = identify_opaque_libc_structs_from_tu(&tu);
+
+        // Supplement with RTL-level analysis: struct IDs flowing through opaque-pointer call args.
+        {
+            let opaque_params_flat = known_opaque_struct_params();
+            let reg_to_sid: HashMap<RTLReg, usize> = db
+                .rel_iter::<(Address, RTLReg, usize)>("reg_to_struct_id")
+                .map(|&(_, reg, sid)| (reg, sid))
+                .collect();
+            let func_names: HashMap<Address, String> = db
+                .rel_iter::<(Address, Symbol, Node)>("emit_function")
+                .map(|(addr, name, _)| (*addr, name.to_string()))
+                .collect();
+            let call_targets: HashMap<Node, String> = db
+                .rel_iter::<(Node, Address)>("call_target_func")
+                .filter_map(|(node, addr)| func_names.get(addr).map(|name| (*node, name.clone())))
+                .collect();
+            for &(call_node, pos, reg) in db.rel_iter::<(Node, usize, RTLReg)>("call_arg_mapping") {
+                if let Some(&sid) = reg_to_sid.get(&reg) {
+                    if let Some(callee_name) = call_targets.get(&call_node) {
+                        if let Some(param_info) = opaque_params_flat.get(callee_name.as_str()) {
+                            for &(expected_pos, typedef_name) in param_info {
+                                if pos == expected_pos {
+                                    let struct_name = format!("struct_{:x}", sid);
+                                    opaque_map.entry(struct_name).or_insert_with(|| typedef_name.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let opaque_struct_names: HashSet<String> = opaque_map.keys().cloned().collect();
+
+        // Collect struct names referenced in emitted function bodies (field accesses, casts, etc.)
+        let structs_referenced_in_code = collect_all_referenced_structs(&tu);
+
+        // Build suppression map: opaque types -> typedef name, unreferenced auto-generated -> void.
+        let mut suppressed_structs: HashMap<String, String> = opaque_map.clone();
+
+        // Append struct defs, skipping opaque libc types and unreferenced auto-generated structs.
+        for extracted in &struct_defs {
+            if let Some(name) = &extracted.definition.name {
+                if opaque_struct_names.contains(name) {
+                    continue;
+                }
+                // Only suppress if: auto-generated fields AND not referenced in any emitted function.
+                if !structs_referenced_in_code.contains(name) && all_fields_autogenerated(&extracted.definition) {
+                    suppressed_structs.insert(name.clone(), "void".to_string());
+                    continue;
+                }
+            }
+            tu.decls.push(TopLevelDecl::StructDef(extracted.definition.clone()));
+        }
+
+        // Rewrite suppressed structs: opaque -> TypedefName, auto-generated -> Void.
+        if !suppressed_structs.is_empty() {
+            rewrite_opaque_types_in_tu(&mut tu, &suppressed_structs);
+            for ty in db.cast_var_types_for_emission.values_mut() {
+                *ty = rewrite_ctype(ty, &suppressed_structs);
+            }
+        }
 
         db.cast_optimized_translation_unit = Some(tu);
     }
@@ -418,11 +934,9 @@ impl IRPass for ClightEmitPass {
             "emit_loop_body",
             "emit_switch_chain",
             "emit_struct_fields",
-            "emit_ifthenelse_body",
-            "ifthenelse_merge_point",
             "primary_exit_node",
             "loop_exit_branch",
-            "suppress_step",
+            "trim_step",
             "known_extern_signature",
             "ident_to_symbol",
             "is_external_function",
@@ -439,6 +953,9 @@ impl IRPass for ClightEmitPass {
             "global_struct_catalog",
             "func_stacksz",
             "symbols",
+            "reg_to_struct_id",
+            "call_target_func",
+            "call_arg_mapping",
         ]
     }
 

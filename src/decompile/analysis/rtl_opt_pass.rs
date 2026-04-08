@@ -23,7 +23,7 @@ impl IRPass for RtlOptPass {
 
     fn run(&self, db: &mut DecompileDB) {
         // Union-find based register coalescing (produces xtl_canonical)
-        crate::decompile::passes::rtl_variable::compute_variable_assignment(db);
+        crate::decompile::analysis::rtl_variable::compute_variable_assignment(db);
 
         // Re-evaluate RTL rules with xtl_canonical from variable assignment
         run_pass!(db, RTLPassProgram);
@@ -72,8 +72,7 @@ impl IRPass for RtlOptPass {
 
                 let mut copies = 0usize;
                 let mut dead = 0usize;
-                let max_iters = 5;
-                for _ in 0..max_iters {
+                loop {
                     let du = DefUseInfo::build(func);
                     let liveness = LivenessInfo::build(func, &du);
 
@@ -93,7 +92,6 @@ impl IRPass for RtlOptPass {
                     let liveness = LivenessInfo::build(func, &du);
                     coalesced = live_range_coalescing(func, &du, &liveness, &mut func_var_types);
                 }
-
                 let splits;
                 {
                     let du = DefUseInfo::build(func);
@@ -101,7 +99,6 @@ impl IRPass for RtlOptPass {
                     let mut local_counter = split_counter.fetch_add(1000, Ordering::Relaxed);
                     splits = variable_splitting(func, &du, &liveness, &mut func_var_types, &mut local_counter);
                 }
-
                 let nops = nop_collapse(func);
 
                 let inlines;
@@ -393,6 +390,21 @@ impl PassContext {
                 }
             }
         }
+
+        // Recompute single_def_const: variable IDs may be stale after coalescing/copy propagation.
+        let new_sdc = ascent::boxcar::Vec::<(RTLReg, Constant)>::new();
+        for (_func_addr, func) in &self.functions {
+            for (_, inst) in &func.inst {
+                if let RTLInst::Iop(op, args, dst) = inst {
+                    if args.is_empty() {
+                        if let Some(cst) = crate::decompile::passes::cminor_pass::constant_from_operation(op) {
+                            new_sdc.push((*dst, cst));
+                        }
+                    }
+                }
+            }
+        }
+        db.rel_set("single_def_const", new_sdc);
 
         db.rel_set("rtl_inst", new_insts);
         db.rel_set("rtl_succ", new_succs);
@@ -1100,9 +1112,9 @@ pub(crate) fn find_inline_temps(
             Some(i) => i,
             None => continue,
         };
+        // SAFETY: Only inline Iop temps; Iload is unsafe without aliasing/intervening store checks.
         let def_args: Vec<RTLReg> = match inst {
             RTLInst::Iop(_, args, _) => args.iter().copied().collect(),
-            RTLInst::Iload(_, _, args, _) => args.iter().copied().collect(),
             _ => continue,
         };
 
@@ -1222,63 +1234,11 @@ pub(crate) fn live_range_coalescing(
 }
 
 pub(crate) fn rename_in_inst(inst: &RTLInst, map: &HashMap<RTLReg, RTLReg>) -> RTLInst {
-    match inst {
-        RTLInst::Inop => RTLInst::Inop,
-        RTLInst::Iop(op, args, dst) => {
-            let new_args = subst_args(args, map);
-            let new_dst = map.get(dst).copied().unwrap_or(*dst);
-            RTLInst::Iop(op.clone(), new_args, new_dst)
-        }
-        RTLInst::Iload(chunk, addr, args, dst) => {
-            let new_args = subst_args(args, map);
-            let new_dst = map.get(dst).copied().unwrap_or(*dst);
-            RTLInst::Iload(*chunk, addr.clone(), new_args, new_dst)
-        }
-        RTLInst::Istore(chunk, addr, args, src) => {
-            let new_args = subst_args(args, map);
-            let new_src = map.get(src).copied().unwrap_or(*src);
-            RTLInst::Istore(*chunk, addr.clone(), new_args, new_src)
-        }
-        RTLInst::Icall(sig, callee, args, dst, next) => {
-            let new_callee = match callee {
-                Either::Left(r) => Either::Left(map.get(r).copied().unwrap_or(*r)),
-                other => other.clone(),
-            };
-            let new_args = subst_args(args, map);
-            let new_dst = dst.map(|d| map.get(&d).copied().unwrap_or(d));
-            RTLInst::Icall(sig.clone(), new_callee, new_args, new_dst, *next)
-        }
-        RTLInst::Itailcall(sig, callee, args) => {
-            let new_callee = match callee {
-                Either::Left(r) => Either::Left(map.get(r).copied().unwrap_or(*r)),
-                other => other.clone(),
-            };
-            let new_args = subst_args(args, map);
-            RTLInst::Itailcall(sig.clone(), new_callee, new_args)
-        }
-        RTLInst::Ibuiltin(name, args, res) => {
-            let new_args: Vec<_> = args.iter().map(|a| subst_ba(a, map)).collect();
-            let new_res = subst_ba(res, map);
-            RTLInst::Ibuiltin(name.clone(), new_args, new_res)
-        }
-        RTLInst::Icond(cond, args, ifso, ifnot) => {
-            let new_args = subst_args(args, map);
-            RTLInst::Icond(cond.clone(), new_args, ifso.clone(), ifnot.clone())
-        }
-        RTLInst::Ijumptable(reg, targets) => {
-            let new_reg = map.get(reg).copied().unwrap_or(*reg);
-            RTLInst::Ijumptable(new_reg, targets.clone())
-        }
-        RTLInst::Ibranch(target) => RTLInst::Ibranch(target.clone()),
-        RTLInst::Ireturn(reg) => {
-            let new_reg = map.get(reg).copied().unwrap_or(*reg);
-            RTLInst::Ireturn(new_reg)
-        }
-    }
+    rename_in_inst_dual(inst, map, map)
 }
 
-/// Like rename_in_inst but applies separate maps to def and use positions, preventing incorrect renaming when a node is both a def in one web and a use reached by a different web during variable splitting.
-fn rename_in_inst_split(
+/// Rename variables in an RTL instruction with separate def/use maps; prevents incorrect renaming during variable splitting.
+fn rename_in_inst_dual(
     inst: &RTLInst,
     def_map: &HashMap<RTLReg, RTLReg>,
     use_map: &HashMap<RTLReg, RTLReg>,
@@ -1442,7 +1402,7 @@ pub(crate) fn variable_splitting(
         if let Some(inst) = func.inst.get_mut(&node) {
             let d = def_rename.get(&node).unwrap_or(&empty_map);
             let u = use_rename.get(&node).unwrap_or(&empty_map);
-            *inst = rename_in_inst_split(inst, d, u);
+            *inst = rename_in_inst_dual(inst, d, u);
         }
     }
 

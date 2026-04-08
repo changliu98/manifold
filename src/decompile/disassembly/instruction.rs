@@ -9,6 +9,14 @@ use crate::x86::mach::Mreg;
 
 const SHF_EXECINSTR: u64 = 0x4;
 
+// Check whether an operand type is the RSP register.
+fn is_rsp_reg(cs: &Capstone, op_type: &X86OperandType) -> bool {
+    matches!(op_type, X86OperandType::Reg(reg_id) if {
+        let name = cs.reg_name(*reg_id).unwrap_or_default().to_ascii_uppercase();
+        name == "RSP"
+    })
+}
+
 fn is_executable_section(section: &object::Section) -> bool {
     match section.flags() {
         SectionFlags::Elf { sh_flags } => sh_flags & SHF_EXECINSTR != 0,
@@ -23,8 +31,6 @@ pub struct DecodedInsn {
     pub size: usize,
     pub mnemonic: &'static str,
     pub op_str: &'static str,
-    #[allow(dead_code)]
-    pub id: capstone::InsnId,
 }
 
 // Disassemble all executable sections and populate instruction/operand/register DB relations.
@@ -32,8 +38,6 @@ pub fn disassemble_sections(
     db: &mut DecompileDB,
     obj: &object::File,
 ) -> Vec<DecodedInsn> {
-    reset_op_counter();
-
     let cs = {
         let mode = if crate::x86::abi::abi_config().is_64bit() {
             arch::x86::ArchMode::Mode64
@@ -121,7 +125,7 @@ pub fn disassemble_sections(
             let mut op_ids: [&'static str; 4] = [NO_OP; 4];
             let num_operands = ops.len();
 
-            let is_nop = mnemonic == "NOP";
+            let is_nop = mnemonic == "NOP" || mnemonic == "VZEROUPPER" || mnemonic == "VZEROALL";
 
             let is_xor_self = if mnemonic == "XOR" && num_operands == 2 {
                 let ops_vec: Vec<_> = x86_detail.operands().collect();
@@ -239,11 +243,7 @@ pub fn disassemble_sections(
                     if num_operands >= 2 {
                         let ops_vec: Vec<_> = x86_detail.operands().collect();
                         if let (Some(dst_op), Some(src_op)) = (ops_vec.get(0), ops_vec.get(1)) {
-                            let is_rsp = matches!(dst_op.op_type, X86OperandType::Reg(reg_id) if {
-                                let name = cs.reg_name(reg_id).unwrap_or_default().to_ascii_uppercase();
-                                name == "RSP"
-                            });
-                            if is_rsp {
+                            if is_rsp_reg(&cs, &dst_op.op_type) {
                                 if let X86OperandType::Imm(imm_val) = src_op.op_type {
                                     adjusts_stack.push((addr, "RSP", -imm_val));
                                 }
@@ -255,11 +255,7 @@ pub fn disassemble_sections(
                     if num_operands >= 2 {
                         let ops_vec: Vec<_> = x86_detail.operands().collect();
                         if let (Some(dst_op), Some(src_op)) = (ops_vec.get(0), ops_vec.get(1)) {
-                            let is_rsp = matches!(dst_op.op_type, X86OperandType::Reg(reg_id) if {
-                                let name = cs.reg_name(reg_id).unwrap_or_default().to_ascii_uppercase();
-                                name == "RSP"
-                            });
-                            if is_rsp {
+                            if is_rsp_reg(&cs, &dst_op.op_type) {
                                 if let X86OperandType::Imm(imm_val) = src_op.op_type {
                                     adjusts_stack.push((addr, "RSP", imm_val));
                                 }
@@ -271,11 +267,7 @@ pub fn disassemble_sections(
                     if num_operands >= 2 {
                         let ops_vec: Vec<_> = x86_detail.operands().collect();
                         if let (Some(dst_op), Some(src_op)) = (ops_vec.get(0), ops_vec.get(1)) {
-                            let is_rsp_dst = matches!(dst_op.op_type, X86OperandType::Reg(reg_id) if {
-                                let name = cs.reg_name(reg_id).unwrap_or_default().to_ascii_uppercase();
-                                name == "RSP"
-                            });
-                            if is_rsp_dst {
+                            if is_rsp_reg(&cs, &dst_op.op_type) {
                                 if let X86OperandType::Mem(mem) = src_op.op_type {
                                     let base_name = if mem.base().0 != 0 {
                                         cs.reg_name(mem.base()).unwrap_or_default().to_ascii_uppercase()
@@ -360,7 +352,6 @@ pub fn disassemble_sections(
                 size,
                 mnemonic,
                 op_str,
-                id: insn.id(),
             });
         }
     }

@@ -432,7 +432,7 @@ fn try_build_layout(accesses: &[(i64, MemoryChunk)]) -> Option<Vec<InferredField
     let sorted: Vec<(i64, usize)> = fields.iter()
         .map(|f| (f.offset, chunk_byte_size(&f.chunk)))
         .collect();
-    if check_field_overlap(&sorted) {
+    if sorted.windows(2).any(|w| w[0].0 + w[0].1 as i64 > w[1].0) {
         return None;
     }
 
@@ -658,7 +658,14 @@ fn post_process_structs(db: &mut DecompileDB) {
     for (&struct_id, fields) in &struct_fields_map {
         for (field_idx, field) in fields.iter().enumerate() {
             let field_type = if let Some(xtypes) = field_type_info.get(&(struct_id, field.offset)) {
-                xtype_to_field_type(pick_best_xtype(xtypes))
+                let best = {
+                    let mut counts: HashMap<XType, usize> = HashMap::new();
+                    for &xt in xtypes.iter() {
+                        *counts.entry(xt).or_insert(0) += 1;
+                    }
+                    counts.into_iter().max_by_key(|(_, c)| *c).map(|(xt, _)| xt).unwrap_or(XType::Xint)
+                };
+                xtype_to_field_type(best)
             } else {
                 FieldType::Scalar(field.chunk)
             };
@@ -751,7 +758,7 @@ fn post_process_structs(db: &mut DecompileDB) {
 
     for &(reg, xtype) in &refined_ptrs {
         if let Some(existing) = existing_types.get(&reg) {
-            if matches!(existing, XType::Xcharptr | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr) {
+            if matches!(existing, XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr) {
                 continue;
             }
         }
@@ -800,17 +807,6 @@ fn is_uniform_stride(offsets: &[(i64, MemoryChunk)]) -> bool {
     true
 }
 
-fn check_field_overlap(sorted_fields: &[(i64, usize)]) -> bool {
-    for i in 0..sorted_fields.len() - 1 {
-        let (ofs, size) = sorted_fields[i];
-        let (next_ofs, _) = sorted_fields[i + 1];
-        if ofs + size as i64 > next_ofs {
-            return true;
-        }
-    }
-    false
-}
-
 fn compute_layout_hash(fields: &[InferredField]) -> u64 {
     let mut hasher = DefaultHasher::new();
     for field in fields {
@@ -827,15 +823,6 @@ fn compute_total_size(fields: &[InferredField]) -> usize {
     let last = &fields[fields.len() - 1];
     let span = (last.offset - first.offset) as usize;
     span + chunk_byte_size(&last.chunk)
-}
-
-fn pick_best_xtype(xtypes: &[XType]) -> XType {
-    if xtypes.is_empty() { return XType::Xint; }
-    let mut counts: HashMap<XType, usize> = HashMap::new();
-    for &xt in xtypes {
-        *counts.entry(xt).or_insert(0) += 1;
-    }
-    counts.into_iter().max_by_key(|(_, c)| *c).map(|(xt, _)| xt).unwrap_or(XType::Xint)
 }
 
 pub use crate::decompile::passes::csh_pass::{make_field_ident, field_ident_to_name};
@@ -865,6 +852,7 @@ fn xtype_to_field_type(xtype: XType) -> FieldType {
         XType::Xsingle => FieldType::Scalar(MemoryChunk::MFloat32),
         XType::Xptr => FieldType::Pointer(Box::new(FieldType::Unknown)),
         XType::Xcharptr => FieldType::Pointer(Box::new(FieldType::Scalar(MemoryChunk::MInt8Signed))),
+        XType::Xcharptrptr => FieldType::Pointer(Box::new(FieldType::Pointer(Box::new(FieldType::Scalar(MemoryChunk::MInt8Signed))))),
         XType::Xintptr => FieldType::Pointer(Box::new(FieldType::Scalar(MemoryChunk::MInt32))),
         XType::Xfloatptr => FieldType::Pointer(Box::new(FieldType::Scalar(MemoryChunk::MFloat64))),
         XType::Xsingleptr => FieldType::Pointer(Box::new(FieldType::Scalar(MemoryChunk::MFloat32))),

@@ -613,7 +613,35 @@ impl Printer {
         self.newline();
 
         let body = if func.return_type == CType::Void {
-            strip_trailing_void_return(&func.body)
+            match &func.body {
+                CStmt::Block(items) => {
+                    let mut items = items.clone();
+                    if let Some(last) = items.last() {
+                        let should_strip = match last {
+                            CBlockItem::Stmt(CStmt::Return(None)) => true,
+                            CBlockItem::Stmt(CStmt::Labeled(_, inner)) => {
+                                matches!(**inner, CStmt::Return(None))
+                            }
+                            _ => false,
+                        };
+                        if should_strip {
+                            items.pop();
+                        }
+                    }
+                    CStmt::Block(items)
+                }
+                CStmt::Sequence(stmts) => {
+                    let mut stmts = stmts.clone();
+                    if let Some(last) = stmts.last() {
+                        if matches!(last, CStmt::Return(None)) {
+                            stmts.pop();
+                        }
+                    }
+                    CStmt::Sequence(stmts)
+                }
+                CStmt::Return(None) => CStmt::Empty,
+                other => other.clone(),
+            }
         } else {
             func.body.clone()
         };
@@ -745,8 +773,35 @@ impl Printer {
             self.newline();
         }
 
+        // Print in C declaration order: types, globals, forward decls, definitions.
+        // This avoids sorting tu.decls (which would invalidate tu.symbols indices).
+        let order = |d: &TopLevelDecl| -> u8 {
+            match d {
+                TopLevelDecl::StructDef(_) | TopLevelDecl::EnumDef(_) | TopLevelDecl::Typedef(_) => 0,
+                TopLevelDecl::VarDecl(_) => 1,
+                TopLevelDecl::FuncDecl(_) => 2,
+                TopLevelDecl::FuncDef(_) => 3,
+            }
+        };
+        let mut indices: Vec<usize> = (0..tu.decls.len()).collect();
+        indices.sort_by_key(|&i| order(&tu.decls[i]));
+
+        fn is_effectively_empty_body(stmt: &CStmt) -> bool {
+            match stmt {
+                CStmt::Empty => true,
+                CStmt::Expr(e) => !e.has_side_effects(),
+                CStmt::Block(items) => items.iter().all(|item| match item {
+                    CBlockItem::Stmt(s) => is_effectively_empty_body(s),
+                    CBlockItem::Decl(decls) => decls.is_empty(),
+                }),
+                CStmt::Sequence(stmts) => stmts.iter().all(is_effectively_empty_body),
+                _ => false,
+            }
+        }
+
         let mut first = true;
-        for decl in tu.decls.iter() {
+        for i in indices {
+            let decl = &tu.decls[i];
             if let TopLevelDecl::FuncDef(f) = decl {
                 if is_effectively_empty_body(&f.body) && f.local_vars.is_empty() {
                     continue;
@@ -1000,38 +1055,6 @@ pub fn print_stmt(stmt: &CStmt) -> String {
     printer.into_string()
 }
 
-fn strip_trailing_void_return(body: &CStmt) -> CStmt {
-    match body {
-        CStmt::Block(items) => {
-            let mut items = items.clone();
-            if let Some(last) = items.last() {
-                let should_strip = match last {
-                    CBlockItem::Stmt(CStmt::Return(None)) => true,
-                    CBlockItem::Stmt(CStmt::Labeled(_, inner)) => {
-                        matches!(**inner, CStmt::Return(None))
-                    }
-                    _ => false,
-                };
-                if should_strip {
-                    items.pop();
-                }
-            }
-            CStmt::Block(items)
-        }
-        CStmt::Sequence(stmts) => {
-            let mut stmts = stmts.clone();
-            if let Some(last) = stmts.last() {
-                if matches!(last, CStmt::Return(None)) {
-                    stmts.pop();
-                }
-            }
-            CStmt::Sequence(stmts)
-        }
-        CStmt::Return(None) => CStmt::Empty,
-        other => other.clone(),
-    }
-}
-
 fn collect_called_names(tu: &TranslationUnit) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
     for decl in &tu.decls {
@@ -1169,15 +1192,3 @@ fn collect_needed_includes(tu: &TranslationUnit) -> Vec<&'static str> {
     includes.into_iter().collect()
 }
 
-fn is_effectively_empty_body(stmt: &CStmt) -> bool {
-    match stmt {
-        CStmt::Empty => true,
-        CStmt::Expr(e) => !e.has_side_effects(),
-        CStmt::Block(items) => items.iter().all(|item| match item {
-            CBlockItem::Stmt(s) => is_effectively_empty_body(s),
-            CBlockItem::Decl(decls) => decls.is_empty(),
-        }),
-        CStmt::Sequence(stmts) => stmts.iter().all(is_effectively_empty_body),
-        _ => false,
-    }
-}

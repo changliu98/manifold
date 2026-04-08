@@ -24,10 +24,7 @@ pub fn build_blocks(db: &mut DecompileDB, insns: &[DecodedInsn], extra_leaders: 
     if insns.is_empty() { return; }
 
     // Pre-compute branch targets from immediate operands
-    let mut op_imm_map: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
-    for (id, val, _) in db.rel_iter::<(Symbol, i64, usize)>("op_immediate") {
-        op_imm_map.insert(id, *val);
-    }
+    let op_imm_map = super::build_op_imm_map(db);
 
     let mut branch_targets: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
     for (addr, _sz, _pfx, mnem, op1, _op2, _op3, _op4, _, _) in db.rel_iter::<(Address, usize, &'static str, &'static str, Symbol, Symbol, Symbol, Symbol, usize, usize)>("unrefinedinstruction") {

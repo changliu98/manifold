@@ -99,6 +99,7 @@ pub enum XType {
     Xsingle,
     Xptr,
     Xcharptr,
+    Xcharptrptr,
     Xintptr,
     Xfloatptr,
     Xsingleptr,
@@ -813,6 +814,10 @@ pub fn is_long_operation(op: &Operation) -> bool {
             | Operation::Odivlu
             | Operation::Omodl
             | Operation::Omodlu
+            | Operation::Odivlimm(_)
+            | Operation::Odivluimm(_)
+            | Operation::Omodlimm(_)
+            | Operation::Omodluimm(_)
             | Operation::Oandl
             | Operation::Oandlimm(_)
             | Operation::Oorl
@@ -853,6 +858,10 @@ pub fn is_int_operation(op: &Operation) -> bool {
             | Operation::Odivu
             | Operation::Omod
             | Operation::Omodu
+            | Operation::Odivimm(_)
+            | Operation::Odivuimm(_)
+            | Operation::Omodimm(_)
+            | Operation::Omoduimm(_)
             | Operation::Oand
             | Operation::Oandimm(_)
             | Operation::Oor
@@ -926,37 +935,13 @@ pub fn is_pointer_operation(op: &Operation) -> bool {
     )
 }
 
-/// Convert MemoryChunk to byte width (1, 2, 4, or 8).
-pub fn chunk_width(chunk: &MemoryChunk) -> u8 {
-    match chunk {
-        MemoryChunk::MBool => 1,
-        MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned => 1,
-        MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => 2,
-        MemoryChunk::MInt32 | MemoryChunk::MAny32 | MemoryChunk::MFloat32 => 4,
-        MemoryChunk::MInt64 | MemoryChunk::MAny64 | MemoryChunk::MFloat64 => 8,
-        MemoryChunk::Unknown => 0,
-    }
-}
-
-/// Convert XType to byte width.
-pub fn xtype_width(xtype: &XType) -> u8 {
-    match xtype {
-        XType::Xbool => 1,
-        XType::Xint8signed | XType::Xint8unsigned => 1,
-        XType::Xint16signed | XType::Xint16unsigned => 2,
-        XType::Xint | XType::Xintunsigned | XType::Xsingle | XType::Xany32 => 4,
-        XType::Xlong | XType::Xlongunsigned | XType::Xfloat | XType::Xany64 => 8,
-        XType::Xptr | XType::Xcharptr | XType::Xintptr
-        | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_) => 8,
-        XType::Xvoid => 0,
-    }
-}
-
 pub fn is_unsigned_operation(op: &Operation) -> bool {
     matches!(
         op,
         Operation::Odivu
             | Operation::Omodu
+            | Operation::Odivuimm(_)
+            | Operation::Omoduimm(_)
             | Operation::Oshru
             | Operation::Oshruimm(_)
             | Operation::Omulhu
@@ -965,6 +950,8 @@ pub fn is_unsigned_operation(op: &Operation) -> bool {
             | Operation::Ocast32unsigned
             | Operation::Odivlu
             | Operation::Omodlu
+            | Operation::Odivluimm(_)
+            | Operation::Omodluimm(_)
             | Operation::Oshrlu
             | Operation::Oshrluimm(_)
             | Operation::Omullhu
@@ -976,6 +963,8 @@ pub fn is_signed_operation(op: &Operation) -> bool {
         op,
         Operation::Odiv
             | Operation::Omod
+            | Operation::Odivimm(_)
+            | Operation::Omodimm(_)
             | Operation::Oshr
             | Operation::Oshrimm(_)
             | Operation::Oshrximm(_)
@@ -985,6 +974,8 @@ pub fn is_signed_operation(op: &Operation) -> bool {
             | Operation::Ocast32signed
             | Operation::Odivl
             | Operation::Omodl
+            | Operation::Odivlimm(_)
+            | Operation::Omodlimm(_)
             | Operation::Oshrl
             | Operation::Oshrlimm(_)
             | Operation::Oshrxlimm(_)

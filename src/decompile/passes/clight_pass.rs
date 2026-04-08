@@ -59,7 +59,6 @@ ascent_par! {
     relation known_func_returns_ptr(Symbol);
     relation known_func_returns_single(Symbol);
     relation main_function(Address);
-    relation node_owned_by_loop(Address, Node, Node);
     relation reg_def_used(Address, Mreg, Address);
     relation reg_rtl(Node, Mreg, RTLReg);
     relation reg_xtl(Node, Mreg, RTLReg);
@@ -74,7 +73,6 @@ ascent_par! {
     relation branch_compares_const(Node, RTLReg, i64, Comparison);
     relation cminor_succ(Node, Node);
     relation csharp_stmt(Node, CsharpminorStmt);
-    relation emit_ifthenelse_body(Address, Node, Node, bool);
     relation emit_loop_body(Address, Node, Node);
     relation emit_loop_exit(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node);
     relation emit_switch_chain(Address, Node, RTLReg);
@@ -83,19 +81,10 @@ ascent_par! {
     relation loop_body(Address, Node, Node);
     relation loop_exit_branch(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node, bool);
     relation loop_head(Address, Node);
-    relation node_owned_by_ifthenelse(Address, Node, Node);
     relation primary_exit_node(Address, Node, Node);
-    relation short_circuit_and(Address, Node, Node, Node, Node);
-    relation short_circuit_or(Address, Node, Node, Node, Node);
-    relation suppress_for_short_circuit(Node);
-    relation suppress_for_ternary(Node);
-    relation suppress_goto_to(Node);
-    relation suppress_node_in_ifthenelse(Address, Node, Node);
-    relation suppress_node_in_loop(Address, Node, Node);
     relation switch_chain_member(Address, Node, Node, RTLReg, i64, Node);
     relation ternary_false_assignment(Address, Node, RTLReg, CsharpminorExpr, Node);
     relation ternary_true_assignment(Address, Node, RTLReg, CsharpminorExpr, Node);
-    relation valid_ifthenelse(Address, Node);
     relation valid_loop(Address, Node);
     relation valid_switch_chain(Address, Node, RTLReg);
     relation valid_ternary(Address, Node, RTLReg, CsharpminorExpr, CsharpminorExpr, Node);
@@ -530,6 +519,7 @@ ascent_par! {
         let converted_args = clight_builtin_args_with_multi_types(&effective_args_init, &var_types),
         let stmt = ClightStmt::Scall(effective_dst, ClightExpr::EvarSymbol(effective_name, default_void_ptr_type()), converted_args);
 
+    // Flat Scond (not lifted by structuring_pass): convert to Sifthenelse with gotos
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Scond(cond, exprs, ifso, ifnot)),
         !valid_switch_chain(_, node, _),
@@ -542,6 +532,18 @@ ascent_par! {
         let then_stmt = ClightStmt::Sgoto(ident_from_node(*ifso)),
         let else_stmt = ClightStmt::Sgoto(ident_from_node(*ifnot)),
         let stmt = ClightStmt::Sifthenelse(condition.clone(), Box::new(then_stmt), Box::new(else_stmt));
+
+    // Compound Sifthenelse (lifted by structuring_pass): recursively convert bodies
+    clight_stmt_without_field(node, stmt) <--
+        csharp_stmt(node, ?CsharpminorStmt::Sifthenelse(cond, args, then_body, else_body)),
+        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        agg func_syms = collect_func_symbols(ident, sym) in ident_to_symbol(ident, sym),
+        let vars_used = extract_vars_from_csharp_exprs(args.as_slice()),
+        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        if let Some(condition) = crate::decompile::passes::clight_pass::clight_condition_expr_with_types(&cond, args.as_slice(), &var_types),
+        let then_clight = crate::decompile::passes::clight_pass::convert_csharp_stmt_to_clight(then_body, &all_var_types, &func_syms),
+        let else_clight = crate::decompile::passes::clight_pass::convert_csharp_stmt_to_clight(else_body, &all_var_types, &func_syms),
+        let stmt = ClightStmt::Sifthenelse(condition, Box::new(then_clight), Box::new(else_clight));
 
     clight_stmt_without_field(head, stmt) <--
         valid_switch_chain(func, head, reg),
@@ -960,7 +962,7 @@ fn xtype_refine_priority(xtype: &XType) -> u8 {
         XType::Xsingle => 11,
         XType::Xptr | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr => 12,
         XType::XstructPtr(_) => 13,
-        XType::Xcharptr => 14,
+        XType::Xcharptr | XType::Xcharptrptr => 14,
         _ => 0,
     }
 }
@@ -1059,6 +1061,13 @@ pub(crate) fn collect_all_var_types<'a>(
     input: impl Iterator<Item = (&'a RTLReg, &'a XType)>,
 ) -> impl Iterator<Item = Vec<(RTLReg, XType)>> {
     let pairs: Vec<(RTLReg, XType)> = input.map(|(reg, xty)| (*reg, xty.clone())).collect();
+    std::iter::once(pairs)
+}
+
+pub(crate) fn collect_func_symbols<'a>(
+    input: impl Iterator<Item = (&'a Ident, &'a Symbol)>,
+) -> impl Iterator<Item = Vec<(Ident, Symbol)>> {
+    let pairs: Vec<(Ident, Symbol)> = input.map(|(id, sym)| (*id, sym.clone())).collect();
     std::iter::once(pairs)
 }
 
@@ -1198,7 +1207,12 @@ pub(crate) fn select_type_from_candidates(
         }
     }
 
-    // No hint or no match: fall back to merge
+    // No hint: prefer non-pointer non-float (integer is safer for arithmetic contexts)
+    if let Some(int_ty) = types.iter().find(|t| !is_pointer_type(t) && !matches!(t, ClightType::Tfloat(_, _))) {
+        return int_ty.clone();
+    }
+
+    // Fall back to merge
     let mut result = types[0].clone();
     for ty in &types[1..] {
         result = merge_clight_types(&result, ty);
@@ -1210,6 +1224,7 @@ pub(crate) fn select_type_from_candidates(
 pub(crate) fn convert_csharp_stmt_to_clight(
     stmt: &CsharpminorStmt,
     all_var_type_pairs: &[(RTLReg, XType)],
+    func_symbols: &[(Ident, Symbol)],
 ) -> ClightStmt {
     match stmt {
         CsharpminorStmt::Sset(dst, expr) => {
@@ -1233,10 +1248,12 @@ pub(crate) fn convert_csharp_stmt_to_clight(
                     ClightExpr::EvarSymbol(sym.to_string(), default_void_ptr_type())
                 }
                 Either::Right(Either::Left(addr)) => {
-                    ClightExpr::EvarSymbol(
-                        format!("sub_{:x}", addr),
-                        default_void_ptr_type(),
-                    )
+                    let ident = *addr as Ident;
+                    let name = func_symbols.iter()
+                        .find(|(id, _)| *id == ident)
+                        .map(|(_, sym)| sym.to_string())
+                        .unwrap_or_else(|| format!("sub_{:x}", addr));
+                    ClightExpr::EvarSymbol(name, default_void_ptr_type())
                 }
                 Either::Left(expr) => {
                     let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]);
@@ -1281,23 +1298,40 @@ pub(crate) fn convert_csharp_stmt_to_clight(
             let vars_used = extract_vars_from_csharp_exprs(args.as_slice());
             let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
             if let Some(condition) = clight_condition_expr_with_types(cond, args.as_slice(), &var_types) {
-                let then_clight = convert_csharp_stmt_to_clight(then_body, all_var_type_pairs);
-                let else_clight = convert_csharp_stmt_to_clight(else_body, all_var_type_pairs);
+                let then_clight = convert_csharp_stmt_to_clight(then_body, all_var_type_pairs, func_symbols);
+                let else_clight = convert_csharp_stmt_to_clight(else_body, all_var_type_pairs, func_symbols);
                 ClightStmt::Sifthenelse(condition, Box::new(then_clight), Box::new(else_clight))
             } else {
                 ClightStmt::Sskip
             }
         }
         CsharpminorStmt::Sloop(body) => {
-            let body_clight = convert_csharp_stmt_to_clight(body, all_var_type_pairs);
+            let body_clight = convert_csharp_stmt_to_clight(body, all_var_type_pairs, func_symbols);
             ClightStmt::Sloop(Box::new(body_clight), Box::new(ClightStmt::Sskip))
         }
         CsharpminorStmt::Sbreak => ClightStmt::Sbreak,
         CsharpminorStmt::Scontinue => ClightStmt::Scontinue,
         CsharpminorStmt::Sseq(stmts) => {
+            // Detect structuring-pass Sseq([Sjumptable(expr, targets), case_body_0..N]) and build Sswitch with inline case bodies.
+            if let Some(CsharpminorStmt::Sjumptable(expr, targets)) = stmts.first() {
+                if stmts.len() == 1 + targets.len() {
+                    let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]);
+                    let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
+                    let discr = clight_expr_from_csharp_with_multi_types(expr, &var_types);
+                    let table: ClightLabeledStatements = stmts[1..]
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, case_body)| {
+                            let body_clight = convert_csharp_stmt_to_clight(case_body, all_var_type_pairs, func_symbols);
+                            (Some(idx as Z), body_clight)
+                        })
+                        .collect();
+                    return ClightStmt::Sswitch(discr, table);
+                }
+            }
             let clight_stmts: Vec<ClightStmt> = stmts
                 .iter()
-                .map(|s| convert_csharp_stmt_to_clight(s, all_var_type_pairs))
+                .map(|s| convert_csharp_stmt_to_clight(s, all_var_type_pairs, func_symbols))
                 .collect();
             ClightStmt::Ssequence(clight_stmts)
         }
@@ -1309,10 +1343,12 @@ pub(crate) fn convert_csharp_stmt_to_clight(
                     ClightExpr::EvarSymbol(sym.to_string(), default_void_ptr_type())
                 }
                 Either::Right(Either::Left(addr)) => {
-                    ClightExpr::EvarSymbol(
-                        format!("sub_{:x}", addr),
-                        default_void_ptr_type(),
-                    )
+                    let ident = *addr as Ident;
+                    let name = func_symbols.iter()
+                        .find(|(id, _)| *id == ident)
+                        .map(|(_, sym)| sym.to_string())
+                        .unwrap_or_else(|| format!("sub_{:x}", addr));
+                    ClightExpr::EvarSymbol(name, default_void_ptr_type())
                 }
                 Either::Left(expr) => {
                     let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]);
@@ -1365,7 +1401,21 @@ pub(crate) fn convert_csharp_stmt_to_clight(
                 ClightStmt::Sskip
             }
         }
-        CsharpminorStmt::Sjumptable(_, _) | CsharpminorStmt::Sloophead(_) => ClightStmt::Sskip,
+        CsharpminorStmt::Sjumptable(expr, targets) => {
+            let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]);
+            let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
+            let discr = clight_expr_from_csharp_with_multi_types(expr, &var_types);
+            let table: ClightLabeledStatements = targets
+                .iter()
+                .enumerate()
+                .map(|(idx, target)| {
+                    let goto_stmt = ClightStmt::Sgoto(ident_from_node(*target));
+                    (Some(idx as Z), goto_stmt)
+                })
+                .collect();
+            ClightStmt::Sswitch(discr, table)
+        }
+        CsharpminorStmt::Sloophead(_) => ClightStmt::Sskip,
     }
 }
 
@@ -1717,12 +1767,6 @@ pub fn extract_struct_field_info(expr: &CsharpminorExpr) -> Option<(i64, i64)> {
                         return Some((base_bucket, field));
                     }
                 }
-                CsharpminorExpr::Evar(reg) => {
-                    let base_key = (*reg) as i64;
-                    if is_valid_field_offset(0, chunk) {
-                        return Some((base_key, 0));
-                    }
-                }
                 _ => {}
             }
             None
@@ -2036,7 +2080,7 @@ fn clight_expr_from_csharp_inner(
         CsharpminorExpr::Econst(cst) => match cst {
             Constant::Ointconst(value) => {
                 let narrowed =
-                    i32::try_from(*value).unwrap_or(if *value >= 0 { i32::MAX } else { i32::MIN });
+                    i32::try_from(*value).unwrap_or((*value as u32) as i32);
 
                 ClightExpr::EconstInt(narrowed, default_int_type())
             }
@@ -3058,7 +3102,94 @@ fn rewrite_clight_stmt_fields(stmt: &ClightStmt, field_info: &FieldInfo, reg_to_
     }
 }
 
+/// Infer struct layouts from mach_imm_stack_init when emit_struct_fields is empty.
+fn infer_struct_fields_from_stack_inits(db: &mut DecompileDB) {
+    let existing_fields: usize = db
+        .rel_iter::<(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_struct_fields")
+        .count();
+    if existing_fields > 0 {
+        return;
+    }
+
+    let node_to_func: HashMap<u64, u64> = db
+        .rel_iter::<(Node, Address)>("instr_in_function")
+        .map(|(n, f)| (*n, *f))
+        .collect();
+
+    let mut func_inits: HashMap<u64, Vec<(i64, Typ)>> = HashMap::new();
+    for (addr, ofs, _val, typ) in db.rel_iter::<(Address, i64, i64, Typ)>("mach_imm_stack_init") {
+        if let Some(&func) = node_to_func.get(addr) {
+            func_inits.entry(func).or_default().push((*ofs, typ.clone()));
+        }
+    }
+
+    let mut new_fields: Vec<(u64, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)> = Vec::new();
+
+    for (func_addr, inits) in &func_inits {
+        let mut offsets: Vec<i64> = inits.iter().map(|(ofs, _)| *ofs).collect();
+        offsets.sort();
+        offsets.dedup();
+
+        if offsets.len() < 4 {
+            continue;
+        }
+
+        let deltas: Vec<i64> = offsets.windows(2).map(|w| w[1] - w[0]).collect();
+
+        if deltas.iter().all(|d| *d == 4) {
+            for fields_per_struct in 2..=4 {
+                let struct_size = 4 * fields_per_struct as i64;
+                if offsets.len() % fields_per_struct != 0 {
+                    continue;
+                }
+                let num_structs = offsets.len() / fields_per_struct;
+                if num_structs < 2 {
+                    continue;
+                }
+
+                let base_ofs = offsets[0];
+                let mut valid = true;
+                for s in 0..num_structs {
+                    for f in 0..fields_per_struct {
+                        let expected = base_ofs + (s as i64) * struct_size + (f as i64) * 4;
+                        if offsets[s * fields_per_struct + f] != expected {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                }
+
+                if valid {
+                    let fields: Vec<(i64, Ident, MemoryChunk)> = (0..fields_per_struct)
+                        .map(|f| {
+                            let field_offset = (f as i64) * 4;
+                            let field_name = generate_field_name(field_offset);
+                            (field_offset, field_name, MemoryChunk::MInt32)
+                        })
+                        .collect();
+
+                    let fields_arc = Arc::new(fields);
+                    for s in 0..num_structs {
+                        let instance_base = base_ofs + (s as i64) * struct_size;
+                        new_fields.push((*func_addr, instance_base, fields_arc.clone()));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    for (func_addr, base_off, fields) in &new_fields {
+        db.rel_push("emit_struct_fields", (*func_addr, *base_off, fields.clone()));
+    }
+}
+
 fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
+    infer_struct_fields_from_stack_inits(db);
+
     let mut func_field_info: HashMap<u64, FieldInfo> = HashMap::new();
     for (func_addr, base_off, fields) in
         db.rel_iter::<(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_struct_fields")
@@ -3326,6 +3457,73 @@ fn synthesize_struct_construction(
             );
             let rewritten = ClightStmt::Sset(var_id, addrof_expr);
             result.rewritten_stmts.insert(*node, rewritten);
+        }
+
+        // Fallback: generate struct fields from init stores when no Oaddrstack references base.
+        if result.new_stmts.iter().all(|(a, _)| !sorted.iter().any(|(sa, _, _, _)| sa == a)) {
+            let mut offsets: Vec<i64> = sorted.iter().map(|(_, ofs, _, _)| *ofs).collect();
+            offsets.sort();
+            offsets.dedup();
+
+            for (layout, (struct_id, fields)) in &known_layouts {
+                let struct_size: i64 = layout.iter().map(|(off, chunk)| {
+                    off + match chunk {
+                        MemoryChunk::MInt32 => 4,
+                        MemoryChunk::MInt64 => 8,
+                        MemoryChunk::MFloat32 => 4,
+                        MemoryChunk::MFloat64 => 8,
+                        _ => 4,
+                    }
+                }).max().unwrap_or(0);
+                let field_count = layout.len();
+                if field_count == 0 || struct_size == 0 { continue; }
+
+                let min_ofs = offsets.first().copied().unwrap_or(0);
+                let mut instance_idx = 0;
+                let mut field_idx = 0;
+                let mut matched_count = 0;
+
+                for &ofs in &offsets {
+                    let expected_ofs = min_ofs + (instance_idx as i64) * struct_size + layout[field_idx].0;
+                    if ofs == expected_ofs {
+                        matched_count += 1;
+                        field_idx += 1;
+                        if field_idx >= field_count {
+                            field_idx = 0;
+                            instance_idx += 1;
+                        }
+                    }
+                }
+
+                if matched_count < offsets.len() || instance_idx < 2 { continue; }
+
+                let struct_ty = ClightType::Tstruct(*struct_id, default_attr());
+                let struct_var_id = min_ofs.unsigned_abs() as Ident;
+
+                for s in 0..instance_idx {
+                    let base_ofs = min_ofs + (s as i64) * struct_size;
+                    for (field_off, field_name, _chunk) in fields {
+                        let target_ofs = base_ofs + field_off;
+                        if let Some((init_addr, _, val, typ)) = sorted.iter().find(|(_, ofs, _, _)| *ofs == target_ofs) {
+                            let field_ty = typ_to_clight_type(typ);
+                            let val_expr = match typ {
+                                Typ::Tlong | Typ::Tany64 => ClightExpr::EconstLong(*val, default_long_type()),
+                                _ => ClightExpr::EconstInt(*val as i32, default_int_type()),
+                            };
+
+                            let lhs = ClightExpr::Efield(
+                                Box::new(ClightExpr::Evar(struct_var_id, struct_ty.clone())),
+                                *field_name,
+                                field_ty,
+                            );
+                            let stmt = ClightStmt::Sassign(lhs, val_expr);
+                            result.new_stmts.push((*init_addr, stmt.clone()));
+                            result.new_emit_stmts.push((*func_addr, *init_addr, stmt));
+                        }
+                    }
+                }
+                break;
+            }
         }
     }
 

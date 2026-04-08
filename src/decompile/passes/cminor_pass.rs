@@ -25,9 +25,31 @@ ascent_par! {
     relation instr_in_function(Node, Address);
     relation func_stacksz(Address, Address, Symbol, u64);
     relation call_return_reg(Node, RTLReg);
+    relation stack_var(Address, Address, i64, RTLReg);
 
     relation cminor_stmt(Node, CminorStmt);
     relation cminor_fallthrough(Node, Node);
+
+    // Track nodes where Olea(Ainstack) was resolved to a stack address constant via stack_var.
+    #[local] relation stack_addr_resolved(Node);
+
+    // Olea(Ainstack(ofs)) with a known stack variable -> Econst(Oaddrstack(ofs))
+    cminor_stmt(node, stmt), stack_addr_resolved(node) <--
+        rtl_inst(node, ?RTLInst::Iop(op, args, dst)),
+        if let Operation::Olea(Addressing::Ainstack(ofs)) = op,
+        if args.is_empty(),
+        instr_in_function(node, func_start),
+        stack_var(func_start, node, *ofs, _stack_rtl),
+        let stmt = CminorStmt::Sassign(*dst, CminorExpr::Econst(Constant::Oaddrstack(*ofs)));
+
+    // Oleal(Ainstack(ofs)) with a known stack variable -> Econst(Oaddrstack(ofs))
+    cminor_stmt(node, stmt), stack_addr_resolved(node) <--
+        rtl_inst(node, ?RTLInst::Iop(op, args, dst)),
+        if let Operation::Oleal(Addressing::Ainstack(ofs)) = op,
+        if args.is_empty(),
+        instr_in_function(node, func_start),
+        stack_var(func_start, node, *ofs, _stack_rtl),
+        let stmt = CminorStmt::Sassign(*dst, CminorExpr::Econst(Constant::Oaddrstack(*ofs)));
 
 
     cminor_stmt(node, CminorStmt::Snop) <--
@@ -37,6 +59,7 @@ ascent_par! {
     cminor_stmt(node, stmt) <--
         rtl_inst(node, ?RTLInst::Iop(op, args, dst)),
         if !(*op == Operation::Omove && args.len() == 1 && args[0] == *dst),
+        !stack_addr_resolved(node),
         let converted = {
             if args.is_empty() {
                 if let Some(cst) = crate::decompile::passes::cminor_pass::constant_from_operation(&op) {
@@ -148,7 +171,6 @@ impl IRPass for CminorPass {
 }
 
 
-const RECURSION_MAX_DEPTH: usize = 100;
 
 pub(crate) fn immediate_from_operation(op: &Operation) -> Option<i64> {
     match op {
@@ -170,6 +192,14 @@ pub(crate) fn immediate_from_operation(op: &Operation) -> Option<i64> {
         Operation::Oshllimm(n) => Some(*n),
         Operation::Oshrlimm(n) => Some(*n),
         Operation::Oshrluimm(n) => Some(*n),
+        Operation::Odivimm(n) => Some(*n),
+        Operation::Odivuimm(n) => Some(*n),
+        Operation::Omodimm(n) => Some(*n),
+        Operation::Omoduimm(n) => Some(*n),
+        Operation::Odivlimm(n) => Some(*n),
+        Operation::Odivluimm(n) => Some(*n),
+        Operation::Omodlimm(n) => Some(*n),
+        Operation::Omodluimm(n) => Some(*n),
         _ => None,
     }
 }
@@ -306,6 +336,14 @@ pub(crate) fn binop_imm_from_operation(op: &Operation) -> Option<(CminorBinop, i
         Operation::Oshrluimm(n) => Some((CminorBinop::Oshrlu, *n)),
         Operation::Oshrximm(n) => Some((CminorBinop::Odiv, 1i64 << *n)),
         Operation::Oshrxlimm(n) => Some((CminorBinop::Odivl, 1i64 << *n)),
+        Operation::Odivimm(n) => Some((CminorBinop::Odiv, *n)),
+        Operation::Odivuimm(n) => Some((CminorBinop::Odivu, *n)),
+        Operation::Omodimm(n) => Some((CminorBinop::Omod, *n)),
+        Operation::Omoduimm(n) => Some((CminorBinop::Omodu, *n)),
+        Operation::Odivlimm(n) => Some((CminorBinop::Odivl, *n)),
+        Operation::Odivluimm(n) => Some((CminorBinop::Odivlu, *n)),
+        Operation::Omodlimm(n) => Some((CminorBinop::Omodl, *n)),
+        Operation::Omodluimm(n) => Some((CminorBinop::Omodlu, *n)),
         // Ororimm/Ororlimm are rotate-right (not shift-right), handled as Eop and expanded in csharp_expr_from_cminor.
         _ => None,
     }
@@ -832,19 +870,12 @@ pub(crate) fn collect_unique_struct_fields<'a>(
 
 pub(crate) fn extract_var_reads_from_stmt(stmt: &ClightStmt) -> Vec<Ident> {
     let mut reads = Vec::new();
-    extract_var_reads_from_stmt_recursive(stmt, &mut reads, 0);
+    extract_var_reads_from_stmt_recursive(stmt, &mut reads);
     reads.sort();
     reads.dedup();
     reads
 }
-fn extract_var_reads_from_stmt_recursive(stmt: &ClightStmt, reads: &mut Vec<Ident>, depth: usize) {
-    if depth > RECURSION_MAX_DEPTH {
-        warn!(
-            "[WARNING] extract_var_reads_from_stmt: Max recursion depth ({}) exceeded. Variable read analysis may be incomplete.",
-            RECURSION_MAX_DEPTH
-        );
-        return;
-    }
+fn extract_var_reads_from_stmt_recursive(stmt: &ClightStmt, reads: &mut Vec<Ident>) {
     match stmt {
         ClightStmt::Sskip => {}
         ClightStmt::Sassign(lhs, rhs) => {
@@ -869,19 +900,19 @@ fn extract_var_reads_from_stmt_recursive(stmt: &ClightStmt, reads: &mut Vec<Iden
         }
         ClightStmt::Ssequence(stmts) => {
             for s in stmts {
-                extract_var_reads_from_stmt_recursive(s, reads, depth + 1);
+                extract_var_reads_from_stmt_recursive(s, reads);
             }
         }
         ClightStmt::Sifthenelse(cond, then_s, else_s) => {
             extract_var_reads_from_expr(cond, reads);
 
-            extract_var_reads_from_stmt_recursive(then_s, reads, depth + 1);
+            extract_var_reads_from_stmt_recursive(then_s, reads);
 
-            extract_var_reads_from_stmt_recursive(else_s, reads, depth + 1);
+            extract_var_reads_from_stmt_recursive(else_s, reads);
         }
         ClightStmt::Sloop(body, cont) => {
-            extract_var_reads_from_stmt_recursive(body, reads, depth + 1);
-            extract_var_reads_from_stmt_recursive(cont, reads, depth + 1);
+            extract_var_reads_from_stmt_recursive(body, reads);
+            extract_var_reads_from_stmt_recursive(cont, reads);
         }
         ClightStmt::Sbreak => {}
         ClightStmt::Scontinue => {}
@@ -894,11 +925,11 @@ fn extract_var_reads_from_stmt_recursive(stmt: &ClightStmt, reads: &mut Vec<Iden
             extract_var_reads_from_expr(expr, reads);
 
             for (_label, case_stmt) in cases {
-                extract_var_reads_from_stmt_recursive(case_stmt, reads, depth + 1);
+                extract_var_reads_from_stmt_recursive(case_stmt, reads);
             }
         }
         ClightStmt::Slabel(_lbl, body) => {
-            extract_var_reads_from_stmt_recursive(body, reads, depth + 1);
+            extract_var_reads_from_stmt_recursive(body, reads);
         }
         ClightStmt::Sgoto(_lbl) => {}
     }
@@ -942,25 +973,13 @@ fn extract_var_reads_from_expr(expr: &ClightExpr, reads: &mut Vec<Ident>) {
 
 pub(crate) fn extract_var_writes_from_stmt(stmt: &ClightStmt) -> Vec<Ident> {
     let mut writes = Vec::new();
-    extract_var_writes_from_stmt_recursive(stmt, &mut writes, 0);
+    extract_var_writes_from_stmt_recursive(stmt, &mut writes);
     writes.sort();
     writes.dedup();
     writes
 }
 
-fn extract_var_writes_from_stmt_recursive(
-    stmt: &ClightStmt,
-    writes: &mut Vec<Ident>,
-    depth: usize,
-) {
-    if depth > RECURSION_MAX_DEPTH {
-        warn!(
-            "[WARNING] extract_var_writes_from_stmt: Max recursion depth ({}) exceeded. Variable write analysis may be incomplete.",
-            RECURSION_MAX_DEPTH
-        );
-
-        return;
-    }
+fn extract_var_writes_from_stmt_recursive(stmt: &ClightStmt, writes: &mut Vec<Ident>) {
     match stmt {
         ClightStmt::Sskip => {}
         ClightStmt::Sassign(_lhs, _rhs) => {}
@@ -979,17 +998,17 @@ fn extract_var_writes_from_stmt_recursive(
         }
         ClightStmt::Ssequence(stmts) => {
             for s in stmts {
-                extract_var_writes_from_stmt_recursive(s, writes, depth + 1);
+                extract_var_writes_from_stmt_recursive(s, writes);
             }
         }
         ClightStmt::Sifthenelse(_cond, then_s, else_s) => {
-            extract_var_writes_from_stmt_recursive(then_s, writes, depth + 1);
+            extract_var_writes_from_stmt_recursive(then_s, writes);
 
-            extract_var_writes_from_stmt_recursive(else_s, writes, depth + 1);
+            extract_var_writes_from_stmt_recursive(else_s, writes);
         }
         ClightStmt::Sloop(body, cont) => {
-            extract_var_writes_from_stmt_recursive(body, writes, depth + 1);
-            extract_var_writes_from_stmt_recursive(cont, writes, depth + 1);
+            extract_var_writes_from_stmt_recursive(body, writes);
+            extract_var_writes_from_stmt_recursive(cont, writes);
         }
         ClightStmt::Sbreak
         | ClightStmt::Scontinue
@@ -997,11 +1016,11 @@ fn extract_var_writes_from_stmt_recursive(
         | ClightStmt::Sgoto(_) => {}
         ClightStmt::Sswitch(_expr, cases) => {
             for (_label, case_stmt) in cases {
-                extract_var_writes_from_stmt_recursive(case_stmt, writes, depth + 1);
+                extract_var_writes_from_stmt_recursive(case_stmt, writes);
             }
         }
         ClightStmt::Slabel(_lbl, body) => {
-            extract_var_writes_from_stmt_recursive(body, writes, depth + 1);
+            extract_var_writes_from_stmt_recursive(body, writes);
         }
     }
 }

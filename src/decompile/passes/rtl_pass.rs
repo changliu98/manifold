@@ -31,7 +31,6 @@ ascent_par! {
     relation call_arg_struct_ptr(Node, usize, usize);
     relation emit_clight_stmt(Address, Node, ClightStmt);
     relation emit_goto_target(Address, Node);
-    relation emit_ifthenelse_body(Address, Node, Node, bool);
     relation emit_loop_body(Address, Node, Node);
     relation emit_loop_exit(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node);
     relation emit_switch_chain(Address, Node, RTLReg);
@@ -39,7 +38,6 @@ ascent_par! {
     relation func_return_struct_type(Address, usize);
     relation func_span(Symbol, Address, Address);
     relation global_struct_catalog(u64, usize, usize, usize);
-    relation ifthenelse_merge_point(Address, Node, Node);
     relation instr_in_function(Node, Address);
     relation is_external_function(Address);
     relation known_extern_signature(Symbol, usize, XType, Arc<Vec<XType>>);
@@ -56,6 +54,7 @@ ascent_par! {
     relation string_data(String, String, usize);
     relation struct_field(u64, i64, String, MemoryChunk);
     relation struct_id_to_canonical(usize, usize);
+    relation symbol_resolved_addr(Symbol, Address);
 
     relation block(Address);
     relation block_boundaries(Address, Address, Address);
@@ -73,10 +72,14 @@ ascent_par! {
     relation known_varargs_function(Symbol, usize);
 
     relation ltl_inst(Node, LTLInst);
-    relation ltl_reachable(Node, Node);
     relation ltl_succ(Node, Node);
     relation mach_imm_indirect_store(Address, i64, Typ, Mreg, i64);
     relation mach_imm_stack_init(Address, i64, i64, Typ);
+    relation arith_load_op(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
+    relation arith_store_reg(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
+    relation arith_store_imm(Address, Operation, MemoryChunk, Mreg, i64);
+    relation arith_store_abs_reg(Address, Operation, MemoryChunk, Ident, i64, Mreg);
+    relation arith_store_abs_imm(Address, Operation, MemoryChunk, Ident, i64);
     relation flags_and_jump_pair(Address, Address, &'static str);
     relation next(Address, Address);
     relation op_immediate(Symbol, i64, usize);
@@ -94,7 +97,7 @@ ascent_par! {
     relation reg_def(Address, Mreg);
     relation reg_def_used(Address, Mreg, Address);
     relation reg_use(Address, Mreg);
-    relation suppress_instruction(Address);
+    relation trim_instruction(Address);
     relation stack_def_used(Address, Symbol, i64, Address, Symbol, i64);
     relation symbols(Address, Symbol, Symbol);
 
@@ -144,6 +147,8 @@ ascent_par! {
     relation rtl_succ_candidate(Node, Node);
 
     relation rtl_edge_negated(Node, Node);
+    // Addresses with a real LTL operation (not just a label/branch fallback)
+    relation has_ltl_op(Node);
     relation is_arg_reg(Mreg);
     relation is_xmm_arg_reg(Mreg);
     relation is_caller_saved(Mreg);
@@ -165,6 +170,9 @@ ascent_par! {
     relation cond_args_collected(Node, Args);
     relation global_var_ref(usize);
     relation global_load_chunk(Ident, MemoryChunk);
+    relation emit_global_is_ptr(Ident);
+    relation emit_global_is_char_ptr(Ident);
+    relation global_addr_reg(Ident, RTLReg);
     relation base_ident_to_symbol(Ident, Symbol);
     relation ident_to_symbol(Ident, Symbol);
     relation arg_reg_used(Address, Mreg);
@@ -183,6 +191,10 @@ ascent_par! {
     relation func_broken_xtl(Address, RTLReg);
     relation stack_mem_add_imm(Address, i64, i64, usize);
     relation stack_mem_sub_imm(Address, i64, i64, usize);
+
+    // SP-indexed load/store detection: loads/stores with 2 mregs where mregs[0] == SP
+    #[local] relation sp_indexed_load(Node);
+    #[local] relation sp_indexed_store(Node);
 
 
     ltl_inst_uses_mreg(addr, mreg) <--
@@ -263,35 +275,53 @@ ascent_par! {
         !op_arg_mapping(addr, _, _);
 
 
+    // Detect SP-indexed loads (2 mregs where mregs[0] is SP)
+    sp_indexed_load(addr) <--
+        ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, _)),
+        if mregs.len() == 2,
+        if mregs[0] == Mreg::SP;
+
+    // Detect SP-indexed stores (2 mregs where mregs[0] is SP)
+    sp_indexed_store(addr) <--
+        ltl_inst(addr, ?LTLInst::Lstore(_, _, mregs, _)),
+        if mregs.len() == 2,
+        if mregs[0] == Mreg::SP;
+
     load_arg_mapping(addr, pos, arg_rtl) <--
         ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, _)),
+        !sp_indexed_load(addr),
         for (pos, arg) in mregs.iter().enumerate(),
         reg_rtl(addr, *arg, arg_rtl);
 
     load_args_collected(addr, args) <--
         ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, _)),
         if mregs.len() > 1,
+        !sp_indexed_load(addr),
         agg args = build_call_args(pos, reg) in load_arg_mapping(addr, pos, reg);
 
     load_args_collected(addr, Arc::new(vec![])) <--
         ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, _)),
         if mregs.len() > 1,
+        !sp_indexed_load(addr),
         !load_arg_mapping(addr, _, _);
 
 
     store_arg_mapping(addr, pos, arg_rtl) <--
         ltl_inst(addr, ?LTLInst::Lstore(_, _, mregs, _)),
+        !sp_indexed_store(addr),
         for (pos, arg) in mregs.iter().enumerate(),
         reg_rtl(addr, *arg, arg_rtl);
 
     store_args_collected(addr, args) <--
         ltl_inst(addr, ?LTLInst::Lstore(_, _, mregs, _)),
         if !mregs.is_empty(),
+        !sp_indexed_store(addr),
         agg args = build_call_args(pos, reg) in store_arg_mapping(addr, pos, reg);
 
     store_args_collected(addr, Arc::new(vec![])) <--
         ltl_inst(addr, ?LTLInst::Lstore(_, _, mregs, _)),
         if !mregs.is_empty(),
+        !sp_indexed_store(addr),
         !store_arg_mapping(addr, _, _);
 
 
@@ -381,6 +411,43 @@ ascent_par! {
 
     global_load_chunk(*ident, chunk.clone()) <--
         ltl_inst(_, ?LTLInst::Lload(chunk, Addressing::Abasedscaled(_, ident, _), _, _));
+
+    // Store chunks via direct addressing (also inform global type inference)
+    global_load_chunk(*ident, chunk.clone()) <--
+        ltl_inst(_, ?LTLInst::Lstore(chunk, Addressing::Aglobal(ident, _), _, _));
+
+    global_load_chunk(*ident, chunk.clone()) <--
+        ltl_inst(_, ?LTLInst::Lstore(chunk, Addressing::Abased(ident, _), _, _));
+
+    global_load_chunk(*ident, chunk.clone()) <--
+        ltl_inst(_, ?LTLInst::Lstore(chunk, Addressing::Abasedscaled(_, ident, _), _, _));
+
+    // Track RTL register holding address of a global (from Oindirectsymbol, used in PIC binaries)
+    global_addr_reg(*ident, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Oindirectsymbol(ident), _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    // Propagate global address register through aliases
+    global_addr_reg(*ident, b) <-- global_addr_reg(ident, a), alias_edge(a, b);
+    global_addr_reg(*ident, a) <-- global_addr_reg(ident, b), alias_edge(a, b);
+
+    // When a global address register is used as base for a load at offset 0, track the chunk
+    global_load_chunk(*ident, chunk.clone()) <--
+        global_addr_reg(ident, addr_rtl),
+        ltl_inst(node, ?LTLInst::Lload(chunk, Addressing::Aindexed(0), args, _)),
+        if !args.is_empty(),
+        reg_rtl(node, args[0], base_rtl),
+        if *addr_rtl == *base_rtl;
+
+    // When a global address register is used as base for a store at offset 0, track the chunk
+    global_load_chunk(*ident, chunk.clone()) <--
+        global_addr_reg(ident, addr_rtl),
+        ltl_inst(node, ?LTLInst::Lstore(chunk, Addressing::Aindexed(0), args, _)),
+        if !args.is_empty(),
+        reg_rtl(node, args[0], base_rtl),
+        if *addr_rtl == *base_rtl;
+
+    // Note: emit_global_is_ptr/emit_global_is_char_ptr are computed in type_pass.rs (more precise).
 
     function_call(caller_func, callee_func) <--
         ltl_inst(caller, ?LTLInst::Lcall(callee)),
@@ -606,7 +673,18 @@ ascent_par! {
 
     rtl_succ_candidate(src, dst) <-- ltl_succ(src, dst), !rtl_edge_negated(src, dst);
 
-    
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lop(_, _, _));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lload(_, _, _, _));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lstore(_, _, _, _));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lcall(_));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Ltailcall(_));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lcond(_, _, _, _));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lbuiltin(_, _, _));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lgetstack(_, _, _, _));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lsetstack(_, _, _, _));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Ljumptable(_, _));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lreturn);
+
     rtl_inst_candidate(addr, iop_inst) <--
         mach_imm_indirect_store(addr, imm_val, typ, _base_mreg, _disp),
         let fresh_reg = fresh_xtl_reg(*addr, Mreg::DI),
@@ -644,6 +722,271 @@ ascent_par! {
         mach_imm_indirect_store(addr, _, _, _, _),
         instr_in_function(addr, func_start),
         let synthetic_addr = *addr | (1u64 << 62),
+        next(addr, next);
+
+    // reg_xtl for arith addresses: chains from reg_def_used definition site when no real ltl op exists.
+    reg_xtl(*addr, *base_mreg, arg_id) <--
+        arith_load_op(addr, _, _, base_mreg, _, _),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *base_mreg, *addr),
+        reg_xtl(defaddr, *base_mreg, arg_id);
+
+    reg_xtl(*addr, *dst_mreg, arg_id) <--
+        arith_load_op(addr, _, _, _, _, dst_mreg),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *dst_mreg, *addr),
+        reg_xtl(defaddr, *dst_mreg, arg_id);
+
+    reg_xtl(*addr, *base_mreg, arg_id) <--
+        arith_store_reg(addr, _, _, base_mreg, _, _),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *base_mreg, *addr),
+        reg_xtl(defaddr, *base_mreg, arg_id);
+
+    reg_xtl(*addr, *src_mreg, arg_id) <--
+        arith_store_reg(addr, _, _, _, _, src_mreg),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *src_mreg, *addr),
+        reg_xtl(defaddr, *src_mreg, arg_id);
+
+    reg_xtl(*addr, *base_mreg, arg_id) <--
+        arith_store_imm(addr, _, _, base_mreg, _),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *base_mreg, *addr),
+        reg_xtl(defaddr, *base_mreg, arg_id);
+
+    reg_xtl(*addr, *src_mreg, arg_id) <--
+        arith_store_abs_reg(addr, _, _, _, _, src_mreg),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *src_mreg, *addr),
+        reg_xtl(defaddr, *src_mreg, arg_id);
+
+    // arith_load_op: memory-source arithmetic (e.g. add [mem], reg); only fires without a real ltl op.
+    rtl_inst_candidate(addr, load_inst) <--
+        arith_load_op(addr, _op, chunk, base_mreg, disp, _dst_mreg),
+        !has_ltl_op(addr),
+        reg_xtl(addr, *base_mreg, base_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp);
+
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        arith_load_op(addr, op, _chunk, _base_mreg, _disp, dst_mreg),
+        !has_ltl_op(addr),
+        reg_xtl(addr, *dst_mreg, dst_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, temp]), *dst_rtl);
+
+    rtl_edge_negated(addr, next) <--
+        arith_load_op(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synthetic_addr), instr_in_function(addr, func_start) <--
+        arith_load_op(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synthetic_addr, next), instr_in_function(synthetic_addr, func_start) <--
+        arith_load_op(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62),
+        next(addr, next);
+
+    // arith_store_reg: memory-dest arithmetic with register source; only fires without a real ltl op.
+    rtl_inst_candidate(addr, load_inst) <--
+        arith_store_reg(addr, _op, chunk, base_mreg, disp, _src_mreg),
+        !has_ltl_op(addr),
+        reg_xtl(addr, *base_mreg, base_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp);
+
+    rtl_inst_candidate(synth1, op_inst) <--
+        arith_store_reg(addr, op, _chunk, _base_mreg, _disp, src_mreg),
+        !has_ltl_op(addr),
+        reg_xtl(addr, *src_mreg, src_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::from("RTEMP")),
+        let synth1 = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![temp, *src_rtl]), temp2);
+
+    rtl_inst_candidate(synth2, store_inst) <--
+        arith_store_reg(addr, _op, chunk, base_mreg, disp, _src_mreg),
+        !has_ltl_op(addr),
+        reg_xtl(addr, *base_mreg, base_rtl),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::from("RTEMP")),
+        let synth2 = *addr | (1u64 << 63),
+        let store_inst = RTLInst::Istore(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp2);
+
+    rtl_edge_negated(addr, next) <--
+        arith_store_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synth1), instr_in_function(addr, func_start) <--
+        arith_store_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth1, synth2), instr_in_function(synth1, func_start) <--
+        arith_store_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62),
+        let synth2 = *addr | (1u64 << 63);
+
+    rtl_succ_candidate(synth2, next), instr_in_function(synth2, func_start) <--
+        arith_store_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth2 = *addr | (1u64 << 63),
+        next(addr, next);
+
+    // arith_store_imm: memory-dest arithmetic with immediate; only fires without a real ltl op.
+    rtl_inst_candidate(addr, load_inst) <--
+        arith_store_imm(addr, _op, chunk, base_mreg, disp),
+        !has_ltl_op(addr),
+        reg_xtl(addr, *base_mreg, base_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp);
+
+    rtl_inst_candidate(synth1, op_inst) <--
+        arith_store_imm(addr, op, _chunk, _base_mreg, _disp),
+        !has_ltl_op(addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::from("RTEMP")),
+        let synth1 = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![temp]), temp2);
+
+    rtl_inst_candidate(synth2, store_inst) <--
+        arith_store_imm(addr, _op, chunk, base_mreg, disp),
+        !has_ltl_op(addr),
+        reg_xtl(addr, *base_mreg, base_rtl),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::from("RTEMP")),
+        let synth2 = *addr | (1u64 << 63),
+        let store_inst = RTLInst::Istore(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp2);
+
+    rtl_edge_negated(addr, next) <--
+        arith_store_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synth1), instr_in_function(addr, func_start) <--
+        arith_store_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth1, synth2), instr_in_function(synth1, func_start) <--
+        arith_store_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62),
+        let synth2 = *addr | (1u64 << 63);
+
+    rtl_succ_candidate(synth2, next), instr_in_function(synth2, func_start) <--
+        arith_store_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth2 = *addr | (1u64 << 63),
+        next(addr, next);
+
+    // arith_store_abs_reg: read-modify-write at absolute (global) address with register source.
+    rtl_inst_candidate(addr, load_inst) <--
+        arith_store_abs_reg(addr, _op, chunk, ident, offset, _src_mreg),
+        !has_ltl_op(addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), temp);
+
+    rtl_inst_candidate(synth1, op_inst) <--
+        arith_store_abs_reg(addr, op, _chunk, _ident, _offset, src_mreg),
+        !has_ltl_op(addr),
+        reg_xtl(addr, *src_mreg, src_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::from("RTEMP")),
+        let synth1 = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![temp, *src_rtl]), temp2);
+
+    rtl_inst_candidate(synth2, store_inst) <--
+        arith_store_abs_reg(addr, _op, chunk, ident, offset, _src_mreg),
+        !has_ltl_op(addr),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::from("RTEMP")),
+        let synth2 = *addr | (1u64 << 63),
+        let store_inst = RTLInst::Istore(*chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), temp2);
+
+    rtl_edge_negated(addr, next) <--
+        arith_store_abs_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synth1), instr_in_function(addr, func_start) <--
+        arith_store_abs_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth1, synth2), instr_in_function(synth1, func_start) <--
+        arith_store_abs_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62),
+        let synth2 = *addr | (1u64 << 63);
+
+    rtl_succ_candidate(synth2, next), instr_in_function(synth2, func_start) <--
+        arith_store_abs_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth2 = *addr | (1u64 << 63),
+        next(addr, next);
+
+    // arith_store_abs_imm: read-modify-write at absolute (global) address with immediate source.
+    rtl_inst_candidate(addr, load_inst) <--
+        arith_store_abs_imm(addr, _op, chunk, ident, offset),
+        !has_ltl_op(addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), temp);
+
+    rtl_inst_candidate(synth1, op_inst) <--
+        arith_store_abs_imm(addr, op, _chunk, _ident, _offset),
+        !has_ltl_op(addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::from("RTEMP")),
+        let synth1 = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![temp]), temp2);
+
+    rtl_inst_candidate(synth2, store_inst) <--
+        arith_store_abs_imm(addr, _op, chunk, ident, offset),
+        !has_ltl_op(addr),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::from("RTEMP")),
+        let synth2 = *addr | (1u64 << 63),
+        let store_inst = RTLInst::Istore(*chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), temp2);
+
+    rtl_edge_negated(addr, next) <--
+        arith_store_abs_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synth1), instr_in_function(addr, func_start) <--
+        arith_store_abs_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth1, synth2), instr_in_function(synth1, func_start) <--
+        arith_store_abs_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62),
+        let synth2 = *addr | (1u64 << 63);
+
+    rtl_succ_candidate(synth2, next), instr_in_function(synth2, func_start) <--
+        arith_store_abs_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth2 = *addr | (1u64 << 63),
         next(addr, next);
 
     reg_xtl(addr, dst, fresh_dst_id), is_def(addr, fresh_dst_id) <--
@@ -869,6 +1212,7 @@ ascent_par! {
         ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
         if mregs.len() > 1,
         if *addressing != Addressing::Aindexed(0),
+        !sp_indexed_load(addr),
         reg_rtl(addr, *dst_reg, dst_rtl),
         load_args_collected(addr, args),
         let inst = RTLInst::Iload(*chunk, addressing.clone(), args.clone(), *dst_rtl);
@@ -877,9 +1221,97 @@ ascent_par! {
         ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
         if mregs.len() > 1,
         if *addressing == Addressing::Aindexed(0),
+        !sp_indexed_load(addr),
         reg_rtl(addr, *dst_reg, dst_rtl),
         reg_rtl(addr, mregs[0], base_rtl),
         let inst = RTLInst::Iload(*chunk, addressing.clone(), Arc::new(vec![*base_rtl]), *dst_rtl);
+
+    // SP-indexed load: Aindexed2scaled(scale, ofs) with [SP, idx] -> expand to Olea(Ainstack(ofs)) + Iload(Aindexed2scaled(scale, 0), [sp_addr, idx])
+    // The Olea goes at the original node; the Iload goes at a synthetic successor node.
+    rtl_inst_candidate(addr, lea_inst), op_produces_ptr(addr, sp_addr_rtl) <--
+        ltl_inst(addr, ?LTLInst::Lload(_, addressing, mregs, _)),
+        if mregs.len() == 2 && mregs[0] == Mreg::SP,
+        if let Addressing::Aindexed2scaled(_, ofs) | Addressing::Aindexed2(ofs) = addressing,
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let lea_inst = RTLInst::Iop(Operation::Olea(Addressing::Ainstack(*ofs)), Arc::new(vec![]), sp_addr_rtl);
+
+    rtl_inst_candidate(synth, load_inst) <--
+        ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
+        if mregs.len() == 2 && mregs[0] == Mreg::SP,
+        if let Addressing::Aindexed2scaled(scale, _) = addressing,
+        reg_rtl(addr, *dst_reg, dst_rtl),
+        reg_rtl(addr, mregs[1], idx_rtl),
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2scaled(*scale, 0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *dst_rtl);
+
+    rtl_inst_candidate(synth, load_inst) <--
+        ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
+        if mregs.len() == 2 && mregs[0] == Mreg::SP,
+        if let Addressing::Aindexed2(ofs) = addressing,
+        reg_rtl(addr, *dst_reg, dst_rtl),
+        reg_rtl(addr, mregs[1], idx_rtl),
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2(0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *dst_rtl);
+
+    // SP-indexed load: edge rewiring -- redirect addr's successors through the synthetic node
+    rtl_edge_negated(addr, next) <--
+        sp_indexed_load(addr),
+        ltl_succ(addr, next);
+
+    rtl_succ_candidate(addr, synth) <--
+        sp_indexed_load(addr),
+        let synth = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth, next), instr_in_function(synth, func_start) <--
+        sp_indexed_load(addr),
+        ltl_succ(addr, next),
+        instr_in_function(addr, func_start),
+        let synth = *addr | (1u64 << 62);
+
+    // SP-indexed store: Aindexed2scaled/Aindexed2 with [SP, idx] -> expand similarly
+    rtl_inst_candidate(addr, lea_inst), op_produces_ptr(addr, sp_addr_rtl) <--
+        ltl_inst(addr, ?LTLInst::Lstore(_, addressing, mregs, _)),
+        if mregs.len() == 2 && mregs[0] == Mreg::SP,
+        if let Addressing::Aindexed2scaled(_, ofs) | Addressing::Aindexed2(ofs) = addressing,
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let lea_inst = RTLInst::Iop(Operation::Olea(Addressing::Ainstack(*ofs)), Arc::new(vec![]), sp_addr_rtl);
+
+    rtl_inst_candidate(synth, store_inst) <--
+        ltl_inst(addr, ?LTLInst::Lstore(chunk, addressing, mregs, src_reg)),
+        if mregs.len() == 2 && mregs[0] == Mreg::SP,
+        if let Addressing::Aindexed2scaled(scale, _) = addressing,
+        reg_rtl(addr, *src_reg, src_rtl),
+        reg_rtl(addr, mregs[1], idx_rtl),
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let store_inst = RTLInst::Istore(*chunk, Addressing::Aindexed2scaled(*scale, 0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *src_rtl);
+
+    rtl_inst_candidate(synth, store_inst) <--
+        ltl_inst(addr, ?LTLInst::Lstore(chunk, addressing, mregs, src_reg)),
+        if mregs.len() == 2 && mregs[0] == Mreg::SP,
+        if let Addressing::Aindexed2(ofs) = addressing,
+        reg_rtl(addr, *src_reg, src_rtl),
+        reg_rtl(addr, mregs[1], idx_rtl),
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let store_inst = RTLInst::Istore(*chunk, Addressing::Aindexed2(0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *src_rtl);
+
+    // SP-indexed store: edge rewiring
+    rtl_edge_negated(addr, next) <--
+        sp_indexed_store(addr),
+        ltl_succ(addr, next);
+
+    rtl_succ_candidate(addr, synth) <--
+        sp_indexed_store(addr),
+        let synth = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth, next), instr_in_function(synth, func_start) <--
+        sp_indexed_store(addr),
+        ltl_succ(addr, next),
+        instr_in_function(addr, func_start),
+        let synth = *addr | (1u64 << 62);
 
     ltl_lstore_has_regvar(addr, src_reg, src_rtl) <--
         ltl_inst(addr, ?LTLInst::Lstore(_chunk, _addressing, _mregs, src_reg)),
@@ -958,7 +1390,7 @@ ascent_par! {
                    else if mnem.ends_with("Q") { MemoryChunk::MInt64 }
                    else { MemoryChunk::MInt32 };
 
-    rtl_inst_candidate(*next_addr, RTLInst::Icond(cond, args.clone(), Either::Right(target_addr), Either::Right(*next_addr))) <--
+    rtl_inst_candidate(*next_addr, RTLInst::Icond(cond, args.clone(), Either::Right(*target_addr), Either::Right(*next_addr))) <--
         instruction(addr, _, mnem, dst, src, _, _, _, _, _),
         if mnem.starts_with("CMP"),
         op_indirect(dst, _, _, _, _, _, _),
@@ -967,8 +1399,7 @@ ascent_par! {
         next(addr, next_addr),
         pjcc(next_addr, test_cond, lbl),
         temp_cmp_reg(addr, fresh_reg),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(lbl),
-        if let Some(target_addr) = target_opt,
+        symbol_resolved_addr(*lbl, target_addr),
         instr_in_function(target_addr, target_func_start),
         instr_in_function(next_addr, my_func_start),
         if target_func_start == my_func_start,
@@ -1014,7 +1445,7 @@ ascent_par! {
                    else if mnem.ends_with("Q") { MemoryChunk::MInt64 }
                    else { MemoryChunk::MInt32 };
 
-    rtl_inst_candidate(*next_addr, RTLInst::Icond(cond, args.clone(), Either::Right(target_addr), Either::Right(*next_addr))) <--
+    rtl_inst_candidate(*next_addr, RTLInst::Icond(cond, args.clone(), Either::Right(*target_addr), Either::Right(*next_addr))) <--
         instruction(addr, _, mnem, dst, src, _, _, _, _, _),
         if mnem.starts_with("CMP"),
         op_immediate(dst, imm_sym, _),
@@ -1023,8 +1454,7 @@ ascent_par! {
         next(addr, next_addr),
         pjcc(next_addr, test_cond, lbl),
         temp_cmp_reg(addr, fresh_reg),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(lbl),
-        if let Some(target_addr) = target_opt,
+        symbol_resolved_addr(*lbl, target_addr),
         instr_in_function(target_addr, target_func_start),
         instr_in_function(next_addr, my_func_start),
         if target_func_start == my_func_start,
@@ -1044,7 +1474,7 @@ ascent_par! {
         },
         let args = Arc::new(vec![*fresh_reg]);
 
-    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, args.clone(), Either::Right(target_addr), Either::Right(*fallthrough))) <--
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, args.clone(), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
         instruction(addr, _, mnem, dst, src, _, _, _, _, _),
         if mnem.starts_with("CMP"),
         op_immediate(dst, imm_sym, _),
@@ -1053,8 +1483,7 @@ ascent_par! {
         flags_and_jump_pair(addr, jcc_addr, _),
         pjcc(jcc_addr, test_cond, lbl),
         temp_cmp_reg(addr, fresh_reg),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(lbl),
-        if let Some(target_addr) = target_opt,
+        symbol_resolved_addr(*lbl, target_addr),
         instr_in_function(target_addr, target_func_start),
         instr_in_function(jcc_addr, my_func_start),
         if target_func_start == my_func_start,
@@ -1110,7 +1539,7 @@ ascent_par! {
         agg mreg_args = build_call_args(pos, rtl_reg) in temp_cmp_args_rtl(addr, pos, rtl_reg),
         let chunk = match *sz { 1 => MemoryChunk::MInt8Unsigned, 2 => MemoryChunk::MInt16Unsigned, 8 => MemoryChunk::MInt64, _ => MemoryChunk::MInt32 };
 
-    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*reg_rtl, *fresh_reg]), Either::Right(target_addr), Either::Right(*fallthrough))) <--
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*reg_rtl, *fresh_reg]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
         pcmp(addr, r1, r2),
         op_register(r1, reg_str),
         op_indirect(r2, _, _, _, _, _, _),
@@ -1119,15 +1548,14 @@ ascent_par! {
         reg_rtl(addr, mreg, reg_rtl),
         next(addr, jcc_addr),
         pjcc(jcc_addr, test_cond, lbl),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(lbl),
-        if let Some(target_addr) = target_opt,
+        symbol_resolved_addr(*lbl, target_addr),
         instr_in_function(target_addr, target_func_start),
         instr_in_function(jcc_addr, my_func_start),
         if target_func_start == my_func_start,
         next(jcc_addr, fallthrough),
         let cond = condition_for_testcond(*test_cond);
 
-    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*reg_rtl, *fresh_reg]), Either::Right(target_addr), Either::Right(*fallthrough))) <--
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*reg_rtl, *fresh_reg]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
         pcmp(addr, r1, r2),
         op_register(r1, reg_str),
         op_indirect(r2, _, _, _, _, _, _),
@@ -1136,8 +1564,7 @@ ascent_par! {
         reg_rtl(addr, mreg, reg_rtl),
         flags_and_jump_pair(addr, jcc_addr, _),
         pjcc(jcc_addr, test_cond, lbl),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(lbl),
-        if let Some(target_addr) = target_opt,
+        symbol_resolved_addr(*lbl, target_addr),
         instr_in_function(target_addr, target_func_start),
         instr_in_function(jcc_addr, my_func_start),
         if target_func_start == my_func_start,
@@ -1180,7 +1607,7 @@ ascent_par! {
         agg mreg_args = build_call_args(pos, rtl_reg) in temp_cmp_args_rtl(addr, pos, rtl_reg),
         let chunk = match *sz { 1 => MemoryChunk::MInt8Unsigned, 2 => MemoryChunk::MInt16Unsigned, 8 => MemoryChunk::MInt64, _ => MemoryChunk::MInt32 };
 
-    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*fresh_reg, *reg_rtl]), Either::Right(target_addr), Either::Right(*fallthrough))) <--
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*fresh_reg, *reg_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
         pcmp(addr, r1, r2),
         op_indirect(r1, _, _, _, _, _, _),
         op_register(r2, reg_str),
@@ -1189,15 +1616,14 @@ ascent_par! {
         reg_rtl(addr, mreg, reg_rtl),
         next(addr, jcc_addr),
         pjcc(jcc_addr, test_cond, lbl),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(lbl),
-        if let Some(target_addr) = target_opt,
+        symbol_resolved_addr(*lbl, target_addr),
         instr_in_function(target_addr, target_func_start),
         instr_in_function(jcc_addr, my_func_start),
         if target_func_start == my_func_start,
         next(jcc_addr, fallthrough),
         let cond = condition_for_testcond(*test_cond);
 
-    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*fresh_reg, *reg_rtl]), Either::Right(target_addr), Either::Right(*fallthrough))) <--
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*fresh_reg, *reg_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
         pcmp(addr, r1, r2),
         op_indirect(r1, _, _, _, _, _, _),
         op_register(r2, reg_str),
@@ -1206,15 +1632,14 @@ ascent_par! {
         reg_rtl(addr, mreg, reg_rtl),
         flags_and_jump_pair(addr, jcc_addr, _),
         pjcc(jcc_addr, test_cond, lbl),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(lbl),
-        if let Some(target_addr) = target_opt,
+        symbol_resolved_addr(*lbl, target_addr),
         instr_in_function(target_addr, target_func_start),
         instr_in_function(jcc_addr, my_func_start),
         if target_func_start == my_func_start,
         next(jcc_addr, fallthrough),
         let cond = condition_for_testcond(*test_cond);
 
-    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, args.clone(), Either::Right(target_addr), Either::Right(*fallthrough))) <--
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, args.clone(), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
         instruction(addr, _, mnem, dst, src, _, _, _, _, _),
         if mnem.starts_with("CMP"),
         op_indirect(dst, _, _, _, _, _, _),
@@ -1223,8 +1648,7 @@ ascent_par! {
         flags_and_jump_pair(addr, jcc_addr, _),
         pjcc(jcc_addr, test_cond, lbl),
         temp_cmp_reg(addr, fresh_reg),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(lbl),
-        if let Some(target_addr) = target_opt,
+        symbol_resolved_addr(*lbl, target_addr),
         instr_in_function(target_addr, target_func_start),
         instr_in_function(jcc_addr, my_func_start),
         if target_func_start == my_func_start,
@@ -1247,6 +1671,7 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lstore(chunk, addressing, mregs, src_reg)),
         if !mregs.is_empty(),
+        !sp_indexed_store(addr),
         reg_rtl(addr, *src_reg, src_rtl),
         store_args_collected(addr, args),
         let inst = RTLInst::Istore(*chunk, addressing.clone(), args.clone(), *src_rtl);
@@ -1277,6 +1702,33 @@ ascent_par! {
         next(addr, next_addr),
         let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
         let inst = RTLInst::Icall(Some(inferred_sig), Either::Left(*callee_rtl), args.clone(), None, *next_addr);
+
+    // Fallback: indirect Lcall where reg_rtl is missing for the callee register.
+    // This handles C++ vtable dispatch and member function pointer calls where the
+    // register allocation pass failed to track the callee register through the
+    // def-use chain. Create a fresh RTL register for the callee target.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Left(mreg) = callee,
+        !reg_rtl(addr, *mreg, _),
+        call_args_collected_candidate(addr, args),
+        call_return_reg(addr, _ret_rtl),
+        reg_rtl(addr, Mreg::AX, final_ret),
+        next(addr, next_addr),
+        let fresh_callee = fresh_xtl_reg(*addr, *mreg),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Left(fresh_callee), args.clone(), Some(*final_ret), *next_addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Left(mreg) = callee,
+        !reg_rtl(addr, *mreg, _),
+        call_args_collected_candidate(addr, args),
+        !call_return_reg(addr, _),
+        next(addr, next_addr),
+        let fresh_callee = fresh_xtl_reg(*addr, *mreg),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Left(fresh_callee), args.clone(), None, *next_addr);
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lcall(callee)),
@@ -1332,7 +1784,7 @@ ascent_par! {
         reg_def(addr, mreg),
         if *mreg != Mreg::SP,
         !ltl_inst(addr, _),
-        !suppress_instruction(addr);
+        !trim_instruction(addr);
 
 
     reg_def_site(*call_addr, *reg) <--
@@ -1367,7 +1819,28 @@ ascent_par! {
     reg_xtl(addr, mreg, id), is_def(addr, id) <--
         reg_def_site(addr, mreg),
         let id = fresh_xtl_reg(*addr, *mreg);
+    
+    // Lbranch addresses reg_def butno ltl op
+    reg_def_site(*addr, *mreg) <--
+        arith_load_op(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        reg_def(addr, mreg),
+        if *mreg != Mreg::SP,
+        !trim_instruction(addr);
 
+    reg_def_site(*addr, *mreg) <--
+        arith_store_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        reg_def(addr, mreg),
+        if *mreg != Mreg::SP,
+        !trim_instruction(addr);
+
+    reg_def_site(*addr, *mreg) <--
+        arith_store_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        reg_def(addr, mreg),
+        if *mreg != Mreg::SP,
+        !trim_instruction(addr);
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
@@ -1384,6 +1857,26 @@ ascent_par! {
         !call_args_collected_candidate(addr, _),
         let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
         let inst = RTLInst::Itailcall(Some(default_sig), Either::Left(*callee_rtl), Arc::new(vec![]));
+
+    // Fallback: indirect Ltailcall where reg_rtl is missing for the callee register.
+    // Mirrors the indirect Lcall fallback above for C++ vtable tail-calls.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Left(mreg) = callee,
+        !reg_rtl(addr, *mreg, _),
+        call_args_collected_candidate(addr, args),
+        let fresh_callee = fresh_xtl_reg(*addr, *mreg),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Itailcall(Some(inferred_sig), Either::Left(fresh_callee), args.clone());
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Left(mreg) = callee,
+        !reg_rtl(addr, *mreg, _),
+        !call_args_collected_candidate(addr, _),
+        let fresh_callee = fresh_xtl_reg(*addr, *mreg),
+        let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
+        let inst = RTLInst::Itailcall(Some(default_sig), Either::Left(fresh_callee), Arc::new(vec![]));
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
@@ -1554,14 +2047,13 @@ ascent_par! {
         instr_in_function(addr, func_start),
         next(addr, jcc_addr),
         pjcc(jcc_addr, testcond, target_sym),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(target_sym),
-        if let Some(target_addr) = target_opt,
+        symbol_resolved_addr(*target_sym, target_addr),
         next(jcc_addr, fallthrough),
         let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
         let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz),
         stack_var(func_start, addr, *disp, arg_rtl),
         reg_rtl(addr, reg1, reg_rtl2),
-        let inst = RTLInst::Icond(cond, Arc::new(vec![*reg_rtl2, *arg_rtl]), Either::Right(target_addr), Either::Right(*fallthrough));
+        let inst = RTLInst::Icond(cond, Arc::new(vec![*reg_rtl2, *arg_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough));
 
     rtl_inst_candidate(addr, inst) <--
         pcmp(addr, sym1, sym2),
@@ -1572,14 +2064,13 @@ ascent_par! {
         instr_in_function(addr, func_start),
         next(addr, jcc_addr),
         pjcc(jcc_addr, testcond, target_sym),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(target_sym),
-        if let Some(target_addr) = target_opt,
+        symbol_resolved_addr(*target_sym, target_addr),
         next(jcc_addr, fallthrough),
         let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
         let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz),
         stack_var(func_start, addr, *disp, arg_rtl),
         reg_rtl(addr, reg1, reg_rtl2),
-        let inst = RTLInst::Icond(cond, Arc::new(vec![*arg_rtl, *reg_rtl2]), Either::Right(target_addr), Either::Right(*fallthrough));
+        let inst = RTLInst::Icond(cond, Arc::new(vec![*arg_rtl, *reg_rtl2]), Either::Right(*target_addr), Either::Right(*fallthrough));
 
     rtl_inst_candidate(addr, inst) <--
         pcmp(addr, sym1, sym2),
@@ -1590,14 +2081,13 @@ ascent_par! {
         instr_in_function(addr, func_start),
         next(addr, jcc_addr),
         pjcc(jcc_addr, testcond, target_sym),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(target_sym),
-        if let Some(target_addr) = target_opt,
+        symbol_resolved_addr(*target_sym, target_addr),
         next(jcc_addr, fallthrough),
         let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
         let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz),
         stack_var(func_start, addr, *disp_a, arg_rtl1),
         stack_var(func_start, addr, *disp, arg_rtl2),
-        let inst = RTLInst::Icond(cond, Arc::new(vec![*arg_rtl1, *arg_rtl2]), Either::Right(target_addr), Either::Right(*fallthrough));
+        let inst = RTLInst::Icond(cond, Arc::new(vec![*arg_rtl1, *arg_rtl2]), Either::Right(*target_addr), Either::Right(*fallthrough));
 
     rtl_inst_candidate(addr, inst) <--
         pcmp(addr, sym1, sym2),
@@ -1607,8 +2097,7 @@ ascent_par! {
         instr_in_function(addr, func_start),
         next(addr, jcc_addr),
         pjcc(jcc_addr, testcond, target_sym),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(target_sym),
-        if let Some(target_addr) = target_opt,
+        symbol_resolved_addr(*target_sym, target_addr),
         next(jcc_addr, fallthrough),
         let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
         let sized_cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz),
@@ -1620,7 +2109,7 @@ ascent_par! {
             _ => sized_cond.clone(),
         },
         stack_var(func_start, addr, *disp, arg_rtl),
-        let inst = RTLInst::Icond(cond_with_imm, Arc::new(vec![*arg_rtl]), Either::Right(target_addr), Either::Right(*fallthrough));
+        let inst = RTLInst::Icond(cond_with_imm, Arc::new(vec![*arg_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough));
 
     rtl_inst_candidate(addr, inst) <--
         pcmp(addr, sym1, sym2),
@@ -1630,8 +2119,7 @@ ascent_par! {
         instr_in_function(addr, func_start),
         next(addr, jcc_addr),
         pjcc(jcc_addr, testcond, target_sym),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(target_sym),
-        if let Some(target_addr) = target_opt,
+        symbol_resolved_addr(*target_sym, target_addr),
         next(jcc_addr, fallthrough),
         let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
         let sized_cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz),
@@ -1643,7 +2131,7 @@ ascent_par! {
             _ => sized_cond.clone(),
         },
         stack_var(func_start, addr, *disp, arg_rtl),
-        let inst = RTLInst::Icond(cond_with_imm, Arc::new(vec![*arg_rtl]), Either::Right(target_addr), Either::Right(*fallthrough));
+        let inst = RTLInst::Icond(cond_with_imm, Arc::new(vec![*arg_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough));
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Ljumptable(arg_reg, targets)),
@@ -1848,7 +2336,7 @@ ascent_par! {
 
 
     relation asm_effective_def(Address, Mreg);
-    asm_effective_def(addr, reg) <-- reg_def(addr, reg), !suppress_instruction(addr);
+    asm_effective_def(addr, reg) <-- reg_def(addr, reg), !trim_instruction(addr);
     asm_effective_def(addr, Mreg::AX) <--
         unrefinedinstruction(addr, _, _, "CALL", _, _, _, _, _, _);
 
@@ -1856,7 +2344,7 @@ ascent_par! {
         unrefinedinstruction(addr, _, _, "CALL", _, _, _, _, _, _),
         is_caller_saved(reg);
 
-    // Lbuiltin result registers are effective defs even if the raw instruction is suppressed (e.g. VLA alloca replaces suppressed MOV RSP instructions)
+    // Lbuiltin results are effective defs even at trimmed addresses (e.g. VLA alloca replaces trimmed MOV RSP)
     asm_effective_def(addr, *dst_reg) <--
         ltl_inst(addr, ?LTLInst::Lbuiltin(_, _, BuiltinArg::BA(dst_reg))),
         if *dst_reg != Mreg::Unknown;
@@ -1912,7 +2400,7 @@ ascent_par! {
     relation live_var_used(Address, Mreg, Address);
     live_var_used(block, reg, use_addr) <--
         reg_use(use_addr, reg),
-        !suppress_instruction(use_addr),
+        !trim_instruction(use_addr),
         code_in_block(use_addr, block),
         !block_last_def(use_addr, _, reg);
 
@@ -1929,7 +2417,7 @@ ascent_par! {
 
     reg_def_used(def_addr, reg, use_addr) <--
         reg_use(use_addr, reg),
-        !suppress_instruction(use_addr),
+        !trim_instruction(use_addr),
         block_last_def(use_addr, def_addr, reg);
 
     reg_def_used(def_addr, reg, use_addr) <--
@@ -1942,7 +2430,7 @@ ascent_par! {
         function_entry_count(func_start, use_addr, count),
         if *count < FUNC_ARG_DIST as i64,
         reg_use(use_addr, mreg),
-        !suppress_instruction(use_addr),
+        !trim_instruction(use_addr),
         is_arg_reg(mreg);
 
     reg_def_used(*func_start, *mreg, *use_addr) <--
@@ -1951,7 +2439,7 @@ ascent_par! {
         function_entry_count(func_start, use_addr, count),
         if *count < FUNC_ARG_DIST as i64,
         reg_use(use_addr, mreg),
-        !suppress_instruction(use_addr),
+        !trim_instruction(use_addr),
         !block_last_def(use_addr, _, mreg);
 
     is_early_arg_use(func_start, addr) <--
@@ -2037,6 +2525,73 @@ ascent_par! {
         !is_def(node, id1),
         !is_def(node, id2);
 
+    // --- Block-level dominator computation for back-edge detection ---
+    // Entry block of each function: the block containing the function start address.
+    #[local] relation func_entry_block(Address, Address);
+    func_entry_block(func, entry_block) <--
+        block_in_function(entry_block, func),
+        code_in_block(func, entry_block);
+
+    // Block reachability from the entry block (within a function).
+    #[local] relation block_reachable_from_entry(Address, Address);
+    block_reachable_from_entry(func, entry_block) <--
+        func_entry_block(func, entry_block);
+    block_reachable_from_entry(func, next_block) <--
+        block_reachable_from_entry(func, blk),
+        asm_block_next(blk, next_block),
+        block_in_function(next_block, func);
+
+    // path_avoiding(func, block, d): block is reachable from entry without passing through d.
+    #[local] relation block_path_avoiding(Address, Address, Address);
+    block_path_avoiding(func, entry_block, d) <--
+        func_entry_block(func, entry_block),
+        block_reachable_from_entry(func, d),
+        if *entry_block != *d;
+    block_path_avoiding(func, next_block, d) <--
+        block_path_avoiding(func, blk, d),
+        asm_block_next(blk, next_block),
+        block_in_function(next_block, func),
+        if *next_block != *d;
+
+    // Block dominance: d dominates b iff no path from entry to b avoids d.
+    #[local] relation block_dom(Address, Address, Address);
+    block_dom(func, blk, blk) <--
+        block_reachable_from_entry(func, blk);
+    block_dom(func, blk, d) <--
+        block_reachable_from_entry(func, blk),
+        block_reachable_from_entry(func, d),
+        !block_path_avoiding(func, blk, d);
+
+    // Back-edge detection: an ltl_succ edge (src, dst) is a loop back-edge if
+    // dst's block dominates src's block within the same function.
+    #[local] relation is_loop_back_edge(Address, Address);
+    is_loop_back_edge(src, dst) <--
+        ltl_succ(src, dst),
+        code_in_block(src, src_block),
+        code_in_block(dst, dst_block),
+        if *src_block != *dst_block,
+        instr_in_function(src, func),
+        block_dom(func, src_block, dst_block);
+    // Intra-block back-edge: dst <= src within the same block (backward jump).
+    is_loop_back_edge(src, dst) <--
+        ltl_succ(src, dst),
+        code_in_block(src, blk),
+        code_in_block(dst, blk),
+        if *dst <= *src;
+
+    // Forward reachability: transitive closure of ltl_succ excluding back-edges, scoped per function.
+    #[local] relation forward_reachable(Address, Address, Address);
+    forward_reachable(func, src, dst) <--
+        ltl_succ(src, dst),
+        instr_in_function(src, func),
+        instr_in_function(dst, func),
+        !is_loop_back_edge(src, dst);
+    forward_reachable(func, src, dst) <--
+        forward_reachable(func, src, mid),
+        ltl_succ(mid, dst),
+        instr_in_function(dst, func),
+        !is_loop_back_edge(mid, dst);
+
     relation has_intervening_def(Address, Address, Mreg);
     has_intervening_def(def_addr, use_addr, mreg) <--
         reg_def_used(def_addr, mreg, use_addr),
@@ -2044,8 +2599,8 @@ ascent_par! {
         if *mid_addr != *def_addr && *mid_addr != *use_addr,
         instr_in_function(def_addr, func),
         instr_in_function(mid_addr, func),
-        ltl_reachable(def_addr, mid_addr),
-        ltl_reachable(mid_addr, use_addr);
+        forward_reachable(func, def_addr, mid_addr),
+        forward_reachable(func, mid_addr, use_addr);
 
     has_intervening_def(def_addr, use_addr, mreg) <--
         reg_def_used(def_addr, mreg, use_addr),
@@ -2053,8 +2608,8 @@ ascent_par! {
         if *mid_addr != *def_addr && *mid_addr != *use_addr,
         instr_in_function(def_addr, func),
         instr_in_function(mid_addr, func),
-        ltl_reachable(def_addr, mid_addr),
-        ltl_reachable(mid_addr, use_addr);
+        forward_reachable(func, def_addr, mid_addr),
+        forward_reachable(func, mid_addr, use_addr);
 
     relation param_live_block(Address, Address, Mreg);
 
@@ -2654,28 +3209,47 @@ ascent_par! {
         func_param_position_type(func_start, _, _),
         agg param_types = build_xtype_vec(pos, xtype) in func_param_position_type(func_start, pos, xtype);
 
+    // For internal functions matching known externs, use known sig to avoid false variadic params.
+    relation func_has_known_extern_sig(Address);
+
+    // Only suppress inferred sigs for variadic functions; non-variadic may be custom implementations.
+    func_has_known_extern_sig(func_start) <--
+        emit_function(func_start, name, _),
+        known_varargs_function(name, _);
+
     relation emit_function_signature_candidate(Address, Signature);
+
+    // When a known varargs extern signature exists, prefer it over inferred signature.
+    emit_function_signature_candidate(func_start, sig) <--
+        emit_function(func_start, name, _),
+        known_varargs_function(name, _),
+        known_extern_signature(name, _, ret_type, known_params),
+        let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: CallConv::default() };
 
     emit_function_signature_candidate(func_start, sig) <--
         emit_function(func_start, _, _),
+        !func_has_known_extern_sig(func_start),
         func_param_types(func_start, param_types),
         emit_function_return_type_xtype_candidate(func_start, ret_type),
         let sig = Signature { sig_args: param_types.clone(), sig_res: *ret_type, sig_cc: CallConv::default() };
 
     emit_function_signature_candidate(func_start, sig) <--
         emit_function(func_start, _, _),
+        !func_has_known_extern_sig(func_start),
         func_param_types(func_start, param_types),
         !emit_function_return_type_xtype_candidate(func_start, _),
         let sig = Signature { sig_args: param_types.clone(), sig_res: XType::Xvoid, sig_cc: CallConv::default() };
 
     emit_function_signature_candidate(func_start, sig) <--
         emit_function(func_start, _, _),
+        !func_has_known_extern_sig(func_start),
         !func_param_types(func_start, _),
         emit_function_return_type_xtype_candidate(func_start, ret_type),
         let sig = Signature { sig_args: Arc::new(vec![]), sig_res: *ret_type, sig_cc: CallConv::default() };
 
     emit_function_signature_candidate(func_start, sig) <--
         emit_function(func_start, _, _),
+        !func_has_known_extern_sig(func_start),
         !func_param_types(func_start, _),
         !emit_function_return_type_xtype_candidate(func_start, _),
         let sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xvoid, sig_cc: CallConv::default() };
@@ -2783,14 +3357,26 @@ ascent_par! {
         call_backward_reach(call_addr, between_call, _),
         ltl_inst(between_call, ?LTLInst::Lcall(_)),
         if *between_call != *call_addr,
-        call_backward_reach(between_call, defaddr, _);
+        call_backward_reach(between_call, defaddr, _),
+        // Ensure between_call is strictly between defaddr and call_addr in instruction order
+        instr_in_function(defaddr, func_start),
+        instr_min_order(func_start, defaddr, def_order),
+        instr_min_order(func_start, between_call, between_order),
+        instr_min_order(func_start, call_addr, call_order),
+        if *between_order > *def_order && *between_order < *call_order;
 
     call_clobbers_arg_reg(defaddr, mreg, call_addr) <--
         float_arg_setup_candidate(defaddr, mreg, call_addr),
         call_backward_reach(call_addr, between_call, _),
         ltl_inst(between_call, ?LTLInst::Lcall(_)),
         if *between_call != *call_addr,
-        call_backward_reach(between_call, defaddr, _);
+        call_backward_reach(between_call, defaddr, _),
+        // Ensure between_call is strictly between defaddr and call_addr in instruction order
+        instr_in_function(defaddr, func_start),
+        instr_min_order(func_start, defaddr, def_order),
+        instr_min_order(func_start, between_call, between_order),
+        instr_min_order(func_start, call_addr, call_order),
+        if *between_order > *def_order && *between_order < *call_order;
 
     relation call_arg_setup_detected(Node, Mreg, Node);
 
@@ -3490,6 +4076,35 @@ ascent_par! {
         !cx_has_non_shift_use(func_start),
         func_has_shift_instr(func_start);
 
+    // General scratch register filter: a register is NOT a parameter if it is defined (written)
+    // before being used as a value within the function's entry block. This catches clang patterns
+    // where DX/CX are used as scratch (e.g., xor %ecx,%ecx for zeroing, idiv remainder output).
+    relation arg_reg_first_action_is_def(Address, Mreg);
+    #[local] relation arg_reg_used_strictly_before(Address, Mreg, Address);
+
+    // There exists a use of mreg at use_addr that is strictly before def_addr (by entry count)
+    arg_reg_used_strictly_before(func_start, *mreg, *def_addr) <--
+        is_arg_reg(mreg),
+        instr_in_function(use_addr, func_start),
+        function_entry_count(func_start, use_addr, use_count),
+        if *use_count < FUNC_ARG_DIST,
+        reg_use(use_addr, mreg),
+        instr_in_function(def_addr, func_start),
+        function_entry_count(func_start, def_addr, def_count),
+        if *def_count < FUNC_ARG_DIST,
+        asm_effective_def(def_addr, mreg),
+        if use_count < def_count;
+
+    // The register's first action in the entry block is a definition (no use precedes it)
+    arg_reg_first_action_is_def(func_start, *mreg) <--
+        is_arg_reg(mreg),
+        instr_in_function(def_addr, func_start),
+        function_entry_count(func_start, def_addr, def_count),
+        if *def_count < FUNC_ARG_DIST,
+        asm_effective_def(def_addr, mreg),
+        !arg_reg_spilled_to_stack(func_start, mreg),
+        !arg_reg_used_strictly_before(func_start, mreg, def_addr);
+
     // Func param positions use max-evidence: all positions up to max are filled per ABI
     relation func_has_param_evidence(Address, usize);
 
@@ -3497,21 +4112,26 @@ ascent_par! {
         func_arg_reg_used(func_start, Mreg::DI);
 
     func_has_param_evidence(func_start, 1) <--
-        func_arg_reg_used(func_start, Mreg::SI);
+        func_arg_reg_used(func_start, Mreg::SI),
+        !arg_reg_first_action_is_def(func_start, Mreg::SI);
 
     func_has_param_evidence(func_start, 2) <--
         func_arg_reg_used(func_start, Mreg::DX),
-        !dx_used_only_in_div(func_start);
+        !dx_used_only_in_div(func_start),
+        !arg_reg_first_action_is_def(func_start, Mreg::DX);
 
     func_has_param_evidence(func_start, 3) <--
         func_arg_reg_used(func_start, Mreg::CX),
-        !cx_used_only_in_shift(func_start);
+        !cx_used_only_in_shift(func_start),
+        !arg_reg_first_action_is_def(func_start, Mreg::CX);
 
     func_has_param_evidence(func_start, 4) <--
-        func_arg_reg_used(func_start, Mreg::R8);
+        func_arg_reg_used(func_start, Mreg::R8),
+        !arg_reg_first_action_is_def(func_start, Mreg::R8);
 
     func_has_param_evidence(func_start, 5) <--
-        func_arg_reg_used(func_start, Mreg::R9);
+        func_arg_reg_used(func_start, Mreg::R9),
+        !arg_reg_first_action_is_def(func_start, Mreg::R9);
 
     relation func_max_param_position(Address, usize);
 
@@ -3824,7 +4444,7 @@ ascent_par! {
     emit_function_void_candidate(undiscov_addr2) <--
         called_address(undiscov_addr2),
         !func_stacksz(undiscov_addr2, _, _, _),
-        ltl_reachable(undiscov_addr2, ret_point2),
+        instr_in_function(ret_point2, undiscov_addr2),
         ltl_inst(ret_point2, ?LTLInst::Lreturn),
         !reg_rtl(ret_point2, Mreg::AX, _);
 
@@ -4515,6 +5135,7 @@ pub(crate) fn fresh_xtl_reg(node: Node, reg: Mreg) -> RTLReg {
 
 pub(crate) const FRESH_NS_STACK_SRC: u64 = 1 << 54;
 pub(crate) const FRESH_NS_REG_DST: u64   = 1 << 55;
+pub(crate) const FRESH_NS_SP_BASE: u64   = 1 << 56;
 
 pub fn convert_builtin_arg(
     node: Node,
@@ -4629,7 +5250,11 @@ pub fn is_arithmetic_op(op: &Operation) -> bool {
         Operation::Omulhs | Operation::Omulhu | Operation::Omullhs | Operation::Omullhu |
         Operation::Oshrximm(_) | Operation::Oshrxlimm(_) |
         Operation::Ororimm(_) | Operation::Ororlimm(_) |
-        Operation::Oshldimm(_)
+        Operation::Oshldimm(_) |
+        Operation::Odivimm(_) | Operation::Odivuimm(_) |
+        Operation::Omodimm(_) | Operation::Omoduimm(_) |
+        Operation::Odivlimm(_) | Operation::Odivluimm(_) |
+        Operation::Omodlimm(_) | Operation::Omodluimm(_)
     )
 }
 

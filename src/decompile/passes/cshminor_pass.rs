@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::decompile::passes::cminor_pass::*;
 
 use crate::x86::mach::Mreg;
-use crate::x86::op::{Condition, Operation};
+use crate::x86::op::{Addressing, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
 
@@ -40,15 +40,15 @@ ascent_par! {
 
 
     relation cminor_stmt(Node, CminorStmt);
-    relation jump_table_impl_suppress(Node);
+    relation trim_jump_table_impl(Node);
 
     #[local] relation active_cminor_stmt(Node, CminorStmt);
     active_cminor_stmt(node, stmt.clone()) <--
         cminor_stmt(node, stmt),
-        !jump_table_impl_suppress(node);
+        !trim_jump_table_impl(node);
     active_cminor_stmt(node, stmt.clone()) <--
         cminor_stmt(node, stmt),
-        jump_table_impl_suppress(node),
+        trim_jump_table_impl(node),
         if matches!(stmt, CminorStmt::Sjumptable(_, _));
 
     relation instr_in_function(Node, Address);
@@ -59,7 +59,7 @@ ascent_par! {
     relation next(Address, Address);
     relation emit_var_type_candidate(RTLReg, XType);
     relation idom(Address, Node, Node);
-    relation pdom(Address, Node, Node);
+    relation stack_var(Address, Address, i64, RTLReg);
 
 
     relation stmt_can_fallthrough(Node);
@@ -75,16 +75,38 @@ ascent_par! {
             CminorStmt::Sreturn(_) |
             CminorStmt::Stailcall(_, _, _));
 
+    // Walk `next` chain to first cminor node (transitive closure)
+    #[local] relation next_to_cminor(Node, Node);
+    next_to_cminor(a, b) <-- next(a, b), active_cminor_stmt(b, _);
+    next_to_cminor(a, c) <-- next(a, b), !active_cminor_stmt(b, _), next_to_cminor(b, c);
+
+    // Natural fallthrough via `next` chain
+    cminor_fallthrough(node, next_cminor) <--
+        active_cminor_stmt(node, _),
+        stmt_can_fallthrough(node),
+        next_to_cminor(node, next_cminor);
+
     csh_next(node, next_node) <--
         stmt_can_fallthrough(node),
         cminor_fallthrough(node, next_node);
 
-    cminor_succ(*node, *target) <-- active_cminor_stmt(node, ?CminorStmt::Sjump(target));
-    cminor_succ(*node, *ifso) <-- active_cminor_stmt(node, ?CminorStmt::Sbranch(_, _, ifso, _));
-    cminor_succ(*node, *ifnot) <-- active_cminor_stmt(node, ?CminorStmt::Sbranch(_, _, _, ifnot));
-    cminor_succ(*node, *ifso) <-- active_cminor_stmt(node, ?CminorStmt::Sifthenelse(_, _, ifso, _));
-    cminor_succ(*node, *ifnot) <-- active_cminor_stmt(node, ?CminorStmt::Sifthenelse(_, _, _, ifnot));
-    cminor_succ(*node, target) <-- active_cminor_stmt(node, ?CminorStmt::Sjumptable(_, targets)), for target in targets.iter();
+    // Direct branch targets (target IS a cminor node)
+    cminor_succ(*node, *target) <-- active_cminor_stmt(node, ?CminorStmt::Sjump(target)), active_cminor_stmt(target, _);
+    cminor_succ(*node, *ifso) <-- active_cminor_stmt(node, ?CminorStmt::Sbranch(_, _, ifso, _)), active_cminor_stmt(ifso, _);
+    cminor_succ(*node, *ifnot) <-- active_cminor_stmt(node, ?CminorStmt::Sbranch(_, _, _, ifnot)), active_cminor_stmt(ifnot, _);
+    cminor_succ(*node, *ifso) <-- active_cminor_stmt(node, ?CminorStmt::Sifthenelse(_, _, ifso, _)), active_cminor_stmt(ifso, _);
+    cminor_succ(*node, *ifnot) <-- active_cminor_stmt(node, ?CminorStmt::Sifthenelse(_, _, _, ifnot)), active_cminor_stmt(ifnot, _);
+    cminor_succ(*node, target) <-- active_cminor_stmt(node, ?CminorStmt::Sjumptable(_, targets)), for target in targets.iter(), active_cminor_stmt(target, _);
+
+    // Resolved branch targets (non-cminor target -> nearest cminor via `next`)
+    cminor_succ(*node, resolved) <-- active_cminor_stmt(node, ?CminorStmt::Sjump(target)), !active_cminor_stmt(target, _), next_to_cminor(*target, resolved);
+    cminor_succ(*node, resolved) <-- active_cminor_stmt(node, ?CminorStmt::Sbranch(_, _, ifso, _)), !active_cminor_stmt(ifso, _), next_to_cminor(*ifso, resolved);
+    cminor_succ(*node, resolved) <-- active_cminor_stmt(node, ?CminorStmt::Sbranch(_, _, _, ifnot)), !active_cminor_stmt(ifnot, _), next_to_cminor(*ifnot, resolved);
+    cminor_succ(*node, resolved) <-- active_cminor_stmt(node, ?CminorStmt::Sifthenelse(_, _, ifso, _)), !active_cminor_stmt(ifso, _), next_to_cminor(*ifso, resolved);
+    cminor_succ(*node, resolved) <-- active_cminor_stmt(node, ?CminorStmt::Sifthenelse(_, _, _, ifnot)), !active_cminor_stmt(ifnot, _), next_to_cminor(*ifnot, resolved);
+    cminor_succ(*node, resolved) <-- active_cminor_stmt(node, ?CminorStmt::Sjumptable(_, targets)), for target in targets.iter(), !active_cminor_stmt(target, _), next_to_cminor(*target, resolved);
+
+    // Fallthrough as successor
     cminor_succ(node, next) <--
         csh_next(node, next),
         active_cminor_stmt(node, _),
@@ -103,6 +125,7 @@ ascent_par! {
 
     relation pred_count(Address, Node, usize);
     relation reachable_from_entry(Address, Node);
+    relation path_avoiding(Address, Node, Node);
     relation dom(Address, Node, Node);
     relation not_idom(Address, Node, Node);
     relation dom_depth(Address, Node, usize);
@@ -116,12 +139,36 @@ ascent_par! {
     reachable_from_entry(func, n) <-- func_entry_node(func, n);
     reachable_from_entry(func, y) <-- reachable_from_entry(func, x), cminor_succ(x, y), instr_in_function(y, func);
 
+    // path_avoiding(func, n, d): n reachable from entry without passing through d
+    path_avoiding(func, entry, d) <--
+        func_entry_node(func, entry),
+        reachable_from_entry(func, d),
+        if entry != d;
+    path_avoiding(func, n, d) <--
+        path_avoiding(func, m, d),
+        cminor_succ(m, n),
+        instr_in_function(n, func),
+        if n != d;
+
+    // d dominates n iff no path from entry to n avoids d
     dom(func, n, n) <--
         reachable_from_entry(func, n);
-
     dom(func, n, d) <--
-        idom(func, n, mid),
-        dom(func, mid, d);
+        reachable_from_entry(func, n),
+        reachable_from_entry(func, d),
+        !path_avoiding(func, n, d);
+
+    // Immediate dominator: closest strict dominator
+    not_idom(func, n, d) <--
+        dom(func, n, d),
+        dom(func, n, mid),
+        dom(func, mid, d),
+        if mid != n,
+        if mid != d;
+    idom(func, n, d) <--
+        dom(func, n, d),
+        !not_idom(func, n, d),
+        if n != d;
 
     dom_depth(func, entry, 0) <--
         func_entry_node(func, entry);
@@ -140,13 +187,48 @@ ascent_par! {
     relation csharp_stmt_candidate(Node, CsharpminorStmt);
     relation has_csharp_stmt_candidate(Node);
 
+    // Track nodes where a stack address was resolved to Eaddrof via stack_var.
+    #[local] relation stack_addr_resolved(Node);
+
+    // Resolve Eop(Olea(Ainstack(ofs)), []) -> Eaddrof(var_ident) when stack_var maps the offset.
+    csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Eop(op, args))),
+        if let Operation::Olea(Addressing::Ainstack(ofs)) = op,
+        if args.is_empty(),
+        instr_in_function(node, func_start),
+        stack_var(func_start, node, *ofs, stack_rtl),
+        let var_ident = ident_from_reg(*stack_rtl),
+        let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Eaddrof(var_ident));
+
+    // Resolve Eop(Oleal(Ainstack(ofs)), []) -> Eaddrof(var_ident) when stack_var maps the offset.
+    csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Eop(op, args))),
+        if let Operation::Oleal(Addressing::Ainstack(ofs)) = op,
+        if args.is_empty(),
+        instr_in_function(node, func_start),
+        stack_var(func_start, node, *ofs, stack_rtl),
+        let var_ident = ident_from_reg(*stack_rtl),
+        let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Eaddrof(var_ident));
+
+    // Resolve Econst(Oaddrstack(ofs)) -> Eaddrof(var_ident) when stack_var maps the offset.
+    // This handles the case where cminor_pass already converted Olea(Ainstack) to Oaddrstack.
+    csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Econst(Constant::Oaddrstack(ofs)))),
+        instr_in_function(node, func_start),
+        stack_var(func_start, node, *ofs, stack_rtl),
+        let var_ident = ident_from_reg(*stack_rtl),
+        let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Eaddrof(var_ident));
+
+    // Generic Sassign -> Sset conversion (skipped when stack_addr_resolved handles the node).
     csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, expr)),
+        !stack_addr_resolved(node),
         if let Some(converted) = csharp_expr_from_cminor(expr),
         let stmt = CsharpminorStmt::Sset(*dst, converted);
 
     csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, expr)),
+        !stack_addr_resolved(node),
         if let Some(converted) = csharp_expr_from_cminor_sized(expr, true),
         let stmt = CsharpminorStmt::Sset(*dst, converted);
 
@@ -181,6 +263,7 @@ ascent_par! {
 
     csharp_stmt_candidate(node, CsharpminorStmt::Snop) <--
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, expr)),
+        !stack_addr_resolved(node),
         if csharp_expr_from_cminor(expr).is_none();
 
     csharp_stmt_candidate(node, stmt) <--
@@ -612,23 +695,12 @@ ascent_par! {
         loop_body(func, header, node),
         valid_loop(func, header);
 
-    relation suppress_goto_to(Node);
-    relation suppress_node_in_loop(Address, Node, Node);
     relation emit_loop_body(Address, Node, Node);
     relation emit_loop_exit(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node);
-    relation suppress_step(Address, Node, Node);
+    relation trim_step(Address, Node, Node);
     relation loop_continue_cond(Address, Node, ClightExpr);
     relation emit_break_stmt(Address, Node, Node, ClightStmt);
     relation node_owned_by_loop(Address, Node, Node);
-
-    suppress_goto_to(header) <--
-        valid_loop(_, header);
-
-    suppress_node_in_loop(func, header, node) <--
-        node_owned_by_loop(func, node, header);
-
-    suppress_node_in_loop(func, header, header) <--
-        valid_loop(func, header);
 
     emit_loop_body(func, header, body_node) <--
         valid_loop(func, header),
@@ -638,7 +710,7 @@ ascent_par! {
         valid_loop(func, header),
         loop_exit_branch(func, header, branch_node, cond, args, exit_target, continue_target, _);
 
-    suppress_step(func, header, step) <--
+    trim_step(func, header, step) <--
         step_node(func, header, step, _);
 
     loop_continue_cond(func, header, continue_cond) <--
@@ -682,174 +754,17 @@ ascent_par! {
     node_owned_by_loop(func, node, header) <--
         innermost_loop(func, node, header),
         valid_loop(func, header),
-        !node_owned_by_ifthenelse(func, node, _),
         !loop_head(func, node);
 
     node_owned_by_loop(func, node, parent) <--
         loop_head(func, node),
         valid_loop(func, node),
-        immediate_loop_parent(func, node, parent),
-        !node_owned_by_ifthenelse(func, node, _);
-
-
-    relation ifthenelse_branch_point(Address, Node, Node, Node);
-    #[local] relation ifthenelse_merge_candidate(Address, Node, Node);
-    #[local] relation ifthenelse_earlier_merge_candidate(Address, Node, Node);
-    #[local] relation ifso_fallthrough(Address, Node, Node);
-    relation ifthenelse_merge_point(Address, Node, Node);
-    relation valid_ifthenelse(Address, Node);
-    relation if_only_block(Address, Node, Node);
-    relation emit_if_only_block(Address, Node);
-    relation ifthenelse_if_branch(Address, Node, Node);
-    relation ifthenelse_else_branch(Address, Node, Node);
-    relation emit_ifthenelse_body(Address, Node, Node, bool);
-    relation suppress_node_in_ifthenelse(Address, Node, Node);
-
-    ifthenelse_branch_point(func, node, *ifso, *ifnot) <--
-        csharp_stmt_candidate(node, ?CsharpminorStmt::Scond(_, _, ifso, ifnot)),
-        instr_in_function(node, func),
-        !valid_loop(func, node),
-        !valid_loop_body(func, _, node),
-        if *ifso != *ifnot;
-
-    ifthenelse_branch_point(func, node, *ifso, *ifnot) <--
-        csharp_stmt_candidate(node, ?CsharpminorStmt::Scond(_, _, ifso, ifnot)),
-        instr_in_function(node, func),
-        !valid_loop(func, node),
-        valid_loop_body(func, header, node),
-        loop_body(func, header, *ifso),
-        loop_body(func, header, *ifnot),
-        if *ifso != *ifnot;
-
-
-    // --- Merge candidates: collect all possible merge points ---
-
-    // Candidate 1: postdominator
-    ifthenelse_merge_candidate(func, branch, merge) <--
-        ifthenelse_branch_point(func, branch, _, _),
-        pdom(func, branch, merge),
-        if *merge != *branch;
-
-    // Candidate 2: common one-hop successor of both targets
-    ifthenelse_merge_candidate(func, branch, succ_node) <--
-        ifthenelse_branch_point(func, branch, ifso, ifnot),
-        cminor_succ(ifso, succ_node),
-        cminor_succ(ifnot, succ_node);
-
-    // Candidate 3: ifso falls through to ifnot (diamond pattern)
-    ifthenelse_merge_candidate(func, branch, ifnot) <--
-        ifthenelse_branch_point(func, branch, ifso, ifnot),
-        cminor_succ(ifso, ifnot),
-        instr_in_function(ifnot, func);
-
-    // Candidate 4: ifnot falls through to ifso
-    ifthenelse_merge_candidate(func, branch, ifso) <--
-        ifthenelse_branch_point(func, branch, ifso, ifnot),
-        cminor_succ(ifnot, ifso),
-        instr_in_function(ifso, func);
-
-    // Candidate 5: sequential continuation -- walk cminor_fallthrough from ifso to the next branch point as merge candidate (fixes conditional chains with shared noreturn else-target).
-    ifso_fallthrough(func, branch, *ifso) <--
-        ifthenelse_branch_point(func, branch, ifso, _);
-
-    ifso_fallthrough(func, branch, next) <--
-        ifso_fallthrough(func, branch, node),
-        cminor_fallthrough(node, next),
-        instr_in_function(next, func),
-        !ifthenelse_branch_point(func, next, _, _);
-
-    ifthenelse_merge_candidate(func, branch, bp) <--
-        ifso_fallthrough(func, branch, node),
-        cminor_fallthrough(node, bp),
-        ifthenelse_branch_point(func, bp, _, _),
-        instr_in_function(bp, func),
-        if *bp != *branch;
-
-    // --- Selection: pick the closest merge candidate ---
-    ifthenelse_earlier_merge_candidate(func, branch, merge) <--
-        ifthenelse_merge_candidate(func, branch, merge),
-        ifthenelse_merge_candidate(func, branch, closer),
-        if *closer > *branch,
-        if *closer < *merge;
-
-    ifthenelse_merge_point(func, branch, merge) <--
-        ifthenelse_merge_candidate(func, branch, merge),
-        if *merge > *branch,
-        !ifthenelse_earlier_merge_candidate(func, branch, merge);
-
-    valid_ifthenelse(func, branch) <--
-        ifthenelse_branch_point(func, branch, _, _),
-        ifthenelse_merge_point(func, branch, _);
-
-    if_only_block(func, branch, merge) <--
-        valid_ifthenelse(func, branch),
-        ifthenelse_branch_point(func, branch, _, ifnot),
-        ifthenelse_merge_point(func, branch, merge),
-        if *ifnot == *merge;
-
-    emit_if_only_block(func, branch) <--
-        if_only_block(func, branch, _);
-
-    ifthenelse_if_branch(func, branch, ifso) <--
-        ifthenelse_branch_point(func, branch, ifso, _),
-        ifthenelse_merge_point(func, branch, merge),
-        if *ifso != *merge;
-
-    ifthenelse_if_branch(func, branch, next) <--
-        ifthenelse_if_branch(func, branch, node),
-        cminor_succ(node, next),
-        ifthenelse_merge_point(func, branch, merge),
-        instr_in_function(next, func),
-        if *next != *merge,
-        if *next != *branch;
-
-    ifthenelse_else_branch(func, branch, ifnot) <--
-        ifthenelse_branch_point(func, branch, _, ifnot),
-        ifthenelse_merge_point(func, branch, merge),
-        if *ifnot != *merge;
-
-    ifthenelse_else_branch(func, branch, next) <--
-        ifthenelse_else_branch(func, branch, node),
-        cminor_succ(node, next),
-        ifthenelse_merge_point(func, branch, merge),
-        instr_in_function(next, func),
-        if *next != *merge,
-        if *next != *branch;
-
-    emit_ifthenelse_body(func, branch, node, true) <--
-        valid_ifthenelse(func, branch),
-        ifthenelse_if_branch(func, branch, node);
-
-    emit_ifthenelse_body(func, branch, node, false) <--
-        valid_ifthenelse(func, branch),
-        ifthenelse_else_branch(func, branch, node),
-        !ifthenelse_if_branch(func, branch, node);
-
-    suppress_node_in_ifthenelse(func, branch, node) <--
-        emit_ifthenelse_body(func, branch, node, _),
-        valid_ifthenelse(func, branch),
-        if *node != *branch;
-
-
-    relation ifthenelse_inside_loop(Address, Node, Node);
-    relation node_owned_by_ifthenelse(Address, Node, Node);
-
-    ifthenelse_inside_loop(func, branch, loop_head) <--
-        valid_ifthenelse(func, branch),
-        suppress_node_in_loop(func, loop_head, branch);
-
-    node_owned_by_ifthenelse(func, node, branch) <--
-        emit_ifthenelse_body(func, branch, node, _),
-        valid_ifthenelse(func, branch),
-        if *node != *branch;
-
+        immediate_loop_parent(func, node, parent);
 
 
     relation ternary_true_assignment(Address, Node, RTLReg, CsharpminorExpr, Node);
     relation ternary_false_assignment(Address, Node, RTLReg, CsharpminorExpr, Node);
     relation valid_ternary(Address, Node, RTLReg, CsharpminorExpr, CsharpminorExpr, Node);
-    relation suppress_for_ternary(Node);
-    relation emit_ternary(Address, Node, RTLReg);
 
     ternary_true_assignment(func, branch, var, expr.clone(), merge) <--
         csharp_stmt_candidate(branch, ?CsharpminorStmt::Scond(_, _, ifso, _)),
@@ -867,395 +782,13 @@ ascent_par! {
         ternary_true_assignment(func, branch, var, true_expr, merge),
         ternary_false_assignment(func, branch, var, false_expr, merge),
         !valid_loop(func, branch),
-        !suppress_node_in_loop(func, _, branch);
+        !node_owned_by_loop(func, branch, _);
 
-    suppress_for_ternary(ifso) <--
-        valid_ternary(func, branch, _, _, _, _),
-        csharp_stmt_candidate(branch, ?CsharpminorStmt::Scond(_, _, ifso, _)),
-        instr_in_function(ifso, func);
-    suppress_for_ternary(ifnot) <--
-        valid_ternary(func, branch, _, _, _, _),
-        csharp_stmt_candidate(branch, ?CsharpminorStmt::Scond(_, _, _, ifnot)),
-        instr_in_function(ifnot, func);
-
-    emit_ternary(func, branch, var) <--
-        valid_ternary(func, branch, var, _, _, _);
-
-
-    relation short_circuit_and(Address, Node, Node, Node, Node);
-    relation short_circuit_or(Address, Node, Node, Node, Node);
-    relation suppress_for_short_circuit(Node);
-    relation emit_short_circuit_and(Address, Node, Node);
-    relation emit_short_circuit_or(Address, Node, Node);
-
-    short_circuit_and(func, branch1, branch2, final_true, final_false) <--
-        csharp_stmt_candidate(branch1, ?CsharpminorStmt::Scond(_, _, ifso1, ifnot1)),
-        instr_in_function(branch1, func),
-        csharp_stmt_candidate(branch2, ?CsharpminorStmt::Scond(_, _, ifso2, ifnot2)),
-        if *ifso1 == *branch2,
-        if *ifnot1 == *ifnot2,
-        let final_true = *ifso2,
-        let final_false = *ifnot2,
-        !valid_loop(func, branch1),
-        !valid_ternary(func, branch1, _, _, _, _);
-
-    short_circuit_or(func, branch1, branch2, final_true, final_false) <--
-        csharp_stmt_candidate(branch1, ?CsharpminorStmt::Scond(_, _, ifso1, ifnot1)),
-        instr_in_function(branch1, func),
-        csharp_stmt_candidate(branch2, ?CsharpminorStmt::Scond(_, _, ifso2, ifnot2)),
-        if *ifnot1 == *branch2,
-        if *ifso1 == *ifso2,
-        let final_true = *ifso1,
-        let final_false = *ifnot2,
-        !valid_loop(func, branch1),
-        !valid_ternary(func, branch1, _, _, _, _);
-
-    suppress_for_short_circuit(branch2) <--
-        short_circuit_and(_, _, branch2, _, _);
-    suppress_for_short_circuit(branch2) <--
-        short_circuit_or(_, _, branch2, _, _);
-
-    emit_short_circuit_and(func, branch1, branch2) <--
-        short_circuit_and(func, branch1, branch2, _, _);
-
-    emit_short_circuit_or(func, branch1, branch2) <--
-        short_circuit_or(func, branch1, branch2, _, _);
-}
-
-fn lengauer_tarjan(
-    succs: &[Vec<usize>],
-    preds: &[Vec<usize>],
-    entry_idx: usize,
-    n: usize,
-) -> Option<Vec<(usize, usize)>> {
-    if n <= 1 {
-        return Some(Vec::new());
-    }
-
-    let mut dfnum = vec![u32::MAX; n];
-    let mut vertex: Vec<usize> = Vec::with_capacity(n);
-    let mut dfs_parent = vec![usize::MAX; n];
-
-    {
-        let mut stack: Vec<(usize, usize)> = Vec::new();
-        dfnum[entry_idx] = 0;
-        vertex.push(entry_idx);
-        stack.push((entry_idx, 0));
-
-        while let Some((node, child_ptr)) = stack.last_mut() {
-            let node_val = *node;
-            if *child_ptr < succs[node_val].len() {
-                let succ = succs[node_val][*child_ptr];
-                *child_ptr += 1;
-                if dfnum[succ] == u32::MAX {
-                    dfs_parent[succ] = node_val;
-                    dfnum[succ] = vertex.len() as u32;
-                    vertex.push(succ);
-                    stack.push((succ, 0));
-                }
-            } else {
-                stack.pop();
-            }
-        }
-    }
-
-    let dfs_count = vertex.len();
-    if dfs_count <= 1 {
-        return Some(Vec::new());
-    }
-
-    let mut semi = vec![0u32; n];
-    let mut idom_arr = vec![usize::MAX; n];
-    let mut ancestor = vec![usize::MAX; n];
-    let mut label = (0..n).collect::<Vec<_>>();
-    let mut bucket: Vec<Vec<usize>> = vec![Vec::new(); n];
-
-    for i in 0..dfs_count {
-        semi[vertex[i]] = i as u32;
-    }
-
-    fn eval(v: usize, ancestor: &mut [usize], label: &mut [usize], semi: &[u32]) -> usize {
-        if ancestor[v] == usize::MAX {
-            return v;
-        }
-        let mut chain = Vec::new();
-        let mut u = v;
-        while ancestor[u] != usize::MAX && ancestor[ancestor[u]] != usize::MAX {
-            chain.push(u);
-            u = ancestor[u];
-        }
-        for &node in chain.iter().rev() {
-            let a = ancestor[node];
-            if semi[label[a]] < semi[label[node]] {
-                label[node] = label[a];
-            }
-            ancestor[node] = ancestor[u];
-        }
-        label[v]
-    }
-
-    for i in (1..dfs_count).rev() {
-        let w = vertex[i];
-        let p = dfs_parent[w];
-
-        let mut s = dfnum[w];
-        for &v in &preds[w] {
-            if dfnum[v] == u32::MAX {
-                continue;
-            }
-            let s_prime = if dfnum[v] <= dfnum[w] {
-                dfnum[v]
-            } else {
-                semi[eval(v, &mut ancestor, &mut label, &semi)]
-            };
-            s = s.min(s_prime);
-        }
-        semi[w] = s;
-        bucket[vertex[s as usize]].push(w);
-        ancestor[w] = p;
-
-        for v in std::mem::take(&mut bucket[p]) {
-            let u = eval(v, &mut ancestor, &mut label, &semi);
-            idom_arr[v] = if semi[u] < semi[v] { u } else { p };
-        }
-    }
-
-    for i in 1..dfs_count {
-        let w = vertex[i];
-        if idom_arr[w] != usize::MAX && idom_arr[w] != vertex[semi[w] as usize] {
-            idom_arr[w] = idom_arr[idom_arr[w]];
-        }
-    }
-
-    let mut result = Vec::with_capacity(dfs_count);
-    for i in 1..dfs_count {
-        let w = vertex[i];
-        if idom_arr[w] < n {
-            result.push((w, idom_arr[w]));
-        }
-    }
-
-    Some(result)
 }
 
 pub struct CshminorPass;
 
 impl CshminorPass {
-    fn prepare_dominators(db: &mut DecompileDB) {
-        let mut func_nodes: HashMap<u64, HashSet<u64>> = HashMap::new();
-        let mut func_entry: HashMap<u64, u64> = HashMap::new();
-
-        let mut node_to_func: HashMap<u64, u64> = HashMap::new();
-        for &(node, func) in db.rel_iter::<(Node, Address)>("instr_in_function") {
-            node_to_func.insert(node, func);
-        }
-
-        for &(node, ref _stmt) in db.rel_iter::<(Node, CminorStmt)>("cminor_stmt") {
-            if let Some(&func) = node_to_func.get(&node) {
-                func_nodes.entry(func).or_default().insert(node);
-            }
-        }
-
-        for &(func, _, entry) in db.rel_iter::<(Address, Symbol, Node)>("emit_function") {
-            func_entry.insert(func, entry);
-        }
-
-        let mut succs_map: HashMap<u64, Vec<u64>> = HashMap::new();
-
-        let cminor_nodes: HashSet<u64> = db.rel_iter::<(Node, CminorStmt)>("cminor_stmt").map(|&(n, _)| n).collect();
-
-        let mut sorted_func_cminor: HashMap<u64, Vec<u64>> = HashMap::new();
-        for (&func, nodes) in &func_nodes {
-            let mut sorted: Vec<u64> = nodes.iter().copied().collect();
-            sorted.sort_unstable();
-            sorted_func_cminor.insert(func, sorted);
-        }
-
-        let resolve_target = |target: u64, func: u64| -> Option<u64> {
-            if cminor_nodes.contains(&target) {
-                return Some(target);
-            }
-            if let Some(sorted) = sorted_func_cminor.get(&func) {
-                match sorted.binary_search(&target) {
-                    Ok(_) => Some(target),
-                    Err(pos) => {
-                        if pos < sorted.len() {
-                            Some(sorted[pos])
-                        } else {
-                            None
-                        }
-                    }
-                }
-            } else {
-                None
-            }
-        };
-
-
-        for &(node, ref stmt) in db.rel_iter::<(Node, CminorStmt)>("cminor_stmt") {
-            let targets: Vec<u64> = match stmt {
-                CminorStmt::Sjump(target) => vec![*target],
-                CminorStmt::Sbranch(_, _, ifso, ifnot) => vec![*ifso, *ifnot],
-                CminorStmt::Sifthenelse(_, _, ifso, ifnot) => vec![*ifso, *ifnot],
-                CminorStmt::Sjumptable(_, targets) => targets.to_vec(),
-                _ => vec![],
-            };
-            let func = node_to_func.get(&node).copied().unwrap_or(0);
-            for t in targets {
-                if let Some(resolved) = resolve_target(t, func) {
-                    succs_map.entry(node).or_default().push(resolved);
-                }
-            }
-        }
-
-        let non_fallthrough: HashSet<u64> = db.rel_iter::<(Node, CminorStmt)>("cminor_stmt")
-            .filter(|&&(_, ref stmt)| matches!(stmt,
-                CminorStmt::Sjump(_) | CminorStmt::Sreturn(_) | CminorStmt::Stailcall(_, _, _)))
-            .map(|&(node, _)| node)
-            .collect();
-
-        // Collect synthetic-node fallthrough edges (from cminor_pass via rtl_succ)
-        let synthetic_ft: HashSet<(u64, u64)> = db.rel_iter::<(Node, Node)>("cminor_fallthrough")
-            .map(|&(a, b)| (a, b))
-            .collect();
-        let has_synthetic_ft: HashSet<u64> = synthetic_ft.iter().map(|&(a, _)| a).collect();
-
-        for &(src, dst) in &synthetic_ft {
-            succs_map.entry(src).or_default().push(dst);
-        }
-
-        // Address-sorted fallthrough for non-synthetic nodes
-        for (&_func, sorted) in &sorted_func_cminor {
-            for i in 0..sorted.len().saturating_sub(1) {
-                let node = sorted[i];
-                if non_fallthrough.contains(&node) { continue; }
-                if has_synthetic_ft.contains(&node) { continue; }
-                let next_cminor = sorted[i + 1];
-                if next_cminor & (1u64 << 62) != 0 { continue; }
-                succs_map.entry(node).or_default().push(next_cminor);
-                db.rel_push("cminor_fallthrough", (node, next_cminor));
-            }
-        }
-
-        let mut resolved_edges: Vec<(u64, u64)> = Vec::new();
-        for &(node, ref stmt) in db.rel_iter::<(Node, CminorStmt)>("cminor_stmt") {
-            let targets: Vec<u64> = match stmt {
-                CminorStmt::Sjump(target) => vec![*target],
-                CminorStmt::Sbranch(_, _, ifso, ifnot) => vec![*ifso, *ifnot],
-                CminorStmt::Sifthenelse(_, _, ifso, ifnot) => vec![*ifso, *ifnot],
-                CminorStmt::Sjumptable(_, targets) => targets.to_vec(),
-                _ => vec![],
-            };
-            let func = node_to_func.get(&node).copied().unwrap_or(0);
-            for t in targets {
-                if !cminor_nodes.contains(&t) {
-                    if let Some(resolved) = resolve_target(t, func) {
-                        if resolved != t {
-                            resolved_edges.push((node, resolved));
-                        }
-                    }
-                }
-            }
-        }
-        for (from, to) in resolved_edges {
-            db.rel_push("cminor_succ", (from, to));
-        }
-
-        for (&func, nodes) in &func_nodes {
-            let entry = match func_entry.get(&func) {
-                Some(&e) => e,
-                None => continue,
-            };
-
-            if !nodes.contains(&entry) {
-                continue;
-            }
-
-            let node_vec: Vec<u64> = nodes.iter().copied().collect();
-            let n = node_vec.len();
-            let mut node_to_idx: HashMap<u64, usize> = HashMap::with_capacity(n);
-            for (i, &node) in node_vec.iter().enumerate() {
-                node_to_idx.insert(node, i);
-            }
-
-            let mut fwd_succs: Vec<Vec<usize>> = vec![Vec::new(); n];
-            let mut fwd_preds: Vec<Vec<usize>> = vec![Vec::new(); n];
-
-            for &node in nodes {
-                if let Some(targets) = succs_map.get(&node) {
-                    if let Some(&from_idx) = node_to_idx.get(&node) {
-                        for &target in targets {
-                            if let Some(&to_idx) = node_to_idx.get(&target) {
-                                fwd_succs[from_idx].push(to_idx);
-                                fwd_preds[to_idx].push(from_idx);
-                            }
-                        }
-                    }
-                }
-            }
-
-            for s in fwd_succs.iter_mut() { s.sort_unstable(); s.dedup(); }
-            for p in fwd_preds.iter_mut() { p.sort_unstable(); p.dedup(); }
-
-            let entry_idx = node_to_idx[&entry];
-            if let Some(idom_map) = lengauer_tarjan(&fwd_succs, &fwd_preds, entry_idx, n) {
-                for (node_idx, idom_idx) in idom_map {
-                    db.rel_push("idom", (func, node_vec[node_idx], node_vec[idom_idx]));
-                }
-            }
-
-            let mut exit_indices: Vec<usize> = Vec::new();
-            for &(node, ref stmt) in db.rel_iter::<(Node, CminorStmt)>("cminor_stmt") {
-                if nodes.contains(&node) {
-                    if matches!(stmt, CminorStmt::Sreturn(_) | CminorStmt::Stailcall(_, _, _)) {
-                        if let Some(&idx) = node_to_idx.get(&node) {
-                            exit_indices.push(idx);
-                        }
-                    }
-                }
-            }
-
-            // For non-returning functions (e.g., exit()/abort()), use leaf nodes as fallback exit points
-            if exit_indices.is_empty() {
-                for idx in 0..n {
-                    if fwd_succs[idx].is_empty() {
-                        exit_indices.push(idx);
-                    }
-                }
-            }
-
-            if !exit_indices.is_empty() {
-                let vn = n + 1;
-                let virtual_exit = n;
-                let mut rev_succs: Vec<Vec<usize>> = vec![Vec::new(); vn];
-                let mut rev_preds: Vec<Vec<usize>> = vec![Vec::new(); vn];
-
-                for from_idx in 0..n {
-                    for &to_idx in &fwd_succs[from_idx] {
-                        rev_succs[to_idx].push(from_idx);
-                        rev_preds[from_idx].push(to_idx);
-                    }
-                }
-
-                for &exit_idx in &exit_indices {
-                    rev_succs[virtual_exit].push(exit_idx);
-                    rev_preds[exit_idx].push(virtual_exit);
-                }
-
-                for s in rev_succs.iter_mut() { s.sort_unstable(); s.dedup(); }
-                for p in rev_preds.iter_mut() { p.sort_unstable(); p.dedup(); }
-
-                if let Some(ipdom_map) = lengauer_tarjan(&rev_succs, &rev_preds, virtual_exit, vn) {
-                    for (node_idx, ipdom_idx) in ipdom_map {
-                        if node_idx < n && ipdom_idx < n {
-                            db.rel_push("pdom", (func, node_vec[node_idx], node_vec[ipdom_idx]));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     fn prepare_jump_tables(db: &mut DecompileDB) {
         if db.rel_iter::<(Node, usize, Node)>("jump_table_target").next().is_none() {
             return;
@@ -1288,6 +821,11 @@ impl CshminorPass {
                 Some(&e) => e,
                 None => continue,
             };
+            // Build a set of all nodes in the impl sequence + the JMP node
+            // so the bounds-check branch can target any of them.
+            let impl_set_local: std::collections::HashSet<Node> = impl_nodes.iter().copied()
+                .chain(std::iter::once(*jmp_node))
+                .collect();
 
             let ordered_targets: Vec<Node> = targets.iter().map(|(_, t)| *t).collect();
 
@@ -1295,13 +833,13 @@ impl CshminorPass {
             for (_node, stmt) in db.rel_iter::<(Node, CminorStmt)>("cminor_stmt") {
                 match stmt {
                     CminorStmt::Sbranch(_, args, ifso, ifnot) => {
-                        if (*ifso == entry || *ifnot == entry) && args.len() == 1 {
+                        if (impl_set_local.contains(ifso) || impl_set_local.contains(ifnot)) && args.len() == 1 {
                             discriminant = Some(args[0]);
                             break;
                         }
                     }
                     CminorStmt::Sifthenelse(_, args, ifso, ifnot) => {
-                        if (*ifso == entry || *ifnot == entry) && args.len() == 1 {
+                        if (impl_set_local.contains(ifso) || impl_set_local.contains(ifnot)) && args.len() == 1 {
                             discriminant = Some(args[0]);
                             break;
                         }
@@ -1333,7 +871,7 @@ impl CshminorPass {
         }
 
         for &node in &impl_set {
-            db.rel_push("jump_table_impl_suppress", (node,));
+            db.rel_push("trim_jump_table_impl", (node,));
         }
     }
 }
@@ -1343,7 +881,6 @@ impl IRPass for CshminorPass {
 
     fn run(&self, db: &mut DecompileDB) {
         Self::prepare_jump_tables(db);
-        Self::prepare_dominators(db);
 
         run_pass!(db, CshminorPassProgram);
     }

@@ -28,7 +28,6 @@ ascent_par! {
     relation emit_clight_stmt(Address, Node, ClightStmt);
     relation emit_function_return_type_candidate(Address, ClightType);
     relation emit_goto_target(Address, Node);
-    relation emit_ifthenelse_body(Address, Node, Node, bool);
     relation emit_loop_body(Address, Node, Node);
     relation emit_loop_exit(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node);
     relation emit_switch_chain(Address, Node, RTLReg);
@@ -37,7 +36,6 @@ ascent_par! {
     relation func_span(Symbol, Address, Address);
     relation global_struct_catalog(u64, usize, usize, usize);
     relation ident_to_symbol(Ident, Symbol);
-    relation ifthenelse_merge_point(Address, Node, Node);
     relation instr_in_function(Node, Address);
     relation is_external_function(Address);
     relation known_extern_signature(Symbol, usize, XType, Arc<Vec<XType>>);

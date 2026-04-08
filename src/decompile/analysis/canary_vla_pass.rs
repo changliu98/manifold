@@ -31,7 +31,7 @@ ascent_par! {
     relation plt_entry(Address, Symbol);
     relation plt_block(Address, Symbol);
 
-    relation suppress_instruction(Address);
+    relation trim_instruction(Address);
 
     #[local] relation prev(Address, Address);
     prev(b, a) <-- next(a, b);
@@ -50,7 +50,7 @@ ascent_par! {
         unrefinedinstruction(addr, _, _, _, _, op2, _, _, _, _),
         fs_segment_op(op2);
 
-    suppress_instruction(addr) <-- fs_insn(addr);
+    trim_instruction(addr) <-- fs_insn(addr);
 
     #[local] relation stack_chk_fail_addr(Address);
     stack_chk_fail_addr(addr) <--
@@ -84,7 +84,7 @@ ascent_par! {
         op_indirect(op2, _, base, _, _, disp, _),
         if *base == "RBP" && *disp < 0;
 
-    suppress_instruction(store_addr) <-- canary_store(_, store_addr, _);
+    trim_instruction(store_addr) <-- canary_store(_, store_addr, _);
 
     // Determine which function contains each FS instruction
     #[local] relation fs_func_le(Address, Address);
@@ -107,7 +107,7 @@ ascent_par! {
         unrefinedinstruction(addr, _, _, mnem, _, _, _, _, _, _),
         if *mnem == "SUB" || *mnem == "XOR";
 
-    suppress_instruction(jcc) <--
+    trim_instruction(jcc) <--
         fs_check(cmp), flags_and_jump_pair(cmp, jcc, _);
 
     #[local] relation jcc_fwd(Address, Address, usize);
@@ -117,12 +117,12 @@ ascent_par! {
         jcc_fwd(jcc, cur, n), next(cur, nxt), if *n < 2;
 
     // Suppress __stack_chk_fail calls after canary check JCC
-    suppress_instruction(call_addr) <--
+    trim_instruction(call_addr) <--
         jcc_fwd(_, call_addr, n), if *n > 0,
         direct_call(call_addr, target),
         stack_chk_fail_addr(target);
 
-    suppress_instruction(call_addr) <--
+    trim_instruction(call_addr) <--
         jcc_fwd(_, call_addr, n), if *n > 0,
         unrefinedinstruction(call_addr, _, _, mnem, op1, _, _, _, _, _),
         if *mnem == "CALL",
@@ -140,7 +140,7 @@ ascent_par! {
     check_canary_ofs(chk, ofs) <--
         fs_check(chk), fs_func(chk, func), canary_slot(func, ofs);
 
-    suppress_instruction(reload_addr) <--
+    trim_instruction(reload_addr) <--
         fs_check_bwd(chk, reload_addr, n), if *n > 0,
         unrefinedinstruction(reload_addr, _, _, mnem, op1, _, _, _, _, _),
         if *mnem == "MOV",
@@ -164,7 +164,7 @@ ascent_par! {
         if *size_reg != "RSP" && *size_reg != "ESP";
 
     // Suppress the alloc itself
-    suppress_instruction(addr) <-- vla_dynamic_alloc(addr, _);
+    trim_instruction(addr) <-- vla_dynamic_alloc(addr, _);
 
     // Forward walk from alloc (up to 30 steps)
     #[local] relation vla_alloc_fwd(Address, Address, usize);
@@ -197,13 +197,13 @@ ascent_par! {
         vla_dynamic_alloc(alloc, size_reg);
 
     // Suppress everything between alloc and capture (inclusive of capture)
-    suppress_instruction(mid) <--
+    trim_instruction(mid) <--
         vla_alloc_fwd(alloc, mid, n), if *n > 0,
         vla_capture_step(alloc, cap_n),
         if *n <= *cap_n;
 
-    // Suppress JCCs for flag-setting instructions in the suppressed range
-    suppress_instruction(jcc) <--
+    // Trim JCCs for flag-setting instructions in the trimmed range
+    trim_instruction(jcc) <--
         vla_alloc_fwd(alloc, mid, n), if *n > 0,
         vla_capture_step(alloc, cap_n),
         if *n <= *cap_n,
@@ -278,7 +278,7 @@ impl IRPass for CanaryVlaPass {
 
     fn outputs(&self) -> &'static [&'static str] {
         &[
-            "suppress_instruction",
+            "trim_instruction",
             "vla_alloca",
             "vla_base_var",
             "vla_capture",
@@ -286,7 +286,7 @@ impl IRPass for CanaryVlaPass {
     }
 }
 
-// VLA suppression: reads Datalog-identified VLA facts and suppresses alignment/probe boilerplate
+// VLA trimming: reads Datalog-identified VLA facts and trims alignment/probe boilerplate
 type InsnTuple = (Address, usize, &'static str, &'static str, Symbol, Symbol, Symbol, Symbol, usize, usize);
 type OpIndirectTuple = (Symbol, &'static str, &'static str, &'static str, i64, i64, usize);
 type OpRegisterTuple = (Symbol, &'static str);
@@ -345,7 +345,7 @@ fn detect_vla(db: &mut DecompileDB) {
         .map(|&(cmp, jcc, _)| (cmp, jcc))
         .collect();
 
-    let mut suppress: BTreeSet<Address> = BTreeSet::new();
+    let mut trimmed: BTreeSet<Address> = BTreeSet::new();
     let mut vla_allocas: Vec<(Address, Mreg, Mreg)> = Vec::new();
 
     let walk_forward = |start: Address, max_steps: usize| -> Vec<Address> {
@@ -446,11 +446,11 @@ fn detect_vla(db: &mut DecompileDB) {
                                     if let Some(imm) = get_immediate(pm_op1) {
                                         let tgt = get_reg_name(pm_op2);
                                         if imm == 0 && matches!(tgt, Some("RDX" | "EDX")) {
-                                            suppress.insert(pre_addr);
+                                            trimmed.insert(pre_addr);
                                             alignment_start = pre_addr;
                                         }
                                         if imm == STACK_ALIGNMENT && tgt == div_operand_reg {
-                                            suppress.insert(pre_addr);
+                                            trimmed.insert(pre_addr);
                                             alignment_start = pre_addr;
                                         }
                                     }
@@ -458,7 +458,7 @@ fn detect_vla(db: &mut DecompileDB) {
                                 "XOR" => {
                                     let r1 = get_reg_name(pm_op1);
                                     if r1 == get_reg_name(pm_op2) && matches!(r1, Some("RDX" | "EDX")) {
-                                        suppress.insert(pre_addr);
+                                        trimmed.insert(pre_addr);
                                         alignment_start = pre_addr;
                                     }
                                 }
@@ -476,14 +476,14 @@ fn detect_vla(db: &mut DecompileDB) {
                                     let imm1 = get_immediate(pm_op1);
                                     let imm2 = get_immediate(pm_op2);
                                     if matches!(imm1, Some(1) | Some(15)) || matches!(imm2, Some(1) | Some(15)) {
-                                        suppress.insert(pre_addr);
+                                        trimmed.insert(pre_addr);
                                         alignment_start = pre_addr;
                                     }
                                 }
                                 "MOV" => {
                                     if let Some(imm) = get_immediate(pm_op1) {
                                         if imm == STACK_ALIGNMENT {
-                                            suppress.insert(pre_addr);
+                                            trimmed.insert(pre_addr);
                                             alignment_start = pre_addr;
                                         }
                                     }
@@ -496,10 +496,10 @@ fn detect_vla(db: &mut DecompileDB) {
             }
 
             let mut cur = alignment_start;
-            suppress.insert(cur);
+            trimmed.insert(cur);
             while cur < alloc_addr {
                 if let Some(&nxt) = next_map.get(&cur) {
-                    suppress.insert(nxt);
+                    trimmed.insert(nxt);
                     cur = nxt;
                 } else {
                     break;
@@ -519,14 +519,14 @@ fn detect_vla(db: &mut DecompileDB) {
         for &probe_addr in &neighborhood {
             if let Some(&(_, _, _, mnem, op1, op2, _, _, _, _)) = insns.get(&probe_addr) {
                 if mnem == "SUB" && is_rsp_operand(op2) && get_immediate(op1) == Some(PAGE_SIZE) {
-                    suppress.insert(probe_addr);
+                    trimmed.insert(probe_addr);
                     for &adj in walk_forward(probe_addr, 3).iter() {
                         if let Some(&(_, _, _, nm, op1_adj, _, _, _, _, _)) = insns.get(&adj) {
                             match nm {
                                 "OR" if is_rsp_operand(op1_adj) || {
                                     op_indirects.get(op1_adj).map_or(false, |&(_, _, base, _, _, _, _)| base == "RSP")
-                                } => suppress.insert(adj),
-                                "JMP" => suppress.insert(adj),
+                                } => trimmed.insert(adj),
+                                "JMP" => trimmed.insert(adj),
                                 _ => false,
                             };
                         }
@@ -535,9 +535,9 @@ fn detect_vla(db: &mut DecompileDB) {
                         if let Some(&(_, _, _, nm, op1_adj, op2_adj, _, _, _, _)) = insns.get(&adj) {
                             match nm {
                                 "CMP" if is_rsp_operand(op1_adj) || is_rsp_operand(op2_adj) => {
-                                    suppress.insert(adj);
+                                    trimmed.insert(adj);
                                     if let Some(&jcc) = flags_pairs.get(&adj) {
-                                        suppress.insert(jcc);
+                                        trimmed.insert(jcc);
                                     }
                                 }
                                 _ => {}
@@ -553,7 +553,7 @@ fn detect_vla(db: &mut DecompileDB) {
             if let Some(&(_, _, _, mnem, _, _, _, _, _, _)) = insns.get(&fwd_addr) {
                 match mnem {
                     "ADD" | "SHR" | "SHL" | "AND" => {
-                        suppress.insert(fwd_addr);
+                        trimmed.insert(fwd_addr);
                     }
                     _ => break,
                 }
@@ -561,50 +561,51 @@ fn detect_vla(db: &mut DecompileDB) {
         }
     }
 
-    let canary_count: usize = db.rel_iter::<(Address,)>("suppress_instruction").count();
+    let canary_count: usize = db.rel_iter::<(Address,)>("trim_instruction").count();
 
-    if canary_count > 0 || !suppress.is_empty() || !vla_allocas.is_empty() {
+    if canary_count > 0 || !trimmed.is_empty() || !vla_allocas.is_empty() {
         let base_var_count: usize = db.rel_iter::<(Address, i64)>("vla_base_var").count();
         info!(
             "[canary-vla] Suppressing {} canary + {} VLA instructions, {} alloca sites, {} base vars",
             canary_count,
-            suppress.len(),
+            trimmed.len(),
             vla_allocas.len(),
             base_var_count,
         );
     }
 
-    if !suppress.is_empty() {
-        let existing: Vec<Address> = db.rel_iter::<(Address,)>("suppress_instruction")
+    if !trimmed.is_empty() {
+        let existing: Vec<Address> = db.rel_iter::<(Address,)>("trim_instruction")
             .map(|&(a,)| a)
             .collect();
 
         let combined: ascent::boxcar::Vec<(Address,)> =
             existing.into_iter().map(|a| (a,)).collect();
-        for addr in suppress {
+        for addr in trimmed {
             combined.push((addr,));
         }
-        db.rel_set("suppress_instruction", combined);
+        db.rel_set("trim_instruction", combined);
     }
 
-    // Bridge next edges across suppressed ranges so downstream passes don't get orphan nodes.
+    // Bridge next edges across trimmed ranges so downstream passes don't get orphan nodes.
     let alloca_addrs: BTreeSet<Address> = vla_allocas.iter().map(|&(addr, _, _)| addr).collect();
 
-    let all_suppressed: BTreeSet<Address> = db.rel_iter::<(Address,)>("suppress_instruction")
+    let all_trimmed: BTreeSet<Address> = db.rel_iter::<(Address,)>("trim_instruction")
         .map(|&(a,)| a)
         .collect();
 
-    for &addr in &all_suppressed {
+    for &addr in &all_trimmed {
         if let Some(&pred) = prev_map.get(&addr) {
-            if !all_suppressed.contains(&pred) {
+            if !all_trimmed.contains(&pred) {
                 let mut cur = addr;
-                loop {
+                let mut visited = HashSet::new();
+                while visited.insert(cur) {
                     if alloca_addrs.contains(&cur) {
                         db.rel_push("next", (pred, cur));
                         break;
                     }
                     if let Some(&nxt) = next_map.get(&cur) {
-                        if !all_suppressed.contains(&nxt) {
+                        if !all_trimmed.contains(&nxt) {
                             db.rel_push("next", (pred, nxt));
                             break;
                         }
@@ -617,14 +618,15 @@ fn detect_vla(db: &mut DecompileDB) {
         }
     }
 
-    // Bridge FROM alloca nodes TO first non-suppressed successor.
+    // Bridge FROM alloca nodes TO first non-trimmed successor.
     for &alloca_addr in &alloca_addrs {
         if let Some(&nxt) = next_map.get(&alloca_addr) {
-            if all_suppressed.contains(&nxt) && !alloca_addrs.contains(&nxt) {
+            if all_trimmed.contains(&nxt) && !alloca_addrs.contains(&nxt) {
                 let mut cur = nxt;
-                loop {
+                let mut visited = HashSet::new();
+                while visited.insert(cur) {
                     if let Some(&nxt2) = next_map.get(&cur) {
-                        if !all_suppressed.contains(&nxt2) {
+                        if !all_trimmed.contains(&nxt2) {
                             db.rel_push("next", (alloca_addr, nxt2));
                             break;
                         }

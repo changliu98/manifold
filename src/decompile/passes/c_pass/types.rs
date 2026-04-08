@@ -771,6 +771,23 @@ impl TranslationUnit {
         self.symbols.insert(name, idx);
     }
 
+    /// Rebuild `symbols` from actual `decls` positions.
+    /// Must be called after any operation that reorders or prepends to `decls`.
+    pub fn rebuild_symbols(&mut self) {
+        self.symbols.clear();
+        for (i, decl) in self.decls.iter().enumerate() {
+            let name = match decl {
+                TopLevelDecl::FuncDef(f) => Some(f.name.clone()),
+                TopLevelDecl::FuncDecl(f) => Some(f.name.clone()),
+                TopLevelDecl::VarDecl(v) => Some(v.name.clone()),
+                _ => None,
+            };
+            if let Some(name) = name {
+                self.symbols.entry(name).or_insert(i);
+            }
+        }
+    }
+
 }
 
 

@@ -102,7 +102,7 @@ fn convert_clight_type(ty: &crate::x86::types::ClightType) -> CType {
             CType::Function(Box::new(convert_clight_type(ret)), c_params, false)
         }
         crate::x86::types::ClightType::Tstruct(id, _attr) => {
-            CType::Struct(format!("struct_{}", id))
+            CType::Struct(format!("struct_{:x}", id))
         }
         crate::x86::types::ClightType::Tunion(id, _attr) => CType::Union(format!("union_{}", id)),
     }
@@ -170,6 +170,16 @@ fn convert_xtype(xt: &XType) -> CType {
             Box::new(CType::Int(
                 crate::decompile::passes::c_pass::types::IntSize::Char,
                 crate::decompile::passes::c_pass::types::Signedness::Signed,
+            )),
+            TypeQualifiers::none(),
+        ),
+        XType::Xcharptrptr => CType::Pointer(
+            Box::new(CType::Pointer(
+                Box::new(CType::Int(
+                    crate::decompile::passes::c_pass::types::IntSize::Char,
+                    crate::decompile::passes::c_pass::types::Signedness::Signed,
+                )),
+                TypeQualifiers::none(),
             )),
             TypeQualifiers::none(),
         ),
@@ -305,6 +315,54 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         .filter(|(_, ty)| !matches!(ty, CType::Void))
         .collect();
 
+    // Build global load chunk map: prefer integer over float (SSE bulk copies produce spurious floats).
+    let global_chunks: HashMap<usize, MemoryChunk> = {
+        let mut chunks: HashMap<usize, Vec<MemoryChunk>> = HashMap::new();
+        for (id, chunk) in db.rel_iter::<(Ident, MemoryChunk)>("global_load_chunk") {
+            chunks.entry(*id).or_default().push(*chunk);
+        }
+        chunks.into_iter().map(|(id, mut chunk_list)| {
+            // Filter out generic MAny/Unknown when specific chunks exist
+            let has_specific = chunk_list.iter().any(|c|
+                !matches!(c, MemoryChunk::MAny32 | MemoryChunk::MAny64 | MemoryChunk::Unknown));
+            if has_specific {
+                chunk_list.retain(|c|
+                    !matches!(c, MemoryChunk::MAny32 | MemoryChunk::MAny64 | MemoryChunk::Unknown));
+            }
+            // Filter out float chunks when integer chunks exist (SSE bulk copies produce MFloat64)
+            let has_int = chunk_list.iter().any(|c|
+                matches!(c, MemoryChunk::MBool | MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned
+                    | MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned
+                    | MemoryChunk::MInt32 | MemoryChunk::MInt64));
+            if has_int {
+                chunk_list.retain(|c|
+                    !matches!(c, MemoryChunk::MFloat32 | MemoryChunk::MFloat64));
+            }
+            // Among remaining, prefer the largest integer type
+            let best = chunk_list.iter().max_by_key(|c| match c {
+                MemoryChunk::MBool => 0,
+                MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned => 1,
+                MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => 2,
+                MemoryChunk::MInt32 => 3,
+                MemoryChunk::MFloat32 => 4,
+                MemoryChunk::MFloat64 => 5,
+                MemoryChunk::MInt64 => 6,
+                MemoryChunk::MAny32 => 7,
+                MemoryChunk::MAny64 => 8,
+                MemoryChunk::Unknown => 9,
+            }).copied().unwrap_or(MemoryChunk::Unknown);
+            (id, best)
+        }).collect()
+    };
+
+    // Build global pointer sets from rtl_pass analysis
+    let global_ptr_ids: HashSet<usize> = db.rel_iter::<(Ident,)>("emit_global_is_ptr")
+        .map(|(id,)| *id)
+        .collect();
+    let global_char_ptr_ids: HashSet<usize> = db.rel_iter::<(Ident,)>("emit_global_is_char_ptr")
+        .map(|(id,)| *id)
+        .collect();
+
     for global in globals {
         if global.is_string || global.scalar_value.is_some() {
             continue;
@@ -312,8 +370,47 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         let sanitized_name = sanitize_c_symbol_name(&global.name);
         let (ty, init) = if let Some(known_ty) = known_global_types.get(&sanitized_name) {
             (known_ty.clone(), None)
-        } else if global.is_pointer {
+        } else if global_char_ptr_ids.contains(&global.id) {
+            (CType::Pointer(
+                Box::new(CType::Int(
+                    crate::decompile::passes::c_pass::types::IntSize::Char,
+                    crate::decompile::passes::c_pass::types::Signedness::Signed,
+                )),
+                TypeQualifiers::none(),
+            ), None)
+        } else if global.is_pointer || global_ptr_ids.contains(&global.id) {
             (CType::ptr(CType::Void), None)
+        } else if let Some(chunk) = global_chunks.get(&global.id) {
+            let chunk_ty = match chunk {
+                MemoryChunk::MBool | MemoryChunk::MInt32 | MemoryChunk::MAny32 => CType::Int(
+                    crate::decompile::passes::c_pass::types::IntSize::Int,
+                    crate::decompile::passes::c_pass::types::Signedness::Signed,
+                ),
+                MemoryChunk::MInt8Signed => CType::Int(
+                    crate::decompile::passes::c_pass::types::IntSize::Char,
+                    crate::decompile::passes::c_pass::types::Signedness::Signed,
+                ),
+                MemoryChunk::MInt8Unsigned => CType::Int(
+                    crate::decompile::passes::c_pass::types::IntSize::Char,
+                    crate::decompile::passes::c_pass::types::Signedness::Unsigned,
+                ),
+                MemoryChunk::MInt16Signed => CType::Int(
+                    crate::decompile::passes::c_pass::types::IntSize::Short,
+                    crate::decompile::passes::c_pass::types::Signedness::Signed,
+                ),
+                MemoryChunk::MInt16Unsigned => CType::Int(
+                    crate::decompile::passes::c_pass::types::IntSize::Short,
+                    crate::decompile::passes::c_pass::types::Signedness::Unsigned,
+                ),
+                MemoryChunk::MFloat32 => CType::Float(
+                    crate::decompile::passes::c_pass::types::FloatSize::Float,
+                ),
+                MemoryChunk::MFloat64 => CType::Float(
+                    crate::decompile::passes::c_pass::types::FloatSize::Double,
+                ),
+                _ => CType::long(),
+            };
+            (chunk_ty, None)
         } else {
             (CType::long(), None)
         };
@@ -380,10 +477,24 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         let nodes = order_nodes_dfs(entry_node, &nodes_set, edges);
 
         let mut body_items = Vec::new();
+        let mut body_terminated = false;
         for &node in &nodes {
             if let Some(stmt) = stmt_map.get(&node) {
-                if !matches!(stmt, CStmt::Empty) {
+                if matches!(stmt, CStmt::Empty) {
+                    continue;
+                }
+                if body_terminated {
+                    // After unconditional exit, only keep statements with named labels (goto targets).
+                    if contains_named_label(stmt) {
+                        body_items.push(CBlockItem::Stmt(stmt.clone()));
+                        // The labeled section might end with a terminator, so re-check.
+                        body_terminated = is_unconditional_exit(stmt);
+                    }
+                } else {
                     body_items.push(CBlockItem::Stmt(stmt.clone()));
+                    if is_unconditional_exit(stmt) {
+                        body_terminated = true;
+                    }
                 }
             }
         }
@@ -475,10 +586,12 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         };
 
         let mut body = crate::decompile::passes::c_pass::helpers::flatten_blocks_and_cleanup(&body);
+        body = eliminate_dead_code(&body);
 
         simplify_xor_self_in_stmt(&mut body);
         strip_dead_expr_stmts(&mut body);
         body = strip_trivial_casts(&body);
+        body = forward_return_value(&body);
 
         let is_reconciled_void = db.rel_iter::<(Address,)>("emit_function_void").any(|&(addr,)| addr == func.address);
 
@@ -690,19 +803,11 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             }
         }
         for decl in forward_decls {
-            tu.decls.push(decl);
+            if let crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(fd) = decl {
+                tu.add_func_decl(fd);
+            }
         }
     }
-
-    // Reorder declarations (structs, var decls, func decls, func defs) so forward declarations are visible before function bodies.
-    tu.decls.sort_by_key(|d| match d {
-        crate::decompile::passes::c_pass::types::TopLevelDecl::StructDef(_) => 0,
-        crate::decompile::passes::c_pass::types::TopLevelDecl::EnumDef(_) => 0,
-        crate::decompile::passes::c_pass::types::TopLevelDecl::Typedef(_) => 0,
-        crate::decompile::passes::c_pass::types::TopLevelDecl::VarDecl(_) => 1,
-        crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(_) => 2,
-        crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDef(_) => 3,
-    });
 
     tu
 }
@@ -1223,6 +1328,13 @@ fn strip_trivial_casts(stmt: &CStmt) -> CStmt {
 }
 
 fn strip_trivial_casts_expr(expr: &CExpr) -> CExpr {
+    fn unwrap_parens(expr: &CExpr) -> &CExpr {
+        match expr {
+            CExpr::Paren(inner) => unwrap_parens(inner),
+            other => other,
+        }
+    }
+
     match expr {
         CExpr::Cast(ty, inner) => {
             let inner_stripped = strip_trivial_casts_expr(inner);
@@ -1479,13 +1591,6 @@ fn is_long_type(ty: &CType) -> bool {
             | CType::Int(IntSize::LongLong, Signedness::Signed)
             | CType::Int(IntSize::LongLong, Signedness::Unsigned)
     )
-}
-
-fn unwrap_parens(expr: &CExpr) -> &CExpr {
-    match expr {
-        CExpr::Paren(inner) => unwrap_parens(inner),
-        other => other,
-    }
 }
 
 fn collect_var_names_from_expr(expr: &CExpr, vars: &mut HashSet<String>) {
@@ -1882,6 +1987,192 @@ pub fn narrow_varargs_in_stmt(stmt: &CStmt) -> CStmt {
     })
 }
 
+/// Eliminate dead code after unconditional exits, preserving labeled goto targets.
+fn eliminate_dead_code(stmt: &CStmt) -> CStmt {
+    match stmt {
+        CStmt::Block(items) => {
+            let pruned = prune_block_items(items);
+            match pruned.len() {
+                0 => CStmt::Empty,
+                _ => CStmt::Block(pruned),
+            }
+        }
+        CStmt::Sequence(stmts) => {
+            let items: Vec<CBlockItem> = stmts.iter().map(|s| CBlockItem::Stmt(s.clone())).collect();
+            let pruned = prune_block_items(&items);
+            let stmts: Vec<CStmt> = pruned.into_iter().filter_map(|item| match item {
+                CBlockItem::Stmt(s) => Some(s),
+                _ => None,
+            }).collect();
+            match stmts.len() {
+                0 => CStmt::Empty,
+                1 => stmts.into_iter().next().unwrap(),
+                _ => CStmt::Sequence(stmts),
+            }
+        }
+        CStmt::If(cond, then_s, else_s) => {
+            CStmt::If(
+                cond.clone(),
+                Box::new(eliminate_dead_code(then_s)),
+                else_s.as_ref().map(|e| Box::new(eliminate_dead_code(e))),
+            )
+        }
+        CStmt::While(cond, body) => {
+            CStmt::While(cond.clone(), Box::new(eliminate_dead_code(body)))
+        }
+        CStmt::DoWhile(body, cond) => {
+            CStmt::DoWhile(Box::new(eliminate_dead_code(body)), cond.clone())
+        }
+        CStmt::For(init, cond, update, body) => {
+            CStmt::For(init.clone(), cond.clone(), update.clone(), Box::new(eliminate_dead_code(body)))
+        }
+        CStmt::Switch(expr, body) => {
+            // Don't prune inside switch bodies: all case/default labels are reachable via dispatch.
+            // Only recurse into individual case bodies, not the sequential structure.
+            CStmt::Switch(expr.clone(), Box::new(eliminate_dead_code_in_switch(body)))
+        }
+        CStmt::Labeled(label, inner) => {
+            CStmt::Labeled(label.clone(), Box::new(eliminate_dead_code(inner)))
+        }
+        other => other.clone(),
+    }
+}
+
+/// Recurse into switch body items without pruning between them (all cases are dispatch targets).
+fn eliminate_dead_code_in_switch(stmt: &CStmt) -> CStmt {
+    match stmt {
+        CStmt::Block(items) => {
+            let cleaned: Vec<CBlockItem> = items.iter().map(|item| match item {
+                CBlockItem::Stmt(s) => CBlockItem::Stmt(eliminate_dead_code(s)),
+                other => other.clone(),
+            }).collect();
+            CStmt::Block(cleaned)
+        }
+        CStmt::Sequence(stmts) => {
+            CStmt::Sequence(stmts.iter().map(|s| eliminate_dead_code(s)).collect())
+        }
+        other => eliminate_dead_code(other),
+    }
+}
+
+/// Prune block items after unconditional exits, preserving named labels (goto targets).
+fn prune_block_items(items: &[CBlockItem]) -> Vec<CBlockItem> {
+    let mut result = Vec::new();
+    let mut terminated = false;
+    for item in items {
+        match item {
+            CBlockItem::Stmt(s) => {
+                // First, recursively eliminate dead code within the statement
+                let cleaned = eliminate_dead_code(s);
+                if matches!(cleaned, CStmt::Empty) {
+                    continue;
+                }
+                if terminated {
+                    // Preserve labeled stmts and loop/switch constructs after terminators.
+                    if contains_named_label(&cleaned) || is_control_flow_construct(&cleaned) {
+                        let exits = is_unconditional_exit(&cleaned);
+                        result.push(CBlockItem::Stmt(cleaned));
+                        terminated = exits;
+                    }
+                } else {
+                    let exits = is_unconditional_exit(&cleaned);
+                    result.push(CBlockItem::Stmt(cleaned));
+                    if exits {
+                        terminated = true;
+                    }
+                }
+            }
+            CBlockItem::Decl(decls) => {
+                // Always keep declarations (they don't produce dead code)
+                result.push(CBlockItem::Decl(decls.clone()));
+            }
+        }
+    }
+    result
+}
+
+/// True if stmt is a loop/switch that should survive DCE after a terminator.
+fn is_control_flow_construct(stmt: &CStmt) -> bool {
+    match stmt {
+        CStmt::While(_, _) | CStmt::DoWhile(_, _) | CStmt::For(_, _, _, _)
+        | CStmt::Switch(_, _) => true,
+        CStmt::Labeled(_, inner) => is_control_flow_construct(inner),
+        _ => false,
+    }
+}
+
+/// Returns true if stmt unconditionally exits (return/goto/break/continue).
+fn is_unconditional_exit(stmt: &CStmt) -> bool {
+    match stmt {
+        CStmt::Return(_) | CStmt::Goto(_) | CStmt::Break | CStmt::Continue => true,
+        // Labeled stmt exit status depends on inner stmt (subsequent code still dead if inner exits).
+        CStmt::Labeled(_, inner) => is_unconditional_exit(inner),
+        CStmt::Block(items) => {
+            // A block exits if its last statement exits
+            items.iter().rev().find_map(|item| match item {
+                CBlockItem::Stmt(s) if !matches!(s, CStmt::Empty) => Some(is_unconditional_exit(s)),
+                _ => None,
+            }).unwrap_or(false)
+        }
+        CStmt::Sequence(stmts) => {
+            stmts.iter().rev().find_map(|s| {
+                if !matches!(s, CStmt::Empty) { Some(is_unconditional_exit(s)) } else { None }
+            }).unwrap_or(false)
+        }
+        CStmt::If(_, then_s, Some(else_s)) => {
+            is_unconditional_exit(then_s) && is_unconditional_exit(else_s)
+        }
+        _ => false,
+    }
+}
+
+/// Returns true if a CStmt contains a Named label (goto target), ignoring case/default labels.
+/// Used when checking statements inside switch bodies to avoid false positives from case labels.
+fn contains_goto_target(stmt: &CStmt) -> bool {
+    match stmt {
+        CStmt::Labeled(Label::Named(_), _) => true,
+        CStmt::Labeled(_, inner) => contains_goto_target(inner),
+        CStmt::Block(items) => items.iter().any(|item| match item {
+            CBlockItem::Stmt(s) => contains_goto_target(s),
+            _ => false,
+        }),
+        CStmt::Sequence(stmts) => stmts.iter().any(contains_goto_target),
+        CStmt::If(_, then_s, else_s) => {
+            contains_goto_target(then_s)
+                || else_s.as_ref().map_or(false, |e| contains_goto_target(e))
+        }
+        CStmt::While(_, body) | CStmt::DoWhile(body, _) | CStmt::For(_, _, _, body) => {
+            contains_goto_target(body)
+        }
+        CStmt::Switch(_, body) => contains_goto_target(body),
+        _ => false,
+    }
+}
+
+/// Returns true if a CStmt contains any reachable label (named goto targets, case/default).
+fn contains_named_label(stmt: &CStmt) -> bool {
+    match stmt {
+        CStmt::Labeled(Label::Named(_), _) => true,
+        CStmt::Labeled(Label::Case(_), _) | CStmt::Labeled(Label::Default, _) => true,
+        CStmt::Labeled(_, inner) => contains_named_label(inner),
+        CStmt::Block(items) => items.iter().any(|item| match item {
+            CBlockItem::Stmt(s) => contains_named_label(s),
+            _ => false,
+        }),
+        CStmt::Sequence(stmts) => stmts.iter().any(contains_named_label),
+        CStmt::If(_, then_s, else_s) => {
+            contains_named_label(then_s)
+                || else_s.as_ref().map_or(false, |e| contains_named_label(e))
+        }
+        CStmt::While(_, body) | CStmt::DoWhile(body, _) | CStmt::For(_, _, _, body) => {
+            contains_named_label(body)
+        }
+        // Dead switch only preserved if it contains a Named goto target (case labels aren't external).
+        CStmt::Switch(_, body) => contains_goto_target(body),
+        _ => false,
+    }
+}
+
 pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> CStmt {
     match stmt {
         clight::ClightStmt::Sskip => CStmt::Empty,
@@ -1953,10 +2244,26 @@ pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> C
         }
 
         clight::ClightStmt::Ssequence(stmts) => {
-            let converted: Vec<CBlockItem> = stmts
-                .iter()
-                .map(|s| CBlockItem::Stmt(convert_stmt(s, ctx)))
-                .collect();
+            let mut converted: Vec<CBlockItem> = Vec::new();
+            let mut terminated = false;
+            for s in stmts {
+                let c = convert_stmt(s, ctx);
+                if terminated {
+                    // After unconditional exit, only keep statements with named labels (goto targets).
+                    if contains_named_label(&c) {
+                        let exits = is_unconditional_exit(&c);
+                        converted.push(CBlockItem::Stmt(c));
+                        // A preserved label can restart reachability for following fallthrough code.
+                        terminated = exits;
+                    }
+                } else {
+                    let exits = is_unconditional_exit(&c);
+                    converted.push(CBlockItem::Stmt(c));
+                    if exits {
+                        terminated = true;
+                    }
+                }
+            }
             if converted.len() == 1 {
                 match converted.into_iter().next().unwrap() {
                     CBlockItem::Stmt(s) => s,
@@ -2085,28 +2392,20 @@ fn extract_loop_condition(body: &CStmt) -> Option<(CExpr, CStmt, bool)> {
 fn extract_condition_break(stmt: &CStmt) -> Option<CExpr> {
     match stmt {
         CStmt::If(cond, then_br, Some(else_br))
-            if is_empty_stmt(then_br) && is_break_stmt(else_br) =>
+            if matches!(**then_br, CStmt::Empty) && matches!(**else_br, CStmt::Break) =>
         {
             Some(cond.clone())
         }
-        CStmt::If(cond, then_br, None) if is_break_stmt(then_br) => {
+        CStmt::If(cond, then_br, None) if matches!(**then_br, CStmt::Break) => {
             Some(negate_cond(cond))
         }
         CStmt::If(cond, then_br, Some(else_br))
-            if is_break_stmt(then_br) && is_empty_stmt(else_br) =>
+            if matches!(**then_br, CStmt::Break) && matches!(**else_br, CStmt::Empty) =>
         {
             Some(negate_cond(cond))
         }
         _ => None,
     }
-}
-
-fn is_empty_stmt(s: &CStmt) -> bool {
-    matches!(s, CStmt::Empty)
-}
-
-fn is_break_stmt(s: &CStmt) -> bool {
-    matches!(s, CStmt::Break)
 }
 
 fn negate_cond(cond: &CExpr) -> CExpr {
@@ -3105,6 +3404,134 @@ fn remove_gotos_to_missing_labels(stmt: &CStmt, missing: &HashSet<String>) -> CS
             l.clone(),
             Box::new(remove_gotos_to_missing_labels(inner, missing)),
         ),
+        other => other.clone(),
+    }
+}
+
+// Return-value forwarding: when `if (...) { var = val; } else { var = val2; } return var;`
+// transform to `if (...) { return val; } else { return val2; }`
+fn forward_return_value(stmt: &CStmt) -> CStmt {
+    match stmt {
+        CStmt::Block(items) => {
+            let new_items = forward_return_in_block_items(items);
+            CStmt::Block(new_items)
+        }
+        CStmt::Sequence(stmts) => {
+            let items: Vec<CBlockItem> = stmts.iter().map(|s| CBlockItem::Stmt(s.clone())).collect();
+            let new_items = forward_return_in_block_items(&items);
+            let new_stmts: Vec<CStmt> = new_items.into_iter().filter_map(|i| match i {
+                CBlockItem::Stmt(s) => Some(s),
+                _ => None,
+            }).collect();
+            if new_stmts.len() == 1 {
+                new_stmts.into_iter().next().unwrap()
+            } else {
+                CStmt::Sequence(new_stmts)
+            }
+        }
+        CStmt::If(cond, then_s, else_s) => CStmt::If(
+            cond.clone(),
+            Box::new(forward_return_value(then_s)),
+            else_s.as_ref().map(|s| Box::new(forward_return_value(s))),
+        ),
+        CStmt::While(cond, body) => CStmt::While(cond.clone(), Box::new(forward_return_value(body))),
+        CStmt::DoWhile(body, cond) => CStmt::DoWhile(Box::new(forward_return_value(body)), cond.clone()),
+        CStmt::For(init, cond, upd, body) => CStmt::For(init.clone(), cond.clone(), upd.clone(), Box::new(forward_return_value(body))),
+        CStmt::Labeled(l, inner) => CStmt::Labeled(l.clone(), Box::new(forward_return_value(inner))),
+        _ => stmt.clone(),
+    }
+}
+
+fn forward_return_in_block_items(items: &[CBlockItem]) -> Vec<CBlockItem> {
+    let mut result = items.to_vec();
+    // Look for: ..., If(cond, then, else), Return(var) where If assigns var in every branch
+    let mut i = 0;
+    while i + 1 < result.len() {
+        let var_match = match (&result[i], &result[i + 1]) {
+            (CBlockItem::Stmt(if_stmt @ CStmt::If(_, _, Some(_))),
+             CBlockItem::Stmt(CStmt::Return(Some(CExpr::Var(ret_var))))) => {
+                if all_branches_assign_last(if_stmt, ret_var) {
+                    Some(ret_var.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(var_name) = var_match {
+            if let CBlockItem::Stmt(if_stmt) = &result[i] {
+                let transformed = replace_last_assign_with_return(if_stmt, &var_name);
+                result[i] = CBlockItem::Stmt(forward_return_value(&transformed));
+                result.remove(i + 1);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    for item in &mut result {
+        if let CBlockItem::Stmt(s) = item {
+            *s = forward_return_value(s);
+        }
+    }
+    result
+}
+
+// Check if every branch of the if-else tree assigns to `var` as its last effective statement
+fn all_branches_assign_last(stmt: &CStmt, var: &str) -> bool {
+    match stmt {
+        CStmt::If(_, then_s, Some(else_s)) => {
+            last_stmt_assigns(then_s, var) && last_stmt_assigns(else_s, var)
+        }
+        _ => false,
+    }
+}
+
+fn last_stmt_assigns(stmt: &CStmt, var: &str) -> bool {
+    match stmt {
+        CStmt::Expr(CExpr::Assign(AssignOp::Assign, lhs, _)) => {
+            matches!(lhs.as_ref(), CExpr::Var(v) if v == var)
+        }
+        CStmt::If(_, _, Some(_)) => all_branches_assign_last(stmt, var),
+        CStmt::Block(items) => {
+            items.iter().rev().find_map(|i| match i {
+                CBlockItem::Stmt(s) if !matches!(s, CStmt::Empty) => Some(s),
+                _ => None,
+            }).map_or(false, |s| last_stmt_assigns(s, var))
+        }
+        CStmt::Sequence(stmts) => {
+            stmts.last().map_or(false, |s| last_stmt_assigns(s, var))
+        }
+        _ => false,
+    }
+}
+
+// Replace the last `var = val` in each branch with `return val`
+fn replace_last_assign_with_return(stmt: &CStmt, var: &str) -> CStmt {
+    match stmt {
+        CStmt::If(cond, then_s, Some(else_s)) => CStmt::If(
+            cond.clone(),
+            Box::new(replace_last_assign_with_return(then_s, var)),
+            Some(Box::new(replace_last_assign_with_return(else_s, var))),
+        ),
+        CStmt::Expr(CExpr::Assign(AssignOp::Assign, lhs, rhs)) if matches!(lhs.as_ref(), CExpr::Var(v) if v == var) => {
+            CStmt::Return(Some(*rhs.clone()))
+        }
+        CStmt::Block(items) => {
+            let mut new_items = items.clone();
+            if let Some(last_stmt_idx) = new_items.iter().rposition(|i| matches!(i, CBlockItem::Stmt(s) if !matches!(s, CStmt::Empty))) {
+                if let CBlockItem::Stmt(s) = &new_items[last_stmt_idx] {
+                    new_items[last_stmt_idx] = CBlockItem::Stmt(replace_last_assign_with_return(s, var));
+                }
+            }
+            CStmt::Block(new_items)
+        }
+        CStmt::Sequence(stmts) => {
+            let mut new_stmts = stmts.clone();
+            if let Some(last) = new_stmts.last_mut() {
+                *last = replace_last_assign_with_return(last, var);
+            }
+            CStmt::Sequence(new_stmts)
+        }
         other => other.clone(),
     }
 }

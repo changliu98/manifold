@@ -10,10 +10,7 @@ use crate::x86::op::Condition;
 use crate::x86::types::*;
 use ascent::ascent_par;
 use either::Either;
-use std::collections::HashMap;
-use std::collections::HashSet;
 use log::info;
-use std::sync::{Mutex, OnceLock};
 
 
 ascent_par! {
@@ -31,7 +28,6 @@ ascent_par! {
     relation emit_clight_stmt(Address, Node, ClightStmt);
     relation emit_function_return_type_candidate(Address, ClightType);
     relation emit_goto_target(Address, Node);
-    relation emit_ifthenelse_body(Address, Node, Node, bool);
     relation emit_loop_body(Address, Node, Node);
     relation emit_loop_exit(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node);
     relation emit_switch_chain(Address, Node, RTLReg);
@@ -40,7 +36,6 @@ ascent_par! {
     relation func_span(Symbol, Address, Address);
     relation global_struct_catalog(u64, usize, usize, usize);
     relation ident_to_symbol(Ident, Symbol);
-    relation ifthenelse_merge_point(Address, Node, Node);
     relation instr_in_function(Node, Address);
     relation is_external_function(Address);
     relation known_extern_signature(Symbol, usize, XType, Arc<Vec<XType>>);
@@ -58,6 +53,11 @@ ascent_par! {
     relation string_data(String, String, usize);
     relation struct_field(u64, i64, String, MemoryChunk);
     relation struct_id_to_canonical(usize, usize);
+    relation symbol_resolved_addr(Symbol, Address);
+
+    relation jumptable_target_sym(Address, usize, Symbol);
+    relation jumptable_target_resolved(Address, usize, Address);
+    relation jumptable_has_resolved(Address);
 
     relation block_boundaries(Address, Address, Address);
     relation block_in_function(Node, Address);
@@ -76,10 +76,6 @@ ascent_par! {
 
     relation ltl_inst(Node, LTLInst);
     relation ltl_succ(Node, Node);
-    #[local]
-    #[ds(ascent_byods_rels::trrel)]
-    relation ltl_reachable_tc(Node, Node);
-    relation ltl_reachable(Node, Node);
     relation is_function_entry(Address);
     relation emit_sseq(Node, Node);
     relation emit_function_has_return_candidate(Address);
@@ -192,14 +188,12 @@ ascent_par! {
 
     ltl_inst(addr, inst) <--
         linear_inst(addr, ?LinearInst::Lcall(Either::Right(Either::Left(sym)))),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(sym),
-        if let Some(target_addr) = target_opt,
-        let inst = LTLInst::Lcall(Either::Right(Either::Left(target_addr)));
+        symbol_resolved_addr(*sym, target_addr),
+        let inst = LTLInst::Lcall(Either::Right(Either::Left(*target_addr)));
 
     ltl_inst(addr, inst) <--
         linear_inst(addr, ?LinearInst::Lcall(Either::Right(Either::Left(sym)))),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(sym),
-        if target_opt.is_none(),
+        !symbol_resolved_addr(*sym, _),
         let inst = LTLInst::Lcall(Either::Right(Either::Right(sym.clone())));
 
     ltl_inst(addr, inst) <--
@@ -212,14 +206,12 @@ ascent_par! {
 
     ltl_inst(addr, inst) <--
         linear_inst(addr, ?LinearInst::Ltailcall(Either::Right(Either::Left(sym)))),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(sym),
-        if let Some(target_addr) = target_opt,
-        let inst = LTLInst::Ltailcall(Either::Right(Either::Left(target_addr)));
+        symbol_resolved_addr(*sym, target_addr),
+        let inst = LTLInst::Ltailcall(Either::Right(Either::Left(*target_addr)));
 
     ltl_inst(addr, inst) <--
         linear_inst(addr, ?LinearInst::Ltailcall(Either::Right(Either::Left(sym)))),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(sym),
-        if target_opt.is_none(),
+        !symbol_resolved_addr(*sym, _),
         let inst = LTLInst::Ltailcall(Either::Right(Either::Right(sym.clone())));
 
     ltl_inst(addr, inst) <--
@@ -303,14 +295,13 @@ ascent_par! {
         if *edge_type == "fallthrough";
 
 
-    ltl_branch_candidate(addr, target_addr) <--
+    ltl_branch_candidate(addr, *target_addr) <--
         linear_inst(addr, ?LinearInst::Lgoto(target_sym)),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(target_sym),
-        if let Some(target_addr) = target_opt;
+        symbol_resolved_addr(*target_sym, target_addr);
 
     ltl_inst(addr, ltlinst) <--
         linear_inst(addr, ?LinearInst::Lgoto(target_sym)),
-        if crate::decompile::passes::linear_pass::resolve_symbol_addr_call(target_sym).is_none(),
+        !symbol_resolved_addr(*target_sym, _),
         let ltlinst = LTLInst::Lbranch(Either::Left(target_sym.clone()));
 
 
@@ -337,9 +328,8 @@ ascent_par! {
     ltl_inst(addr, ltlinst) <--
         linear_inst(addr, ?LinearInst::Lcond(cond, args, target_sym)),
         lcond_real_fallthrough(addr, fallthrough),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(target_sym),
-        if let Some(target_addr) = target_opt,
-        ltl_canonical_node(target_addr, canon_target),
+        symbol_resolved_addr(*target_sym, target_addr),
+        ltl_canonical_node(*target_addr, canon_target),
         ltl_canonical_node(*fallthrough, canon_fallthrough),
         let ltlinst = LTLInst::Lcond(cond.clone(), args.clone(), Either::Right(*canon_target), Either::Right(*canon_fallthrough));
 
@@ -349,28 +339,38 @@ ascent_par! {
         code_in_block(addr, block),
         ddisasm_cfg_edge(block, fallthrough_blk, edge_type),
         if *edge_type == "fallthrough",
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(target_sym),
-        if let Some(target_addr) = target_opt,
-        ltl_canonical_node(target_addr, canon_target),
+        symbol_resolved_addr(*target_sym, target_addr),
+        ltl_canonical_node(*target_addr, canon_target),
         ltl_canonical_node(*fallthrough_blk, canon_fallthrough),
         let ltlinst = LTLInst::Lcond(cond.clone(), args.clone(), Either::Right(*canon_target), Either::Right(*canon_fallthrough));
 
     ltl_inst(addr, ltlinst) <--
         linear_inst(addr, ?LinearInst::Lcond(cond, args, target_sym)),
         lcond_real_fallthrough(addr, fallthrough),
-        if crate::decompile::passes::linear_pass::resolve_symbol_addr_call(target_sym).is_none(),
+        !symbol_resolved_addr(*target_sym, _),
         ltl_canonical_node(*fallthrough, canon_fallthrough),
         let ltlinst = LTLInst::Lcond(cond.clone(), args.clone(), Either::Left(target_sym.clone()), Either::Right(*canon_fallthrough));
 
+    jumptable_target_sym(*addr, i, *sym) <--
+        linear_inst(addr, ?LinearInst::Ljumptable(_, targets)),
+        for (i, sym) in targets.iter().enumerate();
+
+    jumptable_target_resolved(*addr, *i, *target_addr) <--
+        jumptable_target_sym(addr, i, sym),
+        symbol_resolved_addr(sym, target_addr);
+
+    jumptable_has_resolved(addr) <--
+        jumptable_target_resolved(addr, _, _);
+
     ltl_inst(addr, ltlinst) <--
-        linear_inst(addr, ?LinearInst::Ljumptable(arg, targets)),
-        let mut addrs = Vec::new(),
-        if { for sym in targets.iter() { if let Some(a) = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(sym) { addrs.push(a); } } !addrs.is_empty() },
+        linear_inst(addr, ?LinearInst::Ljumptable(arg, _)),
+        jumptable_has_resolved(addr),
+        agg addrs = crate::decompile::passes::linear_pass::build_jumptable_addrs(idx, target_addr) in jumptable_target_resolved(addr, idx, target_addr),
         let ltlinst = LTLInst::Ljumptable(*arg, addrs);
 
     ltl_inst(addr, ltlinst) <--
-        linear_inst(addr, ?LinearInst::Ljumptable(arg, targets)),
-        if { let any_resolved = targets.iter().any(|sym| crate::decompile::passes::linear_pass::resolve_symbol_addr_call(sym).is_some()); !any_resolved },
+        linear_inst(addr, ?LinearInst::Ljumptable(_, _)),
+        !jumptable_has_resolved(addr),
         next(addr, fallthrough),
         let ltlinst = LTLInst::Lbranch(Either::Right(*fallthrough));
 
@@ -455,10 +455,9 @@ ascent_par! {
         !ltl_branch_cycle(n),
         ltl_canonical_node(*t, canon);
 
-    ltl_canonical_node(target_addr, target_addr) <--
-        linear_inst(addr, ?LinearInst::Lcond(_, _, target_sym)),
-        let target_opt = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(target_sym),
-        if let Some(target_addr) = target_opt;
+    ltl_canonical_node(*target_addr, *target_addr) <--
+        linear_inst(_, ?LinearInst::Lcond(_, _, target_sym)),
+        symbol_resolved_addr(*target_sym, target_addr);
 
     ltl_canonical_node(ft, ft) <--
         lcond_real_fallthrough(_, ft);
@@ -502,9 +501,6 @@ ascent_par! {
     ltl_succ(src, dst) <--
         ltl_tailcall_target(src, dst);
 
-    ltl_reachable_tc(x, y) <-- ltl_succ(x, y);
-    ltl_reachable(x, y) <-- ltl_reachable_tc(x, y);
-
 
     call_targets_noreturn(call_site) <--
         call_to_callee(call_site, callee),
@@ -544,9 +540,9 @@ ascent_par! {
     call_to_callee(call_site, callee) <--
         ltl_inst(call_site, ?LTLInst::Lcall(Either::Right(Either::Left(callee))));
 
-    call_to_callee(call_site, addr) <--
+    call_to_callee(call_site, *addr) <--
         ltl_inst(call_site, ?LTLInst::Lcall(Either::Right(Either::Right(symbol)))),
-        if let Some(addr) = crate::decompile::passes::linear_pass::resolve_symbol_addr_call(symbol);
+        symbol_resolved_addr(*symbol, addr);
 
     call_to_callee(call_site, callee_addr) <--
         ltl_inst(call_site, ?LTLInst::Lcall(Either::Right(Either::Right(symbol)))),
@@ -560,7 +556,7 @@ ascent_par! {
 
     call_to_external(call_site, *symbol) <--
         ltl_inst(call_site, ?LTLInst::Lcall(Either::Right(Either::Right(symbol)))),
-        if crate::decompile::passes::linear_pass::resolve_symbol_addr_call(symbol).is_none();
+        !symbol_resolved_addr(*symbol, _);
 
     call_may_target(call_site, callee) <--
         call_to_callee(call_site, callee);
@@ -688,43 +684,14 @@ impl IRPass for LinearPass {
 }
 
 
-static UNRESOLVED_SYMBOLS_LOGGED: OnceLock<Mutex<HashSet<Symbol>>> = OnceLock::new();
-
-// Deduplicated set of unresolved symbols to avoid repeated log spam.
-fn unresolved_symbols_store() -> &'static Mutex<HashSet<Symbol>> {
-    UNRESOLVED_SYMBOLS_LOGGED.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-// Global symbol-to-address mapping, populated from op_immediate data during pipeline setup.
-static OP_IMMEDIATE_MAP: OnceLock<HashMap<&'static str, Address>> = OnceLock::new();
-
-// Initialize the symbol-to-address mapping table (called once during pipeline setup).
-pub fn init_op_immediate_map(entries: &[(&'static str, i64, usize)]) {
-    OP_IMMEDIATE_MAP.get_or_init(|| {
-        let mut map = HashMap::new();
-        for (sym, addr, _) in entries.iter() {
-            if *addr >= 0 {
-                map.insert(*sym, *addr as Address);
-            }
-        }
-        map
-    });
-}
-
-// Look up a symbol's concrete address in the global mapping.
-pub fn resolve_symbol_addr(sym: &Symbol) -> Option<Address> {
-    OP_IMMEDIATE_MAP.get().and_then(|map| map.get(sym)).copied()
-}
-
-// Resolve symbol address, logging once per unresolved symbol.
-pub fn resolve_symbol_addr_call(sym: &Symbol) -> Option<Address> {
-    if let Some(addr) = resolve_symbol_addr(sym) {
-        Some(addr)
-    } else {
-        let mut guard = unresolved_symbols_store().lock().unwrap();
-        guard.insert(sym.clone());
-        None
-    }
+// Ascent aggregator: collects jumptable target addresses sorted by index.
+pub fn build_jumptable_addrs<'a>(
+    inp: impl Iterator<Item = (&'a usize, &'a Address)>,
+) -> impl Iterator<Item = Vec<Address>> {
+    let mut pairs: Vec<(usize, Address)> = inp.map(|(idx, addr)| (*idx, *addr)).collect();
+    pairs.sort_by_key(|(idx, _)| *idx);
+    let addrs: Vec<Address> = pairs.into_iter().map(|(_, addr)| addr).collect();
+    std::iter::once(addrs)
 }
 
 // Returns true if the instruction can fall through to the next sequential address.

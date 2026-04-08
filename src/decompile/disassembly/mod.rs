@@ -6,10 +6,19 @@ pub mod block;
 pub mod cfg;
 pub mod function;
 
+use std::collections::HashMap;
 use std::path::Path;
 use crate::decompile::elevator::DecompileDB;
-use crate::decompile::passes::linear_pass::init_op_immediate_map;
 use crate::x86::types::*;
+
+/// Build a map from operand ID to immediate value from the op_immediate relation.
+pub fn build_op_imm_map<'a>(db: &'a DecompileDB) -> HashMap<&'a str, i64> {
+    let mut op_imm_map = HashMap::new();
+    for (id, val, _) in db.rel_iter::<(Symbol, i64, usize)>("op_immediate") {
+        op_imm_map.insert(*id, *val);
+    }
+    op_imm_map
+}
 
 // Top-level entry point: disassemble and analyze a binary, populating all DB relations.
 pub fn load_from_binary(db: &mut DecompileDB, binary_path: &Path) {
@@ -47,6 +56,28 @@ pub fn load_from_binary(db: &mut DecompileDB, binary_path: &Path) {
 
     cfg::build_cfg(db, &insns, &obj, jump_table_targets);
 
+    // Detect clang-style data lookup tables (value tables, not code address tables)
+    let data_lookup_tables = cfg::analyze_data_lookup_tables(db, &insns, &obj);
+    if !data_lookup_tables.is_empty() {
+        log::info!("Detected {} data lookup table(s)", data_lookup_tables.len());
+    }
+    for info in &data_lookup_tables {
+        let reg_str: &'static str = match &info.index_reg {
+            Some(r) => Box::leak(r.clone().into_boxed_str()),
+            None => "",
+        };
+        db.rel_push("data_lookup_table", (
+            info.mov_addr,
+            info.table_base,
+            info.entry_count,
+            info.entry_scale,
+            reg_str,
+        ));
+        for (idx, &val) in info.values.iter().enumerate() {
+            db.rel_push("data_lookup_table_value", (info.mov_addr, idx, val));
+        }
+    }
+
     db.rel_set("function_call", db.rel_iter::<(Address, Address)>("direct_call").cloned().collect::<ascent::boxcar::Vec<_>>());
 
     function::infer_functions(db, &insns);
@@ -55,13 +86,6 @@ pub fn load_from_binary(db: &mut DecompileDB, binary_path: &Path) {
 
 
     symbol::compute_labeled_addresses(db, &obj);
-
-    // Initialize op_immediate map with both operand immediates and symbol addresses
-    let mut combined: Vec<_> = db.rel_iter::<(Symbol, i64, usize)>("op_immediate").cloned().collect();
-    for (addr, name, _) in db.rel_iter::<(Address, Symbol, Symbol)>("symbols") {
-        combined.push((*name, *addr as i64, 0));
-    }
-    init_op_immediate_map(&combined);
 
     load_static_csv(db);
 

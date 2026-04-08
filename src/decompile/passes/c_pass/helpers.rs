@@ -480,6 +480,7 @@ pub fn convert_param_type_from_param(
             crate::x86::types::XType::Xlongunsigned => CType::ulong(),
             crate::x86::types::XType::Xptr => CType::ptr(CType::Void),
             crate::x86::types::XType::Xcharptr => CType::ptr(CType::char_signed()),
+            crate::x86::types::XType::Xcharptrptr => CType::ptr(CType::ptr(CType::char_signed())),
             crate::x86::types::XType::Xintptr => CType::ptr(CType::int()),
             crate::x86::types::XType::Xfloatptr => CType::ptr(CType::double()),
             crate::x86::types::XType::Xsingleptr => CType::ptr(CType::float()),

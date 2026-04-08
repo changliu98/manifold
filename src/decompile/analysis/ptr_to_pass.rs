@@ -144,10 +144,19 @@ ascent_par! {
         if *depth < 3,
         let child_prov_id = compute_provenance_id(*func, *dst);
 
-    // Every register in a provenance chain is derived from a pointer root (allocation site or function param) and carries a pointer value.
+    // A chain has pointer evidence when any member has an outgoing Embed or Deref edge.
+    // Chains with only Assign edges (simple register copies of integer values) do not
+    // constitute pointer evidence.
+    #[local] relation chain_has_ptr_evidence(Address, RTLReg, u64);
+    chain_has_ptr_evidence(func, root, prov_id) <--
+        provenance_chain(func, src, root, prov_id, _, _),
+        provenance_edge(func, src, _, edge_type, _),
+        if !matches!(edge_type, EdgeType::Assign);
+
     relation emit_var_type_candidate(RTLReg, XType);
     emit_var_type_candidate(reg, XType::Xptr) <--
-        provenance_chain(_, reg, _, _, _, _);
+        provenance_chain(func, reg, root, prov_id, _, _),
+        chain_has_ptr_evidence(func, root, prov_id);
 }
 
 // Unique provenance ID from function address and register

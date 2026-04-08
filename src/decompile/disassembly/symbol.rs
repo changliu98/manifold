@@ -1,5 +1,5 @@
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use object::{Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, SectionKind, SymbolKind};
 use crate::decompile::elevator::DecompileDB;
 use crate::x86::types::*;
@@ -103,6 +103,9 @@ fn load_plt(db: &mut DecompileDB, obj: &object::File) {
     let mut got_to_name: std::collections::HashMap<u64, &'static str> =
         std::collections::HashMap::new();
 
+    // Build relocation-index to name map for CET .plt entries (PUSH idx style)
+    let mut rela_plt_names: Vec<&'static str> = Vec::new();
+
     if let Some(dyn_symtab) = obj.dynamic_symbol_table() {
         // .rela.dyn entries (GLOB_DAT, etc.)
         if let Some(dyn_relocs) = obj.dynamic_relocations() {
@@ -119,6 +122,7 @@ fn load_plt(db: &mut DecompileDB, obj: &object::File) {
             }
         }
         // .rela.plt entries (JUMP_SLOT for PLT stubs -- not included in dynamic_relocations())
+        // Also builds rela_plt_names for CET .plt entries in a single pass.
         for section in obj.sections() {
             if section.name().unwrap_or("") == ".rela.plt" {
                 if let Ok(data) = section.data() {
@@ -139,30 +143,7 @@ fn load_plt(db: &mut DecompileDB, obj: &object::File) {
                                 got_to_name.insert(got_offset, leak(clean_name.to_string()));
                             }
                         }
-                        off += entry_size;
-                    }
-                }
-                break;
-            }
-        }
-    }
-
-    if got_to_name.is_empty() {
-        return;
-    }
-
-    // Build relocation-index to name map for CET .plt entries (PUSH idx style)
-    let mut rela_plt_names: Vec<&'static str> = Vec::new();
-    if obj.dynamic_symbol_table().is_some() {
-        for section in obj.sections() {
-            if section.name().unwrap_or("") == ".rela.plt" {
-                if let Ok(data) = section.data() {
-                    let entry_size = 24usize;
-                    let mut off = 0;
-                    while off + entry_size <= data.len() {
-                        let got_offset = u64::from_le_bytes(
-                            data[off..off + 8].try_into().unwrap_or([0; 8]),
-                        );
+                        // Build rela_plt_names: look up the got_offset we just potentially inserted
                         if let Some(&name) = got_to_name.get(&got_offset) {
                             rela_plt_names.push(name);
                         } else {
@@ -174,6 +155,10 @@ fn load_plt(db: &mut DecompileDB, obj: &object::File) {
                 break;
             }
         }
+    }
+
+    if got_to_name.is_empty() {
+        return;
     }
 
     let cs = match capstone::Capstone::new()
@@ -440,10 +425,16 @@ pub fn compute_labeled_addresses(db: &mut DecompileDB, obj: &object::File) {
 
     let mut rip_ops: HashSet<&'static str> = HashSet::new();
     let mut rip_op_disp: Vec<(&'static str, i64)> = Vec::new();
-    for (id, _seg, base, _index, _scale, disp, _) in db.rel_iter::<(Symbol, &'static str, &'static str, &'static str, i64, i64, usize)>("op_indirect") {
+    let mut abs_ops: HashSet<&'static str> = HashSet::new();
+    let mut abs_op_disp: Vec<(&'static str, i64)> = Vec::new();
+    for (id, _seg, base, index, _scale, disp, _) in db.rel_iter::<(Symbol, &'static str, &'static str, &'static str, i64, i64, usize)>("op_indirect") {
         if base.ends_with("IP") {
             rip_ops.insert(*id);
             rip_op_disp.push((*id, *disp));
+        } else if (*base == "NONE" || base.is_empty()) && (*index == "NONE" || index.is_empty()) && *disp > 0 {
+            // Absolute addressing (clang -fno-pie): displacement is the address itself
+            abs_ops.insert(*id);
+            abs_op_disp.push((*id, *disp));
         }
     }
 
@@ -454,6 +445,18 @@ pub fn compute_labeled_addresses(db: &mut DecompileDB, obj: &object::File) {
                 for (rid, disp) in &rip_op_disp {
                     if *rid == *op_id {
                         let target = (*addr as i64 + *size as i64 + *disp) as u64;
+                        if target > 0 && in_data_section(target) {
+                            labeled.insert(target);
+                        }
+                        break;
+                    }
+                }
+            }
+            if abs_ops.contains(op_id) {
+                for (rid, disp) in &abs_op_disp {
+                    if *rid == *op_id {
+                        // For absolute addressing, the displacement IS the target address
+                        let target = *disp as u64;
                         if target > 0 && in_data_section(target) {
                             labeled.insert(target);
                         }
@@ -529,4 +532,18 @@ pub fn compute_labeled_addresses(db: &mut DecompileDB, obj: &object::File) {
 
     log::info!("Labeled addresses: {} new symbols ({} total)",
              count, db.rel_iter::<(Address, Symbol, Symbol)>("symbols").count());
+
+    // Build symbol_resolved_addr: maps symbol names to addresses (symbols override op_immediate, last-write-wins).
+    let mut resolved_map: std::collections::BTreeMap<Symbol, Address> = std::collections::BTreeMap::new();
+    for (sym, addr, _) in db.rel_iter::<(Symbol, i64, usize)>("op_immediate") {
+        if *addr >= 0 {
+            resolved_map.insert(*sym, *addr as Address);
+        }
+    }
+    for (addr, name, _) in db.rel_iter::<(Address, Symbol, Symbol)>("symbols") {
+        resolved_map.insert(*name, *addr);
+    }
+    for (sym, addr) in &resolved_map {
+        db.rel_push("symbol_resolved_addr", (*sym, *addr));
+    }
 }

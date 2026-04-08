@@ -47,17 +47,6 @@ pub struct StackVar {
     pub ptr_class: String,
 }
 
-// Classify an RTL register as pointer, data, or unknown from is_ptr/is_not_ptr relations.
-fn get_ptr_class_string(db: &DecompileDB, rtl_reg: u64) -> String {
-    let in_ptr = db.rel_iter::<(RTLReg,)>("is_ptr").any(|(r,)| *r == rtl_reg);
-    let in_not_ptr = db.rel_iter::<(RTLReg,)>("is_not_ptr").any(|(r,)| *r == rtl_reg);
-
-    match (in_ptr, in_not_ptr) {
-        (true, false) => "pointer".to_string(),
-        (false, true) => "data".to_string(),
-        _ => "unknown".to_string(),
-    }
-}
 
 // Dump all IR stages (mach, linear, ltl, rtl, cminor, clight) per instruction to YAML.
 pub fn dump_debug(
@@ -192,7 +181,13 @@ pub fn dump_debug(
         let mut stack_vars_set = HashSet::new();
         if let Some(stack_var_list) = stack_var_map.get(addr) {
             for (offset, rtl_reg) in stack_var_list {
-                let ptr_class = get_ptr_class_string(db, *rtl_reg);
+                let in_ptr = db.rel_iter::<(RTLReg,)>("is_ptr").any(|(r,)| *r == *rtl_reg);
+                let in_not_ptr = db.rel_iter::<(RTLReg,)>("is_not_ptr").any(|(r,)| *r == *rtl_reg);
+                let ptr_class = match (in_ptr, in_not_ptr) {
+                    (true, false) => "pointer".to_string(),
+                    (false, true) => "data".to_string(),
+                    _ => "unknown".to_string(),
+                };
                 stack_vars_set.insert((*offset, *rtl_reg, ptr_class));
             }
         }

@@ -15,6 +15,69 @@ use ascent::ascent_par;
 use ascent::Dual;
 use either::Either;
 
+// Infer MemoryChunk from x86 mnemonic suffix (AT&T: b/w/l/q, MOV variants).
+fn chunk_from_mnem(mnem: &str) -> MemoryChunk {
+    let m = mnem.to_ascii_uppercase();
+    if m.contains("MOVB") || m.ends_with('B') { MemoryChunk::MInt8Unsigned }
+    else if m.contains("MOVW") || m.ends_with('W') { MemoryChunk::MInt16Unsigned }
+    else if m.contains("MOVL") || m.ends_with('L') { MemoryChunk::MInt32 }
+    else if m.contains("MOVQ") || m.ends_with('Q') { MemoryChunk::MInt64 }
+    else if m.contains("MOVSS") { MemoryChunk::MFloat32 }
+    else if m.contains("MOVSD") { MemoryChunk::MAny64 }
+    else { MemoryChunk::MAny64 }
+}
+
+// Like chunk_from_mnem but also handles MOVZB/MOVSB/MOVZW/MOVSW (sign/zero-extend loads).
+fn chunk_from_mnem_ext(mnem: &str) -> MemoryChunk {
+    let m = mnem.to_ascii_uppercase();
+    if m.contains("MOVZB") { MemoryChunk::MInt8Unsigned }
+    else if m.contains("MOVSB") { MemoryChunk::MInt8Signed }
+    else if m.contains("MOVZW") { MemoryChunk::MInt16Unsigned }
+    else if m.contains("MOVSW") { MemoryChunk::MInt16Signed }
+    else { chunk_from_mnem(mnem) }
+}
+
+/// Recover signed divisor d from magic-multiply constant: d = round(2^total_shift / magic).
+fn recover_signed_divisor(magic: i64, total_shift: i64) -> Option<i64> {
+    if magic <= 0 || total_shift < 32 {
+        return None;
+    }
+    let num = 1u128 << total_shift as u32;
+    let mag = magic as u128;
+    let d = (num + (mag / 2)) / mag; // rounded division
+    if d <= 1 || d > i64::MAX as u128 {
+        return None;
+    }
+    // Verify: magic ~= 2^total_shift / d
+    let check = num / d;
+    if (check as i64 - magic).unsigned_abs() <= 1 {
+        Some(d as i64)
+    } else {
+        None
+    }
+}
+
+/// Recover unsigned divisor d from magic-multiply constant: d = round(2^total_shift / magic).
+fn recover_unsigned_divisor(magic: i64, total_shift: i64) -> Option<i64> {
+    if total_shift < 32 {
+        return None;
+    }
+    let mag = magic as u64 as u128;
+    if mag == 0 {
+        return None;
+    }
+    let num = 1u128 << total_shift as u32;
+    let d = (num + (mag / 2)) / mag;
+    if d <= 1 || d > i64::MAX as u128 {
+        return None;
+    }
+    let check = num / d;
+    if (check as u64).wrapping_sub(magic as u64) <= 1 {
+        Some(d as i64)
+    } else {
+        None
+    }
+}
 
 ascent_par! {
     #![measure_rule_times]
@@ -30,15 +93,14 @@ ascent_par! {
     relation emit_clight_stmt(Address, Node, ClightStmt);
     relation emit_function_return_type_candidate(Address, ClightType);
     relation emit_goto_target(Address, Node);
-    relation emit_ifthenelse_body(Address, Node, Node, bool);
+
     relation emit_loop_body(Address, Node, Node);
     relation emit_loop_exit(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node);
     relation emit_switch_chain(Address, Node, RTLReg);
     relation func_param_struct_type_candidate(Address, usize, usize);
-    relation func_return_struct_type(Address, usize);
     relation global_struct_catalog(u64, usize, usize, usize);
     relation ident_to_symbol(Ident, Symbol);
-    relation ifthenelse_merge_point(Address, Node, Node);
+
     relation instr_in_function(Node, Address);
     relation known_extern_signature(Symbol, usize, XType, Arc<Vec<XType>>);
     relation known_func_param_is_ptr(Symbol, usize);
@@ -52,7 +114,6 @@ ascent_par! {
     relation reg_xtl(Node, Mreg, RTLReg);
     relation stack_var(Address, Address, i64, RTLReg);
     relation string_data(String, String, usize);
-    relation struct_field(u64, i64, String, MemoryChunk);
     relation struct_id_to_canonical(usize, usize);
 
     relation block_in_function(Node, Address);
@@ -402,6 +463,14 @@ ascent_par! {
         instruction(addr, _, _, inst, src, dst, _, _, _, _),
         if *inst == "CMOVNP" || *inst == "CMOVPO";
 
+    // CMOVS (sign flag set = negative) maps to CondL (same as JS)
+    pcmov(addr, TestCond::CondL, dst, src) <--
+        instruction(addr, _, _, "CMOVS", src, dst, _, _, _, _);
+
+    // CMOVNS (sign flag clear = non-negative) maps to CondGe (same as JNS)
+    pcmov(addr, TestCond::CondGe, dst, src) <--
+        instruction(addr, _, _, "CMOVNS", src, dst, _, _, _, _);
+
     relation pconvert(Address, Symbol, Symbol);
     pconvert(addr, dst, src)<--
         instruction(addr, _, _, inst_str, src, dst, _, _, _, _),
@@ -415,8 +484,16 @@ ascent_par! {
 
     relation pimul(Address, Symbol, Symbol);
     pimul(addr, dst, src)<--
-        instruction(addr, _, _, "IMUL", src, dst, _, _, _, _),
-        if *dst != "0";
+        instruction(addr, _, _, "IMUL", src, dst, op3, _, _, _),
+        if *dst != "0",
+        if *op3 == "0";
+
+    // 3-operand IMUL: imul dst, src, imm (dst = src * imm)
+    relation pimul3(Address, Symbol, Symbol, Symbol);
+    pimul3(addr, dst, src, imm)<--
+        instruction(addr, _, _, "IMUL", src, dst, imm, _, _, _),
+        if *dst != "0",
+        if *imm != "0";
 
     relation ppush(Address, Symbol);
     ppush(addr, src)<--
@@ -634,6 +711,10 @@ ascent_par! {
     relation pnop(Address);
     pnop(addr) <--
         instruction(addr, _, _, "NOP", _, _, _, _, _, _);
+    pnop(addr) <--
+        instruction(addr, _, _, "VZEROUPPER", _, _, _, _, _, _);
+    pnop(addr) <--
+        instruction(addr, _, _, "VZEROALL", _, _, _, _, _, _);
 
     relation pendbr64(Address);
     pendbr64(addr) <--
@@ -750,7 +831,7 @@ ascent_par! {
     relation pointer_to_external_symbol(Address, Symbol);
     relation global_symbol(Address, Symbol);
     relation arch_bit(i64);
-    relation suppress_instruction(Address);
+    relation trim_instruction(Address);
     relation vla_alloca(Address, Mreg, Mreg);
 
     relation mach_inst(Address, MachInst);
@@ -770,6 +851,7 @@ ascent_par! {
     relation type_to_memchunk(Typ, MemoryChunk);
     relation instruction(Address, usize, &'static str, &'static str, Symbol, Symbol, Symbol, Symbol, usize, usize);
     relation rip_target_addr(Address, Address);
+    relation abs_target_addr(Address, Address);
     relation is_external_function(Address);
     relation function_symbol(Address, Symbol);
     relation mach_func(Address, Address);
@@ -784,6 +866,15 @@ ascent_par! {
     relation addr_requiring_symbol(Address);
     relation mach_imm_stack_init(Address, i64, i64, Typ);
     relation mach_imm_indirect_store(Address, i64, Typ, Mreg, i64);
+    // Memory-source arithmetic: load from [base+disp], then apply op with dst_reg.
+    relation arith_load_op(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
+    // Memory-dest arithmetic with register source: load [base+disp], op with src_reg, store back.
+    relation arith_store_reg(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
+    // Memory-dest arithmetic with immediate source: load [base+disp], op_imm, store back.
+    relation arith_store_imm(Address, Operation, MemoryChunk, Mreg, i64);
+    // Absolute addressing arith store: read-modify-write at global symbol address.
+    relation arith_store_abs_reg(Address, Operation, MemoryChunk, Ident, i64, Mreg);
+    relation arith_store_abs_imm(Address, Operation, MemoryChunk, Ident, i64);
     relation transl_load_inferred(Address, MemoryChunk, Addrmode, Arc<Vec<Mreg>>, Mreg);
     relation transl_load(Address, MemoryChunk, Addrmode, Arc<Vec<Mreg>>, Mreg);
     relation expand_builtin_inline(Address, Symbol, Arc<Vec<BuiltinArg<Mreg>>>, BuiltinArg<Mreg>);
@@ -839,6 +930,11 @@ ascent_par! {
     reg_xmm("XMM4"); reg_xmm("XMM5"); reg_xmm("XMM6"); reg_xmm("XMM7");
     reg_xmm("XMM8"); reg_xmm("XMM9"); reg_xmm("XMM10"); reg_xmm("XMM11");
     reg_xmm("XMM12"); reg_xmm("XMM13"); reg_xmm("XMM14"); reg_xmm("XMM15");
+    // YMM registers alias to their XMM counterparts for scalarization
+    reg_xmm("YMM0"); reg_xmm("YMM1"); reg_xmm("YMM2"); reg_xmm("YMM3");
+    reg_xmm("YMM4"); reg_xmm("YMM5"); reg_xmm("YMM6"); reg_xmm("YMM7");
+    reg_xmm("YMM8"); reg_xmm("YMM9"); reg_xmm("YMM10"); reg_xmm("YMM11");
+    reg_xmm("YMM12"); reg_xmm("YMM13"); reg_xmm("YMM14"); reg_xmm("YMM15");
     ireg_hold_type("EAX".to_string(), Typ::Tint);
     ireg_hold_type("EBX".to_string(), Typ::Tint);
     ireg_hold_type("ECX".to_string(), Typ::Tint);
@@ -961,6 +1057,92 @@ ascent_par! {
         reg_ip(*base_str),
         let target = (*addr as i64 + *size as i64 + disp) as Address;
 
+    // RIP-relative target for comiss/ucomiss/comisd/ucomisd with memory operand
+    rip_target_addr(addr, target) <--
+        pucomiss(addr, _, src),
+        instruction(addr, size, _, _, _, _, _, _, _, _),
+        op_indirect(src, _, base_str, _, _, disp, _),
+        reg_ip(*base_str),
+        let target = (*addr as i64 + *size as i64 + disp) as Address;
+
+    rip_target_addr(addr, target) <--
+        pucomisd(addr, _, src),
+        instruction(addr, size, _, _, _, _, _, _, _, _),
+        op_indirect(src, _, base_str, _, _, disp, _),
+        reg_ip(*base_str),
+        let target = (*addr as i64 + *size as i64 + disp) as Address;
+
+    // Generic RIP-relative catch-all for instructions with a RIP-relative operand.
+    rip_target_addr(addr, target) <--
+        instruction(addr, size, _, _, op1, _, _, _, _, _),
+        op_indirect(op1, _, base_str, _, _, disp, _),
+        reg_ip(*base_str),
+        let target = (*addr as i64 + *size as i64 + disp) as Address;
+
+    rip_target_addr(addr, target) <--
+        instruction(addr, size, _, _, _, op2, _, _, _, _),
+        op_indirect(op2, _, base_str, _, _, disp, _),
+        reg_ip(*base_str),
+        let target = (*addr as i64 + *size as i64 + disp) as Address;
+
+    // Absolute addressing (clang -fno-pie): base="NONE", no index, displacement IS the address
+    abs_target_addr(addr, target) <--
+        pmov(addr, _, am),
+        op_indirect(am, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
+    abs_target_addr(addr, target) <--
+        pmov(addr, am, _),
+        op_indirect(am, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
+    abs_target_addr(addr, target) <--
+        plea(addr, _, am),
+        op_indirect(am, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
+    abs_target_addr(addr, target) <--
+        pucomiss(addr, _, src),
+        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
+    abs_target_addr(addr, target) <--
+        pucomisd(addr, _, src),
+        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
+    // Absolute addressing for padd/psub (arith_store patterns)
+    abs_target_addr(addr, target) <--
+        padd(addr, dst, _),
+        op_indirect(dst, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
+    abs_target_addr(addr, target) <--
+        psub(addr, dst, _),
+        op_indirect(dst, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
     resolved_addr_to_symbol(target, ident, 0) <--
         rip_target_addr(_, target),
         symbols(target, _, _),
@@ -968,6 +1150,19 @@ ascent_par! {
 
     resolved_addr_to_symbol(target, ident, offset) <--
         rip_target_addr(_, target),
+        func_span(_, start, end),
+        if *target >= *start && *target < *end,
+        let ident = *start as Ident,
+        let offset = (target - start) as i64;
+
+    // Symbol resolution for absolute addressing targets
+    resolved_addr_to_symbol(target, ident, 0) <--
+        abs_target_addr(_, target),
+        symbols(target, _, _),
+        let ident = *target as Ident;
+
+    resolved_addr_to_symbol(target, ident, offset) <--
+        abs_target_addr(_, target),
         func_span(_, start, end),
         if *target >= *start && *target < *end,
         let ident = *start as Ident,
@@ -1023,7 +1218,7 @@ ascent_par! {
     instruction(addr, size, mnemonic, dst, src1, src2, src3, src4, prefix, suffix) <--
         unrefinedinstruction(addr, size, mnemonic, dst, src1, src2, src3, src4, prefix, suffix),
         code_in_refined_block(addr, _),
-        !suppress_instruction(addr);
+        !trim_instruction(addr);
 
     mach_inst(addr, MachInst::Mbuiltin(
         "alloca".to_string(),
@@ -1165,8 +1360,9 @@ ascent_par! {
         pmov(addr, dst, src_sym),
         op_register(src_sym, src_str),
         let src = Mreg::from(src_str),
-        op_indirect(dst, _, r2, _, _scale, disp, _),
+        op_indirect(dst, _, r2, idx_str, _scale, disp, _),
         if Mreg::from(r2) != Mreg::BP && Mreg::from(r2) != Mreg::SP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
         let addrmode = Addrmode{
             base: Some(Ireg::from(r2)),
             index: None,
@@ -1178,6 +1374,46 @@ ascent_par! {
         ireg_hold_type(src_str.to_string(), typ),
         type_to_memchunk(typ, chunk);
 
+    // Indexed store (non-SP/non-BP base with index register)
+    transl_store_inferred(addr, *chunk, addrmode, regs.clone(), src) <--
+        pmov(addr, dst, src_sym),
+        op_register(src_sym, src_str),
+        let src = Mreg::from(src_str),
+        op_indirect(dst, _, r2, idx_str, scale, disp, _),
+        if Mreg::from(r2) != Mreg::BP && Mreg::from(r2) != Mreg::SP,
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        let addrmode = Addrmode{
+            base: Some(Ireg::from(r2)),
+            index: Some((Ireg::from(idx_str), *scale)),
+            disp: Displacement::from(*disp),
+        },
+        ireg_of(preg_of_r2, Ireg::from(r2)),
+        preg_of(arg, preg_of_r2),
+        ireg_of(preg_of_idx, Ireg::from(idx_str)),
+        preg_of(idx_arg, preg_of_idx),
+        let regs = Arc::new(vec![*arg, *idx_arg]),
+        ireg_hold_type(src_str.to_string(), typ),
+        type_to_memchunk(typ, chunk);
+
+    // Scaled-index store with no base register: mov src, disp(,%idx,scale)
+    transl_store_inferred(addr, *chunk, addrmode, regs.clone(), src) <--
+        pmov(addr, dst, src_sym),
+        op_register(src_sym, src_str),
+        let src = Mreg::from(src_str),
+        op_indirect(dst, _, base_str, idx_str, scale, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        let addrmode = Addrmode{
+            base: None,
+            index: Some((Ireg::from(idx_str), *scale)),
+            disp: Displacement::from(*disp),
+        },
+        ireg_of(preg_of_idx, Ireg::from(idx_str)),
+        preg_of(idx_arg, preg_of_idx),
+        let regs = Arc::new(vec![*idx_arg]),
+        ireg_hold_type(src_str.to_string(), typ),
+        type_to_memchunk(typ, chunk);
+
     transl_store(addr, mc, addrmode, regs, src) <--
         transl_store_inferred(addr, mc, addrmode, regs, src);
 
@@ -1185,8 +1421,9 @@ ascent_par! {
         pmov(addr, dst, src),
         op_register(src, dst_str),
         let dst_reg = Mreg::from(dst_str),
-        op_indirect(dst, _, r2, _, _scale, disp, _),
+        op_indirect(dst, _, r2, idx_str, _scale, disp, _),
         if Mreg::from(r2) != Mreg::BP && Mreg::from(r2) != Mreg::SP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
         let addrmode = Addrmode{
             base: Some(Ireg::from(r2)),
             index: None,
@@ -1197,23 +1434,49 @@ ascent_par! {
         let regs = Arc::new(vec![*arg]),
         !transl_store_inferred(addr, _, addrmode, _, _),
         instruction(addr, _, mnem, _, _, _, _, _, _, _),
-        let mnem_upper = mnem.to_ascii_uppercase(),
-        let mc = if mnem_upper.contains("MOVB") || mnem_upper.ends_with("B") {
-            MemoryChunk::MInt8Unsigned
-        } else if mnem_upper.contains("MOVW") || mnem_upper.ends_with("W") {
-            MemoryChunk::MInt16Unsigned
-        } else if mnem_upper.contains("MOVL") || mnem_upper.ends_with("L") {
-            MemoryChunk::MInt32
-        } else if mnem_upper.contains("MOVQ") || mnem_upper.ends_with("Q") {
-            MemoryChunk::MInt64
-        } else if mnem_upper.contains("MOVSS") {
-            MemoryChunk::MFloat32
-        } else if mnem_upper.contains("MOVSD") {
-            MemoryChunk::MFloat64
-        } else {
-            MemoryChunk::MAny64
-        };
+        let mc = chunk_from_mnem(mnem);
 
+    // Indexed store (mnemonic-based, non-SP/non-BP base with index register)
+    transl_store(addr, mc, addrmode, regs.clone(), dst_reg) <--
+        pmov(addr, dst, src),
+        op_register(src, dst_str),
+        let dst_reg = Mreg::from(dst_str),
+        op_indirect(dst, _, r2, idx_str, scale, disp, _),
+        if Mreg::from(r2) != Mreg::BP && Mreg::from(r2) != Mreg::SP,
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        let addrmode = Addrmode{
+            base: Some(Ireg::from(r2)),
+            index: Some((Ireg::from(idx_str), *scale)),
+            disp: Displacement::from(*disp),
+        },
+        ireg_of(preg_of_r2, Ireg::from(r2)),
+        preg_of(arg, preg_of_r2),
+        ireg_of(preg_of_idx, Ireg::from(idx_str)),
+        preg_of(idx_arg, preg_of_idx),
+        let regs = Arc::new(vec![*arg, *idx_arg]),
+        !transl_store_inferred(addr, _, addrmode, _, _),
+        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        let mc = chunk_from_mnem(mnem);
+
+    // Scaled-index store with no base register (mnemonic-based): mov src, disp(,%idx,scale)
+    transl_store(addr, mc, addrmode, regs.clone(), dst_reg) <--
+        pmov(addr, dst, src),
+        op_register(src, dst_str),
+        let dst_reg = Mreg::from(dst_str),
+        op_indirect(dst, _, base_str, idx_str, scale, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        let addrmode = Addrmode{
+            base: None,
+            index: Some((Ireg::from(idx_str), *scale)),
+            disp: Displacement::from(*disp),
+        },
+        ireg_of(preg_of_idx, Ireg::from(idx_str)),
+        preg_of(idx_arg, preg_of_idx),
+        let regs = Arc::new(vec![*idx_arg]),
+        !transl_store_inferred(addr, _, addrmode, _, _),
+        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        let mc = chunk_from_mnem(mnem);
 
     addrmode_needs_resolution(am, target_addr) <--
         transl_store(_, _, am, _, _),
@@ -1231,6 +1494,9 @@ ascent_par! {
 
     addr_requiring_symbol(target_addr) <--
         rip_target_addr(_, target_addr);
+
+    addr_requiring_symbol(target_addr) <--
+        abs_target_addr(_, target_addr);
     mach_inst(addr, MachInst::Mstore(*memory_chunk, addressing, Arc::new(args), *src)) <--
         transl_store(addr, memory_chunk, addrmode, regs, src),
         addrmode_needs_resolution(*addrmode, target_addr),
@@ -1247,8 +1513,9 @@ ascent_par! {
         pmov(addr, dst, src),
         op_register(src, srcstr),
         let src_reg = Mreg::from(srcstr),
-        op_indirect(dst, _, r2, _, _, disp, _),
+        op_indirect(dst, _, r2, idx, _, disp, _),
         if Mreg::from(r2) == Mreg::SP,
+        if *idx == "NONE",
         stack_offset(_, addr, rsp_ofs),
         let ofs_adjusted = *disp + rsp_ofs.0,
         ireg_hold_type(srcstr.to_string(), typ);
@@ -1257,8 +1524,9 @@ ascent_par! {
         pmov(addr, dst, src),
         op_register(src, srcstr),
         let src_reg = Mreg::from(srcstr),
-        op_indirect(dst, _, r2, _, _, disp, _),
+        op_indirect(dst, _, r2, idx, _, disp, _),
         if Mreg::from(r2) == Mreg::BP,
+        if *idx == "NONE",
         instr_in_function(addr, func),
         func_has_frame_pointer(func),
         ireg_hold_type(srcstr.to_string(), typ);
@@ -1266,8 +1534,9 @@ ascent_par! {
     mach_imm_stack_init(addr, disp, imm_int, ty) <--
         pmov(addr, dst, src),
         op_immediate(src, imm_sym, _),
-        op_indirect(dst, _, base, _, _, disp, sz),
+        op_indirect(dst, _, base, idx, _, disp, sz),
         if Mreg::from(base) == Mreg::BP,
+        if *idx == "NONE" || idx.is_empty(),
         instr_in_function(addr, func),
         func_has_frame_pointer(func),
         let ty = if *sz <= 4 { Typ::Tint } else { Typ::Tany64 },
@@ -1276,8 +1545,9 @@ ascent_par! {
     mach_imm_stack_init(addr, ofs_adjusted, imm_int, ty) <--
         pmov(addr, dst, src),
         op_immediate(src, imm_sym, _),
-        op_indirect(dst, _, base, _, _, disp, sz),
+        op_indirect(dst, _, base, idx, _, disp, sz),
         if Mreg::from(base) == Mreg::SP,
+        if *idx == "NONE" || idx.is_empty(),
         stack_offset(_, addr, rsp_ofs),
         let ofs_adjusted = *disp + rsp_ofs.0,
         let ty = if *sz <= 4 { Typ::Tint } else { Typ::Tany64 },
@@ -1288,14 +1558,16 @@ ascent_par! {
         op_immediate(src, imm_sym, _),
         op_indirect(dst, _, r2, _, _scale, disp, sz),
         if Mreg::from(r2) != Mreg::BP && Mreg::from(r2) != Mreg::SP,
+        if *r2 != "NONE" && !r2.is_empty(),
         let base_mreg = Mreg::from(r2),
         let ty = if *sz <= 4 { Typ::Tint } else { Typ::Tany64 },
         let imm_int = *imm_sym as i64;
 
     mach_inst(addr, MachInst::Mgetstack(*disp, *typ, Mreg::from(dststr))) <--
         pmov(addr, dst, src),
-        op_indirect(src, _, r2, _, _, disp, _),
+        op_indirect(src, _, r2, idx, _, disp, _),
         if Mreg::from(r2) == Mreg::SP,
+        if *idx == "NONE",
         op_register(dst, dststr),
         stack_offset(_, addr, rsp_ofs),
         let ofs_adjusted = *disp + rsp_ofs.0,
@@ -1303,12 +1575,49 @@ ascent_par! {
 
     mach_inst(addr, MachInst::Mgetstack(*disp, *typ, Mreg::from(dststr))) <--
         pmov(addr, dst, src),
-        op_indirect(src, _, r2, _, _, disp, _),
+        op_indirect(src, _, r2, idx, _, disp, _),
         if Mreg::from(r2) == Mreg::BP,
+        if *idx == "NONE",
         op_register(dst, dststr),
         instr_in_function(addr, func),
         func_has_frame_pointer(func),
         ireg_hold_type(dststr.to_string(), typ);
+
+    // SP-relative indexed load: treat as Mload with Aindexed2scaled addressing
+    mach_inst(addr, MachInst::Mload(*mc, addressing, Arc::new(args), Mreg::from(dststr))) <--
+        pmov(addr, dst, src),
+        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        if Mreg::from(base_str) == Mreg::SP,
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        op_register(dst, dststr),
+        ireg_hold_type(dststr.to_string(), typ),
+        type_to_memchunk(typ, mc),
+        ireg_of(preg_of_idx, Ireg::from(idx_str)),
+        preg_of(idx_arg, preg_of_idx),
+        let (addressing, args) = if *scale > 1 {
+            (Addressing::Aindexed2scaled(*scale, *disp), vec![Mreg::SP, *idx_arg])
+        } else {
+            (Addressing::Aindexed2(*disp), vec![Mreg::SP, *idx_arg])
+        };
+
+    // BP-relative indexed load with frame pointer: treat as Mload
+    mach_inst(addr, MachInst::Mload(*mc, addressing, Arc::new(args), Mreg::from(dststr))) <--
+        pmov(addr, dst, src),
+        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        if Mreg::from(base_str) == Mreg::BP,
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        op_register(dst, dststr),
+        instr_in_function(addr, func),
+        func_has_frame_pointer(func),
+        ireg_hold_type(dststr.to_string(), typ),
+        type_to_memchunk(typ, mc),
+        ireg_of(preg_of_idx, Ireg::from(idx_str)),
+        preg_of(idx_arg, preg_of_idx),
+        let (addressing, args) = if *scale > 1 {
+            (Addressing::Aindexed2scaled(*scale, *disp), vec![Mreg::BP, *idx_arg])
+        } else {
+            (Addressing::Aindexed2(*disp), vec![Mreg::BP, *idx_arg])
+        };
 
     // BP-relative load when BP is NOT the frame pointer: treat as regular memory load
     mach_inst(addr, MachInst::Mload(*mc, Addressing::Aindexed(*disp), Arc::new(vec![Mreg::BP]), Mreg::from(dststr))) <--
@@ -1331,22 +1640,7 @@ ascent_par! {
         !func_has_frame_pointer(func),
         !ireg_hold_type(dststr.to_string(), _),
         instruction(addr, _, mnem, _, _, _, _, _, _, _),
-        let mnem_upper = mnem.to_ascii_uppercase(),
-        let mc = if mnem_upper.contains("MOVZB") {
-            MemoryChunk::MInt8Unsigned
-        } else if mnem_upper.contains("MOVSB") {
-            MemoryChunk::MInt8Signed
-        } else if mnem_upper.contains("MOVZW") {
-            MemoryChunk::MInt16Unsigned
-        } else if mnem_upper.contains("MOVSW") {
-            MemoryChunk::MInt16Signed
-        } else if mnem_upper.contains("MOVL") || mnem_upper.ends_with("L") {
-            MemoryChunk::MInt32
-        } else if mnem_upper.contains("MOVQ") || mnem_upper.ends_with("Q") {
-            MemoryChunk::MInt64
-        } else {
-            MemoryChunk::MAny64
-        };
+        let mc = chunk_from_mnem_ext(mnem);
 
     // BP-relative store when BP is NOT the frame pointer
     mach_inst(addr, MachInst::Mstore(*mc, Addressing::Aindexed(*disp), Arc::new(vec![Mreg::BP]), src_reg)) <--
@@ -1371,18 +1665,7 @@ ascent_par! {
         !func_has_frame_pointer(func),
         !ireg_hold_type(srcstr.to_string(), _),
         instruction(addr, _, mnem, _, _, _, _, _, _, _),
-        let mnem_upper = mnem.to_ascii_uppercase(),
-        let mc = if mnem_upper.contains("MOVB") || mnem_upper.ends_with("B") {
-            MemoryChunk::MInt8Unsigned
-        } else if mnem_upper.contains("MOVW") || mnem_upper.ends_with("W") {
-            MemoryChunk::MInt16Unsigned
-        } else if mnem_upper.contains("MOVL") || mnem_upper.ends_with("L") {
-            MemoryChunk::MInt32
-        } else if mnem_upper.contains("MOVQ") || mnem_upper.ends_with("Q") {
-            MemoryChunk::MInt64
-        } else {
-            MemoryChunk::MAny64
-        };
+        let mc = chunk_from_mnem(mnem);
 
     // BP-relative immediate store when BP is NOT the frame pointer
     mach_imm_indirect_store(addr, imm_int, ty, Mreg::BP, *disp) <--
@@ -1424,6 +1707,75 @@ ascent_par! {
         pcmp(addr0, _, _),
         pcmov(addr1, _, _, _);
 
+    // CMP/TEST -> 1 non-flag-clobbering instruction -> CMOV
+    cmp_cmov_link(addr0, addr2) <--
+        pcmp(addr0, _, _),
+        next(addr0, addr1),
+        instruction(addr1, _, _, mnem1, _, _, _, _, _, _),
+        if !is_flag_setting(mnem1),
+        next(addr1, addr2),
+        pcmov(addr2, _, _, _);
+
+    // CMP/TEST -> 2 non-flag-clobbering instructions -> CMOV
+    cmp_cmov_link(addr0, addr3) <--
+        pcmp(addr0, _, _),
+        next(addr0, addr1),
+        instruction(addr1, _, _, mnem1, _, _, _, _, _, _),
+        if !is_flag_setting(mnem1),
+        next(addr1, addr2),
+        instruction(addr2, _, _, mnem2, _, _, _, _, _, _),
+        if !is_flag_setting(mnem2),
+        next(addr2, addr3),
+        pcmov(addr3, _, _, _);
+
+    // TEST -> CMOV link (TEST with different operands, not covered by TEST->pcmp synthesis)
+    #[local] relation test_cmov_link(Address, Address);
+    test_cmov_link(addr0, addr1) <--
+        ptest(addr0, _, _),
+        next(addr0, addr1),
+        pcmov(addr1, _, _, _);
+    test_cmov_link(addr0, addr1) <--
+        flags_and_jump_pair(addr0, addr1, _),
+        ptest(addr0, _, _),
+        pcmov(addr1, _, _, _);
+
+    // TEST -> 1 non-flag-clobbering instruction -> CMOV
+    test_cmov_link(addr0, addr2) <--
+        ptest(addr0, _, _),
+        next(addr0, addr1),
+        instruction(addr1, _, _, mnem1, _, _, _, _, _, _),
+        if !is_flag_setting(mnem1),
+        next(addr1, addr2),
+        pcmov(addr2, _, _, _);
+
+    // TEST -> 2 non-flag-clobbering instructions -> CMOV
+    test_cmov_link(addr0, addr3) <--
+        ptest(addr0, _, _),
+        next(addr0, addr1),
+        instruction(addr1, _, _, mnem1, _, _, _, _, _, _),
+        if !is_flag_setting(mnem1),
+        next(addr1, addr2),
+        instruction(addr2, _, _, mnem2, _, _, _, _, _, _),
+        if !is_flag_setting(mnem2),
+        next(addr2, addr3),
+        pcmov(addr3, _, _, _);
+
+    // NEG -> CMOV link: NEG sets flags (SF based on result), enabling CMOVS/CMOVNS.
+    #[local] relation neg_cmov_link(Address, Address);
+    neg_cmov_link(addr0, addr1) <--
+        pneg(addr0, _),
+        next(addr0, addr1),
+        pcmov(addr1, _, _, _);
+
+    // NEG -> 1 non-flag-clobbering instruction -> CMOV
+    neg_cmov_link(addr0, addr2) <--
+        pneg(addr0, _),
+        next(addr0, addr1),
+        instruction(addr1, _, _, mnem1, _, _, _, _, _, _),
+        if !is_flag_setting(mnem1),
+        next(addr1, addr2),
+        pcmov(addr2, _, _, _);
+
     #[local] relation fcmp_jcc_link(Address, Address);
     fcmp_jcc_link(addr0, addr1) <--
         pucomisd(addr0, _, _),
@@ -1440,8 +1792,7 @@ ascent_par! {
         flags_and_jump_pair(addr0, addr1, _),
         pucomiss(addr0, _, _);
 
-    // TestCond -> Condition divergence: CondE/CondNe are ZF-based (signedness-agnostic),
-    // so they map to both signed and unsigned comparison conditions.
+    // TestCond -> Condition divergence: CondE/CondNe are ZF-based (signedness-agnostic), so they map to both signed and unsigned comparison conditions.
     #[local] relation testcond_to_cond(TestCond, Condition);
     #[local] relation testcond_to_cond_64(TestCond, Condition);
 
@@ -1555,7 +1906,8 @@ ascent_par! {
         };
 
 
-    mach_inst(addr0, MachInst::Mop(
+    // CMP-imm + CMOV -> Osel: anchored at CMOV address so dst_mreg def is visible to downstream uses (avoids DSE when there is a gap).
+    mach_inst(addr1, MachInst::Mop(
         Operation::Osel(condition, typ),
         Arc::new(vec![*dst_mreg, *src_mreg, *cmp_arg1]),
         *dst_mreg
@@ -1587,7 +1939,8 @@ ascent_par! {
         reg_is_64(dst_str, dst_is_64),
         let typ = if *dst_is_64 { Typ::Tany64 } else { Typ::Tint };
 
-    mach_inst(addr0, MachInst::Mop(
+    // CMP-reg + CMOV -> Osel: anchored at CMOV address.
+    mach_inst(addr1, MachInst::Mop(
         Operation::Osel(condition, typ),
         Arc::new(vec![*dst_mreg, *src_mreg, *cmp_arg1, *cmp_arg2]),
         *dst_mreg
@@ -1611,6 +1964,38 @@ ascent_par! {
         let neg_cond = negate_testcond(*cmov_cond),
         reg_is_64(cmp_str1, cmp_is_64),
         let condition = condition_for_testcond_sized(neg_cond, *cmp_is_64),
+        reg_is_64(dst_str, dst_is_64),
+        let typ = if *dst_is_64 { Typ::Tany64 } else { Typ::Tint };
+
+    // NEG + CMOV -> Osel: anchored at CMOV address; NEG sets flags as `0 - operand`, condition compares NEG operand against 0; NEG reg is both input and negated output.
+    mach_inst(addr1, MachInst::Mop(
+        Operation::Osel(condition, typ),
+        Arc::new(vec![*dst_mreg, *src_mreg, *neg_arg]),
+        *dst_mreg
+    )) <--
+        pneg(addr0, neg_r),
+        op_register(neg_r, neg_reg_str),
+        ireg_of(preg_of_neg, Ireg::from(neg_reg_str)),
+        preg_of(neg_arg, preg_of_neg),
+        neg_cmov_link(addr0, addr1),
+        pcmov(addr1, cmov_cond, dst_sym, src_sym),
+        op_register(dst_sym, dst_str),
+        op_register(src_sym, src_str),
+        !reg_xmm(dst_str),
+        ireg_of(preg_of_dst, Ireg::from(dst_str)),
+        ireg_of(preg_of_src, Ireg::from(src_str)),
+        preg_of(dst_mreg, preg_of_dst),
+        preg_of(src_mreg, preg_of_src),
+        let neg_cond = negate_testcond(*cmov_cond),
+        reg_is_64(neg_reg_str, neg_is_64),
+        let base_cond = condition_for_testcond_sized(neg_cond, *neg_is_64),
+        let condition = match base_cond {
+            Condition::Ccomp(cmp) => Condition::Ccompimm(cmp, 0),
+            Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, 0),
+            Condition::Ccompl(cmp) => Condition::Ccomplimm(cmp, 0),
+            Condition::Ccomplu(cmp) => Condition::Ccompluimm(cmp, 0),
+            other => other,
+        },
         reg_is_64(dst_str, dst_is_64),
         let typ = if *dst_is_64 { Typ::Tany64 } else { Typ::Tint };
 
@@ -1939,6 +2324,140 @@ ascent_par! {
         preg_of(arg_mreg, preg_of_arg),
         let args = vec![*arg_mreg];
 
+    // Reusable sub-relations for multi-instruction idiom detection
+
+    // Unify SAR and SHR
+    relation pshift_right(Address, Symbol, Symbol);
+    pshift_right(addr, dst, src) <-- psar(addr, dst, src);
+    pshift_right(addr, dst, src) <-- pshr(addr, dst, src);
+
+    // 32-bit magic multiply: MOVSXD -> IMUL3 $MAGIC -> SAR/SHR
+    #[local] relation div_magic_32(Address, Address, i64, i64, Ireg, Ireg);
+    div_magic_32(addr0, addr2, *magic, *shift_n, Ireg::from(input_str), Ireg::from(imul_dst_str)) <--
+        pmov(addr0, movsxd_dst, movsxd_src),
+        instruction(addr0, _, _, mnem0, _, _, _, _, _, _),
+        if *mnem0 == "MOVSXD",
+        op_register(movsxd_dst, temp_str),
+        op_register(movsxd_src, input_str),
+        next(addr0, addr1),
+        pimul3(addr1, imul_dst, imul_src, imul_imm),
+        op_register(imul_dst, imul_dst_str),
+        op_register(imul_src, imul_src_str),
+        if imul_src_str == temp_str,
+        op_immediate(imul_imm, magic, _),
+        next(addr1, addr2),
+        pshift_right(addr2, sar_dst, sar_src),
+        op_register(sar_dst, sar_dst_str),
+        if sar_dst_str == imul_dst_str,
+        op_immediate(sar_src, shift_n, _),
+        if *shift_n >= 32;
+
+    // Magic multiply via MOV + 2-operand IMUL: mov $MAGIC, tmp; imul tmp, reg
+    #[local] relation div_magic_64(Address, Address, i64, i64, Ireg);
+    div_magic_64(addr0, addr2, *magic, *shift_n, Ireg::from(input_str)) <--
+        pmov(addr0, mov_dst, mov_src),
+        op_register(mov_dst, temp_str),
+        op_immediate(mov_src, magic, _),
+        if *magic != 0,
+        next(addr0, addr1),
+        pimul(addr1, imul_dst, imul_src),
+        op_register(imul_dst, input_str),
+        op_register(imul_src, imul_src_str),
+        if imul_src_str == temp_str,
+        next(addr1, addr2),
+        pshift_right(addr2, shr_dst, shr_src),
+        op_register(shr_dst, shr_dst_str),
+        if shr_dst_str == input_str,
+        op_immediate(shr_src, shift_n, _),
+        if *shift_n >= 32;
+
+    // Sign correction: SAR/SHR $31/$63 + SUB (signed division fixup)
+    #[local] relation sign_correction(Address, Address, Ireg, Ireg, i64);
+    sign_correction(shift_addr, sub_addr, Ireg::from(sign_str), Ireg::from(sub_dst_str), *sign_shift) <--
+        pshift_right(shift_addr, sign_dst, sign_src),
+        op_register(sign_dst, sign_str),
+        op_immediate(sign_src, sign_shift, _),
+        if *sign_shift == 31 || *sign_shift == 63,
+        next(shift_addr, sub_addr),
+        psub(sub_addr, sub_dst, sub_src),
+        op_register(sub_dst, sub_dst_str),
+        op_register(sub_src, sub_src_str),
+        if Ireg::from(sub_src_str) == Ireg::from(sign_str);
+
+    // Signed div (32-bit): MOVSXD -> IMUL3 -> SHR/SAR -> sign_correction
+    mach_inst(addr0, MachInst::Mop(op.clone(), Arc::new(args.clone()), *result_mreg)) <--
+        div_magic_32(addr0, shift_addr, magic, shift_n, input_ireg, result_ireg),
+        next(shift_addr, sign_addr),
+        sign_correction(sign_addr, _sub_addr, sign_ireg, sub_dst_ireg, sign_shift),
+        if *sign_shift == 31,
+        if sign_ireg == input_ireg,
+        if sub_dst_ireg == result_ireg,
+        let divisor_opt = recover_signed_divisor(*magic, *shift_n),
+        if divisor_opt.is_some(),
+        let divisor = divisor_opt.unwrap(),
+        ireg_of(preg_of_input, input_ireg),
+        preg_of(input_mreg, preg_of_input),
+        ireg_of(preg_of_result, sub_dst_ireg),
+        preg_of(result_mreg, preg_of_result),
+        let args = vec![*input_mreg],
+        let op = Operation::Odivimm(divisor);
+
+    // Signed div (64-bit): MOV $MAGIC -> IMUL -> SAR -> sign_correction
+    mach_inst(addr0, MachInst::Mop(op.clone(), Arc::new(args.clone()), *input_mreg)) <--
+        div_magic_64(addr0, shift_addr, magic, shift_n, input_ireg),
+        next(shift_addr, sign_addr),
+        sign_correction(sign_addr, _sub_addr, _sign_ireg, _sub_dst_ireg, 63),
+        let divisor_opt = recover_signed_divisor(*magic, *shift_n),
+        if divisor_opt.is_some(),
+        let divisor = divisor_opt.unwrap(),
+        ireg_of(preg_of_input, input_ireg),
+        preg_of(input_mreg, preg_of_input),
+        let args = vec![*input_mreg],
+        let op = Operation::Odivlimm(divisor);
+
+    // Unsigned div: MOV $MAGIC -> IMUL -> SHR (no sign correction)
+    mach_inst(addr0, MachInst::Mop(op.clone(), Arc::new(args.clone()), *input_mreg)) <--
+        div_magic_64(addr0, _shift_addr, magic, shift_n, input_ireg),
+        // Unsigned: the SHR is logical (already in div_magic_64) and no sign_correction follows
+        let divisor_opt = recover_unsigned_divisor(*magic, *shift_n),
+        if divisor_opt.is_some(),
+        let divisor = divisor_opt.unwrap(),
+        ireg_of(preg_of_input, input_ireg),
+        preg_of(input_mreg, preg_of_input),
+        let args = vec![*input_mreg],
+        let op = Operation::Odivuimm(divisor);
+
+
+    // Mark div-magic-consumed instructions so generic rules skip them.
+    #[local] relation div_consumed(Address);
+
+    // 32-bit: MOVSXD(addr0) -> IMUL(addr1) -> SHIFT(addr2) -> SAR(addr3) -> SUB(addr4)
+    div_consumed(imul_addr) <--
+        div_magic_32(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, imul_addr);
+    div_consumed(shift_addr) <--
+        div_magic_32(_, shift_addr, _, _, _, _);
+    div_consumed(sar_addr) <--
+        div_magic_32(_, shift_addr, _, _, _, _),
+        next(shift_addr, sar_addr);
+    div_consumed(sub_addr) <--
+        div_magic_32(_, shift_addr, _, _, _, _),
+        next(shift_addr, sar_addr),
+        next(sar_addr, sub_addr);
+
+    // 64-bit: MOV(addr0) -> IMUL(addr1) -> SHIFT(addr2) [-> SAR(addr3) -> SUB(addr4)]
+    div_consumed(imul_addr) <--
+        div_magic_64(mov_addr, _, _, _, _),
+        next(mov_addr, imul_addr);
+    div_consumed(shift_addr) <--
+        div_magic_64(_, shift_addr, _, _, _);
+    div_consumed(sar_addr) <--
+        div_magic_64(_, shift_addr, _, _, _),
+        next(shift_addr, sar_addr);
+    div_consumed(sub_addr) <--
+        div_magic_64(_, shift_addr, _, _, _),
+        next(shift_addr, sar_addr),
+        next(sar_addr, sub_addr);
 
     mach_inst(addr0, MachInst::Mcond(
         Condition::Cnotcompf(Comparison::Ceq),
@@ -1977,8 +2496,9 @@ ascent_par! {
         pmov(addr, dst_sym, src),
         op_register(dst_sym, dst_str),
         let dst = Mreg::from(dst_str),
-        op_indirect(src, _, r2, _, _scale, disp, _),
+        op_indirect(src, _, r2, idx_str, _scale, disp, _),
         if Mreg::from(r2) != Mreg::BP && Mreg::from(r2) != Mreg::SP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
         let addrmode = Addrmode{
             base: Some(Ireg::from(r2)),
             index: None,
@@ -1993,6 +2513,53 @@ ascent_par! {
         let mnem_upper = mnem.to_ascii_uppercase(),
         if !mnem_upper.contains("MOVZ") && !mnem_upper.contains("MOVS");
 
+    // Indexed load (non-SP/non-BP base with index register)
+    transl_load_inferred(addr, *chunk, addrmode, regs.clone(), dst) <--
+        pmov(addr, dst_sym, src),
+        op_register(dst_sym, dst_str),
+        let dst = Mreg::from(dst_str),
+        op_indirect(src, _, r2, idx_str, scale, disp, _),
+        if Mreg::from(r2) != Mreg::BP && Mreg::from(r2) != Mreg::SP,
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        let addrmode = Addrmode{
+            base: Some(Ireg::from(r2)),
+            index: Some((Ireg::from(idx_str), *scale)),
+            disp: Displacement::from(*disp),
+        },
+        ireg_of(preg_of_r2, Ireg::from(r2)),
+        preg_of(arg, preg_of_r2),
+        ireg_of(preg_of_idx, Ireg::from(idx_str)),
+        preg_of(idx_arg, preg_of_idx),
+        let regs = Arc::new(vec![*arg, *idx_arg]),
+        ireg_hold_type(dst_str.to_string(), typ),
+        type_to_memchunk(typ, chunk),
+        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        let mnem_upper = mnem.to_ascii_uppercase(),
+        if !mnem_upper.contains("MOVZ") && !mnem_upper.contains("MOVS");
+
+    // Scaled-index load with no base register: mov disp(,%idx,scale), dst
+    // Handles clang data lookup tables and similar patterns where base=NONE.
+    transl_load_inferred(addr, *chunk, addrmode, regs.clone(), dst) <--
+        pmov(addr, dst_sym, src),
+        op_register(dst_sym, dst_str),
+        let dst = Mreg::from(dst_str),
+        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        let addrmode = Addrmode{
+            base: None,
+            index: Some((Ireg::from(idx_str), *scale)),
+            disp: Displacement::from(*disp),
+        },
+        ireg_of(preg_of_idx, Ireg::from(idx_str)),
+        preg_of(idx_arg, preg_of_idx),
+        let regs = Arc::new(vec![*idx_arg]),
+        ireg_hold_type(dst_str.to_string(), typ),
+        type_to_memchunk(typ, chunk),
+        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        let mnem_upper = mnem.to_ascii_uppercase(),
+        if !mnem_upper.contains("MOVZ") && !mnem_upper.contains("MOVS");
+
     transl_load(addr, mc, addrmode, regs, dst) <--
         transl_load_inferred(addr, mc, addrmode, regs, dst);
 
@@ -2000,8 +2567,9 @@ ascent_par! {
         pmov(addr, dst, src),
         op_register(dst, dst_str),
         let dst_reg = Mreg::from(dst_str),
-        op_indirect(src, _, r2, _, _scale, disp, _),
+        op_indirect(src, _, r2, idx_str, _scale, disp, _),
         if Mreg::from(r2) != Mreg::BP && Mreg::from(r2) != Mreg::SP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
         let addrmode = Addrmode{
             base: Some(Ireg::from(r2)),
             index: None,
@@ -2012,35 +2580,62 @@ ascent_par! {
         let regs = Arc::new(vec![*arg]),
         !transl_load_inferred(addr, _, addrmode, _, _),
         instruction(addr, _, mnem, _, _, _, _, _, _, _),
-        let mnem_upper = mnem.to_ascii_uppercase(),
-        let mc = if mnem_upper.contains("MOVZB") {
-            MemoryChunk::MInt8Unsigned
-        } else if mnem_upper.contains("MOVSB") {
-            MemoryChunk::MInt8Signed
-        } else if mnem_upper.contains("MOVB") || mnem_upper.ends_with("B") {
-            MemoryChunk::MInt8Unsigned
-        } else if mnem_upper.contains("MOVZW") {
-            MemoryChunk::MInt16Unsigned
-        } else if mnem_upper.contains("MOVSW") {
-            MemoryChunk::MInt16Signed
-        } else if mnem_upper.contains("MOVW") || mnem_upper.ends_with("W") {
-            MemoryChunk::MInt16Unsigned
-        } else if mnem_upper.contains("MOVL") || mnem_upper.ends_with("L") {
-            MemoryChunk::MInt32
-        } else if mnem_upper.contains("MOVQ") || mnem_upper.ends_with("Q") {
-            MemoryChunk::MInt64
-        } else if mnem_upper.contains("MOVSS") {
-            MemoryChunk::MFloat32
-        } else if mnem_upper.contains("MOVSD") {
-            MemoryChunk::MFloat64
-        } else {
-            MemoryChunk::MAny64
-        };
+        let mc = chunk_from_mnem_ext(mnem);
+
+    // Indexed load (mnemonic-based, non-SP/non-BP base with index register)
+    transl_load(addr, mc, addrmode, regs.clone(), dst_reg) <--
+        pmov(addr, dst, src),
+        op_register(dst, dst_str),
+        let dst_reg = Mreg::from(dst_str),
+        op_indirect(src, _, r2, idx_str, scale, disp, _),
+        if Mreg::from(r2) != Mreg::BP && Mreg::from(r2) != Mreg::SP,
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        let addrmode = Addrmode{
+            base: Some(Ireg::from(r2)),
+            index: Some((Ireg::from(idx_str), *scale)),
+            disp: Displacement::from(*disp),
+        },
+        ireg_of(preg_of_r2, Ireg::from(r2)),
+        preg_of(arg, preg_of_r2),
+        ireg_of(preg_of_idx, Ireg::from(idx_str)),
+        preg_of(idx_arg, preg_of_idx),
+        let regs = Arc::new(vec![*arg, *idx_arg]),
+        !transl_load_inferred(addr, _, addrmode, _, _),
+        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        let mc = chunk_from_mnem_ext(mnem);
+
+    // Scaled-index load with no base register (mnemonic-based): mov disp(,%idx,scale), dst
+    transl_load(addr, mc, addrmode, regs.clone(), dst_reg) <--
+        pmov(addr, dst, src),
+        op_register(dst, dst_str),
+        let dst_reg = Mreg::from(dst_str),
+        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        let addrmode = Addrmode{
+            base: None,
+            index: Some((Ireg::from(idx_str), *scale)),
+            disp: Displacement::from(*disp),
+        },
+        ireg_of(preg_of_idx, Ireg::from(idx_str)),
+        preg_of(idx_arg, preg_of_idx),
+        let regs = Arc::new(vec![*idx_arg]),
+        !transl_load_inferred(addr, _, addrmode, _, _),
+        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        let mc = chunk_from_mnem_ext(mnem);
 
     mach_inst(addr, MachInst::Mload(*memory_chunk, addressing, Arc::new(args), *dst)) <--
         transl_load(addr, memory_chunk, addrmode, regs, dst),
         !addrmode_needs_resolution(*addrmode, _),
         if let Ok((addressing, args)) = transl_addressing_rev(*addrmode, None);
+
+    // Resolved load: transl_load whose addrmode needs symbol resolution (e.g., absolute displacement)
+    mach_inst(addr, MachInst::Mload(*memory_chunk, addressing, Arc::new(args), *src)) <--
+        transl_load(addr, memory_chunk, addrmode, regs, src),
+        addrmode_needs_resolution(*addrmode, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let resolved = Some((*ident, *offset)),
+        if let Ok((addressing, args)) = transl_addressing_rev(*addrmode, resolved);
 
     mach_inst(addr, MachInst::Mload(*mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), dst)) <--
         pmov(addr, dst_sym, src),
@@ -2063,6 +2658,87 @@ ascent_par! {
         resolved_addr_to_symbol(target_addr, ident, offset),
         ireg_hold_type(src_str.to_string(), typ),
         type_to_memchunk(typ, mc);
+
+    // Absolute addressing load: mov 0x40402c, %eax (base="NONE", disp is the address)
+    mach_inst(addr, MachInst::Mload(*mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), dst)) <--
+        pmov(addr, dst_sym, src),
+        op_register(dst_sym, dst_str),
+        let dst = Mreg::from(dst_str),
+        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        ireg_hold_type(dst_str.to_string(), typ),
+        type_to_memchunk(typ, mc);
+
+    // Absolute addressing load (mnemonic-based fallback)
+    mach_inst(addr, MachInst::Mload(mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), dst)) <--
+        pmov(addr, dst_sym, src),
+        op_register(dst_sym, dst_str),
+        let dst = Mreg::from(dst_str),
+        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        !ireg_hold_type(dst_str.to_string(), _),
+        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        let mc = chunk_from_mnem_ext(mnem);
+
+    // Absolute addressing store: mov %eax, 0x40402c (base="NONE", disp is the address)
+    mach_inst(addr, MachInst::Mstore(*mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), src)) <--
+        pmov(addr, dst, src_sym),
+        op_register(src_sym, src_str),
+        let src = Mreg::from(src_str),
+        op_indirect(dst, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        ireg_hold_type(src_str.to_string(), typ),
+        type_to_memchunk(typ, mc);
+
+    // Absolute addressing store (mnemonic-based fallback)
+    mach_inst(addr, MachInst::Mstore(mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), src)) <--
+        pmov(addr, dst, src_sym),
+        op_register(src_sym, src_str),
+        let src = Mreg::from(src_str),
+        op_indirect(dst, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        !ireg_hold_type(src_str.to_string(), _),
+        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        let mc = chunk_from_mnem(mnem);
+
+    // Absolute addressing immediate store: movl $0x1, 0x40402c (base="NONE", disp is the address)
+    mach_inst(addr, MachInst::Mop(Operation::Ointconst(imm_int), Arc::new(vec![]), Mreg::DI)) <--
+        pmov(addr, dst, src),
+        op_immediate(src, imm_sym, _),
+        op_indirect(dst, _, base_str, idx_str, _, disp, sz),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, _, _),
+        let imm_int = *imm_sym as i64;
+
+    mach_inst(addr, MachInst::Mstore(mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::DI)) <--
+        pmov(addr, dst, src),
+        op_immediate(src, _, _),
+        op_indirect(dst, _, base_str, idx_str, _, disp, sz),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let mc = if *sz <= 4 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
 
 
     mach_inst(address, MachInst::Mop(Operation::Omove, Arc::new(args), *res)) <--
@@ -2241,6 +2917,28 @@ ascent_par! {
             Operation::Ocast8signed
         };
 
+    // Sub-32-bit sign/zero extension via MOVSX/MOVZX from 8/16-bit source (prior rule only fires for reg_is_64 operands).
+    mach_inst(address, MachInst::Mop(cast_op, Arc::new(args.clone()), *res)) <--
+        pmov(address, r, r1),
+        op_register(r1, r1_str),
+        op_register(r, r_str),
+        if is_reg_8(r1_str) || is_reg_16(r1_str),
+        if !is_reg_8(r_str) && !is_reg_16(r_str),
+        ireg_of(preg_of_r1, Ireg::from(r1_str)),
+        preg_of(a1, preg_of_r1),
+        ireg_of(preg_of_res, Ireg::from(r_str)),
+        preg_of(res, preg_of_res),
+        instruction(address, _, mnem, _, _, _, _, _, _, _),
+        let mnem_upper = mnem.to_ascii_uppercase(),
+        let args = vec![*a1],
+        let cast_op = if mnem_upper.starts_with("MOVZX") || mnem_upper.starts_with("MOVZB") || mnem_upper.starts_with("MOVZW") {
+            if is_reg_8(r1_str) { Operation::Ocast8unsigned } else { Operation::Ocast16unsigned }
+        } else if mnem_upper.starts_with("MOVSX") || mnem_upper.starts_with("MOVSB") || mnem_upper.starts_with("MOVSW") {
+            if is_reg_8(r1_str) { Operation::Ocast8signed } else { Operation::Ocast16signed }
+        } else {
+            if is_reg_8(r1_str) { Operation::Ocast8signed } else { Operation::Ocast16signed }
+        };
+
     mach_inst(address, MachInst::Mop(Operation::Oneg, Arc::new(args), *res)) <--
         pneg(address, r),
         op_register(r, r_str),
@@ -2250,6 +2948,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(op, Arc::new(args), *res)) <--
         psub(address, r, r2),
+        !div_consumed(address),
         instruction(address, _, mnem, _, _, _, _, _, _, _),
         op_register(r, r_str),
         op_register(r2, r2_str),
@@ -2328,8 +3027,7 @@ ascent_par! {
             Operation::Oaddl
         };
 
-    // Divergence: ADD reg,reg can also be Olea(Aindexed2(0)) — CompCert has no Oadd for x86,
-    // register addition is Olea(Aindexed2 0) which compiles to LEA r,[r1+r2].
+    // Divergence: ADD reg,reg can also be Olea(Aindexed2(0)); CompCert has no Oadd for x86, register addition is Olea(Aindexed2 0) compiling to LEA r,[r1+r2].
     mach_inst(address, MachInst::Mop(op, Arc::new(args), *res)) <--
         padd(address, r, r2),
         instruction(address, _, mnem, _, _, _, _, _, _, _),
@@ -2350,8 +3048,9 @@ ascent_par! {
     mach_inst(address, MachInst::Mop(Operation::Olea(addressing), Arc::new(empty_args), *res)) <--
         plea(address, dst_reg, src_addr),
         op_register(dst_reg, dst_str),
-        op_indirect(src_addr, _, base_str, _, _, offset, _),
+        op_indirect(src_addr, _, base_str, idx_str, _, offset, _),
         reg_sp(base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
         ireg_of(preg_of_dst, Ireg::from(dst_str)),
         preg_of(res, preg_of_dst),
         let addressing = Addressing::Ainstack(*offset),
@@ -2360,8 +3059,9 @@ ascent_par! {
     mach_inst(address, MachInst::Mop(Operation::Olea(addressing), Arc::new(empty_args), *res)) <--
         pmov(address, dst_reg, src_addr),
         op_register(dst_reg, dst_str),
-        op_indirect(src_addr, _, base_str, _, _, offset, _),
+        op_indirect(src_addr, _, base_str, idx_str, _, offset, _),
         reg_sp(base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
         ireg_of(preg_of_dst, Ireg::from(dst_str)),
         preg_of(res, preg_of_dst),
         let addressing = Addressing::Ainstack(*offset),
@@ -2420,6 +3120,193 @@ ascent_par! {
             Operation::Oaddlimm(imm_int)
         };
 
+    // ADD/SUB with memory source, register destination: add reg, [mem]
+    // padd.dst = [mem] (memory source), padd.src = reg (register destination).
+    arith_load_op(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(dst_str)) <--
+        padd(address, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        !reg_sp(base_str),
+        !reg_ip(base_str),
+        let op = if *dst_is_64 { Operation::Oaddl } else { Operation::Oadd },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_load_op(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(dst_str)) <--
+        psub(address, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        !reg_sp(base_str),
+        !reg_ip(base_str),
+        let op = if *dst_is_64 { Operation::Osubl } else { Operation::Osub },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    // ADD/SUB with memory source on SP-relative (stack parameter access)
+    arith_load_op(*address, op, chunk, Mreg::SP, *disp, Mreg::from(dst_str)) <--
+        padd(address, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_sp(base_str),
+        let op = if *dst_is_64 { Operation::Oaddl } else { Operation::Oadd },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    // ADD/SUB with memory destination, register source: add [mem], reg
+    // padd.dst = [mem] (x86 destination), padd.src = reg (x86 source).
+    // This is a read-modify-write: load from [mem], op with reg, store back.
+    arith_store_reg(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(src_str)) <--
+        padd(address, dst, src),
+        op_register(src, src_str),
+        reg_is_64(src_str, src_is_64),
+        op_indirect(dst, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_sp(base_str),
+        !reg_ip(base_str),
+        let op = if *src_is_64 { Operation::Oaddl } else { Operation::Oadd },
+        let chunk = if *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_store_reg(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(src_str)) <--
+        psub(address, dst, src),
+        op_register(src, src_str),
+        reg_is_64(src_str, src_is_64),
+        op_indirect(dst, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_sp(base_str),
+        !reg_ip(base_str),
+        let op = if *src_is_64 { Operation::Osubl } else { Operation::Osub },
+        let chunk = if *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_store_reg(*address, op, chunk, Mreg::SP, *disp, Mreg::from(src_str)) <--
+        padd(address, dst, src),
+        op_register(src, src_str),
+        reg_is_64(src_str, src_is_64),
+        op_indirect(dst, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_sp(base_str),
+        let op = if *src_is_64 { Operation::Oaddl } else { Operation::Oadd },
+        let chunk = if *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_load_op(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(src_str)) <--
+        pand(address, dst, src),
+        op_register(src, src_str),
+        reg_is_64(src_str, src_is_64),
+        op_indirect(dst, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_sp(base_str),
+        !reg_ip(base_str),
+        let op = if *src_is_64 { Operation::Oandl } else { Operation::Oand },
+        let chunk = if *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_load_op(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(src_str)) <--
+        por(address, dst, src),
+        op_register(src, src_str),
+        reg_is_64(src_str, src_is_64),
+        op_indirect(dst, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_sp(base_str),
+        !reg_ip(base_str),
+        let op = if *src_is_64 { Operation::Oorl } else { Operation::Oor },
+        let chunk = if *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_load_op(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(src_str)) <--
+        pxor(address, dst, src),
+        op_register(src, src_str),
+        reg_is_64(src_str, src_is_64),
+        op_indirect(dst, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_sp(base_str),
+        !reg_ip(base_str),
+        let op = if *src_is_64 { Operation::Oxorl } else { Operation::Oxor },
+        let chunk = if *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    // ADD/SUB with immediate source, memory destination: addl $imm, [mem]
+    arith_store_imm(*address, op, chunk, Mreg::from(base_str), *disp) <--
+        padd(address, dst, src),
+        op_immediate(src, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_indirect(dst, _, base_str, idx, _, disp, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        let is_32 = *sz <= 4,
+        let op = if is_32 { Operation::Oaddimm(imm_int) } else { Operation::Oaddlimm(imm_int) },
+        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+
+    arith_store_imm(*address, op, chunk, Mreg::from(base_str), *disp) <--
+        psub(address, dst, src),
+        op_immediate(src, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_indirect(dst, _, base_str, idx, _, disp, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        let is_32 = *sz <= 4,
+        let op = if is_32 { Operation::Oaddimm(-imm_int) } else { Operation::Oaddlimm(-imm_int) },
+        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+
+    // Absolute addressing arith: add reg, 0x40402c (read-modify-write at global)
+    arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::from(src_str)) <--
+        padd(address, dst, src),
+        op_register(src, src_str),
+        reg_is_64(src_str, src_is_64),
+        op_indirect(dst, _, base_str, idx, _, disp, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *src_is_64 { Operation::Oaddl } else { Operation::Oadd },
+        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::from(src_str)) <--
+        psub(address, dst, src),
+        op_register(src, src_str),
+        reg_is_64(src_str, src_is_64),
+        op_indirect(dst, _, base_str, idx, _, disp, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *src_is_64 { Operation::Osubl } else { Operation::Osub },
+        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    // Absolute addressing arith: addl $imm, 0x40402c (read-modify-write at global)
+    arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
+        padd(address, dst, src),
+        op_immediate(src, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_indirect(dst, _, base_str, idx, _, disp, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let is_32 = *sz <= 4,
+        let op = if is_32 { Operation::Oaddimm(imm_int) } else { Operation::Oaddlimm(imm_int) },
+        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+
+    arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
+        psub(address, dst, src),
+        op_immediate(src, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_indirect(dst, _, base_str, idx, _, disp, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let is_32 = *sz <= 4,
+        let op = if is_32 { Operation::Oaddimm(-imm_int) } else { Operation::Oaddlimm(-imm_int) },
+        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+
     mach_inst(address, MachInst::Mop(Operation::Omul, Arc::new(args), *res)) <--
         pimul(address, r, r2),
         op_register(r, r_str),
@@ -2442,6 +3329,39 @@ ascent_par! {
         preg_of(res, preg_of_r),
         let args = vec![*res];
 
+    // 3-operand IMUL: imul dst, src, imm -> dst = src * imm (32-bit)
+    // Suppressed when the IMUL is part of a division-by-constant pattern.
+    mach_inst(address, MachInst::Mop(Operation::Omulimm(imm_int), Arc::new(args), *res)) <--
+        pimul3(address, dst, src, imm),
+        !div_consumed(address),
+        op_immediate(imm, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_register(dst, dst_str),
+        ireg_hold_type(dst_str.to_string(), typ),
+        if *typ == Typ::Tint,
+        op_register(src, src_str),
+        ireg_of(preg_of_dst, Ireg::from(dst_str)),
+        preg_of(res, preg_of_dst),
+        ireg_of(preg_of_src, Ireg::from(src_str)),
+        preg_of(src_arg, preg_of_src),
+        let args = vec![*src_arg];
+
+    // 3-operand IMUL: imul dst, src, imm -> dst = src * imm (64-bit)
+    // Suppressed when the IMUL is part of a division-by-constant pattern.
+    mach_inst(address, MachInst::Mop(Operation::Omullimm(imm_int), Arc::new(args), *res)) <--
+        pimul3(address, dst, src, imm),
+        !div_consumed(address),
+        op_immediate(imm, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_register(dst, dst_str),
+        ireg_hold_type(dst_str.to_string(), typ),
+        if *typ == Typ::Tlong || *typ == Typ::Tany64,
+        op_register(src, src_str),
+        ireg_of(preg_of_dst, Ireg::from(dst_str)),
+        preg_of(res, preg_of_dst),
+        ireg_of(preg_of_src, Ireg::from(src_str)),
+        preg_of(src_arg, preg_of_src),
+        let args = vec![*src_arg];
 
     mach_inst(address, MachInst::Mop(Operation::Omul, Arc::new(args), *res)) <--
         pimul(address, r, mem),
@@ -2703,6 +3623,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Oshrimm(imm_int), Arc::new(args), *res)) <--
         psar(address, r, n),
+        !div_consumed(address),
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, r_str),
@@ -2721,6 +3642,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Oshruimm(imm_int), Arc::new(args), *res)) <--
         pshr(address, r, n),
+        !div_consumed(address),
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, r_str),
@@ -2857,6 +3779,31 @@ ascent_par! {
         op_indirect(am, _, base_str, _, _, disp, _),
         reg_ip(*base_str),
         rip_target_addr(address, target_addr),
+        !resolved_addr_to_symbol(target_addr, _, _),
+        op_register(r, res_str),
+        ireg_of(preg_of_res, Ireg::from(res_str)),
+        preg_of(res, preg_of_res);
+
+    // Absolute addressing LEA: lea 0x40402c, %rax (base="NONE", no index, disp is the address)
+    mach_inst(address, MachInst::Mop(Operation::Oindirectsymbol(*ident as usize), Arc::new(vec![]), *res)) <--
+        plea(address, r, am),
+        op_indirect(am, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, _offset),
+        op_register(r, res_str),
+        ireg_of(preg_of_res, Ireg::from(res_str)),
+        preg_of(res, preg_of_res);
+
+    mach_inst(address, MachInst::Mop(Operation::Olongconst(*target_addr as i64), Arc::new(vec![]), *res)) <--
+        plea(address, r, am),
+        op_indirect(am, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(address, target_addr),
         !resolved_addr_to_symbol(target_addr, _, _),
         op_register(r, res_str),
         ireg_of(preg_of_res, Ireg::from(res_str)),
@@ -3138,6 +4085,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Oshrlimm(imm_int), Arc::new(args), *res)) <--
         psar(address, r, n),
+        !div_consumed(address),
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, r_str),
@@ -3156,6 +4104,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Oshrluimm(imm_int), Arc::new(args), *res)) <--
         pshr(address, r, n),
+        !div_consumed(address),
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, r_str),
@@ -3188,7 +4137,8 @@ ascent_par! {
         !reg_64(res_str),
         ireg_of(preg_of_res, Ireg::from(res_str)),
         preg_of(res, preg_of_res),
-        op_indirect(am, _, r_str, _, scale, disp, _),
+        op_indirect(am, _, r_str, index_str, scale, disp, _),
+        if *index_str == "NONE" || index_str.is_empty(),
         !reg_sp(*r_str), !reg_bp(*r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(arg, preg_of_r),
@@ -3217,13 +4167,64 @@ ascent_par! {
         !reg_64(res_str),
         ireg_of(preg_of_res, Ireg::from(res_str)),
         preg_of(res, preg_of_res),
-        op_indirect(am, _, r_str, _, scale, disp, _),
+        op_indirect(am, _, r_str, index_str, scale, disp, _),
+        if *index_str == "NONE" || index_str.is_empty(),
         !reg_sp(*r_str), !reg_bp(*r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(arg, preg_of_r),
         let args = vec![*arg],
         let addr = Addressing::Aindexed(*disp);
 
+    // 32-bit LEA with base + index (scale=1) -> Oleal(Aindexed2)
+    mach_inst(address, MachInst::Mop(Operation::Oleal(addr), Arc::new(args), *res)) <--
+        plea(address, r, am),
+        op_indirect(am, _, base_str, index_str, scale, disp, _),
+        if *index_str != "NONE" && !index_str.is_empty(),
+        !reg_sp(*base_str), !reg_bp(*base_str), !reg_ip(*base_str),
+        if *scale == 1,
+        op_register(r, res_str),
+        !reg_64(res_str),
+        ireg_of(preg_of_res, Ireg::from(res_str)),
+        preg_of(res, preg_of_res),
+        ireg_of(preg_of_base, Ireg::from(base_str)),
+        preg_of(base_arg, preg_of_base),
+        ireg_of(preg_of_index, Ireg::from(index_str)),
+        preg_of(index_arg, preg_of_index),
+        let args = vec![*base_arg, *index_arg],
+        let addr = Addressing::Aindexed2(*disp);
+
+    // 32-bit LEA with base + index (scale>1) -> Oleal(Aindexed2scaled)
+    mach_inst(address, MachInst::Mop(Operation::Oleal(addr), Arc::new(args), *res)) <--
+        plea(address, r, am),
+        op_indirect(am, _, base_str, index_str, scale, disp, _),
+        if *index_str != "NONE" && !index_str.is_empty(),
+        !reg_sp(*base_str), !reg_bp(*base_str), !reg_ip(*base_str),
+        if *scale > 1,
+        op_register(r, res_str),
+        !reg_64(res_str),
+        ireg_of(preg_of_res, Ireg::from(res_str)),
+        preg_of(res, preg_of_res),
+        ireg_of(preg_of_base, Ireg::from(base_str)),
+        preg_of(base_arg, preg_of_base),
+        ireg_of(preg_of_index, Ireg::from(index_str)),
+        preg_of(index_arg, preg_of_index),
+        let args = vec![*base_arg, *index_arg],
+        let addr = Addressing::Aindexed2scaled(*scale, *disp);
+
+    // 32-bit LEA with no base, just index -> Oleal(Ascaled)
+    mach_inst(address, MachInst::Mop(Operation::Oleal(addr), Arc::new(args), *res)) <--
+        plea(address, r, am),
+        op_indirect(am, _, base_str, index_str, scale, disp, _),
+        if *index_str != "NONE" && !index_str.is_empty(),
+        if *base_str == "NONE" || base_str.is_empty(),
+        op_register(r, res_str),
+        !reg_64(res_str),
+        ireg_of(preg_of_res, Ireg::from(res_str)),
+        preg_of(res, preg_of_res),
+        ireg_of(preg_of_index, Ireg::from(index_str)),
+        preg_of(index_arg, preg_of_index),
+        let args = vec![*index_arg],
+        let addr = Addressing::Ascaled(*scale, *disp);
 
     mach_inst(address, MachInst::Mop(Operation::Ointconst(0), Arc::new(vec![]), res)) <--
         ppxor(address, r, r2),
@@ -3722,6 +4723,80 @@ ascent_par! {
         fcmp_jcc_link(addr0, addr1),
         pjcc(addr1, TestCond::CondNe, lbl);
 
+    // comiss/ucomiss with RIP-relative memory operand: load float constant into FP0 (x87 ST0, safe scratch since SSE never uses it); Mcond rules below use FP0 as second operand.
+    mach_inst(addr0, MachInst::Mload(MemoryChunk::MFloat32, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::FP0)) <--
+        pucomiss(addr0, _r1, r2),
+        op_indirect(r2, _, base_str, _, _, _, _),
+        reg_ip(*base_str),
+        rip_target_addr(addr0, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset);
+
+    mach_inst(addr0, MachInst::Mload(MemoryChunk::MFloat64, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::FP0)) <--
+        pucomisd(addr0, _r1, r2),
+        op_indirect(r2, _, base_str, _, _, _, _),
+        reg_ip(*base_str),
+        rip_target_addr(addr0, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset);
+
+    // comiss/ucomiss with absolute addressing memory operand
+    mach_inst(addr0, MachInst::Mload(MemoryChunk::MFloat32, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::FP0)) <--
+        pucomiss(addr0, _r1, r2),
+        op_indirect(r2, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(addr0, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset);
+
+    mach_inst(addr0, MachInst::Mload(MemoryChunk::MFloat64, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::FP0)) <--
+        pucomisd(addr0, _r1, r2),
+        op_indirect(r2, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(addr0, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset);
+
+    // pucomiss with memory operand: Ccompfs variants
+    mach_inst(addr0, MachInst::Mcond(Condition::Ccompfs(Comparison::Cgt), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
+        pucomiss(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
+        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondA, lbl);
+    mach_inst(addr0, MachInst::Mcond(Condition::Ccompfs(Comparison::Cge), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
+        pucomiss(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
+        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondAe, lbl);
+    mach_inst(addr0, MachInst::Mcond(Condition::Ccompfs(Comparison::Clt), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
+        pucomiss(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
+        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondB, lbl);
+    mach_inst(addr0, MachInst::Mcond(Condition::Ccompfs(Comparison::Cle), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
+        pucomiss(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
+        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondBe, lbl);
+    mach_inst(addr0, MachInst::Mcond(Condition::Ccompfs(Comparison::Ceq), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
+        pucomiss(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
+        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondE, lbl);
+    mach_inst(addr0, MachInst::Mcond(Condition::Cnotcompfs(Comparison::Ceq), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
+        pucomiss(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
+        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondNe, lbl);
+
+    // pucomisd with memory operand: Ccompf variants
+    mach_inst(addr0, MachInst::Mcond(Condition::Ccompf(Comparison::Cgt), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
+        pucomisd(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
+        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondA, lbl);
+    mach_inst(addr0, MachInst::Mcond(Condition::Ccompf(Comparison::Cge), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
+        pucomisd(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
+        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondAe, lbl);
+    mach_inst(addr0, MachInst::Mcond(Condition::Ccompf(Comparison::Clt), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
+        pucomisd(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
+        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondB, lbl);
+    mach_inst(addr0, MachInst::Mcond(Condition::Ccompf(Comparison::Cle), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
+        pucomisd(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
+        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondBe, lbl);
+    mach_inst(addr0, MachInst::Mcond(Condition::Ccompf(Comparison::Ceq), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
+        pucomisd(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
+        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondE, lbl);
+    mach_inst(addr0, MachInst::Mcond(Condition::Cnotcompf(Comparison::Ceq), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
+        pucomisd(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
+        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondNe, lbl);
+
 
     mach_inst(address, MachInst::Mop(Operation::Omove, Arc::new(args), res)) <--
         pmovss(address, rd, rs),
@@ -4015,6 +5090,50 @@ ascent_par! {
         reg_sp(rsp_str),
         op_immediate(sz_sym, sz, _);
 
+    stack_delta(addr, -(*sz as i64)) <--
+        psub(addr, rsp_sym, sz_sym),
+        op_register(rsp_sym, rsp_str),
+        reg_sp(rsp_str),
+        op_immediate(sz_sym, sz, _);
+
+    // SysV x86-64 callee-save register names (RBX, RBP, R12-R15) for alignment push detection
+    #[local] relation is_callee_save_str(&'static str);
+    is_callee_save_str("RBX"); is_callee_save_str("EBX"); is_callee_save_str("BX"); is_callee_save_str("BL"); is_callee_save_str("BH");
+    is_callee_save_str("RBP"); is_callee_save_str("EBP"); is_callee_save_str("BP"); is_callee_save_str("BPL");
+    is_callee_save_str("R12"); is_callee_save_str("R12D"); is_callee_save_str("R12W"); is_callee_save_str("R12B");
+    is_callee_save_str("R13"); is_callee_save_str("R13D"); is_callee_save_str("R13W"); is_callee_save_str("R13B");
+    is_callee_save_str("R14"); is_callee_save_str("R14D"); is_callee_save_str("R14W"); is_callee_save_str("R14B");
+    is_callee_save_str("R15"); is_callee_save_str("R15D"); is_callee_save_str("R15W"); is_callee_save_str("R15B");
+
+    // Clang stack alignment: push of scratch register at function entry instead of sub $8, %rsp
+    #[local] relation push_align_alloc(Symbol, Address, i64);
+
+    push_align_alloc(func_name, start_addr, 8) <--
+        func_span(func_name, start_addr, end_addr),
+        ppush(start_addr, sym),
+        op_register(sym, reg_str),
+        !is_callee_save_str(reg_str),
+        !reg_sp(reg_str);
+
+    push_align_alloc(func_name, push_addr, 8) <--
+        func_span(func_name, start_addr, end_addr),
+        next(start_addr, push_addr),
+        if push_addr < end_addr,
+        ppush(push_addr, sym),
+        op_register(sym, reg_str),
+        !is_callee_save_str(reg_str),
+        !reg_sp(reg_str);
+
+    push_align_alloc(func_name, push_addr, 8) <--
+        func_span(func_name, start_addr, end_addr),
+        next(start_addr, mid_addr),
+        next(mid_addr, push_addr),
+        if push_addr < end_addr,
+        ppush(push_addr, sym),
+        op_register(sym, reg_str),
+        !is_callee_save_str(reg_str),
+        !reg_sp(reg_str);
+
     pfreeframe(addr1, sz_val) <--
         padd(addr1, rsp_sym, sz),
         op_register(rsp_sym, rsp_str),
@@ -4022,6 +5141,12 @@ ascent_par! {
         op_immediate(sz, sz_val, _),
         next(addr1, addr2),
         pret(addr2);
+
+    stack_delta(addr, *sz_val as i64) <--
+        padd(addr, rsp_sym, sz_sym),
+        op_register(rsp_sym, rsp_str),
+        reg_sp(rsp_str),
+        op_immediate(sz_sym, sz_val, _);
 
     pfreeframe(addr1, 0) <--
         ppop(addr1, rbp_sym),
@@ -4069,15 +5194,24 @@ ascent_par! {
         agg stack_size = aggregators::sum(sz) in pallocframe_by_func(func_name, _, sz),
         let stack_size_u64 = stack_size.max(0) as u64;
 
+    // Functions with no sub RSP but with alignment pushes: use push-based stack size
+    func_stacksz(start_addr, end_addr, *func_name, push_size_u64) <--
+        func_span(func_name, start_addr, end_addr),
+        !pallocframe_by_func(func_name, _, _),
+        agg push_size = aggregators::sum(sz) in push_align_alloc(func_name, _, sz),
+        let push_size_u64 = push_size.max(0) as u64;
+
+    // Functions with no sub RSP and no alignment pushes: zero stack size
     func_stacksz(start_addr, end_addr, *func_name, 0u64) <--
         func_span(func_name, start_addr, end_addr),
-        !pallocframe_by_func(func_name, _, _);
+        !pallocframe_by_func(func_name, _, _),
+        !push_align_alloc(func_name, _, _);
 
 
     relation is_arg_reg(Mreg);
     relation is_ret_reg(Mreg);
 
-    // Emit both signed and unsigned memory chunk variants for byte/word load/store since x86 MOV doesn't encode signedness; downstream type inference narrows.
+    // Emit signed+unsigned chunk variants for byte/word; type inference narrows later
 
     // Load: byte signedness variants
     mach_inst(addr, MachInst::Mload(MemoryChunk::MInt8Signed, addressing.clone(), args.clone(), *dst)) <--
@@ -4171,6 +5305,37 @@ pub fn is_reg_8(name: &str) -> bool {
         | "R8B" | "R9B" | "R10B" | "R11B" | "R12B" | "R13B" | "R14B" | "R15B")
 }
 
+// Check if register name is a 16-bit GPR.
+pub fn is_reg_16(name: &str) -> bool {
+    matches!(name, "AX" | "BX" | "CX" | "DX" | "SI" | "DI" | "SP" | "BP"
+        | "R8W" | "R9W" | "R10W" | "R11W" | "R12W" | "R13W" | "R14W" | "R15W")
+}
+
+// Returns true if the mnemonic modifies CPU flags; conservative (true when uncertain); used by gap-bridging rules to detect flag-safe instructions between CMP/TEST and CMOV.
+fn is_flag_setting(mnem: &str) -> bool {
+    !matches!(mnem,
+        "MOV" | "MOVZX" | "MOVSX" | "MOVSXD" | "MOVABS"
+        | "LEA"
+        | "NOP" | "ENDBR64" | "ENDBR32"
+        | "PUSH" | "POP"
+        | "XCHG" | "BSWAP"
+        | "VZEROUPPER" | "VZEROALL"
+        | "MOVAPS" | "MOVUPS" | "MOVAPD" | "MOVUPD"
+        | "VMOVAPS" | "VMOVUPS" | "VMOVAPD" | "VMOVUPD"
+        | "MOVSS" | "MOVSD" | "MOVDQA" | "MOVDQU"
+        | "VMOVSS" | "VMOVSD" | "VMOVDQA" | "VMOVDQU"
+        | "MOVQ" | "MOVD" | "MOVHPS" | "MOVLPS"
+        | "VMOVQ" | "VMOVD"
+        | "CMOVE" | "CMOVNE" | "CMOVZ" | "CMOVNZ"
+        | "CMOVB" | "CMOVC" | "CMOVNAE" | "CMOVAE" | "CMOVNC" | "CMOVNB"
+        | "CMOVBE" | "CMOVNA" | "CMOVA" | "CMOVNBE"
+        | "CMOVL" | "CMOVNGE" | "CMOVGE" | "CMOVNL"
+        | "CMOVLE" | "CMOVNG" | "CMOVG" | "CMOVNLE"
+        | "CMOVS" | "CMOVNS"
+        | "CMOVP" | "CMOVPE" | "CMOVNP" | "CMOVPO"
+    )
+}
+
 // Returns the absolute address if the addrmode requires symbol resolution (RIP-relative or absolute).
 pub fn addrmode_needs_symbol_resolution(am: &Addrmode) -> Option<i64> {
     match am {
@@ -4183,6 +5348,13 @@ pub fn addrmode_needs_symbol_resolution(am: &Addrmode) -> Option<i64> {
         Addrmode {
             base: None,
             index: None,
+            disp: Displacement::Const(n),
+        } if *n != 0 => Some(*n),
+
+        // Scaled index with no base: absolute displacement needs symbol resolution
+        Addrmode {
+            base: None,
+            index: Some(_),
             disp: Displacement::Const(n),
         } if *n != 0 => Some(*n),
 
@@ -4281,7 +5453,13 @@ fn transl_addressing_rev_inner(
             base: None,
             index: Some((r1, sc)),
             disp: Displacement::Const(n),
-        } if is_valid_gpr(r1) => Ok((Addressing::Ascaled(sc, n), vec![r1.into()])),
+        } if is_valid_gpr(r1) => {
+            if let Some((ident, offset)) = resolved_symbol {
+                Ok((Addressing::Abasedscaled(sc, ident, offset), vec![r1.into()]))
+            } else {
+                Ok((Addressing::Ascaled(sc, n), vec![r1.into()]))
+            }
+        }
 
         Addrmode {
             base: Some(r1),

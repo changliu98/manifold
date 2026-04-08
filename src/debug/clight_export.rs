@@ -685,6 +685,7 @@ fn serialize_xtype(xtype: &XType) -> Value {
         XType::Xsingle => "Xsingle",
         XType::Xptr => "Xptr",
         XType::Xcharptr => "Xcharptr",
+        XType::Xcharptrptr => "Xcharptrptr",
         XType::Xintptr => "Xintptr",
         XType::Xfloatptr => "Xfloatptr",
         XType::Xsingleptr => "Xsingleptr",
@@ -709,7 +710,7 @@ fn xtype_to_clight_type_json(xtype: &XType) -> Value {
         XType::Xlongunsigned => json!({"tag": "Tlong", "sign": "Unsigned", "attr": null}),
         XType::Xfloat => json!({"tag": "Tfloat", "size": "F64", "attr": null}),
         XType::Xsingle => json!({"tag": "Tfloat", "size": "F32", "attr": null}),
-        XType::Xptr | XType::Xcharptr | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr => {
+        XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr => {
             json!({"tag": "Tpointer", "inner": {"tag": "Tvoid"}, "attr": null})
         }
         XType::XstructPtr(id) => json!({
@@ -878,7 +879,11 @@ fn serialize_ctype_from_field(ty: &crate::decompile::passes::c_pass::types::CTyp
 fn collect_called_functions(stmt: &ClightStmt, names: &mut std::collections::HashSet<String>) {
     match stmt {
         ClightStmt::Scall(_, func_expr, _) => {
-            collect_called_expr(func_expr, names);
+            match func_expr {
+                ClightExpr::EvarSymbol(name, _) => { names.insert(name.clone()); }
+                ClightExpr::Evar(id, _) => { names.insert(format!("{}", id)); }
+                _ => {}
+            }
         }
         ClightStmt::Ssequence(stmts) => {
             for s in stmts { collect_called_functions(s, names); }
@@ -899,13 +904,6 @@ fn collect_called_functions(stmt: &ClightStmt, names: &mut std::collections::Has
     }
 }
 
-fn collect_called_expr(expr: &ClightExpr, names: &mut std::collections::HashSet<String>) {
-    match expr {
-        ClightExpr::EvarSymbol(name, _) => { names.insert(name.clone()); }
-        ClightExpr::Evar(id, _) => { names.insert(format!("{}", id)); }
-        _ => {}
-    }
-}
 
 fn resolve_name(id: usize, id_to_name: &HashMap<usize, String>) -> String {
     id_to_name

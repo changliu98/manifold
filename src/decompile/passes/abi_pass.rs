@@ -493,6 +493,11 @@ fn populate_hardcoded_signatures(db: &mut DecompileDB) {
         ("printf", 1), ("fprintf", 2), ("sprintf", 2), ("snprintf", 3),
         ("scanf", 1), ("fscanf", 2), ("sscanf", 2),
         ("__printf_chk", 2), ("__fprintf_chk", 3), ("__sprintf_chk", 4), ("__snprintf_chk", 5),
+        ("error", 3), ("error_at_line", 5),
+        ("dprintf", 2),
+        ("syslog", 2),
+        ("open", 2), ("openat", 3), ("fcntl", 2), ("ioctl", 2),
+        ("execl", 2), ("execlp", 2), ("execle", 2),
     ];
     for &(name, fixed_args) in varargs {
         db.rel_push("known_varargs_function", (name, fixed_args));

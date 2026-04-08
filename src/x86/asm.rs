@@ -91,45 +91,6 @@ pub enum Freg {
     #[allow(dead_code)]
     Unknown,
 }
-impl From<String> for Freg {
-    fn from(s: String) -> Self {
-        match s.as_str() {
-            "XMM0" => Freg::XMM0,
-            "XMM1" => Freg::XMM1,
-            "XMM2" => Freg::XMM2,
-            "XMM3" => Freg::XMM3,
-            "XMM4" => Freg::XMM4,
-            "XMM5" => Freg::XMM5,
-            "XMM6" => Freg::XMM6,
-            "XMM7" => Freg::XMM7,
-            "XMM8" => Freg::XMM8,
-            "XMM9" => Freg::XMM9,
-            "XMM10" => Freg::XMM10,
-            "XMM11" => Freg::XMM11,
-            "XMM12" => Freg::XMM12,
-            "XMM13" => Freg::XMM13,
-            "XMM14" => Freg::XMM14,
-            "XMM15" => Freg::XMM15,
-            "%xmm0" => Freg::XMM0,
-            "%xmm1" => Freg::XMM1,
-            "%xmm2" => Freg::XMM2,
-            "%xmm3" => Freg::XMM3,
-            "%xmm4" => Freg::XMM4,
-            "%xmm5" => Freg::XMM5,
-            "%xmm6" => Freg::XMM6,
-            "%xmm7" => Freg::XMM7,
-            "%xmm8" => Freg::XMM8,
-            "%xmm9" => Freg::XMM9,
-            "%xmm10" => Freg::XMM10,
-            "%xmm11" => Freg::XMM11,
-            "%xmm12" => Freg::XMM12,
-            "%xmm13" => Freg::XMM13,
-            "%xmm14" => Freg::XMM14,
-            "%xmm15" => Freg::XMM15,
-            _ => panic!("Invalid register name"),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Crbit {

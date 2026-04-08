@@ -22,7 +22,7 @@ ascent_par! {
     relation reg_def(Address, Mreg);
     relation stack_def(Address, Symbol, i64);
     relation stack_use(Address, Symbol, i64);
-    relation suppress_instruction(Address);
+    relation trim_instruction(Address);
     relation ddisasm_cfg_edge(Address, Address, &'static str);
     relation block_in_function(Address, Address);
     relation adjusts_stack(Address, Symbol, i64);
@@ -65,11 +65,11 @@ ascent_par! {
     base_reg_def(addr, "RSP") <--
         reg_def(addr, mreg),
         if *mreg == Mreg::SP,
-        !suppress_instruction(addr);
+        !trim_instruction(addr);
     base_reg_def(addr, "RBP") <--
         reg_def(addr, mreg),
         if *mreg == Mreg::BP,
-        !suppress_instruction(addr);
+        !trim_instruction(addr);
 
     // Block has stack modifications for a given base register
     #[local] relation block_has_stack_mod_for(Address, Symbol);

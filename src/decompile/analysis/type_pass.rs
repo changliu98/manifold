@@ -33,10 +33,12 @@ fn op_output_xtype(op: &Operation) -> Option<XType> {
     match op {
         // Signed 32-bit
         Odiv | Omod | Oshr | Oshrimm(_) | Oshrximm(_) |
+        Odivimm(_) | Omodimm(_) |
         Ocast32signed | Omulhs => Some(XType::Xint),
 
         // Unsigned 32-bit
         Odivu | Omodu | Oshru | Oshruimm(_) |
+        Odivuimm(_) | Omoduimm(_) |
         Ocast32unsigned | Omulhu => Some(XType::Xintunsigned),
 
         // Ambiguous 32-bit (add/sub/mul/logic -- same for signed and unsigned)
@@ -51,10 +53,12 @@ fn op_output_xtype(op: &Operation) -> Option<XType> {
 
         // Signed 64-bit
         Odivl | Omodl | Oshrl | Oshrlimm(_) | Oshrxlimm(_) |
+        Odivlimm(_) | Omodlimm(_) |
         Omullhs => Some(XType::Xlong),
 
         // Unsigned 64-bit
         Odivlu | Omodlu | Oshrlu | Oshrluimm(_) |
+        Odivluimm(_) | Omodluimm(_) |
         Omullhu => Some(XType::Xlongunsigned),
 
         // Ambiguous 64-bit
@@ -112,6 +116,25 @@ fn cond_operand_xtype(cond: &Condition) -> Option<XType> {
         Condition::Ccompfs(_) | Condition::Cnotcompfs(_) => Some(XType::Xsingle),
         _ => None,
     }
+}
+
+/// Returns true if the operation consumes floating-point (double) operands.
+fn is_float_op(op: &Operation) -> bool {
+    use Operation::*;
+    matches!(op,
+        Onegf | Oabsf | Oaddf | Osubf | Omulf | Odivf | Omaxf | Ominf |
+        Osingleoffloat | Ointoffloat | Olongoffloat |
+        Onegfs | Oabsfs | Oaddfs | Osubfs | Omulfs | Odivfs |
+        Ofloatofsingle | Ointofsingle | Olongofsingle
+    )
+}
+
+/// Returns true if the condition compares floating-point operands.
+fn is_float_cond(cond: &Condition) -> bool {
+    matches!(cond,
+        Condition::Ccompf(_) | Condition::Cnotcompf(_) |
+        Condition::Ccompfs(_) | Condition::Cnotcompfs(_)
+    )
 }
 
 
@@ -193,6 +216,29 @@ ascent_par! {
         for mreg in args.iter(),
         reg_rtl(node, *mreg, rtl_reg);
 
+    // 2. Context-sensitive MOVSD upgrade: MAny64 -> Xfloat when the register is used in float arithmetic.
+    // MOVSD now produces MAny64 (not MFloat64) in the asm pass. When a register loaded/stored via
+    // MOVSD is also an operand of a float operation, upgrade to Xfloat.
+    emit_var_type_candidate(rtl_reg, XType::Xfloat) <--
+        emit_var_type_candidate(rtl_reg, ?XType::Xany64),
+        rtl_inst(_, ?RTLInst::Iop(op, args, _)),
+        if is_float_op(op),
+        if args.contains(&rtl_reg);
+
+    // Also upgrade when the register is the destination of a float operation
+    emit_var_type_candidate(rtl_reg, XType::Xfloat) <--
+        emit_var_type_candidate(rtl_reg, ?XType::Xany64),
+        rtl_inst(_, ?RTLInst::Iop(op, _, dst)),
+        if is_float_op(op),
+        if dst == rtl_reg;
+
+    // Also upgrade when the register is used in a float comparison
+    emit_var_type_candidate(rtl_reg, XType::Xfloat) <--
+        emit_var_type_candidate(rtl_reg, ?XType::Xany64),
+        rtl_inst(_, ?RTLInst::Iop(Operation::Ocmp(cond), args, _)),
+        if is_float_cond(cond),
+        if args.contains(&rtl_reg);
+
 
     // 3. Pointer evidence (no is_not_ptr -- pointers are a subtype of 8-byte int, no conflict)
 
@@ -237,14 +283,14 @@ ascent_par! {
         call_arg(node, arg_idx, arg_reg),
         known_extern_signature(func_name, _, _, params),
         if *arg_idx < params.len(),
-        if matches!(params[*arg_idx], XType::Xptr | XType::Xcharptr | XType::Xintptr |
+        if matches!(params[*arg_idx], XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr |
             XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_));
 
     is_ptr(ret_reg) <--
         call_site(node, func_name),
         call_return_reg(node, ret_reg),
         known_extern_signature(func_name, _, ret_type, _),
-        if matches!(ret_type, XType::Xptr | XType::Xcharptr | XType::Xintptr |
+        if matches!(ret_type, XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr |
             XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_));
 
     is_ptr(ret_reg) <--
@@ -263,7 +309,7 @@ ascent_par! {
         call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
         internal_func_signature(func_name, arg_idx, xtype),
-        if matches!(xtype, XType::Xptr | XType::Xcharptr | XType::Xintptr |
+        if matches!(xtype, XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr |
             XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_));
 
     // From load/store base address
@@ -510,7 +556,7 @@ ascent_par! {
         call_site(node, func_name),
         call_return_reg(node, ret_reg),
         internal_func_return_type(func_name, xtype),
-        if matches!(xtype, XType::Xptr | XType::Xcharptr | XType::Xintptr |
+        if matches!(xtype, XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr |
             XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_));
 
     // Function's own return register: emit return type as candidate
@@ -604,6 +650,89 @@ ascent_par! {
 
     emit_var_type_candidate(*callee_reg, XType::Xfuncptr) <--
         rtl_inst(_, ?RTLInst::Itailcall(_, Either::Left(callee_reg), _));
+
+    // 9. Global pointer type detection via dereference evidence, call constraints, and known sigs.
+    relation global_addr_reg(Ident, RTLReg);
+    relation emit_global_is_ptr(Ident);
+    relation emit_global_is_char_ptr(Ident);
+    #[local] relation global_value_reg(Ident, RTLReg);
+
+    // Propagate global address register through aliases (may discover more via type_pass context)
+    global_addr_reg(*ident, b) <-- global_addr_reg(ident, a), alias_edge(a, b);
+    global_addr_reg(*ident, a) <-- global_addr_reg(ident, b), alias_edge(a, b);
+
+    // Via Oindirectsymbol (PIC binaries): track the value register loaded from a global
+    global_value_reg(*ident, loaded_rtl) <--
+        global_addr_reg(ident, addr_rtl),
+        ltl_inst(node, ?LTLInst::Lload(chunk, Addressing::Aindexed(0), args, dst_mreg)),
+        if matches!(chunk, MemoryChunk::MAny64 | MemoryChunk::MInt64),
+        if !args.is_empty(),
+        reg_rtl(node, args[0], base_rtl),
+        if *addr_rtl == *base_rtl,
+        reg_rtl(node, *dst_mreg, loaded_rtl);
+
+    // Via direct Aglobal addressing: track the value register
+    global_value_reg(*ident, loaded_rtl) <--
+        ltl_inst(node, ?LTLInst::Lload(chunk, Addressing::Aglobal(ident, 0), _, dst_mreg)),
+        if matches!(chunk, MemoryChunk::MAny64 | MemoryChunk::MInt64),
+        reg_rtl(node, *dst_mreg, loaded_rtl);
+
+    global_value_reg(*ident, loaded_rtl) <--
+        ltl_inst(node, ?LTLInst::Lload(chunk, Addressing::Abased(ident, 0), _, dst_mreg)),
+        if matches!(chunk, MemoryChunk::MAny64 | MemoryChunk::MInt64),
+        reg_rtl(node, *dst_mreg, loaded_rtl);
+
+    // Propagate global value reg through aliases
+    global_value_reg(*ident, b) <-- global_value_reg(ident, a), alias_edge(a, b);
+    global_value_reg(*ident, a) <-- global_value_reg(ident, b), alias_edge(a, b);
+
+    // A global is a pointer if its loaded value is dereferenced (used as memory base)
+    emit_global_is_ptr(*ident) <--
+        global_value_reg(ident, loaded_rtl),
+        ptr_deref(loaded_rtl, _);
+
+    // Also mark as pointer if the loaded value has must_be_ptr evidence (strong call constraint)
+    emit_global_is_ptr(*ident) <--
+        global_value_reg(ident, loaded_rtl),
+        must_be_ptr(loaded_rtl);
+
+    // A global is a pointer if passed as a call argument to a known pointer parameter
+    emit_global_is_ptr(*ident) <--
+        global_value_reg(ident, loaded_rtl),
+        call_arg(node, arg_idx, loaded_rtl),
+        call_site(node, func_name),
+        known_extern_signature(func_name, _, _, params),
+        if *arg_idx < params.len(),
+        if matches!(params[*arg_idx], XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr |
+            XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_));
+
+    emit_global_is_ptr(*ident) <--
+        global_value_reg(ident, loaded_rtl),
+        call_arg(node, arg_idx, loaded_rtl),
+        call_site(node, func_name),
+        internal_func_signature(func_name, arg_idx, xtype),
+        if matches!(xtype, XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr |
+            XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_));
+
+    emit_global_is_ptr(*ident) <--
+        global_value_reg(ident, loaded_rtl),
+        call_arg(node, arg_idx, loaded_rtl),
+        call_site(node, func_name),
+        known_func_param_is_ptr(func_name, arg_idx);
+
+    // A global is a char pointer if its loaded value is used to load/store bytes
+    emit_global_is_char_ptr(*ident) <--
+        global_value_reg(ident, loaded_rtl),
+        is_char_ptr(loaded_rtl);
+
+    // A global is a char pointer if passed as a char* argument
+    emit_global_is_char_ptr(*ident) <--
+        global_value_reg(ident, loaded_rtl),
+        call_arg(node, arg_idx, loaded_rtl),
+        call_site(node, func_name),
+        known_extern_signature(func_name, _, _, params),
+        if *arg_idx < params.len(),
+        if params[*arg_idx] == XType::Xcharptr;
 }
 
 pub struct TypePass;

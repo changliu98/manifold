@@ -20,7 +20,6 @@ ascent_par! {
 
     relation emit_function(Address, Symbol, Node);
     relation instr_in_function(Node, Address);
-    relation ltl_reachable(Node, Node);
 
 
     relation func_stacksz(Address, Address, Symbol, u64);
@@ -71,7 +70,7 @@ ascent_par! {
     ident_to_symbol(ident, name) <--
         addr_to_func_ident(addr, ident),
         func_stacksz(start, end, name, _),
-        ltl_reachable(start, addr);
+        if addr >= start && addr < end;
 
     base_addr_usage(node, *reg, 0) <--
         cminorsel_stmt(node, ?CminorStmt::Sassign(_, expr)),
@@ -274,6 +273,11 @@ pub fn clight_type_from_xtype(xtype: &XType) -> ClightType {
             ClightSignedness::Signed,
             default_attr(),
         )),
+        XType::Xcharptrptr => pointer_to(pointer_to(ClightType::Tint(
+            ClightIntSize::I8,
+            ClightSignedness::Signed,
+            default_attr(),
+        ))),
         XType::Xvoid => ClightType::Tvoid,
         XType::XstructPtr(struct_id) => ClightType::Tpointer(
             Arc::new(ClightType::Tstruct(*struct_id, default_attr())),
@@ -282,46 +286,10 @@ pub fn clight_type_from_xtype(xtype: &XType) -> ClightType {
     }
 }
 
-pub fn is_pointer_xtype(xtype: &XType) -> bool {
-    matches!(xtype, XType::Xptr | XType::Xintptr | XType::Xfloatptr
-        | XType::Xsingleptr | XType::Xfuncptr | XType::Xcharptr | XType::XstructPtr(_))
-}
-
-pub fn xtype_from_clight_type(clight_type: &ClightType) -> XType {
-    match clight_type {
-        ClightType::Tvoid => XType::Xvoid,
-        ClightType::Tint(ClightIntSize::IBool, _, _) => XType::Xbool,
-        ClightType::Tint(ClightIntSize::I8, ClightSignedness::Signed, _) => XType::Xint8signed,
-        ClightType::Tint(ClightIntSize::I8, ClightSignedness::Unsigned, _) => XType::Xint8unsigned,
-        ClightType::Tint(ClightIntSize::I16, ClightSignedness::Signed, _) => XType::Xint16signed,
-        ClightType::Tint(ClightIntSize::I16, ClightSignedness::Unsigned, _) => {
-            XType::Xint16unsigned
-        }
-        ClightType::Tint(ClightIntSize::I32, _, _) => XType::Xint,
-        ClightType::Tlong(_, _) => XType::Xlong,
-        ClightType::Tfloat(ClightFloatSize::F32, _) => XType::Xsingle,
-        ClightType::Tfloat(ClightFloatSize::F64, _) => XType::Xfloat,
-        ClightType::Tpointer(inner, _) => match inner.as_ref() {
-            ClightType::Tint(ClightIntSize::I8, ClightSignedness::Signed, _) => XType::Xcharptr,
-            ClightType::Tint(ClightIntSize::I32, _, _) => XType::Xintptr,
-            ClightType::Tfloat(ClightFloatSize::F64, _) => XType::Xfloatptr,
-            ClightType::Tfloat(ClightFloatSize::F32, _) => XType::Xsingleptr,
-            _ => XType::Xptr,
-        },
-        ClightType::Tarray(_, _, _) => XType::Xptr,
-        ClightType::Tfunction(_, _, _) => XType::Xfuncptr,
-        ClightType::Tstruct(_, _) | ClightType::Tunion(_, _) => XType::Xany64,
-    }
-}
-
-pub fn clight_function_type(sig: &Signature) -> ClightType {
+pub fn clight_function_pointer_type(sig: &Signature) -> ClightType {
     let arg_types: Vec<ClightType> = sig.sig_args.iter().map(clight_type_from_xtype).collect();
     let ret_type = clight_type_from_xtype(&sig.sig_res);
-    ClightType::Tfunction(Arc::new(arg_types), Arc::new(ret_type), sig.sig_cc)
-}
-
-pub fn clight_function_pointer_type(sig: &Signature) -> ClightType {
-    pointer_to(clight_function_type(sig))
+    pointer_to(ClightType::Tfunction(Arc::new(arg_types), Arc::new(ret_type), sig.sig_cc))
 }
 
 pub fn default_function_signature() -> Signature {
@@ -369,32 +337,32 @@ pub fn clight_cast_supported(from: &ClightType, to: &ClightType) -> bool {
     }
 }
 
-/// Specificity rank for ClightType (lower = more specific = wins in merge), aligned with xtype_priority ordering from type_pass.
-fn clight_type_specificity(ty: &ClightType) -> u8 {
-    use ClightType::*;
-    match ty {
-        Tpointer(_, _) => 0,
-        Tstruct(_, _) => 1,
-        Tunion(_, _) => 2,
-        Tarray(_, _, _) => 3,
-        Tfunction(_, _, _) => 4,
-        Tfloat(ClightFloatSize::F64, _) => 5,
-        Tfloat(ClightFloatSize::F32, _) => 6,
-        Tint(ClightIntSize::I8, ClightSignedness::Signed, _) => 7,
-        Tint(ClightIntSize::I8, ClightSignedness::Unsigned, _) => 8,
-        Tint(ClightIntSize::I16, ClightSignedness::Signed, _) => 9,
-        Tint(ClightIntSize::I16, ClightSignedness::Unsigned, _) => 10,
-        Tint(ClightIntSize::IBool, _, _) => 11,
-        Tlong(ClightSignedness::Unsigned, _) => 12,
-        Tlong(ClightSignedness::Signed, _) => 13,
-        Tint(ClightIntSize::I32, ClightSignedness::Unsigned, _) => 14,
-        Tint(ClightIntSize::I32, ClightSignedness::Signed, _) => 15,
-        Tvoid => 16,
-    }
-}
-
 pub fn merge_clight_types(existing: &ClightType, candidate: &ClightType) -> ClightType {
     use ClightType::*;
+
+    /// Specificity rank for ClightType (lower = more specific = wins in merge), aligned with xtype_priority ordering from type_pass.
+    fn specificity(ty: &ClightType) -> u8 {
+        use ClightType::*;
+        match ty {
+            Tpointer(_, _) => 0,
+            Tstruct(_, _) => 1,
+            Tunion(_, _) => 2,
+            Tarray(_, _, _) => 3,
+            Tfunction(_, _, _) => 4,
+            Tfloat(ClightFloatSize::F64, _) => 5,
+            Tfloat(ClightFloatSize::F32, _) => 6,
+            Tint(ClightIntSize::I8, ClightSignedness::Signed, _) => 7,
+            Tint(ClightIntSize::I8, ClightSignedness::Unsigned, _) => 8,
+            Tint(ClightIntSize::I16, ClightSignedness::Signed, _) => 9,
+            Tint(ClightIntSize::I16, ClightSignedness::Unsigned, _) => 10,
+            Tint(ClightIntSize::IBool, _, _) => 11,
+            Tlong(ClightSignedness::Unsigned, _) => 12,
+            Tlong(ClightSignedness::Signed, _) => 13,
+            Tint(ClightIntSize::I32, ClightSignedness::Unsigned, _) => 14,
+            Tint(ClightIntSize::I32, ClightSignedness::Signed, _) => 15,
+            Tvoid => 16,
+        }
+    }
 
     if existing == candidate {
         return existing.clone();
@@ -418,8 +386,8 @@ pub fn merge_clight_types(existing: &ClightType, candidate: &ClightType) -> Clig
                 }
             }
             // Different sizes: more specific (smaller) wins
-            let e_spec = clight_type_specificity(existing);
-            let c_spec = clight_type_specificity(candidate);
+            let e_spec = specificity(existing);
+            let c_spec = specificity(candidate);
             if e_spec <= c_spec {
                 return existing.clone();
             } else {
@@ -452,8 +420,8 @@ pub fn merge_clight_types(existing: &ClightType, candidate: &ClightType) -> Clig
     }
 
     // Fallback: more specific (lower specificity rank) wins for deterministic ordering
-    let e_spec = clight_type_specificity(existing);
-    let c_spec = clight_type_specificity(candidate);
+    let e_spec = specificity(existing);
+    let c_spec = specificity(candidate);
     if e_spec <= c_spec {
         existing.clone()
     } else {
@@ -521,22 +489,6 @@ pub fn types_equal_ignoring_attr(t1: &ClightType, t2: &ClightType) -> bool {
     }
 }
 
-fn is_narrowing_integer_cast(from_ty: &ClightType, to_ty: &ClightType) -> bool {
-    if matches!(from_ty, ClightType::Tlong(_, _)) && matches!(to_ty, ClightType::Tint(_, _, _)) {
-        return true;
-    }
-    if let (
-        ClightType::Tint(ClightIntSize::I32, _, _),
-        ClightType::Tint(to_size, _, _),
-    ) = (from_ty, to_ty)
-    {
-        if matches!(to_size, ClightIntSize::I8 | ClightIntSize::I16) {
-            return true;
-        }
-    }
-    false
-}
-
 pub fn cast_expr_to_type(expr: ClightExpr, target_ty: ClightType) -> ClightExpr {
     let expr_ty = clight_expr_type(&expr);
 
@@ -544,8 +496,18 @@ pub fn cast_expr_to_type(expr: ClightExpr, target_ty: ClightType) -> ClightExpr 
         return expr;
     }
 
-    if is_narrowing_integer_cast(&expr_ty, &target_ty) {
+    // Narrowing integer cast check (inlined)
+    if matches!(expr_ty, ClightType::Tlong(_, _)) && matches!(target_ty, ClightType::Tint(_, _, _)) {
         return expr;
+    }
+    if let (
+        ClightType::Tint(ClightIntSize::I32, _, _),
+        ClightType::Tint(to_size, _, _),
+    ) = (&expr_ty, &target_ty)
+    {
+        if matches!(to_size, ClightIntSize::I8 | ClightIntSize::I16) {
+            return expr;
+        }
     }
 
     if is_pointer_type(&target_ty) {
@@ -712,15 +674,6 @@ pub fn expr_has_bad_binop(expr: &ClightExpr) -> bool {
             let lhs_ty = clight_expr_type(lhs);
             let rhs_ty = clight_expr_type(rhs);
 
-            let lhs_inner_ty = match lhs.as_ref() {
-                ClightExpr::Ecast(inner, _) => clight_expr_type(inner),
-                _ => lhs_ty.clone(),
-            };
-            let rhs_inner_ty = match rhs.as_ref() {
-                ClightExpr::Ecast(inner, _) => clight_expr_type(inner),
-                _ => rhs_ty.clone(),
-            };
-
             let calls_make_binarith_strict = matches!(
                 op,
                 ClightBinaryOp::Omul
@@ -745,15 +698,8 @@ pub fn expr_has_bad_binop(expr: &ClightExpr) -> bool {
                 let rhs_is_int = matches!(rhs_ty, ClightType::Tint(_, _, _));
                 let rhs_is_ptr = is_pointer_type(&rhs_ty);
 
-                let lhs_inner_is_int = matches!(lhs_inner_ty, ClightType::Tint(_, _, _));
-                let lhs_inner_is_ptr = is_pointer_type(&lhs_inner_ty);
-                let rhs_inner_is_int = matches!(rhs_inner_ty, ClightType::Tint(_, _, _));
-                let rhs_inner_is_ptr = is_pointer_type(&rhs_inner_ty);
-
                 let has_int_ptr_mismatch = (lhs_is_int && rhs_is_ptr)
-                    || (lhs_is_ptr && rhs_is_int)
-                    || (lhs_inner_is_int && rhs_inner_is_ptr)
-                    || (lhs_inner_is_ptr && rhs_inner_is_int);
+                    || (lhs_is_ptr && rhs_is_int);
 
                 if has_int_ptr_mismatch {
                     return true;
