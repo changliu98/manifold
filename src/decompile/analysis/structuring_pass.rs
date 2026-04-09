@@ -80,6 +80,10 @@ impl IRPass for StructuringPass {
                         goto_is_break: vec![],
                         switch_chain_members: vec![],
                         valid_switches: vec![],
+                        ifbody_true: vec![],
+                        ifbody_false: vec![],
+                        join_points: vec![],
+                        scond_no_join: vec![],
                     });
                 }
 
@@ -93,6 +97,10 @@ impl IRPass for StructuringPass {
         let mut all_goto_is_break: Vec<(Node, Node)> = Vec::new();
         let mut all_switch_members: Vec<(Address, Node, Node, u64, i64, Node)> = Vec::new();
         let mut all_valid_switches: Vec<(Address, Node, u64)> = Vec::new();
+        let mut all_ifbody_true: Vec<(Address, Node, Node)> = Vec::new();
+        let mut all_ifbody_false: Vec<(Address, Node, Node)> = Vec::new();
+        let mut all_join_points: Vec<(Address, Node, Node)> = Vec::new();
+        let mut all_scond_no_join: Vec<(Address, Node)> = Vec::new();
         for (func_addr, structured) in per_func_results {
             result_stmts.extend(structured.stmts);
             all_goto_is_break.extend(structured.goto_is_break);
@@ -101,6 +109,18 @@ impl IRPass for StructuringPass {
             }
             for (head, reg) in &structured.valid_switches {
                 all_valid_switches.push((func_addr, *head, *reg));
+            }
+            for (branch, member) in &structured.ifbody_true {
+                all_ifbody_true.push((func_addr, *branch, *member));
+            }
+            for (branch, member) in &structured.ifbody_false {
+                all_ifbody_false.push((func_addr, *branch, *member));
+            }
+            for (branch, join) in &structured.join_points {
+                all_join_points.push((func_addr, *branch, *join));
+            }
+            for branch in &structured.scond_no_join {
+                all_scond_no_join.push((func_addr, *branch));
             }
         }
 
@@ -135,14 +155,40 @@ impl IRPass for StructuringPass {
             emit_switch_rel.push(*tuple);
         }
         db.rel_set("emit_switch_chain", emit_switch_rel);
+
+        // Export if-body structural metadata for clight_select compound assembly
+        let ifbody_true_rel = ascent::boxcar::Vec::<(Address, Node, Node)>::new();
+        for tuple in all_ifbody_true {
+            ifbody_true_rel.push(tuple);
+        }
+        db.rel_set("emit_ifbody_true", ifbody_true_rel);
+
+        let ifbody_false_rel = ascent::boxcar::Vec::<(Address, Node, Node)>::new();
+        for tuple in all_ifbody_false {
+            ifbody_false_rel.push(tuple);
+        }
+        db.rel_set("emit_ifbody_false", ifbody_false_rel);
+
+        let join_point_rel = ascent::boxcar::Vec::<(Address, Node, Node)>::new();
+        for tuple in all_join_points {
+            join_point_rel.push(tuple);
+        }
+        db.rel_set("emit_join_point", join_point_rel);
+
+        let scond_no_join_rel = ascent::boxcar::Vec::<(Address, Node)>::new();
+        for tuple in all_scond_no_join {
+            scond_no_join_rel.push(tuple);
+        }
+        db.rel_set("emit_scond_no_join", scond_no_join_rel);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
-        &["csharp_stmt_candidate", "instr_in_function", "single_def_const", "dead_def", "code_in_block", "next", "emit_inline_temp"]
+        &["csharp_stmt_candidate", "instr_in_function", "single_def_const", "dead_def", "code_in_block", "next", "emit_inline_temp", "emit_var_type_candidate"]
     }
 
     fn outputs(&self) -> &'static [&'static str] {
-        &["csharp_stmt", "csharp_stmt_override", "goto_is_break", "switch_chain_member", "valid_switch_chain", "emit_switch_chain"]
+        &["csharp_stmt", "csharp_stmt_override", "goto_is_break", "switch_chain_member", "valid_switch_chain", "emit_switch_chain",
+          "emit_ifbody_true", "emit_ifbody_false", "emit_join_point", "emit_scond_no_join", "emit_var_type_candidate"]
     }
 }
 
@@ -584,6 +630,10 @@ pub struct StructuringResult {
     pub goto_is_break: Vec<(Node, Node)>,
     pub switch_chain_members: Vec<(Node, Node, u64, i64, Node)>,
     pub valid_switches: Vec<(Node, u64)>,
+    pub ifbody_true: Vec<(Node, Node)>,
+    pub ifbody_false: Vec<(Node, Node)>,
+    pub join_points: Vec<(Node, Node)>,
+    pub scond_no_join: Vec<Node>,
 }
 
 // Run CFG analysis, if-then-else construction, loop recovery, and break/continue conversion
@@ -594,6 +644,10 @@ pub fn structure(stmts: &[(Node, CsharpminorStmt)], next_map: &HashMap<Node, Nod
             goto_is_break: vec![],
             switch_chain_members: vec![],
             valid_switches: vec![],
+            ifbody_true: vec![],
+            ifbody_false: vec![],
+            join_points: vec![],
+            scond_no_join: vec![],
         };
     }
 
@@ -787,8 +841,7 @@ pub fn structure(stmts: &[(Node, CsharpminorStmt)], next_map: &HashMap<Node, Nod
         .map(|(_, member, _, _, _)| *member)
         .collect();
 
-    // Build compound Sifthenelse in-place: replace Scond nodes with structured bodies.
-    // Include join-point and no-join branches (one/both sides return).
+    // Determine valid if-then-else branches for metadata export.
     // Exclude loop exit conditions and switch members.
     let skip_branches: HashSet<Node> = loop_exit_cond_nodes.iter()
         .chain(switch_member_nodes.iter())
@@ -801,169 +854,42 @@ pub fn structure(stmts: &[(Node, CsharpminorStmt)], next_map: &HashMap<Node, Nod
         .copied()
         .collect();
 
+    // Flat output: keep all statements, only trim redundant Sjumps and switch interior nodes
     let mut result_stmts: Vec<(Node, CsharpminorStmt)> = current_stmts.clone();
 
     result_stmts.retain(|(node, stmt)| {
         !(trimmed.contains(node) && matches!(stmt, CsharpminorStmt::Sjump(_)))
     });
 
-    // Build CFG successor map for ordering body statements by control flow
-    let mut cfg_succs: HashMap<Node, Vec<Node>> = HashMap::new();
-    for (from, to) in &prog.cfg_edge {
-        cfg_succs.entry(*from).or_default().push(*to);
-    }
-
-    // Build a mutable map for compound construction
-    let mut stmt_map_mut: HashMap<Node, CsharpminorStmt> = result_stmts.iter().cloned().collect();
-
-    // Process smallest bodies first (inner-to-outer) so nested compounds are ready.
-    // Break ties by later address first (inner branches have higher addresses in chains).
-    let mut ite_branches: Vec<Node> = valid_ite_branches.iter().copied().collect();
-    ite_branches.sort_by(|a, b| {
-        let a_len = true_bodies.get(a).map_or(0, |v| v.len()) + false_bodies.get(a).map_or(0, |v| v.len());
-        let b_len = true_bodies.get(b).map_or(0, |v| v.len()) + false_bodies.get(b).map_or(0, |v| v.len());
-        a_len.cmp(&b_len).then(b.cmp(a))
-    });
-
-    let mut consumed_nodes: HashSet<Node> = HashSet::new();
-
-    // Walk body in CFG order starting from the target node.
-    // Returns tagged (node, stmt) pairs to enable jump table case body construction.
-    let collect_body_tagged = |start: Node, body_set: &[Node], stmt_map: &HashMap<Node, CsharpminorStmt>| -> Vec<(Node, CsharpminorStmt)> {
-        let members: HashSet<Node> = body_set.iter().copied().collect();
-        let mut ordered = Vec::new();
-        let mut visited = HashSet::new();
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(start);
-        while let Some(node) = queue.pop_front() {
-            if !members.contains(&node) || !visited.insert(node) {
-                continue;
-            }
-            if let Some(stmt) = stmt_map.get(&node) {
-                ordered.push((node, stmt.clone()));
-            }
-            if let Some(succs) = cfg_succs.get(&node) {
-                for &s in succs {
-                    if members.contains(&s) && !visited.contains(&s) {
-                        queue.push_back(s);
-                    }
-                }
-            }
-        }
-        ordered
-    };
-
-    let tagged_to_stmt = |tagged: Vec<(Node, CsharpminorStmt)>| -> CsharpminorStmt {
-        let stmts: Vec<CsharpminorStmt> = tagged.into_iter().map(|(_, s)| s).collect();
-        match stmts.len() {
-            0 => CsharpminorStmt::Snop,
-            1 => stmts.into_iter().next().unwrap(),
-            _ => CsharpminorStmt::Sseq(stmts),
-        }
-    };
-
-    let collect_body_ordered = |start: Node, body_set: &[Node], stmt_map: &HashMap<Node, CsharpminorStmt>| -> CsharpminorStmt {
-        tagged_to_stmt(collect_body_tagged(start, body_set, stmt_map))
-    };
-
-    for branch in &ite_branches {
-        let scond = match stmt_map_mut.get(branch) {
-            Some(CsharpminorStmt::Scond(cond, args, ifso, ifnot)) => (cond.clone(), args.clone(), *ifso, *ifnot),
-            _ => continue,
-        };
-        let (cond, args, ifso, ifnot) = scond;
-
-        let then_body = if let Some(members) = true_bodies.get(branch) {
-            collect_body_ordered(ifso, members, &stmt_map_mut)
-        } else {
-            CsharpminorStmt::Snop
-        };
-
-        let else_body = if let Some(members) = false_bodies.get(branch) {
-            // Check if the else body starts with a Sjumptable -- if so, build case bodies
-            let jt_targets = stmt_map_mut.get(&ifnot).and_then(|s| {
-                if let CsharpminorStmt::Sjumptable(_, targets) = s {
-                    Some(targets.clone())
-                } else {
-                    None
-                }
-            });
-            if let Some(targets) = jt_targets {
-                // Group statements by which jump table target they belong to.
-                // For each target, walk cfg within the body members, not crossing
-                // into another target's block, to collect that case's body.
-                let target_set: HashSet<Node> = targets.iter().copied().collect();
-                let member_set: HashSet<Node> = members.iter().copied().collect();
-
-                let mut case_bodies: Vec<CsharpminorStmt> = Vec::new();
-                for &target in targets.iter() {
-                    let mut case_stmts: Vec<CsharpminorStmt> = Vec::new();
-                    let mut visited_case = HashSet::new();
-                    let mut q = std::collections::VecDeque::new();
-                    q.push_back(target);
-                    while let Some(n) = q.pop_front() {
-                        if !member_set.contains(&n) || !visited_case.insert(n) {
-                            continue;
-                        }
-                        if n != target && target_set.contains(&n) {
-                            continue;
-                        }
-                        if let Some(stmt) = stmt_map_mut.get(&n) {
-                            case_stmts.push(stmt.clone());
-                        }
-                        if let Some(succs) = cfg_succs.get(&n) {
-                            for &s in succs {
-                                if member_set.contains(&s) && !visited_case.contains(&s) {
-                                    q.push_back(s);
-                                }
-                            }
-                        }
-                    }
-                    let body = match case_stmts.len() {
-                        0 => CsharpminorStmt::Snop,
-                        1 => case_stmts.remove(0),
-                        _ => CsharpminorStmt::Sseq(case_stmts),
-                    };
-                    case_bodies.push(body);
-                }
-                // Build an Sseq: [Sjumptable(expr, targets), case_body_0, case_body_1, ...]
-                // The clight conversion recognizes this pattern: when an Sseq starts with
-                // a Sjumptable and has exactly len(targets) subsequent elements, it builds
-                // an Sswitch with inline case bodies instead of gotos.
-                let jt_stmt = stmt_map_mut.get(&ifnot).unwrap().clone();
-                let mut seq = Vec::with_capacity(1 + case_bodies.len());
-                seq.push(jt_stmt);
-                seq.extend(case_bodies);
-                CsharpminorStmt::Sseq(seq)
-            } else {
-                collect_body_ordered(ifnot, members, &stmt_map_mut)
-            }
-        } else {
-            CsharpminorStmt::Snop
-        };
-
-        // Replace the Scond with compound Sifthenelse
-        let compound = CsharpminorStmt::Sifthenelse(cond, args, Box::new(then_body), Box::new(else_body));
-        stmt_map_mut.insert(*branch, compound);
-
-        // Remove consumed body nodes immediately (so outer compounds don't re-collect them)
-        if let Some(members) = true_bodies.get(branch) {
-            for n in members {
-                consumed_nodes.insert(*n);
-                stmt_map_mut.remove(n);
-            }
-        }
-        if let Some(members) = false_bodies.get(branch) {
-            for n in members {
-                consumed_nodes.insert(*n);
-                stmt_map_mut.remove(n);
-            }
-        }
-    }
-
-    // Output remaining statements, sorted by address
-    let mut result_stmts: Vec<(Node, CsharpminorStmt)> = stmt_map_mut.into_iter().collect();
     result_stmts.sort_by_key(|(n, _)| *n);
+
+    // Export if-body membership metadata (filtered to valid branches only)
+    let mut out_ifbody_true: Vec<(Node, Node)> = Vec::new();
+    let mut out_ifbody_false: Vec<(Node, Node)> = Vec::new();
+    for (&branch, members) in &true_bodies {
+        if valid_ite_branches.contains(&branch) {
+            for &member in members {
+                out_ifbody_true.push((branch, member));
+            }
+        }
+    }
+    for (&branch, members) in &false_bodies {
+        if valid_ite_branches.contains(&branch) {
+            for &member in members {
+                out_ifbody_false.push((branch, member));
+            }
+        }
+    }
+
+    let out_join_points: Vec<(Node, Node)> = join_points.iter()
+        .filter(|(branch, _)| valid_ite_branches.contains(branch))
+        .map(|(&branch, &join)| (branch, join))
+        .collect();
+
+    let out_scond_no_join: Vec<Node> = no_join_nodes.iter()
+        .filter(|branch| valid_ite_branches.contains(branch))
+        .copied()
+        .collect();
 
     debug!("=== Structuring complete ===");
 
@@ -972,6 +898,10 @@ pub fn structure(stmts: &[(Node, CsharpminorStmt)], next_map: &HashMap<Node, Nod
         goto_is_break,
         switch_chain_members,
         valid_switches,
+        ifbody_true: out_ifbody_true,
+        ifbody_false: out_ifbody_false,
+        join_points: out_join_points,
+        scond_no_join: out_scond_no_join,
     }
 }
 
@@ -1382,7 +1312,7 @@ fn subst_consts_in_builtin_arg(
     }
 }
 
-fn propagate_copies(working: &mut HashMap<Node, CsharpminorStmt>, db: &DecompileDB) {
+fn propagate_copies(working: &mut HashMap<Node, CsharpminorStmt>, db: &mut DecompileDB) {
     let stmts: Vec<(Node, CsharpminorStmt)> = working.iter()
         .map(|(n, s)| (*n, s.clone()))
         .collect();
@@ -1620,6 +1550,23 @@ fn propagate_copies(working: &mut HashMap<Node, CsharpminorStmt>, db: &Decompile
 
     if replacements.is_empty() && dead_copies.is_empty() {
         return;
+    }
+
+    // Propagate types: for each dead copy Sset(dst, Evar(src)), transfer dst's
+    // types to src in emit_var_type_candidate so downstream conversion uses the
+    // correct type for the substituted variable.
+    let existing_types: Vec<(RTLReg, crate::x86::types::XType)> = db
+        .rel_iter::<(RTLReg, crate::x86::types::XType)>("emit_var_type_candidate")
+        .cloned()
+        .collect();
+    for &copy_node in &dead_copies {
+        if let Some(CsharpminorStmt::Sset(dst, CsharpminorExpr::Evar(src))) = working.get(&copy_node) {
+            for (reg, xty) in &existing_types {
+                if *reg == *dst {
+                    db.rel_push("emit_var_type_candidate", (*src, xty.clone()));
+                }
+            }
+        }
     }
 
     for node in &dead_copies {

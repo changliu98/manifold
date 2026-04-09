@@ -13,7 +13,6 @@ pub fn dump_pipeline_deps() -> (String, String) {
         Box::new(mach_pass::MachPass),
         Box::new(linear_pass::LinearPass),
         Box::new(rtl_pass::RTLPass),
-        Box::new(rtl_opt_pass::RtlOptPass),
         Box::new(type_pass::TypePass),
         Box::new(global_array_pass::GlobalArrayPass),
         Box::new(ptr_to_pass::PtrToPass),

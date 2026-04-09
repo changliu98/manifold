@@ -1,8 +1,7 @@
 
 
 use crate::decompile::elevator::DecompileDB;
-use crate::decompile::passes::pass::IRPass;
-use crate::{declare_io_from, run_pass};
+use crate::run_pass;
 
 use std::sync::Arc;
 use crate::decompile::passes::cminor_pass::*;
@@ -13,9 +12,12 @@ use crate::x86::op::{Addressing, Comparison, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
 use either::Either;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use crate::util::DEFAULT_VAR;
 use crate::decompile::passes::asm_pass::transl_addressing_rev;
+use crate::decompile::passes::pass::IRPass;
+use log::info;
+use rayon::prelude::*;
 
 const ENDBR64_LEN: u64 = 4;
 
@@ -73,6 +75,7 @@ ascent_par! {
 
     relation ltl_inst(Node, LTLInst);
     relation ltl_succ(Node, Node);
+    relation rtl_next(Node, Node);
     relation mach_imm_indirect_store(Address, i64, Typ, Mreg, i64);
     relation mach_imm_stack_init(Address, i64, i64, Typ);
     relation arith_load_op(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
@@ -671,7 +674,7 @@ ascent_par! {
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *base_mreg, arg_id);
 
-    rtl_succ_candidate(src, dst) <-- ltl_succ(src, dst), !rtl_edge_negated(src, dst);
+    rtl_succ_candidate(src, dst) <-- rtl_next(src, dst), !rtl_edge_negated(src, dst);
 
     has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lop(_, _, _));
     has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lload(_, _, _, _));
@@ -2560,7 +2563,7 @@ ascent_par! {
     // Back-edge: ltl_succ (src, dst) where dst's block dominates src's block in the same function.
     #[local] relation is_loop_back_edge(Address, Address);
     is_loop_back_edge(src, dst) <--
-        ltl_succ(src, dst),
+        rtl_next(src, dst),
         code_in_block(src, src_block),
         code_in_block(dst, dst_block),
         if *src_block != *dst_block,
@@ -2568,21 +2571,21 @@ ascent_par! {
         block_dom(func, src_block, dst_block);
     // Intra-block back-edge: dst <= src within the same block (backward jump).
     is_loop_back_edge(src, dst) <--
-        ltl_succ(src, dst),
+        rtl_next(src, dst),
         code_in_block(src, blk),
         code_in_block(dst, blk),
         if *dst <= *src;
 
-    // Forward reachability: transitive closure of ltl_succ excluding back-edges, scoped per function.
+    // Forward reachability: transitive closure of rtl_next excluding back-edges, scoped per function.
     #[local] relation forward_reachable(Address, Address, Address);
     forward_reachable(func, src, dst) <--
-        ltl_succ(src, dst),
+        rtl_next(src, dst),
         instr_in_function(src, func),
         instr_in_function(dst, func),
         !is_loop_back_edge(src, dst);
     forward_reachable(func, src, dst) <--
         forward_reachable(func, src, mid),
-        ltl_succ(mid, dst),
+        rtl_next(mid, dst),
         instr_in_function(dst, func),
         !is_loop_back_edge(mid, dst);
 
@@ -2841,6 +2844,20 @@ ascent_par! {
         stack_xtl(func_start, use_addr, ofs, rtlreg1),
         stack_xtl(func_start, use_addr, ofs, rtlreg2),
         if rtlreg1 != rtlreg2;
+
+    // Transitive closure of alias_edge for computing canonical representatives.
+    #[local] relation alias_reach(RTLReg, RTLReg);
+    alias_reach(x, x) <-- reg_xtl(_, _, x);
+    alias_reach(x, x) <-- is_def(_, x);
+    alias_reach(x, x) <-- stack_xtl(_, _, _, x);
+    alias_reach(a, b) <-- alias_edge(a, b);
+    alias_reach(a, b) <-- alias_edge(b, a);
+    alias_reach(a, c) <-- alias_reach(a, b), alias_edge(b, c);
+    alias_reach(a, c) <-- alias_reach(a, b), alias_edge(c, b);
+
+    xtl_canonical(x, min_y) <--
+        alias_reach(x, _),
+        agg min_y = ascent::aggregators::min(y) in alias_reach(x, y);
 
     stack_var(func_start, use_addr, ofs, *canonical) <--
         stack_xtl(func_start, use_addr, ofs, xtl_id),
@@ -5020,19 +5037,6 @@ ascent_par! {
 
 }
 
-pub struct RTLPass;
-
-impl IRPass for RTLPass {
-    fn name(&self) -> &'static str { "rtl" }
-
-    fn run(&self, db: &mut DecompileDB) {
-        run_pass!(db, RTLPassProgram);
-        trim_direct_call_args_to_callee_arity(db);
-    }
-
-    declare_io_from!(RTLPassProgram);
-}
-
 pub fn convert_and_push_builtins(db: &mut DecompileDB) {
     let reg_rtl_map: HashMap<(Node, Mreg), RTLReg> = db
         .rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl")
@@ -5402,4 +5406,1167 @@ pub(crate) fn build_xtype_vec<'a>(
 
     let args: Vec<XType> = pairs.into_iter().map(|(_, reg)| reg).collect();
     std::iter::once(Arc::new(args))
+}
+
+fn seed_initial_rtl_next(db: &mut DecompileDB) {
+    let seeded = ascent::boxcar::Vec::new();
+    for &(src, dst) in db.rel_iter::<(Node, Node)>("ltl_succ") {
+        seeded.push((src, dst));
+    }
+    db.rel_set("rtl_next", seeded);
+}
+
+fn collect_sorted_rtl_next(db: &DecompileDB) -> Vec<(Node, Node)> {
+    let mut next: Vec<(Node, Node)> = db.rel_iter::<(Node, Node)>("rtl_next").cloned().collect();
+    next.sort_unstable();
+    next.dedup();
+    next
+}
+
+pub struct RTLPass;
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RtlOptStats {
+    copies: usize,
+    dead: usize,
+    nops: usize,
+    inline_temps: usize,
+    zero_rewrites: usize,
+}
+
+impl RtlOptStats {
+    fn accumulate(&mut self, other: Self) {
+        self.copies += other.copies;
+        self.dead += other.dead;
+        self.nops += other.nops;
+        self.inline_temps += other.inline_temps;
+        self.zero_rewrites += other.zero_rewrites;
+    }
+
+    fn has_changes(self) -> bool {
+        self.copies > 0
+            || self.dead > 0
+            || self.nops > 0
+            || self.inline_temps > 0
+            || self.zero_rewrites > 0
+    }
+}
+
+fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
+    let mut ctx = PassContext::load(db);
+    if ctx.functions.is_empty() {
+        return None;
+    }
+
+    let var_types = std::mem::take(&mut ctx.var_types);
+
+    let func_regs: HashMap<Address, HashSet<RTLReg>> = ctx.functions.iter()
+        .map(|(&addr, func)| {
+            let mut regs = HashSet::new();
+            for inst in func.inst.values() {
+                collect_inst_regs(inst, &mut regs);
+            }
+            regs.extend(func.params.iter());
+            (addr, regs)
+        })
+        .collect();
+
+    let per_func_var_types: HashMap<Address, HashMap<RTLReg, XType>> = func_regs.iter()
+        .map(|(&addr, regs)| {
+            let ft: HashMap<RTLReg, XType> = regs.iter()
+                .filter_map(|&reg| var_types.get(&reg).map(|&ty| (reg, ty)))
+                .collect();
+            (addr, ft)
+        })
+        .collect();
+    let per_func_var_types = std::sync::Mutex::new(per_func_var_types);
+
+    let results: Vec<_> = ctx.functions.par_iter_mut()
+        .map(|(&func_addr, func)| {
+            let mut func_var_types = per_func_var_types.lock().unwrap()
+                .remove(&func_addr).unwrap_or_default();
+
+            let zero_rewrites = self_zero_rewrite(func);
+
+            let mut copies = 0usize;
+            let mut dead = 0usize;
+            loop {
+                let du = DefUseInfo::build(func);
+                let liveness = LivenessInfo::build(func, &du);
+
+                let (c, copy_subst) = copy_propagation(func, &du, &liveness);
+                for (&dst, &src) in &copy_subst {
+                    if let Some(&ty) = func_var_types.get(&dst) {
+                        func_var_types.entry(src).or_insert(ty);
+                    }
+                }
+                let d = dead_store_elimination(func, &du, &liveness);
+
+                if c == 0 && d == 0 {
+                    break;
+                }
+                copies += c;
+                dead += d;
+            }
+
+            let nops = nop_collapse(func);
+
+            let du = DefUseInfo::build(func);
+            let liveness = LivenessInfo::build(func, &du);
+            let inlines = find_inline_temps(func, &du, &liveness);
+
+            (
+                RtlOptStats {
+                    copies,
+                    dead,
+                    nops,
+                    inline_temps: inlines.len(),
+                    zero_rewrites,
+                },
+                inlines,
+                func_var_types,
+            )
+        })
+        .collect();
+
+    let mut stats = RtlOptStats::default();
+    let mut merged_var_types = var_types;
+
+    for (func_stats, inlines, func_vt) in results {
+        stats.accumulate(func_stats);
+        ctx.inline_temps.extend(inlines);
+        merged_var_types.extend(func_vt);
+    }
+
+    ctx.var_types = merged_var_types;
+    ctx.write_back(db);
+    Some(stats)
+}
+
+impl IRPass for RTLPass {
+    fn name(&self) -> &'static str { "rtl" }
+
+    fn run(&self, db: &mut DecompileDB) {
+        seed_initial_rtl_next(db);
+
+        let mut total_stats = RtlOptStats::default();
+        let max_iters = 10;
+        let mut converged = false;
+
+        for iter in 0..max_iters {
+            let prev_next = collect_sorted_rtl_next(db);
+
+            run_pass!(db, RTLPassProgram);
+            trim_direct_call_args_to_callee_arity(db);
+            convert_and_push_builtins(db);
+
+            if let Some(stats) = optimize_rtl_candidates(db) {
+                total_stats.accumulate(stats);
+            }
+
+            let next_next = collect_sorted_rtl_next(db);
+
+            if next_next == prev_next {
+                info!("rtl: converged after {} iteration(s)", iter + 1);
+                converged = true;
+                break;
+            }
+        }
+
+        if !converged {
+            info!("rtl: stopped after {} iteration(s) without reaching a fixed point", max_iters);
+        }
+
+        if total_stats.has_changes() {
+            info!(
+                "rtl: {} copies propagated, {} dead stores, {} nops collapsed, {} inline temps, {} zero rewrites",
+                total_stats.copies,
+                total_stats.dead,
+                total_stats.nops,
+                total_stats.inline_temps,
+                total_stats.zero_rewrites,
+            );
+        }
+    }
+
+    fn inputs(&self) -> &'static [&'static str] {
+        static INPUTS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+            let rtl_inputs = RTLPassProgram::inputs_only();
+            let own = &[
+                "rtl_inst_candidate",
+                "rtl_succ_candidate",
+                "rtl_next",
+                "instr_in_function",
+                "emit_function",
+                "emit_function_param_candidate",
+                "emit_var_type_candidate",
+            ];
+            let mut combined: Vec<&'static str> = rtl_inputs.iter().copied().collect();
+            for &s in own {
+                if !combined.contains(&s) {
+                    combined.push(s);
+                }
+            }
+            combined
+        });
+        &INPUTS
+    }
+
+    fn outputs(&self) -> &'static [&'static str] {
+        static OUTPUTS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+            let rtl_outputs = RTLPassProgram::rule_outputs();
+            let own = &[
+                "rtl_inst",
+                "rtl_next",
+                "rtl_succ",
+                "instr_in_function",
+                "emit_inline_temp",
+            ];
+            let mut combined: Vec<&'static str> = rtl_outputs.iter().copied().collect();
+            for &s in own {
+                if !combined.contains(&s) {
+                    combined.push(s);
+                }
+            }
+            combined
+        });
+        &OUTPUTS
+    }
+}
+
+
+pub(crate) struct FunctionCFG {
+    #[allow(dead_code)]
+    pub(crate) func_addr: Address,
+    pub(crate) entry: Node,
+    pub(crate) nodes: BTreeSet<Node>,
+    pub(crate) inst: BTreeMap<Node, RTLInst>,
+    pub(crate) succs: HashMap<Node, Vec<Node>>,
+    pub(crate) preds: HashMap<Node, Vec<Node>>,
+    pub(crate) params: HashSet<RTLReg>,
+}
+
+
+struct PassContext {
+    functions: BTreeMap<Address, FunctionCFG>,
+    var_types: HashMap<RTLReg, XType>,
+    inline_temps: HashSet<RTLReg>,
+}
+
+impl PassContext {
+    fn load(db: &DecompileDB) -> Self {
+        let rtl_insts: Vec<(Node, RTLInst)> = db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+            .cloned()
+            .collect();
+        let rtl_succs: Vec<(Node, Node)> = db
+            .rel_iter::<(Node, Node)>("rtl_succ_candidate")
+            .cloned()
+            .collect();
+        let instr_in_func: Vec<(Node, Address)> = db
+            .rel_iter::<(Node, Address)>("instr_in_function")
+            .cloned()
+            .collect();
+        let emit_funcs: Vec<(Address, Symbol, Node)> = db
+            .rel_iter::<(Address, Symbol, Node)>("emit_function")
+            .cloned()
+            .collect();
+        let emit_params: Vec<(Address, RTLReg)> = db
+            .rel_iter::<(Address, RTLReg)>("emit_function_param_candidate")
+            .cloned()
+            .collect();
+        let var_types: HashMap<RTLReg, XType> = db
+            .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+            .cloned()
+            .collect();
+
+        let node_to_func: HashMap<Node, Address> = instr_in_func.iter()
+            .map(|&(n, f)| (n, f))
+            .collect();
+
+        let func_entries: HashMap<Address, Node> = emit_funcs.iter()
+            .map(|&(addr, _, entry)| (addr, entry))
+            .collect();
+
+        let mut func_params: HashMap<Address, HashSet<RTLReg>> = HashMap::new();
+        for &(addr, reg) in &emit_params {
+            func_params.entry(addr).or_default().insert(reg);
+        }
+
+        let mut func_node_candidates: HashMap<Address, HashMap<Node, Vec<RTLInst>>> = HashMap::new();
+        for (node, inst) in &rtl_insts {
+            if let Some(&func) = node_to_func.get(node) {
+                func_node_candidates.entry(func).or_default()
+                    .entry(*node).or_default().push(inst.clone());
+            }
+        }
+
+        let mut reg_usage_count: HashMap<RTLReg, usize> = HashMap::new();
+        for (_, inst) in &rtl_insts {
+            let mut regs = HashSet::new();
+            collect_inst_regs(inst, &mut regs);
+            for reg in regs {
+                *reg_usage_count.entry(reg).or_insert(0) += 1;
+            }
+        }
+
+        let mut func_insts: HashMap<Address, BTreeMap<Node, RTLInst>> = HashMap::new();
+        for (func, node_candidates) in func_node_candidates {
+            let insts = func_insts.entry(func).or_default();
+            for (node, candidates) in node_candidates {
+                if candidates.len() == 1 {
+                    insts.insert(node, candidates.into_iter().next().unwrap());
+                } else {
+                    let best = candidates.into_iter().max_by_key(|inst| {
+                        let mut regs = HashSet::new();
+                        collect_inst_regs(inst, &mut regs);
+                        let score: usize = regs.iter()
+                            .map(|r| reg_usage_count.get(r).copied().unwrap_or(0))
+                            .sum();
+                        let arg_bonus = match inst {
+                            RTLInst::Iop(_, args, _) if !args.is_empty() => 1,
+                            RTLInst::Iload(_, _, args, _) if !args.is_empty() => 1,
+                            RTLInst::Icond(_, args, _, _) if !args.is_empty() => 1,
+                            _ => 0,
+                        };
+                        score + arg_bonus
+                    }).unwrap();
+                    insts.insert(node, best);
+                }
+            }
+        }
+
+        let mut func_succs: HashMap<Address, HashMap<Node, Vec<Node>>> = HashMap::new();
+        for &(src, dst) in &rtl_succs {
+            if let Some(&func) = node_to_func.get(&src) {
+                func_succs.entry(func).or_default()
+                    .entry(src).or_default().push(dst);
+            }
+        }
+
+        let mut functions = BTreeMap::new();
+        for (&func_addr, insts) in &func_insts {
+            let entry = match func_entries.get(&func_addr) {
+                Some(&e) => e,
+                None => continue,
+            };
+            let nodes: BTreeSet<Node> = insts.keys().copied().collect();
+
+            let raw_succs = func_succs.remove(&func_addr).unwrap_or_default();
+            let mut succs: HashMap<Node, Vec<Node>> = HashMap::new();
+            for (src, dsts) in raw_succs {
+                if nodes.contains(&src) {
+                    succs.insert(src, dsts);
+                }
+            }
+
+            let nodes_vec: Vec<Node> = nodes.iter().copied().collect();
+            for (i, &node) in nodes_vec.iter().enumerate() {
+                if succs.contains_key(&node) {
+                    continue;
+                }
+                let inst = match insts.get(&node) {
+                    Some(inst) => inst,
+                    None => continue,
+                };
+                let needs_fallthrough = matches!(inst,
+                    RTLInst::Inop | RTLInst::Iop(..) | RTLInst::Iload(..)
+                    | RTLInst::Istore(..) | RTLInst::Icall(..) | RTLInst::Ibuiltin(..)
+                );
+                if needs_fallthrough {
+                    if let Some(&next_node) = nodes_vec.get(i + 1) {
+                        succs.entry(node).or_default().push(next_node);
+                    }
+                }
+                match inst {
+                    RTLInst::Ibranch(Either::Right(target)) => {
+                        if !succs.contains_key(&node) {
+                            if let Some(&dst) = nodes.range(*target..).next() {
+                                succs.entry(node).or_default().push(dst);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let mut preds: HashMap<Node, Vec<Node>> = HashMap::new();
+            for (&src, dsts) in &succs {
+                for &dst in dsts {
+                    if nodes.contains(&dst) {
+                        preds.entry(dst).or_default().push(src);
+                    }
+                }
+            }
+
+            functions.insert(func_addr, FunctionCFG {
+                func_addr,
+                entry,
+                nodes,
+                inst: insts.clone(),
+                succs,
+                preds,
+                params: func_params.remove(&func_addr).unwrap_or_default(),
+            });
+        }
+
+        PassContext { functions, var_types, inline_temps: HashSet::new() }
+    }
+
+    fn write_back(self, db: &mut DecompileDB) {
+        let new_insts = ascent::boxcar::Vec::<(Node, RTLInst)>::new();
+        let new_succs = ascent::boxcar::Vec::<(Node, Node)>::new();
+        let mut live_regs: HashSet<RTLReg> = HashSet::new();
+
+        for (_func_addr, func) in &self.functions {
+            for (&node, inst) in &func.inst {
+                new_insts.push((node, inst.clone()));
+                collect_inst_regs(inst, &mut live_regs);
+            }
+            for (&src, dsts) in &func.succs {
+                if func.inst.contains_key(&src) {
+                    for &dst in dsts {
+                        new_succs.push((src, dst));
+                    }
+                }
+            }
+        }
+
+        let new_sdc = ascent::boxcar::Vec::<(RTLReg, Constant)>::new();
+        for (_func_addr, func) in &self.functions {
+            for (_, inst) in &func.inst {
+                if let RTLInst::Iop(op, args, dst) = inst {
+                    if args.is_empty() {
+                        if let Some(cst) = crate::decompile::passes::cminor_pass::constant_from_operation(op) {
+                            new_sdc.push((*dst, cst));
+                        }
+                    }
+                }
+            }
+        }
+        db.rel_set("single_def_const", new_sdc);
+
+        db.rel_set("rtl_next", new_succs.clone());
+        db.rel_set("rtl_inst", new_insts);
+        db.rel_set("rtl_succ", new_succs);
+
+        let inline_vec = ascent::boxcar::Vec::<RTLReg>::new();
+        for &reg in &self.inline_temps {
+            if live_regs.contains(&reg) {
+                inline_vec.push(reg);
+            }
+        }
+        db.rel_set("emit_inline_temp", inline_vec);
+    }
+}
+
+pub(crate) fn collect_inst_regs(inst: &RTLInst, regs: &mut HashSet<RTLReg>) {
+    match inst {
+        RTLInst::Inop => {}
+        RTLInst::Iop(_, args, dst) => {
+            for &a in args.iter() { regs.insert(a); }
+            regs.insert(*dst);
+        }
+        RTLInst::Iload(_, _, args, dst) => {
+            for &a in args.iter() { regs.insert(a); }
+            regs.insert(*dst);
+        }
+        RTLInst::Istore(_, _, args, src) => {
+            for &a in args.iter() { regs.insert(a); }
+            regs.insert(*src);
+        }
+        RTLInst::Icall(_, callee, args, dst, _) => {
+            if let Either::Left(r) = callee { regs.insert(*r); }
+            for &a in args.iter() { regs.insert(a); }
+            if let Some(d) = dst { regs.insert(*d); }
+        }
+        RTLInst::Itailcall(_, callee, args) => {
+            if let Either::Left(r) = callee { regs.insert(*r); }
+            for &a in args.iter() { regs.insert(a); }
+        }
+        RTLInst::Ibuiltin(_, args, res) => {
+            collect_builtin_arg_regs(args, regs);
+            collect_single_builtin_arg_regs(res, regs);
+        }
+        RTLInst::Icond(_, args, _, _) => {
+            for &a in args.iter() { regs.insert(a); }
+        }
+        RTLInst::Ijumptable(reg, _) => { regs.insert(*reg); }
+        RTLInst::Ibranch(_) => {}
+        RTLInst::Ireturn(reg) => { regs.insert(*reg); }
+    }
+}
+
+fn collect_builtin_arg_regs(args: &[BuiltinArg<RTLReg>], regs: &mut HashSet<RTLReg>) {
+    for arg in args {
+        collect_single_builtin_arg_regs(arg, regs);
+    }
+}
+
+fn collect_single_builtin_arg_regs(arg: &BuiltinArg<RTLReg>, regs: &mut HashSet<RTLReg>) {
+    match arg {
+        BuiltinArg::BA(r) => { regs.insert(*r); }
+        BuiltinArg::BASplitLong(a, b) | BuiltinArg::BAAddPtr(a, b) => {
+            collect_single_builtin_arg_regs(a, regs);
+            collect_single_builtin_arg_regs(b, regs);
+        }
+        _ => {}
+    }
+}
+
+
+pub(crate) struct DefUseInfo {
+    node_def: HashMap<Node, RTLReg>,
+    node_uses: HashMap<Node, Vec<RTLReg>>,
+    defs: HashMap<RTLReg, Vec<Node>>,
+    uses: HashMap<RTLReg, Vec<Node>>,
+}
+
+impl DefUseInfo {
+    pub(crate) fn build(func: &FunctionCFG) -> Self {
+        let mut node_def: HashMap<Node, RTLReg> = HashMap::new();
+        let mut node_uses: HashMap<Node, Vec<RTLReg>> = HashMap::new();
+        let mut defs: HashMap<RTLReg, Vec<Node>> = HashMap::new();
+        let mut uses: HashMap<RTLReg, Vec<Node>> = HashMap::new();
+
+        for (&node, inst) in &func.inst {
+            let (def, used) = inst_def_use(inst);
+            if let Some(d) = def {
+                node_def.insert(node, d);
+                defs.entry(d).or_default().push(node);
+            }
+            node_uses.insert(node, used.clone());
+            for u in used {
+                uses.entry(u).or_default().push(node);
+            }
+        }
+
+        DefUseInfo { node_def, node_uses, defs, uses }
+    }
+}
+
+pub(crate) fn inst_def_use(inst: &RTLInst) -> (Option<RTLReg>, Vec<RTLReg>) {
+    match inst {
+        RTLInst::Inop => (None, vec![]),
+        RTLInst::Iop(_, args, dst) => (Some(*dst), args.iter().copied().collect()),
+        RTLInst::Iload(_, _, args, dst) => (Some(*dst), args.iter().copied().collect()),
+        RTLInst::Istore(_, _, args, src) => {
+            let mut used: Vec<RTLReg> = args.iter().copied().collect();
+            used.push(*src);
+            (None, used)
+        }
+        RTLInst::Icall(_, callee, args, dst, _) => {
+            let mut used: Vec<RTLReg> = args.iter().copied().collect();
+            if let Either::Left(r) = callee { used.push(*r); }
+            (dst.as_ref().copied(), used)
+        }
+        RTLInst::Itailcall(_, callee, args) => {
+            let mut used: Vec<RTLReg> = args.iter().copied().collect();
+            if let Either::Left(r) = callee { used.push(*r); }
+            (None, used)
+        }
+        RTLInst::Ibuiltin(_, args, res) => {
+            let mut used = Vec::new();
+            for a in args { collect_ba_uses(a, &mut used); }
+            let def = match res {
+                BuiltinArg::BA(r) => Some(*r),
+                _ => None,
+            };
+            (def, used)
+        }
+        RTLInst::Icond(_, args, _, _) => (None, args.iter().copied().collect()),
+        RTLInst::Ijumptable(reg, _) => (None, vec![*reg]),
+        RTLInst::Ibranch(_) => (None, vec![]),
+        RTLInst::Ireturn(reg) => (None, vec![*reg]),
+    }
+}
+
+fn collect_ba_uses(arg: &BuiltinArg<RTLReg>, out: &mut Vec<RTLReg>) {
+    match arg {
+        BuiltinArg::BA(r) => out.push(*r),
+        BuiltinArg::BASplitLong(a, b) | BuiltinArg::BAAddPtr(a, b) => {
+            collect_ba_uses(a, out);
+            collect_ba_uses(b, out);
+        }
+        _ => {}
+    }
+}
+
+
+pub(crate) struct LivenessInfo {
+    pub(crate) live_in: HashMap<Node, HashSet<RTLReg>>,
+    pub(crate) live_out: HashMap<Node, HashSet<RTLReg>>,
+}
+
+impl LivenessInfo {
+    pub(crate) fn build(func: &FunctionCFG, du: &DefUseInfo) -> Self {
+        let mut live_in: HashMap<Node, HashSet<RTLReg>> = HashMap::new();
+        let mut live_out: HashMap<Node, HashSet<RTLReg>> = HashMap::new();
+
+        for &node in &func.nodes {
+            live_in.insert(node, HashSet::new());
+            live_out.insert(node, HashSet::new());
+        }
+
+        let mut worklist: VecDeque<Node> = func.nodes.iter().copied().collect();
+        let mut in_worklist: HashSet<Node> = func.nodes.iter().copied().collect();
+
+        while let Some(node) = worklist.pop_front() {
+            in_worklist.remove(&node);
+
+            let mut new_out = HashSet::new();
+            if let Some(succs) = func.succs.get(&node) {
+                for &s in succs {
+                    if let Some(s_in) = live_in.get(&s) {
+                        new_out.extend(s_in);
+                    }
+                }
+            }
+
+            let mut new_in = new_out.clone();
+            if let Some(&def) = du.node_def.get(&node) {
+                new_in.remove(&def);
+            }
+            if let Some(used) = du.node_uses.get(&node) {
+                for &u in used {
+                    new_in.insert(u);
+                }
+            }
+
+            let old_in = match live_in.get(&node) {
+                Some(li) => li,
+                None => continue,
+            };
+            if &new_in != old_in {
+                live_in.insert(node, new_in);
+                live_out.insert(node, new_out);
+                if let Some(preds) = func.preds.get(&node) {
+                    for &p in preds {
+                        if func.nodes.contains(&p) && in_worklist.insert(p) {
+                            worklist.push_back(p);
+                        }
+                    }
+                }
+            } else if live_out.get(&node).map_or(true, |o| o != &new_out) {
+                live_out.insert(node, new_out);
+            }
+        }
+
+        LivenessInfo { live_in, live_out }
+    }
+}
+
+
+fn reachable_from(func: &FunctionCFG, node: Node) -> HashSet<Node> {
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    if let Some(succs) = func.succs.get(&node) {
+        for &s in succs {
+            if visited.insert(s) {
+                queue.push_back(s);
+            }
+        }
+    }
+    while let Some(n) = queue.pop_front() {
+        if let Some(succs) = func.succs.get(&n) {
+            for &s in succs {
+                if visited.insert(s) {
+                    queue.push_back(s);
+                }
+            }
+        }
+    }
+    visited
+}
+
+fn src_not_redefined_on_paths_to_uses(
+    func: &FunctionCFG,
+    du: &DefUseInfo,
+    copy_node: Node,
+    src: RTLReg,
+    dst_uses: &[Node],
+) -> bool {
+    let src_def_nodes = match du.defs.get(&src) {
+        Some(defs) => defs,
+        None => return true,
+    };
+
+    let redefs: Vec<Node> = src_def_nodes.iter()
+        .filter(|&&n| n != copy_node)
+        .copied()
+        .collect();
+    if redefs.is_empty() {
+        return true;
+    }
+
+    let forward = reachable_from(func, copy_node);
+
+    let reachable_redefs: Vec<Node> = redefs.iter()
+        .filter(|n| forward.contains(n))
+        .copied()
+        .collect();
+    if reachable_redefs.is_empty() {
+        return true;
+    }
+
+    let mut backward = HashSet::new();
+    let mut queue = VecDeque::new();
+    for &u in dst_uses {
+        if backward.insert(u) {
+            queue.push_back(u);
+        }
+    }
+    while let Some(node) = queue.pop_front() {
+        if let Some(preds) = func.preds.get(&node) {
+            for &p in preds {
+                if backward.insert(p) {
+                    queue.push_back(p);
+                }
+            }
+        }
+    }
+
+    !reachable_redefs.iter().any(|n| backward.contains(n))
+}
+
+pub(crate) fn self_zero_rewrite(func: &mut FunctionCFG) -> usize {
+    let mut count = 0;
+    for (_node, inst) in func.inst.iter_mut() {
+        let rewrite = match inst {
+            RTLInst::Iop(op, args, dst) if args.len() == 2 && args[0] == args[1] => {
+                match op {
+                    Operation::Oxor | Operation::Osub => {
+                        Some(RTLInst::Iop(Operation::Ointconst(0), Arc::new(vec![]), *dst))
+                    }
+                    Operation::Oxorl | Operation::Osubl => {
+                        Some(RTLInst::Iop(Operation::Olongconst(0), Arc::new(vec![]), *dst))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(new_inst) = rewrite {
+            *inst = new_inst;
+            count += 1;
+        }
+    }
+    count
+}
+
+pub(crate) fn copy_propagation(
+    func: &mut FunctionCFG,
+    du: &DefUseInfo,
+    _liveness: &LivenessInfo,
+) -> (usize, HashMap<RTLReg, RTLReg>) {
+    let mut candidates: Vec<(Node, RTLReg, RTLReg)> = Vec::new();
+
+    for (&node, inst) in &func.inst {
+        if let RTLInst::Iop(Operation::Omove, args, dst) = inst {
+            if args.len() == 1 && args[0] != *dst {
+                let src = args[0];
+                candidates.push((node, src, *dst));
+            }
+        }
+    }
+
+    let mut subst: HashMap<RTLReg, RTLReg> = HashMap::new();
+    let mut dead_nodes: HashSet<Node> = HashSet::new();
+
+    for (copy_node, src, dst) in &candidates {
+        let src = *src;
+        let dst = *dst;
+
+        if func.params.contains(&dst) {
+            continue;
+        }
+
+        let dst_defs = du.defs.get(&dst).map_or(0, |d| d.len());
+        if dst_defs != 1 {
+            continue;
+        }
+
+        let dst_uses = match du.uses.get(&dst) {
+            Some(u) => u,
+            None => {
+                continue;
+            }
+        };
+
+        let mut safe = true;
+        for &use_node in dst_uses {
+            if use_node == *copy_node {
+                safe = false;
+                break;
+            }
+        }
+        if !safe { continue; }
+
+        let reachable = reachable_from(func, *copy_node);
+        for &use_node in dst_uses {
+            if !reachable.contains(&use_node) {
+                safe = false;
+                break;
+            }
+        }
+        if !safe { continue; }
+
+        safe = src_not_redefined_on_paths_to_uses(func, du, *copy_node, src, dst_uses);
+
+        if safe {
+            subst.insert(dst, src);
+            dead_nodes.insert(*copy_node);
+        }
+    }
+
+    if subst.is_empty() {
+        return (0, HashMap::new());
+    }
+
+    let mut resolved: HashMap<RTLReg, RTLReg> = HashMap::new();
+    for (&dst, &src) in &subst {
+        let mut target = src;
+        let mut visited = HashSet::new();
+        visited.insert(dst);
+        while let Some(&next) = subst.get(&target) {
+            if !visited.insert(next) {
+                break;
+            }
+            target = next;
+        }
+        resolved.insert(dst, target);
+    }
+
+    let count = resolved.len();
+
+    for (&node, inst) in func.inst.iter_mut() {
+        if dead_nodes.contains(&node) {
+            continue;
+        }
+        *inst = subst_in_inst(inst, &resolved);
+    }
+
+    for &node in &dead_nodes {
+        if let Some(inst) = func.inst.get_mut(&node) {
+            *inst = RTLInst::Inop;
+        }
+    }
+
+    (count, resolved)
+}
+
+pub(crate) fn subst_in_inst(inst: &RTLInst, map: &HashMap<RTLReg, RTLReg>) -> RTLInst {
+    match inst {
+        RTLInst::Inop => RTLInst::Inop,
+        RTLInst::Iop(op, args, dst) => {
+            let new_args = subst_args(args, map);
+            RTLInst::Iop(op.clone(), new_args, *dst)
+        }
+        RTLInst::Iload(chunk, addr, args, dst) => {
+            let new_args = subst_args(args, map);
+            RTLInst::Iload(*chunk, addr.clone(), new_args, *dst)
+        }
+        RTLInst::Istore(chunk, addr, args, src) => {
+            let new_args = subst_args(args, map);
+            let new_src = map.get(src).copied().unwrap_or(*src);
+            RTLInst::Istore(*chunk, addr.clone(), new_args, new_src)
+        }
+        RTLInst::Icall(sig, callee, args, dst, next) => {
+            let new_callee = match callee {
+                Either::Left(r) => Either::Left(map.get(r).copied().unwrap_or(*r)),
+                other => other.clone(),
+            };
+            let new_args = subst_args(args, map);
+            RTLInst::Icall(sig.clone(), new_callee, new_args, *dst, *next)
+        }
+        RTLInst::Itailcall(sig, callee, args) => {
+            let new_callee = match callee {
+                Either::Left(r) => Either::Left(map.get(r).copied().unwrap_or(*r)),
+                other => other.clone(),
+            };
+            let new_args = subst_args(args, map);
+            RTLInst::Itailcall(sig.clone(), new_callee, new_args)
+        }
+        RTLInst::Ibuiltin(name, args, res) => {
+            let new_args: Vec<_> = args.iter().map(|a| subst_ba(a, map)).collect();
+            RTLInst::Ibuiltin(name.clone(), new_args, res.clone())
+        }
+        RTLInst::Icond(cond, args, ifso, ifnot) => {
+            let new_args = subst_args(args, map);
+            RTLInst::Icond(cond.clone(), new_args, ifso.clone(), ifnot.clone())
+        }
+        RTLInst::Ijumptable(reg, targets) => {
+            let new_reg = map.get(reg).copied().unwrap_or(*reg);
+            RTLInst::Ijumptable(new_reg, targets.clone())
+        }
+        RTLInst::Ibranch(target) => RTLInst::Ibranch(target.clone()),
+        RTLInst::Ireturn(reg) => {
+            let new_reg = map.get(reg).copied().unwrap_or(*reg);
+            RTLInst::Ireturn(new_reg)
+        }
+    }
+}
+
+pub(crate) fn subst_args(args: &Args, map: &HashMap<RTLReg, RTLReg>) -> Args {
+    Arc::new(args.iter().map(|r| map.get(r).copied().unwrap_or(*r)).collect())
+}
+
+pub(crate) fn subst_ba(ba: &BuiltinArg<RTLReg>, map: &HashMap<RTLReg, RTLReg>) -> BuiltinArg<RTLReg> {
+    match ba {
+        BuiltinArg::BA(r) => BuiltinArg::BA(map.get(r).copied().unwrap_or(*r)),
+        BuiltinArg::BASplitLong(a, b) => BuiltinArg::BASplitLong(
+            Box::new(subst_ba(a, map)),
+            Box::new(subst_ba(b, map)),
+        ),
+        BuiltinArg::BAAddPtr(a, b) => BuiltinArg::BAAddPtr(
+            Box::new(subst_ba(a, map)),
+            Box::new(subst_ba(b, map)),
+        ),
+        other => other.clone(),
+    }
+}
+
+
+pub(crate) fn dead_store_elimination(
+    func: &mut FunctionCFG,
+    du: &DefUseInfo,
+    liveness: &LivenessInfo,
+) -> usize {
+    let mut count = 0;
+
+    let dead_nodes: Vec<Node> = func.inst.iter()
+        .filter_map(|(&node, inst)| {
+            let def_reg = du.node_def.get(&node)?;
+
+            if func.params.contains(def_reg) {
+                return None;
+            }
+
+            let live_out = liveness.live_out.get(&node)?;
+            if live_out.contains(def_reg) {
+                return None;
+            }
+
+            match inst {
+                RTLInst::Iop(_, _, _) => Some(node),
+                RTLInst::Iload(_, _, _, _) => Some(node),
+                _ => None,
+            }
+        })
+        .collect();
+
+    for node in &dead_nodes {
+        if let Some(inst) = func.inst.get_mut(node) {
+            *inst = RTLInst::Inop;
+            count += 1;
+        }
+    }
+
+    let dead_call_nodes: Vec<Node> = func.inst.iter()
+        .filter_map(|(&node, inst)| {
+            if let RTLInst::Icall(_, _, _, Some(dst), _) = inst {
+                if func.params.contains(dst) {
+                    return None;
+                }
+                let live_out = liveness.live_out.get(&node)?;
+                if !live_out.contains(dst) {
+                    return Some(node);
+                }
+            }
+            None
+        })
+        .collect();
+
+    for node in dead_call_nodes {
+        if let Some(RTLInst::Icall(sig, callee, args, _, next)) = func.inst.get(&node).cloned() {
+            func.inst.insert(node, RTLInst::Icall(sig, callee, args, None, next));
+            count += 1;
+        }
+    }
+
+    count
+}
+
+
+pub(crate) fn nop_collapse(func: &mut FunctionCFG) -> usize {
+    let nop_nodes: Vec<Node> = func.inst.iter()
+        .filter(|(&node, inst)| {
+            matches!(inst, RTLInst::Inop) && node != func.entry
+        })
+        .map(|(&node, _)| node)
+        .collect();
+
+    if nop_nodes.is_empty() {
+        return 0;
+    }
+
+    let nop_set: HashSet<Node> = nop_nodes.iter().copied().collect();
+
+    let mut nop_target: HashMap<Node, Node> = HashMap::new();
+    for &nop in &nop_nodes {
+        let mut target = nop;
+        let mut visited = HashSet::new();
+        visited.insert(nop);
+        loop {
+            let succs = func.succs.get(&target);
+            match succs.and_then(|s| if s.len() == 1 { Some(s[0]) } else { None }) {
+                Some(next) if nop_set.contains(&next) && visited.insert(next) => {
+                    target = next;
+                }
+                Some(next) if nop_set.contains(&next) => {
+                    break;
+                }
+                Some(next) => {
+                    nop_target.insert(nop, next);
+                    break;
+                }
+                None => {
+                    break;
+                }
+            }
+        }
+    }
+
+    if nop_target.is_empty() {
+        return 0;
+    }
+
+    let mut count = 0;
+
+    for (&_pred, succs) in func.succs.iter_mut() {
+        for succ in succs.iter_mut() {
+            if let Some(&target) = nop_target.get(succ) {
+                *succ = target;
+            }
+        }
+    }
+
+    for inst in func.inst.values_mut() {
+        retarget_inst(inst, &nop_target);
+    }
+
+    for (&nop, _) in &nop_target {
+        func.inst.remove(&nop);
+        func.succs.remove(&nop);
+        func.nodes.remove(&nop);
+        count += 1;
+    }
+
+    loop {
+        if !matches!(func.inst.get(&func.entry), Some(RTLInst::Inop)) {
+            break;
+        }
+        let succs = func.succs.get(&func.entry);
+        match succs.and_then(|s| if s.len() == 1 { Some(s[0]) } else { None }) {
+            Some(target) if target != func.entry => {
+                let old_entry = func.entry;
+                func.entry = target;
+                func.inst.remove(&old_entry);
+                func.succs.remove(&old_entry);
+                func.nodes.remove(&old_entry);
+                count += 1;
+            }
+            _ => break,
+        }
+    }
+
+    let mut preds: HashMap<Node, Vec<Node>> = HashMap::new();
+    for (&src, dsts) in &func.succs {
+        if func.inst.contains_key(&src) {
+            for &dst in dsts {
+                preds.entry(dst).or_default().push(src);
+            }
+        }
+    }
+    func.preds = preds;
+
+    count
+}
+
+fn retarget_inst(inst: &mut RTLInst, nop_target: &HashMap<Node, Node>) {
+    match inst {
+        RTLInst::Icond(_, _, ifso, ifnot) => {
+            retarget_either(ifso, nop_target);
+            retarget_either(ifnot, nop_target);
+        }
+        RTLInst::Ibranch(target) => {
+            retarget_either(target, nop_target);
+        }
+        RTLInst::Icall(_, _, _, _, next) => {
+            if let Some(&target) = nop_target.get(next) {
+                *next = target;
+            }
+        }
+        RTLInst::Ijumptable(_, targets) => {
+            let new_targets: Vec<Node> = targets.iter()
+                .map(|n| nop_target.get(n).copied().unwrap_or(*n))
+                .collect();
+            if new_targets != **targets {
+                *targets = Arc::new(new_targets);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn retarget_either(target: &mut Either<Symbol, Node>, nop_target: &HashMap<Node, Node>) {
+    if let Either::Right(node) = target {
+        if let Some(&new_node) = nop_target.get(node) {
+            *node = new_node;
+        }
+    }
+}
+
+
+pub(crate) fn find_inline_temps(
+    func: &FunctionCFG,
+    du: &DefUseInfo,
+    liveness: &LivenessInfo,
+) -> HashSet<RTLReg> {
+    let mut result = HashSet::new();
+
+    for (&reg, def_nodes) in &du.defs {
+        if def_nodes.len() != 1 { continue; }
+        let def_node = def_nodes[0];
+
+        let use_node = match du.uses.get(&reg) {
+            Some(u) => {
+                let mut distinct: Vec<Node> = u.clone();
+                distinct.sort_unstable();
+                distinct.dedup();
+                if distinct.len() != 1 { continue; }
+                distinct[0]
+            }
+            _ => continue,
+        };
+
+        if func.params.contains(&reg) { continue; }
+
+        let inst = match func.inst.get(&def_node) {
+            Some(i) => i,
+            None => continue,
+        };
+        // Only inline Iop temps; Iload is unsafe without aliasing/intervening store checks.
+        let def_args: Vec<RTLReg> = match inst {
+            RTLInst::Iop(_, args, _) => args.iter().copied().collect(),
+            _ => continue,
+        };
+
+        let use_live_in = match liveness.live_in.get(&use_node) {
+            Some(li) => li,
+            None => continue,
+        };
+        if !def_args.iter().all(|a| use_live_in.contains(a)) {
+            continue;
+        }
+
+        let reachable = reachable_from(func, def_node);
+        if !reachable.contains(&use_node) {
+            continue;
+        }
+
+        result.insert(reg);
+    }
+
+    result
 }

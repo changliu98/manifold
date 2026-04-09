@@ -2,8 +2,8 @@
 
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::clight_select::query::{
-    extract_functions, extract_loop_info,
-    FunctionData, LoopInfo,
+    extract_functions, extract_ite_info, extract_loop_info,
+    FunctionData, IteInfo, LoopInfo,
 };
 use crate::decompile::passes::c_pass::convert::from_relations::{convert_stmt, ConversionContext};
 use crate::decompile::passes::c_pass::helpers::{xtype_string_to_ctype, convert_param_type_from_param, param_name_for_reg};
@@ -120,6 +120,7 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
     }
 
     let loop_info_all = extract_loop_info(db);
+    let ite_info_all = extract_ite_info(db);
 
     // Build global struct fields map from all functions' emit_struct_fields
     let mut global_struct_fields: HashMap<i64, Vec<(i64, Ident, MemoryChunk)>> = HashMap::new();
@@ -153,7 +154,7 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
         .iter()
         .map(|func| {
             build_selected_function_from_program_state(
-                func, &best_state, &loop_info_all,
+                func, &best_state, &loop_info_all, &ite_info_all,
             )
         })
         .collect();
@@ -166,6 +167,7 @@ fn build_selected_function_from_program_state(
     func: &FunctionData,
     program_state: &ProgramSelectionState,
     loop_info_all: &HashMap<Address, HashMap<Node, LoopInfo>>,
+    ite_info_all: &HashMap<Address, HashMap<Node, IteInfo>>,
 ) -> SelectedFunction {
     let addr = func.address;
 
@@ -197,6 +199,9 @@ fn build_selected_function_from_program_state(
     let func_loop_info = loop_info_all.get(&func.address).cloned().unwrap_or_default();
 
     assemble_loops(&mut statements, &func_loop_info);
+
+    let func_ite_info = ite_info_all.get(&func.address).cloned().unwrap_or_default();
+    assemble_ite(&mut statements, &func_ite_info);
 
     // sseq grouping
     for (head, members) in &func.sseq_groups {
@@ -1000,6 +1005,82 @@ fn assemble_loops(
             if node != header {
                 statements.remove(&node);
             }
+        }
+    }
+}
+
+// Assemble compound if-then-else from structural metadata, analogous to
+// assemble_loops.  Operates on already-typed ClightStmt so no type decisions
+// are made here -- only structural grouping.
+fn assemble_ite(
+    statements: &mut HashMap<Node, ClightStmt>,
+    ite_info: &HashMap<Node, IteInfo>,
+) {
+    if ite_info.is_empty() {
+        return;
+    }
+
+    // Process smallest bodies first (inner before outer) so nested compounds
+    // are ready when an outer branch collects them.
+    let mut branches: Vec<(&Node, &IteInfo)> = ite_info.iter().collect();
+    branches.sort_by(|a, b| {
+        let a_size = a.1.true_body_nodes.len() + a.1.false_body_nodes.len();
+        let b_size = b.1.true_body_nodes.len() + b.1.false_body_nodes.len();
+        a_size.cmp(&b_size).then(b.0.cmp(a.0))
+    });
+
+    for (&branch, info) in &branches {
+        // The branch node should hold Sifthenelse(cond, Sgoto(then), Sgoto(else))
+        // produced by the clight_pass flat Scond rule.
+        let (cond, _then_target, _else_target) = match statements.get(&branch) {
+            Some(ClightStmt::Sifthenelse(c, t, e)) => (c.clone(), t.clone(), e.clone()),
+            _ => continue,
+        };
+
+        let collect_body = |body_nodes: &[Node]| -> ClightStmt {
+            let mut body_stmts: Vec<ClightStmt> = Vec::new();
+            for &node in body_nodes {
+                if let Some(stmt) = statements.get(&node) {
+                    // Strip outer label -- the node identity is subsumed by the compound
+                    let stripped = match stmt {
+                        ClightStmt::Slabel(_, inner) => (**inner).clone(),
+                        other => other.clone(),
+                    };
+                    if !matches!(&stripped, ClightStmt::Sskip) {
+                        body_stmts.push(stripped);
+                    }
+                }
+            }
+            // Remove trailing gotos to the join point (they become fallthrough)
+            if let Some(join) = info.join_node {
+                let join_ident = ident_from_node(join);
+                while let Some(ClightStmt::Sgoto(target)) = body_stmts.last() {
+                    if *target == join_ident {
+                        body_stmts.pop();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            match body_stmts.len() {
+                0 => ClightStmt::Sskip,
+                1 => body_stmts.into_iter().next().unwrap(),
+                _ => ClightStmt::Ssequence(flatten_sequence(body_stmts)),
+            }
+        };
+
+        let then_body = collect_body(&info.true_body_nodes);
+        let else_body = collect_body(&info.false_body_nodes);
+
+        let compound = ClightStmt::Sifthenelse(cond, Box::new(then_body), Box::new(else_body));
+        statements.insert(branch, compound);
+
+        // Remove consumed body nodes from top-level
+        for &node in &info.true_body_nodes {
+            statements.remove(&node);
+        }
+        for &node in &info.false_body_nodes {
+            statements.remove(&node);
         }
     }
 }

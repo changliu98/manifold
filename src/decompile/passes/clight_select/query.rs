@@ -1020,6 +1020,67 @@ pub fn extract_loop_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, Loo
     result
 }
 
+// If-then-else structural metadata from the structuring pass.
+#[derive(Debug, Clone, Default)]
+pub struct IteInfo {
+    pub true_body_nodes: Vec<Node>,
+    pub false_body_nodes: Vec<Node>,
+    pub join_node: Option<Node>,
+    pub no_join: bool,
+}
+
+pub fn extract_ite_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, IteInfo>> {
+    let mut result: HashMap<Address, HashMap<Node, IteInfo>> = HashMap::new();
+
+    for (func_addr, branch, member) in db.rel_iter::<(Address, Node, Node)>("emit_ifbody_true") {
+        result
+            .entry(*func_addr)
+            .or_default()
+            .entry(*branch)
+            .or_insert_with(IteInfo::default)
+            .true_body_nodes
+            .push(*member);
+    }
+
+    for (func_addr, branch, member) in db.rel_iter::<(Address, Node, Node)>("emit_ifbody_false") {
+        result
+            .entry(*func_addr)
+            .or_default()
+            .entry(*branch)
+            .or_insert_with(IteInfo::default)
+            .false_body_nodes
+            .push(*member);
+    }
+
+    for (func_addr, branch, join) in db.rel_iter::<(Address, Node, Node)>("emit_join_point") {
+        result
+            .entry(*func_addr)
+            .or_default()
+            .entry(*branch)
+            .or_insert_with(IteInfo::default)
+            .join_node = Some(*join);
+    }
+
+    for (func_addr, branch) in db.rel_iter::<(Address, Node)>("emit_scond_no_join") {
+        result
+            .entry(*func_addr)
+            .or_default()
+            .entry(*branch)
+            .or_insert_with(IteInfo::default)
+            .no_join = true;
+    }
+
+    // Sort body nodes by address for deterministic ordering
+    for func_map in result.values_mut() {
+        for info in func_map.values_mut() {
+            info.true_body_nodes.sort();
+            info.false_body_nodes.sort();
+        }
+    }
+
+    result
+}
+
 #[derive(Debug, Clone)]
 pub struct ExtractedStruct {
     pub struct_id: usize,
