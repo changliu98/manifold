@@ -3381,6 +3381,23 @@ ascent_par! {
         instr_min_order(func_start, call_addr, call_order),
         if *between_order > *def_order && *between_order < *call_order;
 
+    // Kill arg setup when a closer redefinition of the same register exists
+    call_clobbers_arg_reg(defaddr, mreg, call_addr) <--
+        arg_setup_candidate(defaddr, mreg, call_addr),
+        arg_setup_candidate(other_def, mreg, call_addr),
+        instr_in_function(defaddr, func_start),
+        instr_min_order(func_start, defaddr, def_order),
+        instr_min_order(func_start, other_def, other_order),
+        if *other_order > *def_order && *defaddr != *other_def;
+
+    call_clobbers_arg_reg(defaddr, mreg, call_addr) <--
+        float_arg_setup_candidate(defaddr, mreg, call_addr),
+        float_arg_setup_candidate(other_def, mreg, call_addr),
+        instr_in_function(defaddr, func_start),
+        instr_min_order(func_start, defaddr, def_order),
+        instr_min_order(func_start, other_def, other_order),
+        if *other_order > *def_order && *defaddr != *other_def;
+
     relation call_arg_setup_detected(Node, Mreg, Node);
 
     call_arg_setup_detected(defaddr, mreg, call_addr) <--
@@ -4242,45 +4259,42 @@ ascent_par! {
 
     relation param_used_in_deref(Address, Mreg);
 
+    // Only check base register (args[0]) for pointer not index
     param_used_in_deref(func_start, *arg_reg) <--
         func_param_validated(func_start, arg_reg),
         instr_in_function(addr, func_start),
         ltl_inst(addr, ?LTLInst::Lload(_, _, args, _)),
-        for reg in args.iter(),
-        if *reg == *arg_reg;
+        if !args.is_empty() && args[0] == *arg_reg;
 
     param_used_in_deref(func_start, *arg_reg) <--
         func_param_validated(func_start, arg_reg),
         arg_reg_copied_early(func_start, arg_reg, copy_dst),
         instr_in_function(addr, func_start),
         ltl_inst(addr, ?LTLInst::Lload(_, _, args, _)),
-        for reg in args.iter(),
-        if *reg == *copy_dst;
+        if !args.is_empty() && args[0] == *copy_dst;
 
     param_used_in_deref(func_start, *arg_reg) <--
         func_param_validated(func_start, arg_reg),
         instr_in_function(addr, func_start),
         ltl_inst(addr, ?LTLInst::Lstore(_, _, args, _)),
-        for reg in args.iter(),
-        if *reg == *arg_reg;
+        if !args.is_empty() && args[0] == *arg_reg;
 
     param_used_in_deref(func_start, *arg_reg) <--
         func_param_validated(func_start, arg_reg),
         arg_reg_copied_early(func_start, arg_reg, copy_dst),
         instr_in_function(addr, func_start),
         ltl_inst(addr, ?LTLInst::Lstore(_, _, args, _)),
-        for reg in args.iter(),
-        if *reg == *copy_dst;
+        if !args.is_empty() && args[0] == *copy_dst;
 
     relation param_used_in_lea(Address, Mreg);
 
+    // Only check base register (srcs[0]) for lea pointer evidence
     param_used_in_lea(func_start, *src_reg) <--
         func_param_validated(func_start, src_reg),
         instr_in_function(addr, func_start),
         ltl_inst(addr, ?LTLInst::Lop(op, srcs, _)),
         if matches!(op, Operation::Olea(_) | Operation::Oleal(_)),
-        for reg in srcs.iter(),
-        if *reg == *src_reg;
+        if !srcs.is_empty() && srcs[0] == *src_reg;
 
     relation param_used_in_null_check(Address, Mreg);
 
@@ -4508,7 +4522,8 @@ ascent_par! {
     is_not_ptr(reg) <--
         comparison_operand(_, cond, reg),
         if matches!(cond, Condition::Ccomp(_) | Condition::Ccompu(_)
-            | Condition::Ccompimm(_, _) | Condition::Ccompuimm(_, _));
+            | Condition::Ccompimm(_, _) | Condition::Ccompuimm(_, _)),
+        if !is_null_comparison_cond(cond);
 
     must_be_ptr(reg) <-- arg_constrained_as_ptr(_, reg);
     must_be_ptr(ret_reg) <--
@@ -5149,10 +5164,20 @@ pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
         .collect();
     db.rel_set("call_args_collected_candidate", new_call_args);
 
-    let rebuilt_args: HashMap<Node, Arc<Vec<RTLReg>>> = db
+    let mut rebuilt_args: HashMap<Node, Arc<Vec<RTLReg>>> = db
         .rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
         .map(|(node, args)| (*node, args.clone()))
         .collect();
+
+    // Merge float args after integer args for each call node
+    for &(call_node, ref float_args) in db.rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_float_args_collected") {
+        if !float_args.is_empty() {
+            let int_args = rebuilt_args.entry(call_node).or_insert_with(|| Arc::new(vec![]));
+            let mut combined = (**int_args).clone();
+            combined.extend_from_slice(float_args);
+            *int_args = Arc::new(combined);
+        }
+    }
 
     let new_rtl_inst: ascent::boxcar::Vec<(Node, RTLInst)> = db
         .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
@@ -5254,6 +5279,11 @@ pub(crate) fn fresh_xtl_reg(node: Node, reg: Mreg) -> RTLReg {
 pub(crate) const FRESH_NS_STACK_SRC: u64 = 1 << 54;
 pub(crate) const FRESH_NS_REG_DST: u64   = 1 << 55;
 pub(crate) const FRESH_NS_SP_BASE: u64   = 1 << 56;
+pub(crate) const FRESH_NS_STACK_PARAM: u64 = 1 << 57;
+
+pub(crate) fn fresh_stack_param_reg(func_addr: Node, stack_idx: usize) -> RTLReg {
+    (1u64 << 63) | FRESH_NS_STACK_PARAM | (func_addr << 6) | ((stack_idx as u64) & 0x3F)
+}
 
 pub fn convert_builtin_arg(
     node: Node,
@@ -5373,6 +5403,16 @@ pub fn is_arithmetic_op(op: &Operation) -> bool {
         Operation::Omodimm(_) | Operation::Omoduimm(_) |
         Operation::Odivlimm(_) | Operation::Odivluimm(_) |
         Operation::Omodlimm(_) | Operation::Omodluimm(_)
+    )
+}
+
+#[inline]
+pub fn is_null_comparison_cond(cond: &Condition) -> bool {
+    matches!(cond,
+        Condition::Ccompimm(Comparison::Ceq, 0) | Condition::Ccompuimm(Comparison::Ceq, 0) |
+        Condition::Ccompimm(Comparison::Cne, 0) | Condition::Ccompuimm(Comparison::Cne, 0) |
+        Condition::Ccomplimm(Comparison::Ceq, 0) | Condition::Ccompluimm(Comparison::Ceq, 0) |
+        Condition::Ccomplimm(Comparison::Cne, 0) | Condition::Ccompluimm(Comparison::Cne, 0)
     )
 }
 
