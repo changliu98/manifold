@@ -2323,7 +2323,22 @@ ascent_par! {
 
     relation alias_edge(RTLReg, RTLReg);
 
+    #[local] lattice xtl_canonical_lat(RTLReg, ascent::Dual<RTLReg>);
+
+    // Seed: each id maps to itself
+    xtl_canonical_lat(a, ascent::Dual(*a)) <-- reg_xtl(_, _, a);
+    xtl_canonical_lat(a, ascent::Dual(*a)) <-- is_def(_, a);
+    xtl_canonical_lat(a, ascent::Dual(*a)) <-- stack_xtl(_, _, _, a);
+    xtl_canonical_lat(a, ascent::Dual(*a)) <-- alias_edge(a, _);
+    xtl_canonical_lat(b, ascent::Dual(*b)) <-- alias_edge(_, b);
+
+    // Propagate min canonical through alias edges
+    xtl_canonical_lat(b, *canonical) <-- alias_edge(a, b), xtl_canonical_lat(a, canonical);
+    xtl_canonical_lat(a, *canonical) <-- alias_edge(a, b), xtl_canonical_lat(b, canonical);
+
+    // Project lattice to regular relation
     relation xtl_canonical(RTLReg, RTLReg);
+    xtl_canonical(id, canonical.0) <-- xtl_canonical_lat(id, canonical);
 
     relation is_early_arg_use(Address, Node);
 
@@ -2447,6 +2462,10 @@ ascent_par! {
     relation stack_xtl(Address, Address, i64, RTLReg);
     relation stack_var(Address, Address, i64, RTLReg);
 
+    stack_var(func_start, use_addr, ofs, canonical.0) <--
+        stack_xtl(func_start, use_addr, ofs, xtl_id),
+        xtl_canonical_lat(xtl_id, canonical);
+
     relation unrefinedinstruction(Address, usize, &'static str, &'static str, Symbol, Symbol, Symbol, Symbol, usize, usize);
     relation symbol_table(Address, usize, Symbol, Symbol, Symbol, usize, Symbol, usize, Symbol);
     relation op_indirect(Symbol, &'static str, &'static str, &'static str, i64, i64, usize);
@@ -2514,7 +2533,7 @@ ascent_par! {
     reg_xtl(addr, *src, use_id) <--
         load_overwrite_use_id(addr, src, use_id);
 
-    // Only merge use-side IDs at the same node; a definition kills the previous value so def-side IDs must not alias propagated use-side IDs (def-to-use connections are handled by the explicit alias_edge rules below).
+    // Merge use-side IDs only at the same node; defs kill values so def/use IDs must not alias (alias_edge handles def-to-use).
     alias_edge(id1, id2) <--
         reg_xtl(node, mreg, id1),
         reg_xtl(node, mreg, id2),
@@ -2815,7 +2834,7 @@ ascent_par! {
         instr_in_function(addr, func_start),
         let rtlreg = fresh_xtl_reg(*addr, Mreg::BP);
 
-    // Propagate stack_xtl through stack def-use chains, joining on def-side offset and outputting use-side offset.
+    // Propagate stack_xtl through def-use chains, joining on def offset and emitting use offset.
     stack_xtl(func_start, use_addr, use_ofs, rtlreg) <--
         stack_xtl(func_start, def_addr, def_ofs, rtlreg),
         instr_in_function(def_addr, func_start),
@@ -2844,24 +2863,6 @@ ascent_par! {
         stack_xtl(func_start, use_addr, ofs, rtlreg1),
         stack_xtl(func_start, use_addr, ofs, rtlreg2),
         if rtlreg1 != rtlreg2;
-
-    // Transitive closure of alias_edge for computing canonical representatives.
-    #[local] relation alias_reach(RTLReg, RTLReg);
-    alias_reach(x, x) <-- reg_xtl(_, _, x);
-    alias_reach(x, x) <-- is_def(_, x);
-    alias_reach(x, x) <-- stack_xtl(_, _, _, x);
-    alias_reach(a, b) <-- alias_edge(a, b);
-    alias_reach(a, b) <-- alias_edge(b, a);
-    alias_reach(a, c) <-- alias_reach(a, b), alias_edge(b, c);
-    alias_reach(a, c) <-- alias_reach(a, b), alias_edge(c, b);
-
-    xtl_canonical(x, min_y) <--
-        alias_reach(x, _),
-        agg min_y = ascent::aggregators::min(y) in alias_reach(x, y);
-
-    stack_var(func_start, use_addr, ofs, *canonical) <--
-        stack_xtl(func_start, use_addr, ofs, xtl_id),
-        xtl_canonical(xtl_id, canonical);
 
     stack_var_chunk(*func, ofs, chunk) <--
         ltl_inst(node, ?LTLInst::Lload(chunk, Addressing::Ainstack(ofs), _, _)),
@@ -5423,6 +5424,7 @@ fn collect_sorted_rtl_next(db: &DecompileDB) -> Vec<(Node, Node)> {
     next
 }
 
+
 pub struct RTLPass;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -5548,44 +5550,21 @@ impl IRPass for RTLPass {
 
     fn run(&self, db: &mut DecompileDB) {
         seed_initial_rtl_next(db);
+        run_pass!(db, RTLPassProgram);
+        trim_direct_call_args_to_callee_arity(db);
+        convert_and_push_builtins(db);
 
-        let mut total_stats = RtlOptStats::default();
-        let max_iters = 10;
-        let mut converged = false;
-
-        for iter in 0..max_iters {
-            let prev_next = collect_sorted_rtl_next(db);
-
-            run_pass!(db, RTLPassProgram);
-            trim_direct_call_args_to_callee_arity(db);
-            convert_and_push_builtins(db);
-
-            if let Some(stats) = optimize_rtl_candidates(db) {
-                total_stats.accumulate(stats);
+        if let Some(stats) = optimize_rtl_candidates(db) {
+            if stats.has_changes() {
+                info!(
+                    "rtl: {} copies propagated, {} dead stores, {} nops collapsed, {} inline temps, {} zero rewrites",
+                    stats.copies,
+                    stats.dead,
+                    stats.nops,
+                    stats.inline_temps,
+                    stats.zero_rewrites,
+                );
             }
-
-            let next_next = collect_sorted_rtl_next(db);
-
-            if next_next == prev_next {
-                info!("rtl: converged after {} iteration(s)", iter + 1);
-                converged = true;
-                break;
-            }
-        }
-
-        if !converged {
-            info!("rtl: stopped after {} iteration(s) without reaching a fixed point", max_iters);
-        }
-
-        if total_stats.has_changes() {
-            info!(
-                "rtl: {} copies propagated, {} dead stores, {} nops collapsed, {} inline temps, {} zero rewrites",
-                total_stats.copies,
-                total_stats.dead,
-                total_stats.nops,
-                total_stats.inline_temps,
-                total_stats.zero_rewrites,
-            );
         }
     }
 
