@@ -76,7 +76,17 @@ impl IRPass for RtlOptPass {
                     let du = DefUseInfo::build(func);
                     let liveness = LivenessInfo::build(func, &du);
 
-                    let c = copy_propagation(func, &du, &liveness);
+                    let (c, copy_subst) = copy_propagation(func, &du, &liveness);
+                    // Transfer types from eliminated copy destinations to their
+                    // sources. The RTL pass assigns types to call-arg-setup
+                    // copies (the Omove destinations); after copy propagation
+                    // replaces those with the original registers, the originals
+                    // need the type info for coalescing to work.
+                    for (&dst, &src) in &copy_subst {
+                        if let Some(&ty) = func_var_types.get(&dst) {
+                            func_var_types.entry(src).or_insert(ty);
+                        }
+                    }
                     let d = dead_store_elimination(func, &du, &liveness);
 
                     if c == 0 && d == 0 {
@@ -90,7 +100,28 @@ impl IRPass for RtlOptPass {
                 let mut du = DefUseInfo::build(func);
                 let mut liveness = LivenessInfo::build(func, &du);
 
-                let coalesced = live_range_coalescing(func, &du, &liveness, &mut func_var_types);
+                // Propagate types through surviving Omoves: if the copy
+                // source has a type but the destination doesn't, transfer it.
+                for (_, inst) in func.inst.iter() {
+                    if let RTLInst::Iop(Operation::Omove, args, dst) = inst {
+                        if args.len() == 1 && !func_var_types.contains_key(dst) {
+                            if let Some(&ty) = func_var_types.get(&args[0]) {
+                                func_var_types.insert(*dst, ty);
+                            }
+                        }
+                    }
+                }
+
+                // Record single-def registers before coalescing. Merge
+                // targets that were single-def gain extra defs only from
+                // absorbed same-type registers — splitting those apart is
+                // counterproductive.
+                let single_def_before: HashSet<RTLReg> = du.defs.iter()
+                    .filter(|(_, defs)| defs.len() == 1)
+                    .map(|(&reg, _)| reg)
+                    .collect();
+
+                let (coalesced, merge_targets) = live_range_coalescing(func, &du, &liveness, &mut func_var_types);
 
                 // Rebuild only if coalescing changed the function
                 if coalesced > 0 {
@@ -98,8 +129,16 @@ impl IRPass for RtlOptPass {
                     liveness = LivenessInfo::build(func, &du);
                 }
 
+                // Merge targets that were single-def before coalescing: their
+                // multiple defs now come entirely from coalescing, not from
+                // original register reuse. Don't split these.
+                let no_split: HashSet<RTLReg> = merge_targets.iter()
+                    .filter(|r| single_def_before.contains(r))
+                    .copied()
+                    .collect();
+
                 let mut local_counter = split_counter.fetch_add(1000, Ordering::Relaxed);
-                let splits = variable_splitting(func, &du, &liveness, &mut func_var_types, &mut local_counter);
+                let splits = variable_splitting(func, &du, &liveness, &mut func_var_types, &mut local_counter, &no_split);
 
                 let nops = nop_collapse(func);
 
@@ -727,7 +766,7 @@ pub(crate) fn copy_propagation(
     func: &mut FunctionCFG,
     du: &DefUseInfo,
     _liveness: &LivenessInfo,
-) -> usize {
+) -> (usize, HashMap<RTLReg, RTLReg>) {
     let mut candidates: Vec<(Node, RTLReg, RTLReg)> = Vec::new();
 
     for (&node, inst) in &func.inst {
@@ -789,7 +828,7 @@ pub(crate) fn copy_propagation(
     }
 
     if subst.is_empty() {
-        return 0;
+        return (0, HashMap::new());
     }
 
     let mut resolved: HashMap<RTLReg, RTLReg> = HashMap::new();
@@ -821,7 +860,7 @@ pub(crate) fn copy_propagation(
         }
     }
 
-    count
+    (count, resolved)
 }
 
 pub(crate) fn subst_in_inst(inst: &RTLInst, map: &HashMap<RTLReg, RTLReg>) -> RTLInst {
@@ -1146,9 +1185,9 @@ pub(crate) fn live_range_coalescing(
     du: &DefUseInfo,
     liveness: &LivenessInfo,
     var_types: &mut HashMap<RTLReg, XType>,
-) -> usize {
+) -> (usize, HashSet<RTLReg>) {
     if func.nodes.len() > 20000 {
-        return 0;
+        return (0, HashSet::new());
     }
 
     let mut interferes: HashMap<RTLReg, HashSet<RTLReg>> = HashMap::new();
@@ -1206,7 +1245,7 @@ pub(crate) fn live_range_coalescing(
     }
 
     if rename.is_empty() {
-        return 0;
+        return (0, HashSet::new());
     }
 
     let mut resolved: HashMap<RTLReg, RTLReg> = HashMap::new();
@@ -1223,6 +1262,9 @@ pub(crate) fn live_range_coalescing(
 
     let count = resolved.len();
 
+    // Collect merge targets: registers that absorbed other registers.
+    let merge_targets: HashSet<RTLReg> = resolved.values().copied().collect();
+
     for (_, inst) in func.inst.iter_mut() {
         *inst = rename_in_inst(inst, &resolved);
     }
@@ -1233,7 +1275,7 @@ pub(crate) fn live_range_coalescing(
         }
     }
 
-    count
+    (count, merge_targets)
 }
 
 pub(crate) fn rename_in_inst(inst: &RTLInst, map: &HashMap<RTLReg, RTLReg>) -> RTLInst {
@@ -1308,6 +1350,7 @@ pub(crate) fn variable_splitting(
     _liveness: &LivenessInfo,
     var_types: &mut HashMap<RTLReg, XType>,
     split_counter: &mut u64,
+    coalesced_regs: &HashSet<RTLReg>,
 ) -> usize {
     if func.nodes.len() > 20000 {
         return 0;
@@ -1320,6 +1363,16 @@ pub(crate) fn variable_splitting(
     for (reg, def_nodes) in &du.defs {
         if def_nodes.len() <= 1 { continue; }
         if func.params.contains(reg) { continue; }
+        // Skip registers whose multiple defs came entirely from
+        // coalescing. Coalescing only merges same-type non-interfering
+        // registers, so the absorbed defs all share the same RTL-pass
+        // type. Splitting them apart would create redundant variables.
+        //
+        // Safe because: coalescing is type-gated (same XType bucket) and
+        // interference-checked. The type_pass downstream resolves any
+        // minor type_candidate conflicts (e.g., Xptr vs Xcharptr) by
+        // priority — the merged result is a valid supertype.
+        if coalesced_regs.contains(reg) { continue; }
 
         let use_nodes = match du.uses.get(reg) {
             Some(u) if !u.is_empty() => u,
