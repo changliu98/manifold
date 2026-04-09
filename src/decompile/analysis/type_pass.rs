@@ -216,9 +216,7 @@ ascent_par! {
         for mreg in args.iter(),
         reg_rtl(node, *mreg, rtl_reg);
 
-    // 2. Context-sensitive MOVSD upgrade: MAny64 -> Xfloat when the register is used in float arithmetic.
-    // MOVSD now produces MAny64 (not MFloat64) in the asm pass. When a register loaded/stored via
-    // MOVSD is also an operand of a float operation, upgrade to Xfloat.
+    // 2. MOVSD upgrade: MAny64 -> Xfloat when the register is used in float arithmetic.
     emit_var_type_candidate(rtl_reg, XType::Xfloat) <--
         emit_var_type_candidate(rtl_reg, ?XType::Xany64),
         rtl_inst(_, ?RTLInst::Iop(op, args, _)),
@@ -434,13 +432,7 @@ ascent_par! {
         if *arg_idx < params.len(),
         if params[*arg_idx] == XType::Xsingleptr;
 
-    // Propagate pointer and element type through aliases
-    is_ptr(b) <-- is_ptr(a), alias_edge(a, b);
-    is_ptr(a) <-- is_ptr(b), alias_edge(a, b);
-    is_char_ptr(b) <-- is_char_ptr(a), alias_edge(a, b);
-    is_char_ptr(a) <-- is_char_ptr(b), alias_edge(a, b);
-    ptr_element_type(b, ty) <-- ptr_element_type(a, ty), alias_edge(a, b);
-    ptr_element_type(a, ty) <-- ptr_element_type(b, ty), alias_edge(a, b);
+    // Alias propagation of is_ptr/is_char_ptr/ptr_element_type is handled in rtl_pass, not here.
 
     has_ptr_element_conflict(reg) <-- ptr_element_type(reg, a), ptr_element_type(reg, b), if a != b;
 
@@ -741,11 +733,11 @@ impl IRPass for TypePass {
     fn name(&self) -> &'static str { "type" }
 
     fn run(&self, db: &mut DecompileDB) {
-        use std::collections::{HashMap, HashSet};
-
-
         let mut prog = TypePassProgram::default();
         prog.swap_db_fields(db);
+
+        // Snapshot pre-existing is_ptr from rtl_pass
+        let pre_is_ptr: std::collections::HashSet<u64> = prog.is_ptr.iter().map(|&(r,)| r).collect();
 
         prog.run();
 
@@ -767,6 +759,63 @@ impl IRPass for TypePass {
             eprintln!("TypePass candidate distribution ({} regs):", reg_types.len());
             for (combo, count) in &combos {
                 eprintln!("  {:>4}x  {{{}}}", count, combo);
+            }
+
+            // Dump 10 {Xptr}-only examples with context
+            let mut ptr_only_regs: Vec<u64> = reg_types.iter()
+                .filter(|(_, types)| types.len() == 1 && types.contains(&XType::Xptr))
+                .map(|(reg, _)| *reg)
+                .collect();
+            ptr_only_regs.sort();
+
+            // Build node->ltl_inst map for fast lookup
+            let mut node_inst: std::collections::HashMap<u64, Vec<String>> = std::collections::HashMap::new();
+            for &(n, ref inst) in prog.ltl_inst.iter() {
+                node_inst.entry(n).or_default().push(format!("{:?}", inst));
+            }
+
+            // Build reverse map: rtl_reg -> Vec<(node, mreg)>
+            let mut reg_sites: std::collections::HashMap<u64, Vec<(u64, Mreg)>> = std::collections::HashMap::new();
+            for &(node, mreg, rtl_reg) in prog.reg_rtl.iter() {
+                reg_sites.entry(rtl_reg).or_default().push((node, mreg));
+            }
+
+            let must_be_ptr_set: std::collections::HashSet<u64> = prog.must_be_ptr.iter().map(|&(r,)| r).collect();
+            let op_produces_ptr_set: std::collections::HashSet<u64> = prog.op_produces_ptr.iter().map(|&(_, r)| r).collect();
+            let base_addr_set: std::collections::HashSet<u64> = prog.base_addr_usage.iter().map(|&(_, r, _)| r).collect();
+            let is_char_ptr_set: std::collections::HashSet<u64> = prog.is_char_ptr.iter().map(|&(r,)| r).collect();
+
+            // Count orphan {Xptr}-only (no reg_rtl entries = non-canonical from alias_edge)
+            let orphan_ptr_only = ptr_only_regs.iter().filter(|r| !reg_sites.contains_key(r)).count();
+            eprintln!("\n  {{Xptr}}-only: {} total, {} orphan (non-canonical), {} real",
+                ptr_only_regs.len(), orphan_ptr_only, ptr_only_regs.len() - orphan_ptr_only);
+
+            eprintln!("\n=== 10 {{Xptr}}-only examples ===");
+            let mut shown = 0;
+            for &reg in ptr_only_regs.iter() {
+                if shown >= 10 { break; }
+                let from_rtl = pre_is_ptr.contains(&reg);
+                let mut src = Vec::new();
+                if from_rtl { src.push("rtl_pass"); }
+                if must_be_ptr_set.contains(&reg) { src.push("must_be_ptr"); }
+                if op_produces_ptr_set.contains(&reg) { src.push("op_produces_ptr"); }
+                if base_addr_set.contains(&reg) { src.push("base_addr"); }
+                if is_char_ptr_set.contains(&reg) { src.push("is_char_ptr"); }
+                eprintln!("  reg 0x{:x}  [{}]", reg, src.join(", "));
+                if let Some(sites) = reg_sites.get(&reg) {
+                    let mut sorted_sites = sites.clone();
+                    sorted_sites.sort_by_key(|&(n, _)| n);
+                    for &(node, mreg) in sorted_sites.iter().take(4) {
+                        if let Some(insts) = node_inst.get(&node) {
+                            for inst in insts.iter().take(1) {
+                                eprintln!("    @0x{:x} {:?} = {}", node, mreg, inst);
+                            }
+                        }
+                    }
+                } else {
+                    eprintln!("    (no reg_rtl entries)");
+                }
+                shown += 1;
             }
         }
 

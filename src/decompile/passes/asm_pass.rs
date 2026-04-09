@@ -1205,7 +1205,7 @@ ascent_par! {
         !symbol_table(target_addr, _, _, _, _, _, _, _, _),
         !function_symbol(target_addr, _),
         !plt_entry(target_addr, _),
-        let name_string = format!("data_{:x}", target_addr),
+        let name_string = format!("SUB_{:x}", target_addr),
         let name_sym = Box::leak(name_string.into_boxed_str()) as &'static str;
 
     symbols(addr, name, name) <--
@@ -2537,8 +2537,7 @@ ascent_par! {
         let mnem_upper = mnem.to_ascii_uppercase(),
         if !mnem_upper.contains("MOVZ") && !mnem_upper.contains("MOVS");
 
-    // Scaled-index load with no base register: mov disp(,%idx,scale), dst
-    // Handles clang data lookup tables and similar patterns where base=NONE.
+    // Scaled-index load with no base register: mov disp(,%idx,scale), dst.
     transl_load_inferred(addr, *chunk, addrmode, regs.clone(), dst) <--
         pmov(addr, dst_sym, src),
         op_register(dst_sym, dst_str),
@@ -3120,8 +3119,7 @@ ascent_par! {
             Operation::Oaddlimm(imm_int)
         };
 
-    // ADD/SUB with memory source, register destination: add reg, [mem]
-    // padd.dst = [mem] (memory source), padd.src = reg (register destination).
+    // ADD/SUB with memory source, register destination: add reg, [mem].
     arith_load_op(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(dst_str)) <--
         padd(address, dst, src),
         op_register(dst, dst_str),
@@ -3155,9 +3153,7 @@ ascent_par! {
         let op = if *dst_is_64 { Operation::Oaddl } else { Operation::Oadd },
         let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
 
-    // ADD/SUB with memory destination, register source: add [mem], reg
-    // padd.dst = [mem] (x86 destination), padd.src = reg (x86 source).
-    // This is a read-modify-write: load from [mem], op with reg, store back.
+    // ADD/SUB with memory destination, register source: read-modify-write at [mem].
     arith_store_reg(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(src_str)) <--
         padd(address, dst, src),
         op_register(src, src_str),
@@ -3329,8 +3325,7 @@ ascent_par! {
         preg_of(res, preg_of_r),
         let args = vec![*res];
 
-    // 3-operand IMUL: imul dst, src, imm -> dst = src * imm (32-bit)
-    // Suppressed when the IMUL is part of a division-by-constant pattern.
+    // 3-operand IMUL (32-bit): imul dst, src, imm; suppressed inside div-by-constant.
     mach_inst(address, MachInst::Mop(Operation::Omulimm(imm_int), Arc::new(args), *res)) <--
         pimul3(address, dst, src, imm),
         !div_consumed(address),
@@ -3346,8 +3341,7 @@ ascent_par! {
         preg_of(src_arg, preg_of_src),
         let args = vec![*src_arg];
 
-    // 3-operand IMUL: imul dst, src, imm -> dst = src * imm (64-bit)
-    // Suppressed when the IMUL is part of a division-by-constant pattern.
+    // 3-operand IMUL (64-bit): imul dst, src, imm; suppressed inside div-by-constant.
     mach_inst(address, MachInst::Mop(Operation::Omullimm(imm_int), Arc::new(args), *res)) <--
         pimul3(address, dst, src, imm),
         !div_consumed(address),

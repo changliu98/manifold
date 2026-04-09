@@ -258,8 +258,15 @@ fn reconcile_signatures(db: &mut DecompileDB) {
     }
 
     let mut call_int_evidence: HashMap<Node, HashSet<usize>> = HashMap::new();
-    for &(call_node, pos) in db.rel_iter::<(Node, usize)>("call_has_arg_evidence") {
+    let mut calls_with_precise_arg_mapping: HashSet<Node> = HashSet::new();
+    for &(call_node, pos, _) in db.rel_iter::<(Node, usize, RTLReg)>("call_arg") {
         call_int_evidence.entry(call_node).or_default().insert(pos);
+        calls_with_precise_arg_mapping.insert(call_node);
+    }
+    for &(call_node, pos) in db.rel_iter::<(Node, usize)>("call_has_arg_evidence") {
+        if !calls_with_precise_arg_mapping.contains(&call_node) {
+            call_int_evidence.entry(call_node).or_default().insert(pos);
+        }
     }
 
     let float_param_counts: HashMap<Address, usize> = db
@@ -426,7 +433,18 @@ fn reconcile_signatures(db: &mut DecompileDB) {
             }
 
             // Priority 1.5: Definition-side emit_var_type (struct/ptr refinements), upgrading to pointer or struct pointer based on RTL load/store base usage.
-            if resolved_type.is_none() || resolved_type == Some(XType::Xint) || resolved_type == Some(XType::Xptr) {
+            if resolved_type.is_none() || matches!(
+                resolved_type,
+                Some(
+                    XType::Xint
+                        | XType::Xintunsigned
+                        | XType::Xlong
+                        | XType::Xlongunsigned
+                        | XType::Xany32
+                        | XType::Xany64
+                        | XType::Xptr
+                )
+            ) {
                 if let Some(params) = existing_params {
                     if let Some(&reg) = params.get(i) {
                         if let Some(xtypes) = emit_var_types.get(&reg) {
@@ -466,8 +484,18 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                 }
             }
 
-            // Priority 2: Call-site argument type evidence (majority vote), only upgrading from default Xint or filling gaps.
-            if resolved_type.is_none() || resolved_type == Some(XType::Xint) {
+            // Priority 2: Call-site majority vote, upgrading generic int placeholders only.
+            if resolved_type.is_none() || matches!(
+                resolved_type,
+                Some(
+                    XType::Xint
+                        | XType::Xintunsigned
+                        | XType::Xlong
+                        | XType::Xlongunsigned
+                        | XType::Xany32
+                        | XType::Xany64
+                )
+            ) {
                 if let Some(pos_types) = call_site_arg_types.get(&func_addr) {
                     if let Some(caller_types) = pos_types.get(&i) {
                         if !caller_types.is_empty() {
@@ -475,11 +503,63 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                             for t in caller_types {
                                 *type_counts.entry(t).or_insert(0) += 1;
                             }
+                            let should_override = match resolved_type.as_ref() {
+                                None => true,
+                                Some(current) => matches!(
+                                    current,
+                                    XType::Xint
+                                        | XType::Xintunsigned
+                                        | XType::Xlong
+                                        | XType::Xlongunsigned
+                                        | XType::Xany32
+                                        | XType::Xany64
+                                ),
+                            };
                             if let Some((&best_type, &best_count)) = type_counts.iter()
                                 .max_by_key(|(_, count)| **count)
                             {
                                 if best_count * 2 > caller_types.len() {
-                                    resolved_type = Some(best_type.clone());
+                                    if should_override {
+                                        resolved_type = Some(best_type.clone());
+                                    }
+                                }
+                            }
+                            if should_override && matches!(
+                                resolved_type,
+                                None
+                                    | Some(
+                                        XType::Xint
+                                            | XType::Xintunsigned
+                                            | XType::Xlong
+                                            | XType::Xlongunsigned
+                                            | XType::Xany32
+                                            | XType::Xany64
+                                    )
+                            ) {
+                                if let Some(best_ptr) = caller_types.iter().max_by_key(|t| match t {
+                                    XType::XstructPtr(_) => 6,
+                                    XType::Xcharptr => 5,
+                                    XType::Xcharptrptr
+                                    | XType::Xintptr
+                                    | XType::Xfloatptr
+                                    | XType::Xsingleptr
+                                    | XType::Xfuncptr => 4,
+                                    XType::Xptr => 3,
+                                    _ => 0,
+                                }) {
+                                    if matches!(
+                                        best_ptr,
+                                        XType::XstructPtr(_)
+                                            | XType::Xcharptr
+                                            | XType::Xcharptrptr
+                                            | XType::Xintptr
+                                            | XType::Xfloatptr
+                                            | XType::Xsingleptr
+                                            | XType::Xfuncptr
+                                            | XType::Xptr
+                                    ) {
+                                        resolved_type = Some(best_ptr.clone());
+                                    }
                                 }
                             }
                         }
@@ -490,9 +570,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
             param_types.push(resolved_type.unwrap_or(XType::Xint));
         }
 
-        // C++ method detection: mangled names starting with "_ZN" are class member
-        // functions whose first parameter (position 0) is the implicit `this` pointer.
-        // Force it to Xptr unless a more specific pointer type was already resolved.
+        // C++ method detection: _ZN-mangled names get Xptr for implicit `this` (param 0).
         if func_name.starts_with("_ZN") && !param_types.is_empty() {
             let needs_upgrade = matches!(
                 param_types[0],
@@ -525,6 +603,16 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         };
 
         let count_changed = reconciled_count != def_count;
+        let current_param_types: Vec<XType> = (0..reconciled_count)
+            .map(|i| {
+                existing_params
+                    .and_then(|params| params.get(i))
+                    .and_then(|reg| existing_types.and_then(|types| types.get(reg)))
+                    .cloned()
+                    .unwrap_or(XType::Xint)
+            })
+            .collect();
+        let param_types_changed = current_param_types != param_types;
         let ret_type_changed = match def_ret_type {
             Some(dt) => *dt != return_type,
             None => return_type != XType::Xvoid,
@@ -532,7 +620,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         let void_override = return_type == XType::Xvoid
             && (def_has_return.contains(&func_addr) || def_return_types.contains_key(&func_addr));
 
-        if count_changed || ret_type_changed || void_override {
+        if count_changed || param_types_changed || ret_type_changed || void_override {
             prototypes.push(FunctionPrototype {
                 address: func_addr,
                 name: func_name,

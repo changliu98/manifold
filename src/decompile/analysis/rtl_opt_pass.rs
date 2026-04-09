@@ -27,10 +27,10 @@ impl IRPass for RtlOptPass {
 
         // Re-evaluate RTL rules with xtl_canonical from variable assignment
         run_pass!(db, RTLPassProgram);
+        crate::decompile::passes::rtl_pass::trim_direct_call_args_to_callee_arity(db);
 
         // Convert LTL builtins to RTL (after 2nd Ascent evaluation, preserving original order)
         crate::decompile::passes::rtl_pass::convert_and_push_builtins(db);
-
 
         let mut ctx = PassContext::load(db);
         if ctx.functions.is_empty() {
@@ -86,27 +86,30 @@ impl IRPass for RtlOptPass {
                     dead += d;
                 }
 
-                let coalesced;
-                {
-                    let du = DefUseInfo::build(func);
-                    let liveness = LivenessInfo::build(func, &du);
-                    coalesced = live_range_coalescing(func, &du, &liveness, &mut func_var_types);
+                // Single rebuild after copy-prop/DSE loop for remaining passes
+                let mut du = DefUseInfo::build(func);
+                let mut liveness = LivenessInfo::build(func, &du);
+
+                let coalesced = live_range_coalescing(func, &du, &liveness, &mut func_var_types);
+
+                // Rebuild only if coalescing changed the function
+                if coalesced > 0 {
+                    du = DefUseInfo::build(func);
+                    liveness = LivenessInfo::build(func, &du);
                 }
-                let splits;
-                {
-                    let du = DefUseInfo::build(func);
-                    let liveness = LivenessInfo::build(func, &du);
-                    let mut local_counter = split_counter.fetch_add(1000, Ordering::Relaxed);
-                    splits = variable_splitting(func, &du, &liveness, &mut func_var_types, &mut local_counter);
-                }
+
+                let mut local_counter = split_counter.fetch_add(1000, Ordering::Relaxed);
+                let splits = variable_splitting(func, &du, &liveness, &mut func_var_types, &mut local_counter);
+
                 let nops = nop_collapse(func);
 
-                let inlines;
-                {
-                    let du = DefUseInfo::build(func);
-                    let liveness = LivenessInfo::build(func, &du);
-                    inlines = find_inline_temps(func, &du, &liveness);
+                // Rebuild only if splitting or nop collapse changed something
+                if splits > 0 || nops > 0 {
+                    du = DefUseInfo::build(func);
+                    liveness = LivenessInfo::build(func, &du);
                 }
+
+                let inlines = find_inline_temps(func, &du, &liveness);
 
                 (copies, dead, nops, coalesced, zero_rewrites, splits, inlines, func_var_types)
             })

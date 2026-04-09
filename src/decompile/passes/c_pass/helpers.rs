@@ -559,7 +559,7 @@ pub fn build_string_literal_map(db: &DecompileDB) -> HashMap<String, String> {
             label_addrs.push((*name, *addr));
         }
         for (label, addr) in &label_addrs {
-            if !label.starts_with("L_") && !label.starts_with(".L_") && !label.starts_with("data_") {
+            if !label.starts_with("L_") && !label.starts_with(".L_") && !label.starts_with("SUB_") {
                 continue;
             }
             if map.contains_key(*label) {

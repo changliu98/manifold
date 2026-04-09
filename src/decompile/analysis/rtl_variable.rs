@@ -96,7 +96,7 @@ pub fn compute_variable_assignment(db: &mut DecompileDB) {
         uf.union(id1, id2);
     }
 
-    // Positive-evidence coalescing: merge canonicals for (func, mreg) when a direct reg_def_used link exists with no intervening def, as a conservative safety net for missed alias_edge connections.
+    // Merge canonicals for (func, mreg) via reg_def_used links with no intervening def.
     {
         let instr_func_data: Vec<(Node, u64)> = db
             .rel_iter::<(Node, u64)>("instr_in_function")
@@ -106,14 +106,16 @@ pub fn compute_variable_assignment(db: &mut DecompileDB) {
 
         let is_def_set: HashSet<(Node, RTLReg)> = is_def_data.iter().cloned().collect();
 
-        // (node, mreg) -> def-side canonical (the is_def ID's canonical)
+        // Index reg_xtl by (node, xtl_id) -> mreg for fast def-canonical lookup
+        let mut reg_xtl_by_node_id: HashMap<(Node, RTLReg), Mreg> = HashMap::new();
+        for &(node, mreg, xtl_id) in &reg_xtl_data {
+            reg_xtl_by_node_id.entry((node, xtl_id)).or_insert(mreg);
+        }
+
         let mut node_mreg_def_canonical: HashMap<(Node, Mreg), RTLReg> = HashMap::new();
         for &(node, id) in &is_def_data {
-            for &(n, mreg, xtl_id) in &reg_xtl_data {
-                if n == node && xtl_id == id {
-                    node_mreg_def_canonical.insert((node, mreg), uf.find(id));
-                    break;
-                }
+            if let Some(&mreg) = reg_xtl_by_node_id.get(&(node, id)) {
+                node_mreg_def_canonical.insert((node, mreg), uf.find(id));
             }
         }
 
@@ -160,28 +162,31 @@ pub fn compute_variable_assignment(db: &mut DecompileDB) {
         }
 
         // Compute per-function block dominance to identify back-edges.
-        // A block d dominates block b if d is on every path from the entry to b.
-        // We use BFS-based reachability-avoiding to compute this.
         let mut func_back_edges: HashMap<u64, HashSet<(Node, Node)>> = HashMap::new();
         {
-            // Collect functions and their entry blocks.
+            // Index: func -> entry block
             let mut func_entries: HashMap<u64, Node> = HashMap::new();
+            let mut code_in_block_by_block: HashMap<Node, Vec<Node>> = HashMap::new();
+            for &(n, b) in &code_in_block_data {
+                code_in_block_by_block.entry(b).or_default().push(n);
+            }
             for (&blk, &func) in &block_to_func {
-                // The entry block contains the function start address.
-                if let Some(&(n, _b)) = code_in_block_data.iter().find(|&&(n, b)| b == blk && n == func) {
-                    let _ = n;
-                    func_entries.insert(func, blk);
+                if let Some(nodes) = code_in_block_by_block.get(&blk) {
+                    if nodes.contains(&func) {
+                        func_entries.insert(func, blk);
+                    }
                 }
+            }
+
+            // Index: func -> blocks
+            let mut func_to_blocks: HashMap<u64, Vec<Node>> = HashMap::new();
+            for (&blk, &func) in &block_to_func {
+                func_to_blocks.entry(func).or_default().push(blk);
             }
 
             for (&func, &entry_blk) in &func_entries {
                 let adj = match func_block_adj.get(&func) { Some(a) => a, None => continue };
-
-                // Collect all blocks in this function.
-                let func_blocks: Vec<Node> = block_to_func.iter()
-                    .filter(|(_, &f)| f == func)
-                    .map(|(&b, _)| b)
-                    .collect();
+                let func_blocks = match func_to_blocks.get(&func) { Some(b) => b, None => continue };
 
                 // BFS to find all reachable blocks from entry.
                 let mut reachable: HashSet<Node> = HashSet::new();
@@ -198,28 +203,17 @@ pub fn compute_variable_assignment(db: &mut DecompileDB) {
                     }
                 }
 
-                // For each reachable block d, check if d dominates some successor's target
-                // by testing if entry can reach that target without going through d.
-                // block_dom(b, d) = d dominates b = entry cannot reach b while avoiding d.
-                // A back-edge is (src_blk, dst_blk) where dst_blk dominates src_blk.
-                // We compute: can entry reach src_blk without going through dst_blk?
-                // If not, then dst_blk dominates src_blk, and (src_blk -> dst_blk) is a back-edge.
-
                 // For each CFG edge (src_blk -> dst_blk), check if dst_blk dominates src_blk.
-                for &src_blk in &func_blocks {
+                for &src_blk in func_blocks {
                     if !reachable.contains(&src_blk) { continue; }
                     if let Some(nexts) = adj.get(&src_blk) {
                         for &dst_blk in nexts {
                             if !reachable.contains(&dst_blk) { continue; }
-                            // Check if dst_blk dominates src_blk:
-                            // dst_blk dominates src_blk iff entry cannot reach src_blk while avoiding dst_blk.
                             if dst_blk == src_blk {
-                                // Self-loop: the block dominates itself, so this is a back-edge.
                                 func_back_edges.entry(func).or_default().insert((src_blk, dst_blk));
                                 continue;
                             }
                             if dst_blk == entry_blk {
-                                // Entry dominates everything reachable.
                                 func_back_edges.entry(func).or_default().insert((src_blk, dst_blk));
                                 continue;
                             }
@@ -242,7 +236,6 @@ pub fn compute_variable_assignment(db: &mut DecompileDB) {
                                 }
                             }
                             if !reached_src {
-                                // dst_blk dominates src_blk -> this is a back-edge.
                                 func_back_edges.entry(func).or_default().insert((src_blk, dst_blk));
                             }
                         }
@@ -251,40 +244,59 @@ pub fn compute_variable_assignment(db: &mut DecompileDB) {
             }
         }
 
-        // BFS-based block reachability check, excluding back-edges.
-        let block_reaches = |func: u64, from_blk: Node, to_blk: Node| -> bool {
-            if from_blk == to_blk { return true; }
-            let adj = match func_block_adj.get(&func) { Some(a) => a, None => return false };
-            let back_edges = func_back_edges.get(&func);
-            let mut visited = HashSet::new();
-            let mut queue = VecDeque::new();
-            visited.insert(from_blk);
-            queue.push_back(from_blk);
-            while let Some(blk) = queue.pop_front() {
-                if let Some(nexts) = adj.get(&blk) {
-                    for &nb in nexts {
-                        // Skip back-edges (where destination dominates source).
-                        if let Some(be) = back_edges {
-                            if be.contains(&(blk, nb)) { continue; }
+        // Precompute per-function forward block reachability (excluding back-edges).
+        let func_block_reach: HashMap<(u64, Node), HashSet<Node>> = {
+            let mut result = HashMap::new();
+            for (&func, adj) in &func_block_adj {
+                let back_edges = func_back_edges.get(&func);
+                for &src in adj.keys() {
+                    let mut visited = HashSet::new();
+                    let mut queue = VecDeque::new();
+                    visited.insert(src);
+                    queue.push_back(src);
+                    while let Some(blk) = queue.pop_front() {
+                        if let Some(nexts) = adj.get(&blk) {
+                            for &nb in nexts {
+                                if let Some(be) = back_edges {
+                                    if be.contains(&(blk, nb)) { continue; }
+                                }
+                                if visited.insert(nb) { queue.push_back(nb); }
+                            }
                         }
-                        if nb == to_blk { return true; }
-                        if visited.insert(nb) { queue.push_back(nb); }
                     }
+                    visited.remove(&src);
+                    result.insert((func, src), visited);
                 }
             }
-            false
+            result
         };
 
-        // Collect all (def_addr, mreg) that define mreg for intervening-def validation.
-        let asm_effective_def: HashSet<(Node, Mreg)> = db.rel_iter::<(Node, Mreg)>("asm_effective_def").cloned().collect();
+        // Index asm_effective_def by (func, mreg) for fast lookup.
+        let asm_effective_def_raw: HashSet<(Node, Mreg)> = db.rel_iter::<(Node, Mreg)>("asm_effective_def").cloned().collect();
+        let mut asm_def_by_func_mreg: HashMap<(u64, Mreg), Vec<Node>> = HashMap::new();
+        for &(addr, mreg) in &asm_effective_def_raw {
+            if let Some(&func) = node_to_func.get(&addr) {
+                asm_def_by_func_mreg.entry((func, mreg)).or_default().push(addr);
+            }
+        }
 
-        // Validate has_intervening_def: check that a REAL intervening def exists on a function-scoped CFG path.
+        let block_reaches = |func: u64, from_blk: Node, to_blk: Node| -> bool {
+            if from_blk == to_blk { return true; }
+            match func_block_reach.get(&(func, from_blk)) {
+                Some(reachable) => reachable.contains(&to_blk),
+                None => false,
+            }
+        };
+
         let validate_intervening = |def_addr: Node, use_addr: Node, mreg: Mreg, func: u64| -> bool {
             let def_blk = match node_to_block.get(&def_addr) { Some(&b) => b, None => return false };
             let use_blk = match node_to_block.get(&use_addr) { Some(&b) => b, None => return false };
-            for &(mid_addr, ref mid_mreg) in &asm_effective_def {
-                if *mid_mreg != mreg || mid_addr == def_addr || mid_addr == use_addr { continue; }
-                if node_to_func.get(&mid_addr) != Some(&func) { continue; }
+            let defs = match asm_def_by_func_mreg.get(&(func, mreg)) {
+                Some(d) => d,
+                None => return false,
+            };
+            for &mid_addr in defs {
+                if mid_addr == def_addr || mid_addr == use_addr { continue; }
                 let mid_blk = match node_to_block.get(&mid_addr) { Some(&b) => b, None => continue };
                 // Same-block: check address ordering.
                 if def_blk == mid_blk && mid_blk == use_blk {

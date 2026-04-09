@@ -13,7 +13,7 @@ use crate::x86::op::{Addressing, Comparison, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
 use either::Either;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crate::util::DEFAULT_VAR;
 use crate::decompile::passes::asm_pass::transl_addressing_rev;
 
@@ -1226,8 +1226,7 @@ ascent_par! {
         reg_rtl(addr, mregs[0], base_rtl),
         let inst = RTLInst::Iload(*chunk, addressing.clone(), Arc::new(vec![*base_rtl]), *dst_rtl);
 
-    // SP-indexed load: Aindexed2scaled(scale, ofs) with [SP, idx] -> expand to Olea(Ainstack(ofs)) + Iload(Aindexed2scaled(scale, 0), [sp_addr, idx])
-    // The Olea goes at the original node; the Iload goes at a synthetic successor node.
+    // SP-indexed load: expand [SP, idx] to Olea(Ainstack(ofs)) + Iload(Aindexed2scaled(scale, 0)).
     rtl_inst_candidate(addr, lea_inst), op_produces_ptr(addr, sp_addr_rtl) <--
         ltl_inst(addr, ?LTLInst::Lload(_, addressing, mregs, _)),
         if mregs.len() == 2 && mregs[0] == Mreg::SP,
@@ -1703,10 +1702,7 @@ ascent_par! {
         let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
         let inst = RTLInst::Icall(Some(inferred_sig), Either::Left(*callee_rtl), args.clone(), None, *next_addr);
 
-    // Fallback: indirect Lcall where reg_rtl is missing for the callee register.
-    // This handles C++ vtable dispatch and member function pointer calls where the
-    // register allocation pass failed to track the callee register through the
-    // def-use chain. Create a fresh RTL register for the callee target.
+    // Fallback: indirect Lcall with missing reg_rtl; create fresh RTL reg for callee target.
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lcall(callee)),
         if let Either::Left(mreg) = callee,
@@ -1858,8 +1854,7 @@ ascent_par! {
         let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
         let inst = RTLInst::Itailcall(Some(default_sig), Either::Left(*callee_rtl), Arc::new(vec![]));
 
-    // Fallback: indirect Ltailcall where reg_rtl is missing for the callee register.
-    // Mirrors the indirect Lcall fallback above for C++ vtable tail-calls.
+    // Fallback: indirect Ltailcall with missing reg_rtl (mirrors Lcall fallback above).
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
         if let Either::Left(mreg) = callee,
@@ -2487,7 +2482,7 @@ ascent_par! {
         let target_addr = (*addr as i64 + *size as i64 + *disp) as Address,
         !symbol_table(target_addr, _, _, _, _, _, _, _, _),
         !plt_entry(target_addr, _),
-        let name_string = format!("data_{:x}", target_addr),
+        let name_string = format!("SUB_{:x}", target_addr),
         let name_sym = Box::leak(name_string.into_boxed_str()) as &'static str;
 
     symbols(addr, name, name) <--
@@ -2525,7 +2520,7 @@ ascent_par! {
         !is_def(node, id1),
         !is_def(node, id2);
 
-    // --- Block-level dominator computation for back-edge detection ---
+    // Block-level dominator computation for back-edge detection.
     // Entry block of each function: the block containing the function start address.
     #[local] relation func_entry_block(Address, Address);
     func_entry_block(func, entry_block) <--
@@ -2562,8 +2557,7 @@ ascent_par! {
         block_reachable_from_entry(func, d),
         !block_path_avoiding(func, blk, d);
 
-    // Back-edge detection: an ltl_succ edge (src, dst) is a loop back-edge if
-    // dst's block dominates src's block within the same function.
+    // Back-edge: ltl_succ (src, dst) where dst's block dominates src's block in the same function.
     #[local] relation is_loop_back_edge(Address, Address);
     is_loop_back_edge(src, dst) <--
         ltl_succ(src, dst),
@@ -2998,6 +2992,7 @@ ascent_par! {
 
     relation function_entry_dist(Address, Node, i64);
     relation call_arg_mapping(Node, usize, RTLReg);
+    relation call_arg_position_allowed(Node, usize);
     relation call_arg_type(Node, usize, XType);
 
     call_arg_type(call_addr, pos, xtype) <--
@@ -3255,45 +3250,34 @@ ascent_par! {
         let sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xvoid, sig_cc: CallConv::default() };
 
 
-    call_arg_mapping(*call_addr, pos, rtl_reg) <--
-        call_arg_setup_detected(defaddr, dst_reg, call_addr),
-        reg_rtl(defaddr, dst_reg, rtl_reg),
-        if let Some(pos) = arg_reg_position(dst_reg),
-        call_has_arg_at_position(call_addr, pos),   
+    call_arg_position_allowed(call_addr, pos) <--
+        call_has_arg_at_position(call_addr, pos),
         !call_has_known_signature(call_addr, _, _, _);
 
-    call_arg_mapping(*call_addr, pos, rtl_reg) <--
-        call_arg_setup_detected(defaddr, dst_reg, call_addr),
-        reg_rtl(defaddr, dst_reg, rtl_reg),
-        if let Some(pos) = arg_reg_position(dst_reg),
-        call_has_arg_at_position(call_addr, pos),
-        call_has_known_signature(call_addr, name, sig_arg_count, _),
-        !known_varargs_function(name, _),
-        if pos < *sig_arg_count;
-
-    // Varargs: pass all detected args through; narrowing happens at C AST emission
-    call_arg_mapping(*call_addr, pos, rtl_reg) <--
-        call_arg_setup_detected(defaddr, dst_reg, call_addr),
-        reg_rtl(defaddr, dst_reg, rtl_reg),
-        if let Some(pos) = arg_reg_position(dst_reg),
+    call_arg_position_allowed(call_addr, pos) <--
         call_has_arg_at_position(call_addr, pos),
         call_has_known_signature(call_addr, name, _, _),
         known_varargs_function(name, _);
 
+    call_arg_position_allowed(call_addr, pos) <--
+        call_has_arg_at_position(call_addr, pos),
+        call_has_known_signature(call_addr, name, sig_arg_count, _),
+        !known_varargs_function(name, _),
+        if pos < sig_arg_count;
+
     call_arg_mapping(*call_addr, pos, rtl_reg) <--
-        tailcall_arg_setup_detected(defaddr, dst_reg, call_addr),
+        call_arg_setup_detected(defaddr, dst_reg, call_addr),
         reg_rtl(defaddr, dst_reg, rtl_reg),
         if let Some(pos) = arg_reg_position(dst_reg),
-        call_has_arg_at_position(call_addr, pos),
-        !call_has_known_signature(call_addr, _, _, _);
+        call_arg_position_allowed(call_addr, pos),
+        instr_in_function(defaddr, _func_start);
 
     call_arg_mapping(*call_addr, pos, rtl_reg) <--
         tailcall_arg_setup_detected(defaddr, dst_reg, call_addr),
         reg_rtl(defaddr, dst_reg, rtl_reg),
         if let Some(pos) = arg_reg_position(dst_reg),
-        call_has_arg_at_position(call_addr, pos),
-        call_has_known_signature(call_addr, _, sig_arg_count, _),
-        if pos < *sig_arg_count;
+        call_arg_position_allowed(call_addr, pos),
+        instr_in_function(defaddr, _func_start);
 
 
     relation arg_setup_candidate(Node, Mreg, Node);
@@ -3325,6 +3309,13 @@ ascent_par! {
         instr_in_function(call_addr, func_start),
         instr_in_function(prev, func_start);
 
+    // Pre-filtered: only call-to-call backward reachability (much smaller than full reach)
+    relation call_to_call_backward(Node, Node);
+    call_to_call_backward(call_addr, between_call) <--
+        call_backward_reach(call_addr, between_call, _),
+        is_call_instruction(between_call),
+        if *call_addr != *between_call;
+
     arg_setup_candidate(*defaddr, *dst_reg, *call_addr) <--
         ltl_inst(defaddr, ?LTLInst::Lop(_, _, dst_reg)),
         is_arg_reg(dst_reg),
@@ -3354,11 +3345,8 @@ ascent_par! {
 
     call_clobbers_arg_reg(defaddr, mreg, call_addr) <--
         arg_setup_candidate(defaddr, mreg, call_addr),
-        call_backward_reach(call_addr, between_call, _),
-        ltl_inst(between_call, ?LTLInst::Lcall(_)),
-        if *between_call != *call_addr,
+        call_to_call_backward(call_addr, between_call),
         call_backward_reach(between_call, defaddr, _),
-        // Ensure between_call is strictly between defaddr and call_addr in instruction order
         instr_in_function(defaddr, func_start),
         instr_min_order(func_start, defaddr, def_order),
         instr_min_order(func_start, between_call, between_order),
@@ -3367,11 +3355,8 @@ ascent_par! {
 
     call_clobbers_arg_reg(defaddr, mreg, call_addr) <--
         float_arg_setup_candidate(defaddr, mreg, call_addr),
-        call_backward_reach(call_addr, between_call, _),
-        ltl_inst(between_call, ?LTLInst::Lcall(_)),
-        if *between_call != *call_addr,
+        call_to_call_backward(call_addr, between_call),
         call_backward_reach(between_call, defaddr, _),
-        // Ensure between_call is strictly between defaddr and call_addr in instruction order
         instr_in_function(defaddr, func_start),
         instr_min_order(func_start, defaddr, def_order),
         instr_min_order(func_start, between_call, between_order),
@@ -4076,9 +4061,7 @@ ascent_par! {
         !cx_has_non_shift_use(func_start),
         func_has_shift_instr(func_start);
 
-    // General scratch register filter: a register is NOT a parameter if it is defined (written)
-    // before being used as a value within the function's entry block. This catches clang patterns
-    // where DX/CX are used as scratch (e.g., xor %ecx,%ecx for zeroing, idiv remainder output).
+    // Scratch register filter: reg defined before use in entry block is not a parameter.
     relation arg_reg_first_action_is_def(Address, Mreg);
     #[local] relation arg_reg_used_strictly_before(Address, Mreg, Address);
 
@@ -5044,6 +5027,7 @@ impl IRPass for RTLPass {
 
     fn run(&self, db: &mut DecompileDB) {
         run_pass!(db, RTLPassProgram);
+        trim_direct_call_args_to_callee_arity(db);
     }
 
     declare_io_from!(RTLPassProgram);
@@ -5063,6 +5047,135 @@ pub fn convert_and_push_builtins(db: &mut DecompileDB) {
     for (node, inst) in converted {
         db.rel_push("rtl_inst_candidate", (node, inst));
     }
+}
+
+pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
+    let callee_arity: HashMap<Address, usize> = db
+        .rel_iter::<(Address, Signature)>("emit_function_signature_candidate")
+        .fold(HashMap::new(), |mut acc, (addr, sig)| {
+            acc.entry(*addr)
+                .and_modify(|curr| *curr = (*curr).max(sig.sig_args.len()))
+                .or_insert(sig.sig_args.len());
+            acc
+        });
+
+    let call_targets: HashMap<Node, Address> = db
+        .rel_iter::<(Node, Address)>("call_target_func")
+        .map(|(call_node, target)| (*call_node, *target))
+        .collect();
+
+    let filtered_mapping: Vec<(Node, usize, RTLReg)> = db
+        .rel_iter::<(Node, usize, RTLReg)>("call_arg_mapping")
+        .filter_map(|&(node, pos, reg)| {
+            if let Some(&target) = call_targets.get(&node) {
+                if let Some(&arity) = callee_arity.get(&target) {
+                    if pos >= arity {
+                        return None;
+                    }
+                }
+            }
+            Some((node, pos, reg))
+        })
+        .collect();
+
+    db.rel_set(
+        "call_arg_mapping",
+        filtered_mapping
+            .iter()
+            .copied()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "call_arg",
+        filtered_mapping
+            .iter()
+            .copied()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    let mut normalized_mapping: HashMap<(Node, usize), RTLReg> = HashMap::new();
+    for (node, pos, reg) in filtered_mapping {
+        if let Some(&target) = call_targets.get(&node) {
+            if let Some(&arity) = callee_arity.get(&target) {
+                debug_assert!(pos < arity);
+            }
+        }
+        normalized_mapping
+            .entry((node, pos))
+            .and_modify(|curr| *curr = (*curr).max(reg))
+            .or_insert(reg);
+    }
+
+    let mut args_by_call: HashMap<Node, Vec<(usize, RTLReg)>> = HashMap::new();
+    for (&(node, pos), &reg) in &normalized_mapping {
+        args_by_call.entry(node).or_default().push((pos, reg));
+    }
+    let rebuild_args = |node: Node| -> Option<Arc<Vec<RTLReg>>> {
+        let mut pairs = args_by_call.get(&node)?.clone();
+        pairs.sort_by_key(|(pos, _)| *pos);
+        Some(Arc::new(pairs.into_iter().map(|(_, reg)| reg).collect()))
+    };
+
+    let mut call_nodes: HashSet<Node> = db
+        .rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
+        .map(|(node, _)| *node)
+        .collect();
+    call_nodes.extend(args_by_call.keys().copied());
+
+    let mut existing_call_args: HashMap<Node, Arc<Vec<RTLReg>>> = HashMap::new();
+    for &(node, ref args) in db.rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate") {
+        let should_replace = existing_call_args
+            .get(&node)
+            .map(|curr| curr.len() < args.len())
+            .unwrap_or(true);
+        if should_replace {
+            existing_call_args.insert(node, args.clone());
+        }
+    }
+
+    let new_call_args: ascent::boxcar::Vec<(Node, Arc<Vec<RTLReg>>)> = call_nodes
+        .into_iter()
+        .map(|node| {
+            let args = rebuild_args(node)
+                .or_else(|| existing_call_args.get(&node).cloned())
+                .unwrap_or_else(|| Arc::new(vec![]));
+            (node, args)
+        })
+        .collect();
+    db.rel_set("call_args_collected_candidate", new_call_args);
+
+    let rebuilt_args: HashMap<Node, Arc<Vec<RTLReg>>> = db
+        .rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
+        .map(|(node, args)| (*node, args.clone()))
+        .collect();
+
+    let new_rtl_inst: ascent::boxcar::Vec<(Node, RTLInst)> = db
+        .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+        .map(|(node, inst)| {
+            let replacement_args = rebuilt_args.get(node);
+            let patched = match inst {
+                RTLInst::Icall(sig, callee, args, dst, next) => {
+                    RTLInst::Icall(
+                        sig.clone(),
+                        callee.clone(),
+                        replacement_args.cloned().unwrap_or_else(|| args.clone()),
+                        *dst,
+                        *next,
+                    )
+                }
+                RTLInst::Itailcall(sig, callee, args) => {
+                    RTLInst::Itailcall(
+                        sig.clone(),
+                        callee.clone(),
+                        replacement_args.cloned().unwrap_or_else(|| args.clone()),
+                    )
+                }
+                _ => inst.clone(),
+            };
+            (*node, patched)
+        })
+        .collect();
+    db.rel_set("rtl_inst_candidate", new_rtl_inst);
 }
 
 pub(crate) const FUNC_ARG_DIST: i64 = 256;

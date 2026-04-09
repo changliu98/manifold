@@ -1,3 +1,4 @@
+#![allow(warnings)]
 mod debug;
 mod decompile;
 mod util;
