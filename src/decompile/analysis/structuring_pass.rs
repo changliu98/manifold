@@ -3,7 +3,7 @@ use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::clight_pass::invert_condition;
 use crate::decompile::passes::pass::IRPass;
 use crate::x86::op::{Comparison, Condition};
-use crate::x86::types::{Address, BuiltinArg, Constant, CsharpminorExpr, CsharpminorStmt, Node, RTLReg};
+use crate::x86::types::{Address, BuiltinArg, Constant, CsharpminorExpr, CsharpminorStmt, Node, RTLReg, Symbol};
 use ascent::ascent_par;
 use log::debug;
 use rayon::prelude::*;
@@ -57,6 +57,13 @@ impl IRPass for StructuringPass {
             .map(|&(a, b)| (a, b))
             .collect();
 
+        // Authoritative function entry from emit_function; may point to a non-stmt node that
+        // structure() will resolve through next_map.
+        let func_entry: HashMap<Address, Node> = db
+            .rel_iter::<(Address, Symbol, Node)>("emit_function")
+            .map(|(addr, _, entry)| (*addr, *entry))
+            .collect();
+
         let all_stmts: Vec<(Node, CsharpminorStmt)> = working
             .into_iter()
             .collect();
@@ -97,7 +104,8 @@ impl IRPass for StructuringPass {
                     });
                 }
 
-                let structured = structure(stmts, &next_map);
+                let declared_entry = func_entry.get(func_addr).copied();
+                let structured = structure(stmts, &next_map, declared_entry);
                 (*func_addr, structured)
             })
             .collect();
@@ -197,7 +205,7 @@ impl IRPass for StructuringPass {
     }
 
     fn inputs(&self) -> &'static [&'static str] {
-        &["csharp_stmt_candidate", "instr_in_function", "single_def_const", "dead_def", "code_in_block", "next", "emit_inline_temp", "emit_var_type_candidate"]
+        &["csharp_stmt_candidate", "instr_in_function", "single_def_const", "dead_def", "code_in_block", "next", "emit_inline_temp", "emit_var_type_candidate", "emit_function"]
     }
 
     fn outputs(&self) -> &'static [&'static str] {
@@ -571,24 +579,17 @@ ascent_par! {
     switch_chain(*node, *node, *reg, *val, *t) <--
         compares_eq(node, reg, val, t, _);
 
-    // Direct chain: false branch of prev is a compares_eq on the same register
+    // Direct chain only: false branch of prev is a compares_eq on the same register.
+    // Bridge rules (crossing a non-Ceq Scond) are intentionally removed: they formed
+    // chains that later dead-coded interior Ceq members, but the bridge's Scond stayed
+    // alive and its ifso/ifnot could point to those dead members. Taking the bridge
+    // then fell through via skip labels to the wrong block. Without bridge rules, GCC
+    // range-guarded switches are not recovered as switches, but the emitted control
+    // flow is correct.
     switch_chain(*head, *f, *reg, *next_val, *next_t) <--
         switch_chain(head, prev, reg, _, _),
         compares_eq(prev, _, _, _, f),
         compares_eq(f, reg, next_val, next_t, _);
-
-    // Bridge chain: prev's false leads to non-eq Scond then compares_eq (GCC range-check interleaving)
-    switch_chain(*head, *f_f, *reg, *next_val, *next_t) <--
-        switch_chain(head, prev, reg, _, _),
-        compares_eq(prev, _, _, _, f),
-        stmt(f, ?CsharpminorStmt::Scond(_, _, _, f_f)),
-        compares_eq(f_f, reg, next_val, next_t, _);
-
-    switch_chain(*head, *f_t, *reg, *next_val, *next_t) <--
-        switch_chain(head, prev, reg, _, _),
-        compares_eq(prev, _, _, _, f),
-        stmt(f, ?CsharpminorStmt::Scond(_, _, f_t, _)),
-        compares_eq(f_t, reg, next_val, next_t, _);
 
     relation switch_count(Node, usize);
     switch_count(*head, count) <--
@@ -623,20 +624,6 @@ ascent_par! {
         switch_chain(head, member, _, _, _),
         if head != member;
 
-    // Suppress intermediate Scond nodes bridged over during chain detection
-    trim_node(*f) <--
-        primary_switch(head, reg),
-        switch_chain(head, prev, reg, _, _),
-        compares_eq(prev, _, _, _, f),
-        stmt(f, ?CsharpminorStmt::Scond(_, _, _, f_f)),
-        switch_chain(head, f_f, _, _, _);
-
-    trim_node(*f) <--
-        primary_switch(head, reg),
-        switch_chain(head, prev, reg, _, _),
-        compares_eq(prev, _, _, _, f),
-        stmt(f, ?CsharpminorStmt::Scond(_, _, f_t, _)),
-        switch_chain(head, f_t, _, _, _);
 }
 
 pub struct StructuringResult {
@@ -651,7 +638,11 @@ pub struct StructuringResult {
 }
 
 // Run CFG analysis, if-then-else construction, loop recovery, and break/continue conversion
-pub fn structure(stmts: &[(Node, CsharpminorStmt)], next_map: &HashMap<Node, Node>) -> StructuringResult {
+pub fn structure(
+    stmts: &[(Node, CsharpminorStmt)],
+    next_map: &HashMap<Node, Node>,
+    declared_entry: Option<Node>,
+) -> StructuringResult {
     if stmts.is_empty() {
         return StructuringResult {
             stmts: vec![],
@@ -714,7 +705,7 @@ pub fn structure(stmts: &[(Node, CsharpminorStmt)], next_map: &HashMap<Node, Nod
         prog.stmt.push((*node, s.clone()));
     }
 
-    let seq_edges = compute_sequential_edges(&current_stmts);
+    let seq_edges = compute_sequential_edges(&current_stmts, next_map);
     for &(a, b) in &seq_edges {
         prog.seq_next.push((a, b));
     }
@@ -727,8 +718,20 @@ pub fn structure(stmts: &[(Node, CsharpminorStmt)], next_map: &HashMap<Node, Nod
         }
     }
 
-    // Populate entry node: the first (lowest address) statement node is the function entry
-    let entry_node = current_stmts[0].0;
+    // Authoritative entry from emit_function, resolved to a stmt node through `next` chain.
+    // Falls back to lowest-address stmt if emit_function entry is missing or unreachable.
+    let entry_node = declared_entry
+        .and_then(|e| {
+            if stmt_nodes.contains(&e) {
+                Some(e)
+            } else {
+                walk_next_to_stmt(e, next_map, &stmt_nodes)
+            }
+        })
+        .unwrap_or_else(|| {
+            debug!("structuring: falling back to lowest-address entry");
+            current_stmts[0].0
+        });
     prog.entry_node.push((entry_node,));
 
     prog.run();
@@ -837,16 +840,17 @@ pub fn structure(stmts: &[(Node, CsharpminorStmt)], next_map: &HashMap<Node, Nod
         .map(|(head, reg)| (*head, *reg))
         .collect();
 
-    // Fallback: imperative comparison tree analysis for complex switch patterns
-    if valid_switches.is_empty() {
-        let tree_results = detect_comparison_tree_switches(&current_stmts, next_map);
-        for (head, reg, ref cases) in &tree_results {
-            if cases.len() >= 3 {
-                for &(val, target, member_node) in cases {
-                    switch_chain_members.push((*head, member_node, *reg, val, target));
-                }
-                valid_switches.push((*head, *reg));
+    // Fallback: imperative comparison tree analysis for complex switch patterns.
+    // Runs alongside Ascent-recovered switches, deduplicating by head.
+    let ascent_heads: HashSet<Node> = valid_switches.iter().map(|(h, _)| *h).collect();
+    let tree_results = detect_comparison_tree_switches(&current_stmts, next_map);
+    for (head, reg, ref cases) in &tree_results {
+        if ascent_heads.contains(head) { continue; }
+        if cases.len() >= 3 {
+            for &(val, target, member_node) in cases {
+                switch_chain_members.push((*head, member_node, *reg, val, target));
             }
+            valid_switches.push((*head, *reg));
         }
     }
 
@@ -928,24 +932,13 @@ fn detect_comparison_tree_switches(
 
     let stmt_map: HashMap<Node, &CsharpminorStmt> = stmts.iter().map(|(n, s)| (*n, s)).collect();
 
-    // Sequential successor map via `next` chain walk
     let stmt_node_set: HashSet<Node> = stmts.iter().map(|(n, _)| *n).collect();
-    let mut seq_next_map: HashMap<Node, Node> = HashMap::new();
-    for &(node, _) in stmts {
-        let mut cur = node;
-        let mut visited = HashSet::new();
-        while visited.insert(cur) {
-            if let Some(&nxt) = next_map.get(&cur) {
-                if stmt_node_set.contains(&nxt) {
-                    seq_next_map.insert(node, nxt);
-                    break;
-                }
-                cur = nxt;
-            } else {
-                break;
-            }
-        }
-    }
+    let seq_next_map: HashMap<Node, Node> = stmts
+        .iter()
+        .filter_map(|&(node, _)| {
+            walk_next_to_stmt(node, next_map, &stmt_node_set).map(|nxt| (node, nxt))
+        })
+        .collect();
 
     // Track register derivations: dst = src +/- offset
     let mut reg_derivation: HashMap<RTLReg, (RTLReg, i64)> = HashMap::new();
@@ -1043,32 +1036,25 @@ fn detect_comparison_tree_switches(
                 walk_tree(ifso, disc_reg, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
             }
 
-            // Cgt range check: disc > (bound - offset); enumerate false-branch cases
-            Condition::Ccompimm(Comparison::Cgt, bound)
-            | Condition::Ccompuimm(Comparison::Cgt, bound)
-            | Condition::Ccomplimm(Comparison::Cgt, bound)
-            | Condition::Ccompluimm(Comparison::Cgt, bound) if is_disc => {
-                let disc_upper = bound - offset;
-                let disc_lower = if offset < 0 { -offset } else { 0 };
-                if disc_upper >= disc_lower && (disc_upper - disc_lower) < 8 {
-                    for v in disc_lower..=disc_upper {
-                        cases.push((v, ifnot, node));
-                    }
-                }
+            // Range guards on the discriminant: partition the disc space, do not bind any
+            // case value. Recurse into both branches; cases come only from Ceq/Cne leaves.
+            Condition::Ccompimm(Comparison::Cgt, _)
+            | Condition::Ccompuimm(Comparison::Cgt, _)
+            | Condition::Ccomplimm(Comparison::Cgt, _)
+            | Condition::Ccompluimm(Comparison::Cgt, _)
+            | Condition::Ccompimm(Comparison::Cle, _)
+            | Condition::Ccompuimm(Comparison::Cle, _)
+            | Condition::Ccomplimm(Comparison::Cle, _)
+            | Condition::Ccompluimm(Comparison::Cle, _)
+            | Condition::Ccompimm(Comparison::Clt, _)
+            | Condition::Ccompuimm(Comparison::Clt, _)
+            | Condition::Ccomplimm(Comparison::Clt, _)
+            | Condition::Ccompluimm(Comparison::Clt, _)
+            | Condition::Ccompimm(Comparison::Cge, _)
+            | Condition::Ccompuimm(Comparison::Cge, _)
+            | Condition::Ccomplimm(Comparison::Cge, _)
+            | Condition::Ccompluimm(Comparison::Cge, _) if is_disc => {
                 walk_tree(ifso, disc_reg, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
-            }
-
-            Condition::Ccompimm(Comparison::Cle, bound)
-            | Condition::Ccompuimm(Comparison::Cle, bound)
-            | Condition::Ccomplimm(Comparison::Cle, bound)
-            | Condition::Ccompluimm(Comparison::Cle, bound) if is_disc => {
-                let disc_upper = bound - offset;
-                let disc_lower = if offset < 0 { -offset } else { 0 };
-                if disc_upper >= disc_lower && (disc_upper - disc_lower) < 8 {
-                    for v in disc_lower..=disc_upper {
-                        cases.push((v, ifso, node));
-                    }
-                }
                 walk_tree(ifnot, disc_reg, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
             }
 
@@ -1080,7 +1066,9 @@ fn detect_comparison_tree_switches(
         }
     }
 
-    // Find switch roots: Scond with Ceq comparison
+    // Find switch roots: Ceq or Cne compares on a register. Both bind a specific case
+    // value to a target. Range guards are NOT seeded as heads because their out-of-range
+    // branch would be silently discarded (the emitted Sswitch has no default export).
     let mut results: Vec<(Node, u64, Vec<(i64, Node, Node)>)> = Vec::new();
     let mut used_heads: HashSet<Node> = HashSet::new();
 
@@ -1088,13 +1076,13 @@ fn detect_comparison_tree_switches(
         if let CsharpminorStmt::Scond(cond, args, _, _) = s {
             if args.len() != 1 { continue; }
             if let CsharpminorExpr::Evar(reg) = &args[0] {
-                let is_eq = matches!(cond,
-                    Condition::Ccompimm(Comparison::Ceq, _)
-                    | Condition::Ccompuimm(Comparison::Ceq, _)
-                    | Condition::Ccomplimm(Comparison::Ceq, _)
-                    | Condition::Ccompluimm(Comparison::Ceq, _)
+                let is_eq_or_ne = matches!(cond,
+                    Condition::Ccompimm(Comparison::Ceq | Comparison::Cne, _)
+                    | Condition::Ccompuimm(Comparison::Ceq | Comparison::Cne, _)
+                    | Condition::Ccomplimm(Comparison::Ceq | Comparison::Cne, _)
+                    | Condition::Ccompluimm(Comparison::Ceq | Comparison::Cne, _)
                 );
-                if !is_eq { continue; }
+                if !is_eq_or_ne { continue; }
 
                 let (root_reg, _) = resolve_reg(*reg);
                 if used_heads.contains(node) { continue; }
@@ -1123,10 +1111,36 @@ fn detect_comparison_tree_switches(
     results
 }
 
-fn compute_sequential_edges(stmts: &[(Node, CsharpminorStmt)]) -> Vec<(Node, Node)> {
-    let mut sorted_nodes: Vec<Node> = stmts.iter().map(|(n, _)| *n).collect();
-    sorted_nodes.sort();
-    sorted_nodes.windows(2).map(|w| (w[0], w[1])).collect()
+// Walk `next` chain starting from `start` until a node in `stmt_nodes` is reached.
+// Returns None if the chain terminates or cycles without hitting a statement node.
+fn walk_next_to_stmt(
+    start: Node,
+    next_map: &HashMap<Node, Node>,
+    stmt_nodes: &HashSet<Node>,
+) -> Option<Node> {
+    let mut cur = start;
+    let mut visited: HashSet<Node> = HashSet::new();
+    while visited.insert(cur) {
+        let nxt = *next_map.get(&cur)?;
+        if stmt_nodes.contains(&nxt) {
+            return Some(nxt);
+        }
+        cur = nxt;
+    }
+    None
+}
+
+fn compute_sequential_edges(
+    stmts: &[(Node, CsharpminorStmt)],
+    next_map: &HashMap<Node, Node>,
+) -> Vec<(Node, Node)> {
+    let stmt_nodes: HashSet<Node> = stmts.iter().map(|(n, _)| *n).collect();
+    stmts
+        .iter()
+        .filter_map(|(n, _)| {
+            walk_next_to_stmt(*n, next_map, &stmt_nodes).map(|nxt| (*n, nxt))
+        })
+        .collect()
 }
 
 fn inline_constants(working: &mut HashMap<Node, CsharpminorStmt>, db: &DecompileDB) {
