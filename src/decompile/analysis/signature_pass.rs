@@ -227,6 +227,10 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                 types.push(xtype.clone());
             }
         }
+        // Sort candidates so tie-breakers are stable regardless of parallel Ascent tuple order.
+        for types in map.values_mut() {
+            types.sort();
+        }
         map
     };
 
@@ -248,6 +252,12 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                         .push(xtype.clone());
                 }
             }
+        }
+    }
+    // Sort caller-type vectors so later tie-breaking is independent of source tuple order.
+    for pos_map in call_site_arg_types.values_mut() {
+        for v in pos_map.values_mut() {
+            v.sort();
         }
     }
 
@@ -516,7 +526,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                                 ),
                             };
                             if let Some((&best_type, &best_count)) = type_counts.iter()
-                                .max_by_key(|(_, count)| **count)
+                                .max_by_key(|(ty, count)| (**count, **ty))
                             {
                                 if best_count * 2 > caller_types.len() {
                                     if should_override {
@@ -536,7 +546,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                                             | XType::Xany64
                                     )
                             ) {
-                                if let Some(best_ptr) = caller_types.iter().max_by_key(|t| match t {
+                                if let Some(best_ptr) = caller_types.iter().max_by_key(|t| (match t {
                                     XType::XstructPtr(_) => 6,
                                     XType::Xcharptr => 5,
                                     XType::Xcharptrptr
@@ -546,7 +556,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                                     | XType::Xfuncptr => 4,
                                     XType::Xptr => 3,
                                     _ => 0,
-                                }) {
+                                }, **t)) {
                                     if matches!(
                                         best_ptr,
                                         XType::XstructPtr(_)

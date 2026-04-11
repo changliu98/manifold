@@ -895,7 +895,8 @@ pub fn collect_switch_cases<'a>(
         .map(|(val, target)| (*val, *target))
         .filter(|(val, target)| !(*val == i64::MIN && *target == 0))
         .collect();
-    pairs.sort_by_key(|(val, _)| *val);
+    // Sort by full tuple so dedup_by_key picks the smallest target when a val has duplicates.
+    pairs.sort();
     pairs.dedup_by_key(|(val, _)| *val);
     std::iter::once(pairs)
 }
@@ -946,7 +947,7 @@ fn best_xtype_for_reg(reg: &RTLReg, all_var_types: &[(RTLReg, XType)]) -> Option
         .map(|(_, xty)| xty.clone())
 }
 
-fn xtype_refine_priority(xtype: &XType) -> u8 {
+pub(crate) fn xtype_refine_priority(xtype: &XType) -> u8 {
     match xtype {
         XType::Xvoid => 0,
         XType::Xbool => 1,
@@ -1060,14 +1061,17 @@ fn extract_vars_from_cminor_expr(expr: &CminorExpr, vars: &mut Vec<RTLReg>) {
 pub(crate) fn collect_all_var_types<'a>(
     input: impl Iterator<Item = (&'a RTLReg, &'a XType)>,
 ) -> impl Iterator<Item = Vec<(RTLReg, XType)>> {
-    let pairs: Vec<(RTLReg, XType)> = input.map(|(reg, xty)| (*reg, xty.clone())).collect();
+    let mut pairs: Vec<(RTLReg, XType)> = input.map(|(reg, xty)| (*reg, xty.clone())).collect();
+    pairs.sort();
     std::iter::once(pairs)
 }
 
 pub(crate) fn collect_func_symbols<'a>(
     input: impl Iterator<Item = (&'a Ident, &'a Symbol)>,
 ) -> impl Iterator<Item = Vec<(Ident, Symbol)>> {
-    let pairs: Vec<(Ident, Symbol)> = input.map(|(id, sym)| (*id, sym.clone())).collect();
+    let mut pairs: Vec<(Ident, Symbol)> = input.map(|(id, sym)| (*id, sym.clone())).collect();
+    // ident_to_symbol is multi-valued; sort so downstream `.find()` picks a deterministic symbol.
+    pairs.sort();
     std::iter::once(pairs)
 }
 
@@ -1075,10 +1079,15 @@ pub(crate) fn collect_func_symbols<'a>(
 pub(crate) fn collect_all_field_info<'a>(
     input: impl Iterator<Item = (&'a i64, &'a i64, &'a Ident, &'a MemoryChunk)>,
 ) -> impl Iterator<Item = FieldInfo> {
+    // Sort so or_insert's first-wins is deterministic on duplicate (base_off, field_off) keys.
+    let mut tuples: Vec<(i64, i64, Ident, MemoryChunk)> = input
+        .map(|(b, f, n, c)| (*b, *f, *n, c.clone()))
+        .collect();
+    tuples.sort();
     let mut fi = FieldInfo::new();
-    for (base_off, field_off, field_name, chunk) in input {
-        fi.entry((*base_off, *field_off))
-            .or_insert((*field_name, chunk.clone()));
+    for (base_off, field_off, field_name, chunk) in tuples {
+        fi.entry((base_off, field_off))
+            .or_insert((field_name, chunk));
     }
     std::iter::once(fi)
 }
@@ -3111,10 +3120,15 @@ fn infer_struct_fields_from_stack_inits(db: &mut DecompileDB) {
         return;
     }
 
-    let node_to_func: HashMap<u64, u64> = db
-        .rel_iter::<(Node, Address)>("instr_in_function")
-        .map(|(n, f)| (*n, *f))
-        .collect();
+    let node_to_func: HashMap<u64, u64> = {
+        let mut groups: HashMap<u64, u64> = HashMap::new();
+        for (n, f) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+            groups.entry(*n)
+                .and_modify(|curr| *curr = (*curr).min(*f))
+                .or_insert(*f);
+        }
+        groups
+    };
 
     let mut func_inits: HashMap<u64, Vec<(i64, Typ)>> = HashMap::new();
     for (addr, ofs, _val, typ) in db.rel_iter::<(Address, i64, i64, Typ)>("mach_imm_stack_init") {
@@ -3201,10 +3215,16 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
     }
 
     // Build reg-to-canonical struct ID mapping so Tstruct IDs in expressions match XstructPtr IDs in declarations.
-    let reg_to_canonical: HashMap<Ident, Ident> = db
-        .rel_iter::<(Address, RTLReg, usize)>("reg_to_struct_id")
-        .map(|&(_, reg, sid)| (reg as Ident, sid as Ident))
-        .collect();
+    // Use min-aggregation on sid to make selection deterministic when a reg has multiple canonical IDs across addresses.
+    let reg_to_canonical: HashMap<Ident, Ident> = {
+        let mut groups: HashMap<Ident, Ident> = HashMap::new();
+        for &(_, reg, sid) in db.rel_iter::<(Address, RTLReg, usize)>("reg_to_struct_id") {
+            groups.entry(reg as Ident)
+                .and_modify(|curr| *curr = (*curr).min(sid as Ident))
+                .or_insert(sid as Ident);
+        }
+        groups
+    };
 
     if func_field_info.is_empty() {
         // No struct fields -- copy clight_stmt_without_field directly to clight_stmt
@@ -3228,10 +3248,15 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
         return;
     }
 
-    let node_to_func: HashMap<u64, u64> = db
-        .rel_iter::<(Node, Address)>("instr_in_function")
-        .map(|(n, f)| (*n, *f))
-        .collect();
+    let node_to_func: HashMap<u64, u64> = {
+        let mut groups: HashMap<u64, u64> = HashMap::new();
+        for (n, f) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+            groups.entry(*n)
+                .and_modify(|curr| *curr = (*curr).min(*f))
+                .or_insert(*f);
+        }
+        groups
+    };
 
     // Struct construction synthesis: detect mach_imm_stack_init struct initialization, synthesize field assignments, and rewrite Oaddrstack to address-of.
     let struct_construction = synthesize_struct_construction(db, &node_to_func, &func_field_info);
@@ -3326,6 +3351,7 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
             }
         }
     }
+
 }
 
 /// Result of struct construction synthesis.
@@ -3378,16 +3404,26 @@ fn synthesize_struct_construction(
         return result;
     }
 
-    for (func_addr, inits) in &func_stack_inits {
-        // Sort inits by offset
+    let mut sorted_funcs: Vec<u64> = func_stack_inits.keys().copied().collect();
+    sorted_funcs.sort();
+    for func_addr_val in sorted_funcs {
+        let func_addr = &func_addr_val;
+        let inits = &func_stack_inits[func_addr];
+        // Sort inits by full tuple so ties at the same offset resolve deterministically.
         let mut sorted = inits.clone();
-        sorted.sort_by_key(|(_, ofs, _, _)| *ofs);
+        sorted.sort();
 
         // Find Oaddrstack bases: Sset(var, EconstLong(negative_val)) matching a mach_imm_stack_init cluster base.
         let init_offsets: std::collections::BTreeSet<i64> = sorted.iter().map(|(_, ofs, _, _)| *ofs).collect();
 
-        for (node, stmt) in db.rel_iter::<(Node, ClightStmt)>("clight_stmt_without_field") {
-            if node_to_func.get(node) != Some(func_addr) { continue; }
+        let mut stmts_for_func: Vec<(Node, ClightStmt)> = db.rel_iter::<(Node, ClightStmt)>("clight_stmt_without_field")
+            .filter(|(n, _)| node_to_func.get(n) == Some(func_addr))
+            .map(|(n, s)| (*n, s.clone()))
+            .collect();
+        stmts_for_func.sort_by_key(|(n, _)| *n);
+        for (node_val, stmt_val) in &stmts_for_func {
+            let node = node_val;
+            let stmt = stmt_val;
             let (var_id, base_ofs) = match stmt {
                 ClightStmt::Sset(var_id, expr) => {
                     if let Some(ofs) = extract_stack_offset_from_expr(expr) {

@@ -790,7 +790,9 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         let declared: HashSet<String> = tu.symbols.keys().cloned().collect();
         // Collect forward declarations and insert them before function definitions so they're visible at the point of use.
         let mut forward_decls = Vec::new();
-        for name in &called_funcs {
+        let mut sorted_called_funcs: Vec<&String> = called_funcs.iter().collect();
+        sorted_called_funcs.sort();
+        for name in sorted_called_funcs {
             let is_label = name.starts_with("L_")
                 || (name.starts_with('L') && name.len() > 1 && name[1..].chars().all(|c| c.is_ascii_hexdigit()));
             if !declared.contains(name) && !is_label && !header_declared.contains(name.as_str()) {

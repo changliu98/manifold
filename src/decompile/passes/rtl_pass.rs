@@ -5054,10 +5054,16 @@ ascent_par! {
 }
 
 pub fn convert_and_push_builtins(db: &mut DecompileDB) {
-    let reg_rtl_map: HashMap<(Node, Mreg), RTLReg> = db
-        .rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl")
-        .map(|(n, m, r)| ((*n, *m), *r))
-        .collect();
+    let reg_rtl_map: HashMap<(Node, Mreg), RTLReg> = {
+        let mut groups: HashMap<(Node, Mreg), Vec<RTLReg>> = HashMap::new();
+        for (n, m, r) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl") {
+            groups.entry((*n, *m)).or_default().push(*r);
+        }
+        groups.into_iter().map(|(k, mut v)| {
+            v.sort();
+            (k, *v.first().unwrap())
+        }).collect()
+    };
 
     let builtin_data: Vec<_> = db
         .rel_iter::<(Node, Symbol, Arc<Vec<BuiltinArg<Mreg>>>, BuiltinArg<Mreg>)>("ltl_builtin_unconverted")
@@ -5264,7 +5270,7 @@ pub fn build_call_args<'a>(
     inp: impl Iterator<Item = (&'a usize, &'a RTLReg)>,
 ) -> impl Iterator<Item = Args> {
     let mut pairs: Vec<(usize, RTLReg)> = inp.map(|(pos, reg)| (*pos, *reg)).collect();
-    pairs.sort_by_key(|(pos, _)| *pos);
+    pairs.sort();
     pairs.dedup_by_key(|(pos, _)| *pos);
 
     let args: Vec<RTLReg> = pairs.into_iter().map(|(_, reg)| reg).collect();
@@ -5694,14 +5700,27 @@ impl PassContext {
             .rel_iter::<(Address, RTLReg)>("emit_function_param_candidate")
             .cloned()
             .collect();
-        let var_types: HashMap<RTLReg, XType> = db
-            .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
-            .cloned()
-            .collect();
+        let var_types: HashMap<RTLReg, XType> = {
+            let mut groups: HashMap<RTLReg, Vec<XType>> = HashMap::new();
+            for (reg, xty) in db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate") {
+                groups.entry(*reg).or_default().push(*xty);
+            }
+            groups.into_iter().map(|(reg, mut tys)| {
+                tys.sort_by_key(|ty| (crate::decompile::passes::clight_pass::xtype_refine_priority(ty), *ty));
+                let chosen = *tys.last().unwrap();
+                (reg, chosen)
+            }).collect()
+        };
 
-        let node_to_func: HashMap<Node, Address> = instr_in_func.iter()
-            .map(|&(n, f)| (n, f))
-            .collect();
+        let node_to_func: HashMap<Node, Address> = {
+            let mut groups: HashMap<Node, Address> = HashMap::new();
+            for &(n, f) in &instr_in_func {
+                groups.entry(n)
+                    .and_modify(|curr| *curr = (*curr).min(f))
+                    .or_insert(f);
+            }
+            groups
+        };
 
         let func_entries: HashMap<Address, Node> = emit_funcs.iter()
             .map(|&(addr, _, entry)| (addr, entry))
@@ -5736,6 +5755,8 @@ impl PassContext {
                 if candidates.len() == 1 {
                     insts.insert(node, candidates.into_iter().next().unwrap());
                 } else {
+                    let mut candidates = candidates;
+                    candidates.sort_by_cached_key(|inst| format!("{:?}", inst));
                     let best = candidates.into_iter().max_by_key(|inst| {
                         let mut regs = HashSet::new();
                         collect_inst_regs(inst, &mut regs);

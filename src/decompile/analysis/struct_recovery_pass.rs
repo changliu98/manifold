@@ -415,7 +415,10 @@ fn try_build_layout(accesses: &[(i64, MemoryChunk)]) -> Option<Vec<InferredField
     let mut field_map: BTreeMap<i64, MemoryChunk> = BTreeMap::new();
     for &(ofs, chunk) in accesses {
         let entry = field_map.entry(ofs).or_insert(chunk);
-        if chunk_byte_size(&chunk) > chunk_byte_size(entry) {
+        let new_size = chunk_byte_size(&chunk);
+        let old_size = chunk_byte_size(entry);
+        // Break size ties by Ord<MemoryChunk> so the winner is iteration-order independent.
+        if new_size > old_size || (new_size == old_size && chunk < *entry) {
             *entry = chunk;
         }
     }
@@ -610,7 +613,10 @@ fn post_process_structs(db: &mut DecompileDB) {
         })
         .collect();
 
-    candidates.sort_by(|a, b| b.access_count.cmp(&a.access_count));
+    candidates.sort_by(|a, b|
+        b.access_count.cmp(&a.access_count)
+            .then_with(|| a.fields.cmp(&b.fields))
+    );
 
     let cutoff = if candidates.is_empty() { 0 }
     else if candidates.len() <= 5 { candidates.len() }
@@ -655,7 +661,10 @@ fn post_process_structs(db: &mut DecompileDB) {
     }
 
     let mut emit_struct_field: Vec<(usize, usize, i64, FieldType, Ident)> = Vec::new();
-    for (&struct_id, fields) in &struct_fields_map {
+    let mut sorted_struct_ids: Vec<usize> = struct_fields_map.keys().copied().collect();
+    sorted_struct_ids.sort();
+    for struct_id in sorted_struct_ids {
+        let fields = &struct_fields_map[&struct_id];
         for (field_idx, field) in fields.iter().enumerate() {
             let field_type = if let Some(xtypes) = field_type_info.get(&(struct_id, field.offset)) {
                 let best = {
@@ -663,7 +672,9 @@ fn post_process_structs(db: &mut DecompileDB) {
                     for &xt in xtypes.iter() {
                         *counts.entry(xt).or_insert(0) += 1;
                     }
-                    counts.into_iter().max_by_key(|(_, c)| *c).map(|(xt, _)| xt).unwrap_or(XType::Xint)
+                    let mut sorted: Vec<(XType, usize)> = counts.into_iter().collect();
+                    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    sorted.first().map(|(xt, _)| *xt).unwrap_or(XType::Xint)
                 };
                 xtype_to_field_type(best)
             } else {

@@ -432,7 +432,9 @@ ascent_par! {
         if *arg_idx < params.len(),
         if params[*arg_idx] == XType::Xsingleptr;
 
-    // Alias propagation of is_ptr/is_char_ptr/ptr_element_type is handled in rtl_pass, not here.
+    // ptr_element_type alias propagation lives here (is_ptr/is_char_ptr live in rtl_pass).
+    ptr_element_type(b, ty) <-- ptr_element_type(a, ty), alias_edge(a, b);
+    ptr_element_type(a, ty) <-- ptr_element_type(b, ty), alias_edge(a, b);
 
     has_ptr_element_conflict(reg) <-- ptr_element_type(reg, a), ptr_element_type(reg, b), if a != b;
 

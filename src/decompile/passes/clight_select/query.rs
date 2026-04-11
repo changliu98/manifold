@@ -544,7 +544,10 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
             }
 
             if candidates.len() > 1 {
-                candidates.sort_by(|a, b| type_str_sort_priority(b).cmp(&type_str_sort_priority(a)));
+                candidates.sort_by(|a, b|
+                    type_str_sort_priority(b).cmp(&type_str_sort_priority(a))
+                        .then_with(|| a.cmp(b))
+                );
                 func.var_type_candidates.insert(reg, candidates);
             }
         }

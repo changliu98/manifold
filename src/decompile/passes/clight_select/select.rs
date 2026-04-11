@@ -130,22 +130,29 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
         }
     }
 
-    // Build global mapping: canonical struct ID -> register-based base_key.
+    // Build canonical struct ID -> register-based base_key; sort per-func and sort Vec values so find_map is stable across runs.
     let mut global_canonical_to_reg_key: HashMap<i64, Vec<i64>> = HashMap::new();
     for func in &functions {
-        for (reg, sid) in &func.reg_struct_ids {
-            let reg_key = *reg as i64;
-            let canonical_key = *sid as i64;
+        let mut sorted_pairs: Vec<(RTLReg, usize)> =
+            func.reg_struct_ids.iter().map(|(&r, &s)| (r, s)).collect();
+        sorted_pairs.sort();
+        for (reg, sid) in sorted_pairs {
+            let reg_key = reg as i64;
+            let canonical_key = sid as i64;
             global_canonical_to_reg_key.entry(canonical_key).or_default().push(reg_key);
         }
+    }
+    for v in global_canonical_to_reg_key.values_mut() {
+        v.sort();
+        v.dedup();
     }
 
     if clang_sys::load().is_err() {
         panic!("libclang not found; install libclang-dev or set LIBCLANG_PATH");
     }
 
-    // Function-based parallel search: process each function independently
-    let best_state = function_based_parallel_search(
+    // Function-based sequential search: process each function independently on a single thread
+    let best_state = function_based_sequential_search(
         &functions, &global_struct_fields, &global_canonical_to_reg_key,
     );
 
@@ -203,8 +210,12 @@ fn build_selected_function_from_program_state(
     let func_ite_info = ite_info_all.get(&func.address).cloned().unwrap_or_default();
     assemble_ite(&mut statements, &func_ite_info);
 
-    // sseq grouping
-    for (head, members) in &func.sseq_groups {
+    // Sort sseq groups by head so overlapping groups resolve deterministically.
+    let mut sorted_sseq: Vec<(Node, Vec<Node>)> = func.sseq_groups.iter()
+        .map(|(&h, m)| (h, m.clone()))
+        .collect();
+    sorted_sseq.sort_by_key(|(h, _)| *h);
+    for (head, members) in &sorted_sseq {
         if members.len() <= 1 {
             continue;
         }
@@ -474,7 +485,11 @@ fn propagate_type_constraints(
     // reg -> (all_deref, any_non_deref, needs_struct_ptr)
     let mut reg_deref_info: BTreeMap<RTLReg, (bool, bool, Option<usize>)> = BTreeMap::new();
 
-    for (_node, candidates) in &func.node_statements {
+    // Sorted iteration: deterministic entry.2 update when a reg spans nodes with different sids.
+    let mut sorted_nodes: Vec<Node> = func.node_statements.keys().copied().collect();
+    sorted_nodes.sort();
+    for node in &sorted_nodes {
+        let candidates = &func.node_statements[node];
         // Collect deref regs across ALL candidates for this node
         let mut regs_in_any_candidate: BTreeSet<RTLReg> = BTreeSet::new();
         let mut regs_derefed_in_all: Option<BTreeSet<RTLReg>> = None;
@@ -638,9 +653,9 @@ fn merge_hybrid_into_program_state(
     }
 }
 
-// Function-based parallel search: independently optimize each function's error nodes via a thread pool.
+// Per-function sequential search; single-threaded for deterministic output.
 
-fn function_based_parallel_search(
+fn function_based_sequential_search(
     functions: &[FunctionData],
     global_struct_fields: &HashMap<i64, Vec<(i64, Ident, MemoryChunk)>>,
     global_canonical_to_reg_key: &HashMap<i64, Vec<i64>>,
@@ -655,41 +670,34 @@ fn function_based_parallel_search(
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
 
-    // Identify functions that need search
-    let funcs_to_search: Vec<usize> = functions.iter().enumerate()
+    // Sort by address so traversal (and shared libclang state) is stable across runs.
+    let mut funcs_to_search: Vec<usize> = functions.iter().enumerate()
         .filter(|(_, func)| {
             func.node_statements.values().any(|c| c.len() > 1)
                 || !func.var_type_candidates.is_empty()
         })
         .map(|(i, _)| i)
         .collect();
+    funcs_to_search.sort_by_key(|&i| functions[i].address);
 
-    // eprintln!("function_based_select: {} functions total, {} need search, budget {}/func, max {}/node",
-    //     functions.len(), funcs_to_search.len(), step_budget, max_per_node);
+    // Sequential per-function search -- one function at a time on the current thread.
+    let mut results: Vec<(Address, HybridFunctionState)> = Vec::with_capacity(funcs_to_search.len());
+    for &func_idx in &funcs_to_search {
+        let func = &functions[func_idx];
 
-    // All functions in parallel -- each function optimized independently
-    use rayon::prelude::*;
+        let meta = build_hybrid_refinable_metadata(func);
+        if meta.refinable_set.is_empty() {
+            continue;
+        }
 
-    let results: Vec<(Address, HybridFunctionState)> = funcs_to_search
-        .par_iter()
-        .filter_map(|&func_idx| {
-            let func = &functions[func_idx];
-            let _ = clang_sys::load();
+        let result = function_standalone_search(
+            func, &meta,
+            global_struct_fields, global_canonical_to_reg_key,
+            step_budget, max_per_node,
+        );
 
-            let meta = build_hybrid_refinable_metadata(func);
-            if meta.refinable_set.is_empty() {
-                return None;
-            }
-
-            let result = function_standalone_search(
-                func, &meta,
-                global_struct_fields, global_canonical_to_reg_key,
-                step_budget, max_per_node,
-            );
-
-            Some((func.address, result))
-        })
-        .collect();
+        results.push((func.address, result));
+    }
 
     // Build program state from all results
     let mut program_state = build_program_initial_state(functions);
@@ -697,7 +705,6 @@ fn function_based_parallel_search(
         merge_hybrid_into_program_state(&mut program_state, *addr, hybrid);
     }
 
-    // eprintln!("  function_based_select: done, processed {} functions", results.len());
     program_state
 }
 
@@ -934,9 +941,9 @@ fn assemble_loops(
     statements: &mut HashMap<Node, ClightStmt>,
     loop_info: &HashMap<Node, LoopInfo>,
 ) {
-    // Process smallest loops first (inner before outer).
+    // Process smallest loops first (inner before outer). Break ties by header address.
     let mut headers: Vec<(&Node, &LoopInfo)> = loop_info.iter().collect();
-    headers.sort_by_key(|(_, info)| info.body_nodes.len());
+    headers.sort_by(|a, b| a.1.body_nodes.len().cmp(&b.1.body_nodes.len()).then(a.0.cmp(b.0)));
 
     for (&header, info) in &headers {
         let header_label = ident_from_node(header);
@@ -1030,10 +1037,14 @@ fn assemble_ite(
     });
 
     for (&branch, info) in &branches {
-        // The branch node should hold Sifthenelse(cond, Sgoto(then), Sgoto(else))
-        // produced by the clight_pass flat Scond rule.
-        let (cond, _then_target, _else_target) = match statements.get(&branch) {
-            Some(ClightStmt::Sifthenelse(c, t, e)) => (c.clone(), t.clone(), e.clone()),
+        // Branch holds Sifthenelse from clight_pass flat Scond rule, possibly wrapped in Slabel.
+        let unwrapped = match statements.get(&branch) {
+            Some(ClightStmt::Slabel(_, inner)) => inner.as_ref(),
+            Some(other) => other,
+            None => continue,
+        };
+        let (cond, _then_target, _else_target) = match unwrapped {
+            ClightStmt::Sifthenelse(c, t, e) => (c.clone(), t.clone(), e.clone()),
             _ => continue,
         };
 
@@ -1073,7 +1084,11 @@ fn assemble_ite(
         let else_body = collect_body(&info.false_body_nodes);
 
         let compound = ClightStmt::Sifthenelse(cond, Box::new(then_body), Box::new(else_body));
-        statements.insert(branch, compound);
+        let wrapped = match statements.get(&branch) {
+            Some(ClightStmt::Slabel(lbl, _)) => ClightStmt::Slabel(*lbl, Box::new(compound)),
+            _ => compound,
+        };
+        statements.insert(branch, wrapped);
 
         // Remove consumed body nodes from top-level
         for &node in &info.true_body_nodes {
@@ -1948,9 +1963,13 @@ fn chunk_to_c_type_str(chunk: &MemoryChunk) -> &'static str {
     }
 }
 
-/// Parse C code in-memory via libclang and return error diagnostics.
+/// Parse C code in-memory via libclang; serialized behind a mutex because libclang shares caches across CXIndex instances and races under concurrent use.
 fn run_clang_check(c_code: &str) -> Vec<ClangError> {
     use clang_sys::*;
+    use std::sync::Mutex;
+
+    static CLANG_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = CLANG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let c_code_bytes = c_code.as_bytes();
     let filename = CString::new("check.c").unwrap();
@@ -2608,7 +2627,8 @@ fn ensure_goto_labels(statements: &mut HashMap<Node, ClightStmt>) {
         collect_label_defs_recursive(stmt, &mut label_defs);
     }
 
-    let missing: Vec<usize> = goto_targets.difference(&label_defs).copied().collect();
+    let mut missing: Vec<usize> = goto_targets.difference(&label_defs).copied().collect();
+    missing.sort();
     for label_ident in missing {
         let already_nested = statements.values().any(|s| stmt_contains_label(s, label_ident));
         if already_nested {

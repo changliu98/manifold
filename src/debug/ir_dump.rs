@@ -212,10 +212,17 @@ pub fn dump_all_ir(
     }
 
     {
-        let id_to_name: HashMap<usize, String> = db
-            .rel_iter::<(Ident, Symbol)>("ident_to_symbol")
-            .map(|(id, name)| (*id, name.to_string()))
-            .collect();
+        // ident_to_symbol is multi-valued (versioned globals, aliases); pick lex-smallest name per id.
+        let id_to_name: HashMap<usize, String> = {
+            let mut groups: HashMap<usize, String> = HashMap::new();
+            for (id, name) in db.rel_iter::<(Ident, Symbol)>("ident_to_symbol") {
+                let s = name.to_string();
+                groups.entry(*id)
+                    .and_modify(|curr| { if &s < curr { *curr = s.clone(); } })
+                    .or_insert(s);
+            }
+            groups
+        };
         let mut ctx = ConversionContext::new(id_to_name.clone());
 
         use std::collections::HashSet;

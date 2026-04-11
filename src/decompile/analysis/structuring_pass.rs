@@ -38,10 +38,18 @@ impl IRPass for StructuringPass {
             }
         }
 
-        let node_to_func: HashMap<Node, Address> = db
-            .rel_iter::<(Node, Address)>("instr_in_function")
-            .map(|(n, f)| (*n, *f))
-            .collect();
+        // instr_in_function is multi-valued: shared nodes (e.g. PLT trampolines) belong to every reaching function.
+        let node_to_funcs: HashMap<Node, Vec<Address>> = {
+            let mut groups: HashMap<Node, Vec<Address>> = HashMap::new();
+            for (n, f) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+                groups.entry(*n).or_default().push(*f);
+            }
+            for v in groups.values_mut() {
+                v.sort();
+                v.dedup();
+            }
+            groups
+        };
 
         // Next relation for target resolution and sequential ordering
         let next_map: HashMap<Node, Node> = db
@@ -57,11 +65,13 @@ impl IRPass for StructuringPass {
         let mut unowned_stmts: Vec<(Node, CsharpminorStmt)> = Vec::new();
 
         for (node, stmt) in &all_stmts {
-            if let Some(&func_addr) = node_to_func.get(node) {
-                func_stmts
-                    .entry(func_addr)
-                    .or_default()
-                    .push((*node, stmt.clone()));
+            if let Some(funcs) = node_to_funcs.get(node) {
+                for &func_addr in funcs {
+                    func_stmts
+                        .entry(func_addr)
+                        .or_default()
+                        .push((*node, stmt.clone()));
+                }
             } else {
                 unowned_stmts.push((*node, stmt.clone()));
             }
@@ -126,9 +136,13 @@ impl IRPass for StructuringPass {
 
         result_stmts.extend(unowned_stmts);
 
+        // Shared nodes are structured once per owning function, so the same (node, stmt) can appear multiple times.
+        let mut seen: HashSet<(Node, CsharpminorStmt)> = HashSet::new();
         let new_rel = ascent::boxcar::Vec::<(Node, CsharpminorStmt)>::new();
         for tuple in result_stmts {
-            new_rel.push(tuple);
+            if seen.insert(tuple.clone()) {
+                new_rel.push(tuple);
+            }
         }
         db.rel_set("csharp_stmt", new_rel);
 
