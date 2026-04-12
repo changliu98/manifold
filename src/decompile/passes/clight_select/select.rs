@@ -13,6 +13,7 @@ use crate::x86::types::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_uint;
+use rayon::prelude::*;
 
 /// Synthetic node base for variable declaration nodes (ID = DECL_NODE_BASE + register_id).
 const DECL_NODE_BASE: u64 = 0xDEC0_0000_0000_0000;
@@ -151,8 +152,7 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
         panic!("libclang not found; install libclang-dev or set LIBCLANG_PATH");
     }
 
-    // Function-based sequential search: process each function independently on a single thread
-    let best_state = function_based_sequential_search(
+    let best_state = function_based_parallel_search(
         &functions, &global_struct_fields, &global_canonical_to_reg_key,
     );
 
@@ -653,9 +653,7 @@ fn merge_hybrid_into_program_state(
     }
 }
 
-// Per-function sequential search; single-threaded for deterministic output.
-
-fn function_based_sequential_search(
+fn function_based_parallel_search(
     functions: &[FunctionData],
     global_struct_fields: &HashMap<i64, Vec<(i64, Ident, MemoryChunk)>>,
     global_canonical_to_reg_key: &HashMap<i64, Vec<i64>>,
@@ -670,7 +668,6 @@ fn function_based_sequential_search(
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
 
-    // Sort by address so traversal (and shared libclang state) is stable across runs.
     let mut funcs_to_search: Vec<usize> = functions.iter().enumerate()
         .filter(|(_, func)| {
             func.node_statements.values().any(|c| c.len() > 1)
@@ -680,26 +677,30 @@ fn function_based_sequential_search(
         .collect();
     funcs_to_search.sort_by_key(|&i| functions[i].address);
 
-    // Sequential per-function search -- one function at a time on the current thread.
-    let mut results: Vec<(Address, HybridFunctionState)> = Vec::with_capacity(funcs_to_search.len());
-    for &func_idx in &funcs_to_search {
-        let func = &functions[func_idx];
+    let raw: Vec<Option<(Address, HybridFunctionState)>> = funcs_to_search
+        .par_iter()
+        .map(|&func_idx| {
+            let _ = clang_sys::load();
+            let func = &functions[func_idx];
 
-        let meta = build_hybrid_refinable_metadata(func);
-        if meta.refinable_set.is_empty() {
-            continue;
-        }
+            let meta = build_hybrid_refinable_metadata(func);
+            if meta.refinable_set.is_empty() {
+                return None;
+            }
 
-        let result = function_standalone_search(
-            func, &meta,
-            global_struct_fields, global_canonical_to_reg_key,
-            step_budget, max_per_node,
-        );
+            let result = function_standalone_search(
+                func, &meta,
+                global_struct_fields, global_canonical_to_reg_key,
+                step_budget, max_per_node,
+            );
 
-        results.push((func.address, result));
-    }
+            Some((func.address, result))
+        })
+        .collect();
 
-    // Build program state from all results
+    let mut results: Vec<(Address, HybridFunctionState)> = raw.into_iter().flatten().collect();
+    results.sort_by_key(|(addr, _)| *addr);
+
     let mut program_state = build_program_initial_state(functions);
     for (addr, hybrid) in &results {
         merge_hybrid_into_program_state(&mut program_state, *addr, hybrid);
@@ -833,8 +834,6 @@ fn function_standalone_search(
         }
     }
 
-    // Wave 2: Per-node exhaustive search.
-    // For each error node (sorted), try ALL alternatives and pick the best.
     let wave2_budget = step_budget * 3 / 4;
     {
         let sorted_errors: Vec<Node> = error_nodes.clone();
@@ -844,38 +843,35 @@ fn function_standalone_search(
             let alts = build_hybrid_alternatives(*node, &state, func, meta);
             if alts.is_empty() { continue; }
 
-            let mut best_state: Option<HybridFunctionState> = None;
-            let mut best_errors = current_errors;
-            let mut best_en = error_nodes.clone();
-            let mut best_ne = node_errors.clone();
+            let budget_here = (wave2_budget - steps).min(alts.len());
+            if budget_here == 0 { break; }
+            steps += budget_here;
 
-            for alt in &alts {
-                if steps >= wave2_budget { break; }
-                let mut trial = state.clone();
-                apply_hybrid_choice(&mut trial, *node, *alt, func, meta);
-                steps += 1;
-                let (trial_errors, trial_en, trial_ne) = evaluate(&trial, &mut func_view);
-                if trial_errors < best_errors {
-                    best_errors = trial_errors;
-                    best_state = Some(trial);
-                    best_en = trial_en;
-                    best_ne = trial_ne;
+            type TrialResult = (usize, HybridFunctionState, usize, Vec<Node>, HashMap<Node, Vec<String>>);
+            let results: Vec<TrialResult> = alts[..budget_here].par_iter().enumerate()
+                .map(|(i, &alt)| {
+                    let mut trial = state.clone();
+                    apply_hybrid_choice(&mut trial, *node, alt, func, meta);
+                    let mut fv = func.clone();
+                    let (e, en, ne) = evaluate(&trial, &mut fv);
+                    (i, trial, e, en, ne)
+                })
+                .collect();
+
+            if let Some((_, new_state, new_err, new_en, new_ne)) = results.into_iter()
+                .min_by(|a, b| a.2.cmp(&b.2).then(a.0.cmp(&b.0)))
+            {
+                if new_err < current_errors {
+                    state = new_state;
+                    current_errors = new_err;
+                    error_nodes = new_en;
+                    node_errors = new_ne;
+                    if current_errors == 0 { return state; }
                 }
-            }
-
-            if let Some(new_state) = best_state {
-                state = new_state;
-                current_errors = best_errors;
-                error_nodes = best_en;
-                node_errors = best_ne;
-                if current_errors == 0 { return state; }
             }
         }
     }
 
-    // Wave 3: Beam search for combinatorial exploration.
-    // Maintain a beam of K states; for each remaining error node, expand all
-    // beam entries and keep the top K by error count (ties broken by hash).
     let beam_width: usize = 3;
     if steps < step_budget && current_errors > 0 {
         let remaining_errors: Vec<Node> = error_nodes.iter()
@@ -890,35 +886,40 @@ fn function_standalone_search(
             for &node in &remaining_errors {
                 if steps >= step_budget { break; }
 
-                let mut next_beam: Vec<(HybridFunctionState, usize, Vec<Node>, HashMap<Node, Vec<String>>)> = Vec::new();
+                let mut next_beam: Vec<(HybridFunctionState, usize, Vec<Node>, HashMap<Node, Vec<String>>)> =
+                    beam.iter()
+                        .map(|(s, e, en, ne)| (s.clone(), *e, en.clone(), ne.clone()))
+                        .collect();
 
-                for (beam_state, beam_errors, beam_en, beam_ne) in &beam {
+                let mut trial_specs: Vec<(usize, Option<usize>)> = Vec::new();
+                for (b, (beam_state, _, _, _)) in beam.iter().enumerate() {
                     let alts = build_hybrid_alternatives(node, beam_state, func, meta);
-                    if alts.is_empty() {
-                        next_beam.push((beam_state.clone(), *beam_errors, beam_en.clone(), beam_ne.clone()));
-                        continue;
-                    }
-
-                    // Keep current choice as an option too
-                    next_beam.push((beam_state.clone(), *beam_errors, beam_en.clone(), beam_ne.clone()));
-
                     for alt in &alts {
-                        if steps >= step_budget { break; }
-                        let mut trial = beam_state.clone();
-                        apply_hybrid_choice(&mut trial, node, *alt, func, meta);
-                        steps += 1;
-                        let (trial_errors, trial_en, trial_ne) = evaluate(&trial, &mut func_view);
-                        next_beam.push((trial, trial_errors, trial_en, trial_ne));
+                        trial_specs.push((b, *alt));
                     }
                 }
+                let cap = step_budget - steps;
+                let trial_len = trial_specs.len().min(cap);
+                let trial_specs = &trial_specs[..trial_len];
+                steps += trial_len;
 
-                // Sort by (error_count, deterministic_hash) and keep top K
+                let trials: Vec<(HybridFunctionState, usize, Vec<Node>, HashMap<Node, Vec<String>>)> =
+                    trial_specs.par_iter().map(|&(b, alt)| {
+                        let (beam_state, _, _, _) = &beam[b];
+                        let mut trial = beam_state.clone();
+                        apply_hybrid_choice(&mut trial, node, alt, func, meta);
+                        let mut fv = func.clone();
+                        let (e, en, ne) = evaluate(&trial, &mut fv);
+                        (trial, e, en, ne)
+                    }).collect();
+
+                next_beam.extend(trials);
+
                 next_beam.sort_by(|a, b| {
                     a.1.cmp(&b.1)
                         .then_with(|| state_deterministic_hash(&a.0).cmp(&state_deterministic_hash(&b.0)))
                 });
                 next_beam.truncate(beam_width);
-                // Dedup identical states
                 next_beam.dedup_by(|a, b| state_deterministic_hash(&a.0) == state_deterministic_hash(&b.0));
                 beam = next_beam;
 
@@ -1963,13 +1964,9 @@ fn chunk_to_c_type_str(chunk: &MemoryChunk) -> &'static str {
     }
 }
 
-/// Parse C code in-memory via libclang; serialized behind a mutex because libclang shares caches across CXIndex instances and races under concurrent use.
+// Fresh CXIndex per call sidesteps the per-instance LLVM bug #25896 race.
 fn run_clang_check(c_code: &str) -> Vec<ClangError> {
     use clang_sys::*;
-    use std::sync::Mutex;
-
-    static CLANG_LOCK: Mutex<()> = Mutex::new(());
-    let _guard = CLANG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let c_code_bytes = c_code.as_bytes();
     let filename = CString::new("check.c").unwrap();
@@ -2643,4 +2640,57 @@ fn ensure_goto_labels(statements: &mut HashMap<Node, ClightStmt>) {
             statements.insert(node, ClightStmt::Slabel(label_ident, Box::new(ClightStmt::Sskip)));
         }
     }
+}
+
+#[doc(hidden)]
+pub fn libclang_concurrent_check(runs: usize) -> Result<(), String> {
+    let clean_src = r#"
+        int main(void) {
+            int x = 1;
+            int y = x + 2;
+            return y;
+        }
+    "#;
+    let broken_src = r#"
+        int main(void) {
+            int *p = 0;
+            int x = p;
+            return x + undefined_symbol;
+        }
+    "#;
+
+    let clean_results: Vec<usize> = (0..runs)
+        .into_par_iter()
+        .map(|_| {
+            let _ = clang_sys::load();
+            run_clang_check(clean_src).len()
+        })
+        .collect();
+    let broken_results: Vec<usize> = (0..runs)
+        .into_par_iter()
+        .map(|_| {
+            let _ = clang_sys::load();
+            run_clang_check(broken_src).len()
+        })
+        .collect();
+
+    let clean_first = clean_results[0];
+    if clean_first != 0 {
+        return Err(format!("clean source produced {} errors, expected 0", clean_first));
+    }
+    for (i, &n) in clean_results.iter().enumerate() {
+        if n != clean_first {
+            return Err(format!("clean run {} returned {} errors, expected {}", i, n, clean_first));
+        }
+    }
+    let broken_first = broken_results[0];
+    if broken_first == 0 {
+        return Err("broken source produced 0 errors, expected at least one".to_string());
+    }
+    for (i, &n) in broken_results.iter().enumerate() {
+        if n != broken_first {
+            return Err(format!("broken run {} returned {} errors, expected {}", i, n, broken_first));
+        }
+    }
+    Ok(())
 }
