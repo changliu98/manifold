@@ -144,10 +144,16 @@ impl IRPass for StructuringPass {
 
         result_stmts.extend(unowned_stmts);
 
+        // Preserve pre-existing csharp_stmt tuples in case the single-producer invariant breaks.
+        let existing: Vec<(Node, CsharpminorStmt)> = db
+            .rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt")
+            .map(|(n, s)| (*n, s.clone()))
+            .collect();
+
         // Shared nodes are structured once per owning function, so the same (node, stmt) can appear multiple times.
         let mut seen: HashSet<(Node, CsharpminorStmt)> = HashSet::new();
         let new_rel = ascent::boxcar::Vec::<(Node, CsharpminorStmt)>::new();
-        for tuple in result_stmts {
+        for tuple in existing.into_iter().chain(result_stmts) {
             if seen.insert(tuple.clone()) {
                 new_rel.push(tuple);
             }
@@ -1162,7 +1168,13 @@ fn inline_constants(working: &mut HashMap<Node, CsharpminorStmt>, db: &Decompile
 
     let mut const_map: HashMap<RTLReg, Constant> = HashMap::new();
     let mut multi_def: HashSet<RTLReg> = HashSet::new();
-    for &(reg, ref cst) in db.rel_iter::<(RTLReg, Constant)>("single_def_const") {
+    // Sort so first-seen-wins-unless-conflict is order-invariant.
+    let mut sdc_tuples: Vec<(RTLReg, Constant)> = db
+        .rel_iter::<(RTLReg, Constant)>("single_def_const")
+        .cloned()
+        .collect();
+    sdc_tuples.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| format!("{:?}", a.1).cmp(&format!("{:?}", b.1))));
+    for (reg, cst) in sdc_tuples {
         if multi_def.contains(&reg) {
             continue;
         }
@@ -1171,12 +1183,12 @@ fn inline_constants(working: &mut HashMap<Node, CsharpminorStmt>, db: &Decompile
             continue;
         }
         if let Some(existing) = const_map.get(&reg) {
-            if *existing != *cst {
+            if *existing != cst {
                 const_map.remove(&reg);
                 multi_def.insert(reg);
             }
         } else {
-            const_map.insert(reg, cst.clone());
+            const_map.insert(reg, cst);
         }
     }
     if const_map.is_empty() {
@@ -1340,258 +1352,82 @@ fn subst_consts_in_builtin_arg(
     }
 }
 
+// Block-local copy propagation; analysis in CopyPropagationProgram, fixpoint fold in Rust.
 fn propagate_copies(working: &mut HashMap<Node, CsharpminorStmt>, db: &mut DecompileDB) {
-    let stmts: Vec<(Node, CsharpminorStmt)> = working.iter()
-        .map(|(n, s)| (*n, s.clone()))
-        .collect();
+    use crate::x86::types::XType;
 
     let code_in_block: HashMap<Node, Node> = db
         .rel_iter::<(Node, Node)>("code_in_block")
         .map(|&(addr, blk)| (addr, blk))
         .collect();
 
-    let mut blocks: HashMap<Node, Vec<(Node, CsharpminorStmt)>> = HashMap::new();
-    for (node, stmt) in &stmts {
-        if let Some(&blk) = code_in_block.get(node) {
-            blocks.entry(blk).or_default().push((*node, stmt.clone()));
-        }
+    let mut prog = CopyPropagationProgram::default();
+    for (node, stmt) in working.iter() {
+        prog.stmt.push((*node, stmt.clone()));
     }
-    for block_stmts in blocks.values_mut() {
-        block_stmts.sort_by_key(|(node, _)| *node);
-    }
-
-    fn collect_expr_vars(expr: &CsharpminorExpr, vars: &mut HashSet<RTLReg>) {
-        match expr {
-            CsharpminorExpr::Evar(reg) => { vars.insert(*reg); }
-            CsharpminorExpr::Eunop(_, inner) => collect_expr_vars(inner, vars),
-            CsharpminorExpr::Ebinop(_, l, r) => {
-                collect_expr_vars(l, vars);
-                collect_expr_vars(r, vars);
-            }
-            CsharpminorExpr::Eload(_, addr) => collect_expr_vars(addr, vars),
-            CsharpminorExpr::Econdition(c, t, f) => {
-                collect_expr_vars(c, vars);
-                collect_expr_vars(t, vars);
-                collect_expr_vars(f, vars);
-            }
-            _ => {}
+    for (&node, &blk) in &code_in_block {
+        if working.contains_key(&node) {
+            prog.in_block.push((node, blk));
         }
     }
 
-    fn stmt_uses(stmt: &CsharpminorStmt) -> HashSet<RTLReg> {
-        let mut vars = HashSet::new();
-        match stmt {
-            CsharpminorStmt::Sset(_, expr) => collect_expr_vars(expr, &mut vars),
-            CsharpminorStmt::Sstore(_, addr, val) => {
-                collect_expr_vars(addr, &mut vars);
-                collect_expr_vars(val, &mut vars);
-            }
-            CsharpminorStmt::Scall(_, _, callee, args) => {
-                if let either::Either::Left(e) = callee { collect_expr_vars(e, &mut vars); }
-                for a in args { collect_expr_vars(a, &mut vars); }
-            }
-            CsharpminorStmt::Stailcall(_, callee, args) => {
-                if let either::Either::Left(e) = callee { collect_expr_vars(e, &mut vars); }
-                for a in args { collect_expr_vars(a, &mut vars); }
-            }
-            CsharpminorStmt::Sbuiltin(_, _, args, res) => {
-                fn ba_vars(ba: &BuiltinArg<CsharpminorExpr>, vars: &mut HashSet<RTLReg>) {
-                    match ba {
-                        BuiltinArg::BA(e) => collect_expr_vars(e, vars),
-                        BuiltinArg::BASplitLong(a, b) |
-                        BuiltinArg::BAAddPtr(a, b) => { ba_vars(a, vars); ba_vars(b, vars); }
-                        _ => {}
-                    }
-                }
-                for a in args { ba_vars(a, &mut vars); }
-                ba_vars(res, &mut vars);
-            }
-            CsharpminorStmt::Scond(_, args, _, _) => {
-                for a in args { collect_expr_vars(a, &mut vars); }
-            }
-            CsharpminorStmt::Sjumptable(expr, _) => collect_expr_vars(expr, &mut vars),
-            CsharpminorStmt::Sreturn(expr) => collect_expr_vars(expr, &mut vars),
-            _ => {}
-        }
-        vars
+    prog.run();
+
+    // Gather per-node applicable substitutions: Vec<(dst, src)>.
+    let mut substs_by_node: HashMap<Node, Vec<(RTLReg, RTLReg)>> = HashMap::new();
+    for (u, dst, src) in &prog.applicable_subst {
+        substs_by_node.entry(*u).or_default().push((*dst, *src));
     }
 
-    fn stmt_def(stmt: &CsharpminorStmt) -> Option<RTLReg> {
-        match stmt {
-            CsharpminorStmt::Sset(reg, _) => Some(*reg),
-            CsharpminorStmt::Scall(Some(reg), _, _, _) => Some(*reg),
-            CsharpminorStmt::Sbuiltin(Some(reg), _, _, _) => Some(*reg),
-            _ => None,
-        }
-    }
-
-    fn subst_var_in_expr(
-        expr: &CsharpminorExpr, old: RTLReg, new: RTLReg,
-    ) -> CsharpminorExpr {
-        match expr {
-            CsharpminorExpr::Evar(r) if *r == old => CsharpminorExpr::Evar(new),
-            CsharpminorExpr::Eunop(op, inner) =>
-                CsharpminorExpr::Eunop(op.clone(), Box::new(subst_var_in_expr(inner, old, new))),
-            CsharpminorExpr::Ebinop(op, l, r) =>
-                CsharpminorExpr::Ebinop(
-                    op.clone(),
-                    Box::new(subst_var_in_expr(l, old, new)),
-                    Box::new(subst_var_in_expr(r, old, new)),
-                ),
-            CsharpminorExpr::Eload(chunk, addr) =>
-                CsharpminorExpr::Eload(*chunk, Box::new(subst_var_in_expr(addr, old, new))),
-            CsharpminorExpr::Econdition(c, t, f) =>
-                CsharpminorExpr::Econdition(
-                    Box::new(subst_var_in_expr(c, old, new)),
-                    Box::new(subst_var_in_expr(t, old, new)),
-                    Box::new(subst_var_in_expr(f, old, new)),
-                ),
-            _ => expr.clone(),
-        }
-    }
-
-    fn subst_var_in_ba(
-        ba: &BuiltinArg<CsharpminorExpr>, old: RTLReg, new: RTLReg,
-    ) -> BuiltinArg<CsharpminorExpr> {
-        match ba {
-            BuiltinArg::BA(e) => BuiltinArg::BA(subst_var_in_expr(e, old, new)),
-            BuiltinArg::BASplitLong(a, b) =>
-                BuiltinArg::BASplitLong(
-                    Box::new(subst_var_in_ba(a, old, new)),
-                    Box::new(subst_var_in_ba(b, old, new)),
-                ),
-            BuiltinArg::BAAddPtr(a, b) =>
-                BuiltinArg::BAAddPtr(
-                    Box::new(subst_var_in_ba(a, old, new)),
-                    Box::new(subst_var_in_ba(b, old, new)),
-                ),
-            _ => ba.clone(),
-        }
-    }
-
-    fn subst_var_in_stmt(
-        stmt: &CsharpminorStmt, old: RTLReg, new: RTLReg,
-    ) -> CsharpminorStmt {
-        match stmt {
-            CsharpminorStmt::Sset(dst, expr) =>
-                CsharpminorStmt::Sset(*dst, subst_var_in_expr(expr, old, new)),
-            CsharpminorStmt::Sstore(chunk, addr, val) =>
-                CsharpminorStmt::Sstore(
-                    *chunk,
-                    subst_var_in_expr(addr, old, new),
-                    subst_var_in_expr(val, old, new),
-                ),
-            CsharpminorStmt::Scall(dst, sig, callee, args) => {
-                let new_callee = match callee {
-                    either::Either::Left(e) =>
-                        either::Either::Left(subst_var_in_expr(e, old, new)),
-                    other => other.clone(),
-                };
-                let new_args: Vec<_> = args.iter()
-                    .map(|a| subst_var_in_expr(a, old, new)).collect();
-                CsharpminorStmt::Scall(dst.clone(), sig.clone(), new_callee, new_args)
-            }
-            CsharpminorStmt::Stailcall(sig, callee, args) => {
-                let new_callee = match callee {
-                    either::Either::Left(e) =>
-                        either::Either::Left(subst_var_in_expr(e, old, new)),
-                    other => other.clone(),
-                };
-                let new_args: Vec<_> = args.iter()
-                    .map(|a| subst_var_in_expr(a, old, new)).collect();
-                CsharpminorStmt::Stailcall(sig.clone(), new_callee, new_args)
-            }
-            CsharpminorStmt::Sbuiltin(dst, name, args, res) => {
-                let new_args: Vec<_> = args.iter()
-                    .map(|a| subst_var_in_ba(a, old, new)).collect();
-                let new_res = subst_var_in_ba(res, old, new);
-                CsharpminorStmt::Sbuiltin(dst.clone(), name.clone(), new_args, new_res)
-            }
-            CsharpminorStmt::Scond(cond, args, ifso, ifnot) => {
-                let new_args: Vec<_> = args.iter()
-                    .map(|a| subst_var_in_expr(a, old, new)).collect();
-                CsharpminorStmt::Scond(cond.clone(), new_args, *ifso, *ifnot)
-            }
-            CsharpminorStmt::Sjumptable(expr, targets) =>
-                CsharpminorStmt::Sjumptable(subst_var_in_expr(expr, old, new), targets.clone()),
-            CsharpminorStmt::Sreturn(expr) =>
-                CsharpminorStmt::Sreturn(subst_var_in_expr(expr, old, new)),
-            _ => stmt.clone(),
-        }
-    }
-
+    // Fold to fixpoint per node; sort pairs first for determinism.
     let mut replacements: HashMap<Node, CsharpminorStmt> = HashMap::new();
-    let mut dead_copies: HashSet<Node> = HashSet::new();
-
-    for (_blk, block_stmts) in &blocks {
-        let mut active_copies: Vec<(RTLReg, RTLReg, Node)> = Vec::new();
-        let mut copy_use_count: HashMap<Node, usize> = HashMap::new();
-        let mut copy_replaced_count: HashMap<Node, usize> = HashMap::new();
-
-        for (node, stmt) in block_stmts {
-            let node = *node;
-
-            let uses = stmt_uses(stmt);
-            let mut current_stmt = stmt.clone();
-            for (dst, src, copy_node) in &active_copies {
-                if uses.contains(dst) {
-                    current_stmt = subst_var_in_stmt(&current_stmt, *dst, *src);
-                    *copy_replaced_count.entry(*copy_node).or_insert(0) += 1;
+    for (node, pairs) in &mut substs_by_node {
+        pairs.sort();
+        pairs.dedup();
+        let original = match working.get(node) {
+            Some(s) => s.clone(),
+            None => continue,
+        };
+        let mut current = original.clone();
+        loop {
+            let mut changed = false;
+            for &(dst, src) in pairs.iter() {
+                let next = subst_var_in_stmt(&current, dst, src);
+                if next != current {
+                    current = next;
+                    changed = true;
                 }
             }
-            if current_stmt != *stmt {
-                replacements.insert(node, current_stmt.clone());
-            }
-
-            if let Some(def_reg) = stmt_def(&current_stmt) {
-                active_copies.retain(|(dst, src, _)| {
-                    def_reg != *src && def_reg != *dst
-                });
-            }
-
-            if let CsharpminorStmt::Sset(dst, CsharpminorExpr::Evar(src)) = stmt {
-                if dst != src {
-                    active_copies.push((*dst, *src, node));
-                    let mut use_count = 0usize;
-                    for (future_node, future_stmt) in block_stmts {
-                        if *future_node <= node { continue; }
-                        let future_uses = stmt_uses(future_stmt);
-                        if future_uses.contains(dst) {
-                            use_count += 1;
-                        }
-                        if let Some(def_reg) = stmt_def(future_stmt) {
-                            if def_reg == *src || def_reg == *dst { break; }
-                        }
-                    }
-                    copy_use_count.insert(node, use_count);
-                }
+            if !changed {
+                break;
             }
         }
-
-        for (copy_node, total) in &copy_use_count {
-            let replaced = copy_replaced_count.get(copy_node).copied().unwrap_or(0);
-            if replaced >= *total && *total > 0 {
-                dead_copies.insert(*copy_node);
-            }
+        if current != original {
+            replacements.insert(*node, current);
         }
     }
+
+    let dead_copies: HashSet<Node> = prog.dead_copy_v2.iter().map(|(n,)| *n).collect();
 
     if replacements.is_empty() && dead_copies.is_empty() {
         return;
     }
 
-    // Propagate types: for each dead copy Sset(dst, Evar(src)), transfer dst's
-    // types to src in emit_var_type_candidate so downstream conversion uses the
-    // correct type for the substituted variable.
-    let existing_types: Vec<(RTLReg, crate::x86::types::XType)> = db
-        .rel_iter::<(RTLReg, crate::x86::types::XType)>("emit_var_type_candidate")
+    // For each dead copy, transfer dst's types to src via Ascent's copy_intro.
+    let existing_types: Vec<(RTLReg, XType)> = db
+        .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
         .cloned()
         .collect();
+    let intros_by_node: HashMap<Node, (RTLReg, RTLReg)> = prog
+        .copy_intro
+        .iter()
+        .map(|(n, dst, src)| (*n, (*dst, *src)))
+        .collect();
     for &copy_node in &dead_copies {
-        if let Some(CsharpminorStmt::Sset(dst, CsharpminorExpr::Evar(src))) = working.get(&copy_node) {
+        if let Some(&(dst, src)) = intros_by_node.get(&copy_node) {
             for (reg, xty) in &existing_types {
-                if *reg == *dst {
-                    db.rel_push("emit_var_type_candidate", (*src, xty.clone()));
+                if *reg == dst {
+                    db.rel_push("emit_var_type_candidate", (src, xty.clone()));
                 }
             }
         }
@@ -1605,6 +1441,206 @@ fn propagate_copies(working: &mut HashMap<Node, CsharpminorStmt>, db: &mut Decom
     }
 }
 
+// Helpers used by propagate_copies and its Ascent rules.
+
+fn stmt_uses_set(stmt: &CsharpminorStmt) -> HashSet<RTLReg> {
+    let mut vars = HashSet::new();
+    match stmt {
+        CsharpminorStmt::Sset(_, expr) => collect_expr_vars(expr, &mut vars),
+        CsharpminorStmt::Sstore(_, addr, val) => {
+            collect_expr_vars(addr, &mut vars);
+            collect_expr_vars(val, &mut vars);
+        }
+        CsharpminorStmt::Scall(_, _, callee, args) => {
+            if let either::Either::Left(e) = callee { collect_expr_vars(e, &mut vars); }
+            for a in args { collect_expr_vars(a, &mut vars); }
+        }
+        CsharpminorStmt::Stailcall(_, callee, args) => {
+            if let either::Either::Left(e) = callee { collect_expr_vars(e, &mut vars); }
+            for a in args { collect_expr_vars(a, &mut vars); }
+        }
+        CsharpminorStmt::Sbuiltin(_, _, args, res) => {
+            for a in args { collect_builtin_arg_vars(a, &mut vars); }
+            collect_builtin_arg_vars(res, &mut vars);
+        }
+        CsharpminorStmt::Scond(_, args, _, _) => {
+            for a in args { collect_expr_vars(a, &mut vars); }
+        }
+        CsharpminorStmt::Sjumptable(expr, _) => collect_expr_vars(expr, &mut vars),
+        CsharpminorStmt::Sreturn(expr) => collect_expr_vars(expr, &mut vars),
+        _ => {}
+    }
+    vars
+}
+
+fn stmt_def_reg(stmt: &CsharpminorStmt) -> Option<RTLReg> {
+    match stmt {
+        CsharpminorStmt::Sset(reg, _) => Some(*reg),
+        CsharpminorStmt::Scall(Some(reg), _, _, _) => Some(*reg),
+        CsharpminorStmt::Sbuiltin(Some(reg), _, _, _) => Some(*reg),
+        _ => None,
+    }
+}
+
+fn subst_var_in_expr(
+    expr: &CsharpminorExpr, old: RTLReg, new: RTLReg,
+) -> CsharpminorExpr {
+    match expr {
+        CsharpminorExpr::Evar(r) if *r == old => CsharpminorExpr::Evar(new),
+        CsharpminorExpr::Eunop(op, inner) =>
+            CsharpminorExpr::Eunop(op.clone(), Box::new(subst_var_in_expr(inner, old, new))),
+        CsharpminorExpr::Ebinop(op, l, r) =>
+            CsharpminorExpr::Ebinop(
+                op.clone(),
+                Box::new(subst_var_in_expr(l, old, new)),
+                Box::new(subst_var_in_expr(r, old, new)),
+            ),
+        CsharpminorExpr::Eload(chunk, addr) =>
+            CsharpminorExpr::Eload(*chunk, Box::new(subst_var_in_expr(addr, old, new))),
+        CsharpminorExpr::Econdition(c, t, f) =>
+            CsharpminorExpr::Econdition(
+                Box::new(subst_var_in_expr(c, old, new)),
+                Box::new(subst_var_in_expr(t, old, new)),
+                Box::new(subst_var_in_expr(f, old, new)),
+            ),
+        _ => expr.clone(),
+    }
+}
+
+fn subst_var_in_ba(
+    ba: &BuiltinArg<CsharpminorExpr>, old: RTLReg, new: RTLReg,
+) -> BuiltinArg<CsharpminorExpr> {
+    match ba {
+        BuiltinArg::BA(e) => BuiltinArg::BA(subst_var_in_expr(e, old, new)),
+        BuiltinArg::BASplitLong(a, b) =>
+            BuiltinArg::BASplitLong(
+                Box::new(subst_var_in_ba(a, old, new)),
+                Box::new(subst_var_in_ba(b, old, new)),
+            ),
+        BuiltinArg::BAAddPtr(a, b) =>
+            BuiltinArg::BAAddPtr(
+                Box::new(subst_var_in_ba(a, old, new)),
+                Box::new(subst_var_in_ba(b, old, new)),
+            ),
+        _ => ba.clone(),
+    }
+}
+
+fn subst_var_in_stmt(
+    stmt: &CsharpminorStmt, old: RTLReg, new: RTLReg,
+) -> CsharpminorStmt {
+    match stmt {
+        CsharpminorStmt::Sset(dst, expr) =>
+            CsharpminorStmt::Sset(*dst, subst_var_in_expr(expr, old, new)),
+        CsharpminorStmt::Sstore(chunk, addr, val) =>
+            CsharpminorStmt::Sstore(
+                *chunk,
+                subst_var_in_expr(addr, old, new),
+                subst_var_in_expr(val, old, new),
+            ),
+        CsharpminorStmt::Scall(dst, sig, callee, args) => {
+            let new_callee = match callee {
+                either::Either::Left(e) =>
+                    either::Either::Left(subst_var_in_expr(e, old, new)),
+                other => other.clone(),
+            };
+            let new_args: Vec<_> = args.iter()
+                .map(|a| subst_var_in_expr(a, old, new)).collect();
+            CsharpminorStmt::Scall(dst.clone(), sig.clone(), new_callee, new_args)
+        }
+        CsharpminorStmt::Stailcall(sig, callee, args) => {
+            let new_callee = match callee {
+                either::Either::Left(e) =>
+                    either::Either::Left(subst_var_in_expr(e, old, new)),
+                other => other.clone(),
+            };
+            let new_args: Vec<_> = args.iter()
+                .map(|a| subst_var_in_expr(a, old, new)).collect();
+            CsharpminorStmt::Stailcall(sig.clone(), new_callee, new_args)
+        }
+        CsharpminorStmt::Sbuiltin(dst, name, args, res) => {
+            let new_args: Vec<_> = args.iter()
+                .map(|a| subst_var_in_ba(a, old, new)).collect();
+            let new_res = subst_var_in_ba(res, old, new);
+            CsharpminorStmt::Sbuiltin(dst.clone(), name.clone(), new_args, new_res)
+        }
+        CsharpminorStmt::Scond(cond, args, ifso, ifnot) => {
+            let new_args: Vec<_> = args.iter()
+                .map(|a| subst_var_in_expr(a, old, new)).collect();
+            CsharpminorStmt::Scond(cond.clone(), new_args, *ifso, *ifnot)
+        }
+        CsharpminorStmt::Sjumptable(expr, targets) =>
+            CsharpminorStmt::Sjumptable(subst_var_in_expr(expr, old, new), targets.clone()),
+        CsharpminorStmt::Sreturn(expr) =>
+            CsharpminorStmt::Sreturn(subst_var_in_expr(expr, old, new)),
+        _ => stmt.clone(),
+    }
+}
+
+// CopyPropagationProgram: Ascent copy propagation. Outputs applicable_subst, dead_copy_v2, copy_intro.
+ascent_par! {
+    pub struct CopyPropagationProgram;
+
+    relation stmt(Node, CsharpminorStmt);
+    relation in_block(Node, Node);
+
+    // Both in same block AND a strictly precedes b.
+    relation before_in_block(Node, Node);
+    before_in_block(*a, *b) <--
+        in_block(a, blk),
+        in_block(b, blk),
+        if *a < *b;
+
+    // Registers defined at a node.
+    relation stmt_defines(Node, RTLReg);
+    stmt_defines(*n, reg) <--
+        stmt(n, s),
+        if let Some(reg) = stmt_def_reg(s);
+
+    // Registers used (read) at a node. Computed once per stmt.
+    relation stmt_uses(Node, RTLReg);
+    stmt_uses(*n, reg) <--
+        stmt(n, s),
+        let used = stmt_uses_set(s),
+        for reg in used;
+
+    // Copy introductions: Sset(dst, Evar(src)) with dst != src.
+    relation copy_intro(Node, RTLReg, RTLReg);
+    copy_intro(*n, *dst, *src) <--
+        stmt(n, ?CsharpminorStmt::Sset(dst, CsharpminorExpr::Evar(src))),
+        if dst != src;
+
+    // A kill of the copy between intro and use: some k strictly between intro
+    // and u (in the same block) defines either dst or src.
+    relation copy_killed_between(Node, RTLReg, RTLReg, Node);
+    copy_killed_between(*intro, *dst, *src, *u) <--
+        copy_intro(intro, dst, src),
+        before_in_block(intro, k),
+        before_in_block(k, u),
+        stmt_defines(k, d),
+        if d == dst || d == src;
+
+    // The copy introduced at `intro` is live at use-node `u`.
+    relation copy_active_at(Node, RTLReg, RTLReg, Node);
+    copy_active_at(*u, *dst, *src, *intro) <--
+        copy_intro(intro, dst, src),
+        before_in_block(intro, u),
+        !copy_killed_between(intro, dst, src, u);
+
+    // Non-transitive on purpose; Rust fold runs the chain while preserving the original-uses anchor.
+    relation applicable_subst(Node, RTLReg, RTLReg);
+    applicable_subst(*u, *dst, *src) <--
+        copy_active_at(u, dst, src, _intro),
+        stmt_uses(u, dst);
+
+    // A copy is dead if at least one substitution fires for it.
+    relation dead_copy_v2(Node);
+    dead_copy_v2(*intro) <--
+        copy_intro(intro, dst, src),
+        copy_active_at(u, dst, src, intro),
+        stmt_uses(u, dst);
+}
+
 fn eliminate_dead_returns(working: &mut HashMap<Node, CsharpminorStmt>, db: &DecompileDB) {
     let dead_regs: HashSet<RTLReg> = db
         .rel_iter::<(RTLReg,)>("dead_def")
@@ -1614,14 +1650,68 @@ fn eliminate_dead_returns(working: &mut HashMap<Node, CsharpminorStmt>, db: &Dec
         return;
     }
 
-    let nodes: Vec<Node> = working.keys().copied().collect();
+    // Cross-check dead_def claims against actual uses in working to avoid dropping live returns.
+    let mut used_regs: HashSet<RTLReg> = HashSet::new();
+    for stmt in working.values() {
+        match stmt {
+            CsharpminorStmt::Sset(_, expr) => {
+                collect_expr_vars(expr, &mut used_regs);
+            }
+            CsharpminorStmt::Sstore(_, addr, value) => {
+                collect_expr_vars(addr, &mut used_regs);
+                collect_expr_vars(value, &mut used_regs);
+            }
+            CsharpminorStmt::Sreturn(expr) => {
+                collect_expr_vars(expr, &mut used_regs);
+            }
+            CsharpminorStmt::Scall(_, _, callee, args) => {
+                if let either::Either::Left(expr) = callee {
+                    collect_expr_vars(expr, &mut used_regs);
+                }
+                for a in args.iter() { collect_expr_vars(a, &mut used_regs); }
+            }
+            CsharpminorStmt::Stailcall(_, callee, args) => {
+                if let either::Either::Left(expr) = callee {
+                    collect_expr_vars(expr, &mut used_regs);
+                }
+                for a in args.iter() { collect_expr_vars(a, &mut used_regs); }
+            }
+            CsharpminorStmt::Sbuiltin(_, _, args, res) => {
+                for a in args.iter() { collect_builtin_arg_vars(a, &mut used_regs); }
+                collect_builtin_arg_vars(res, &mut used_regs);
+            }
+            CsharpminorStmt::Scond(_, args, _, _) => {
+                for a in args.iter() { collect_expr_vars(a, &mut used_regs); }
+            }
+            CsharpminorStmt::Sjumptable(expr, _) => {
+                collect_expr_vars(expr, &mut used_regs);
+            }
+            _ => {}
+        }
+    }
+
+    // Sort nodes so deterministic even if downstream reads working in insertion order.
+    let mut nodes: Vec<Node> = working.keys().copied().collect();
+    nodes.sort();
     for node in nodes {
         let stmt = working.get(&node).unwrap().clone();
         if let CsharpminorStmt::Scall(Some(dst), sig, callee, args) = &stmt {
-            if dead_regs.contains(dst) {
+            if dead_regs.contains(dst) && !used_regs.contains(dst) {
                 working.insert(node, CsharpminorStmt::Scall(None, sig.clone(), callee.clone(), args.clone()));
             }
         }
+    }
+}
+
+/// Collect free variable registers referenced inside a BuiltinArg<CsharpminorExpr>.
+fn collect_builtin_arg_vars(ba: &BuiltinArg<CsharpminorExpr>, out: &mut HashSet<RTLReg>) {
+    match ba {
+        BuiltinArg::BA(e) => collect_expr_vars(e, out),
+        BuiltinArg::BASplitLong(a, b) | BuiltinArg::BAAddPtr(a, b) => {
+            collect_builtin_arg_vars(a, out);
+            collect_builtin_arg_vars(b, out);
+        }
+        _ => {}
     }
 }
 

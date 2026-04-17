@@ -293,11 +293,12 @@ type OpRegisterTuple = (Symbol, &'static str);
 type OpImmediateTuple = (Symbol, i64, usize);
 
 fn detect_vla(db: &mut DecompileDB) {
-    // Read VLA captures identified by Datalog
-    let captures: Vec<(Address, Address, &'static str, &'static str)> = db
+    // Sort captures so trim_instruction pushes are deterministic across thread schedules.
+    let mut captures: Vec<(Address, Address, &'static str, &'static str)> = db
         .rel_iter::<(Address, Address, &'static str, &'static str)>("vla_capture")
         .copied()
         .collect();
+    captures.sort();
 
     if captures.is_empty() {
         let alloca_rel: ascent::boxcar::Vec<(Address, Mreg, Mreg)> = Default::default();
@@ -325,14 +326,36 @@ fn detect_vla(db: &mut DecompileDB) {
         .map(|&(id, val, _)| (id, val))
         .collect();
 
-    let next_map: HashMap<Address, Address> = db
-        .rel_iter::<(Address, Address)>("next")
-        .map(|&(a, b)| (a, b))
+    // Only follow next/prev when unambiguous; smallest-at-branches could splice a loop backedge.
+    let mut next_multi: std::collections::BTreeMap<Address, std::collections::BTreeSet<Address>> =
+        std::collections::BTreeMap::new();
+    for &(a, b) in db.rel_iter::<(Address, Address)>("next") {
+        next_multi.entry(a).or_default().insert(b);
+    }
+    let next_map: HashMap<Address, Address> = next_multi
+        .iter()
+        .filter_map(|(k, v)| {
+            if v.len() == 1 {
+                v.iter().next().map(|&only| (*k, only))
+            } else {
+                None
+            }
+        })
         .collect();
-
-    let prev_map: HashMap<Address, Address> = db
-        .rel_iter::<(Address, Address)>("next")
-        .map(|&(a, b)| (b, a))
+    let mut prev_multi: std::collections::BTreeMap<Address, std::collections::BTreeSet<Address>> =
+        std::collections::BTreeMap::new();
+    for &(a, b) in db.rel_iter::<(Address, Address)>("next") {
+        prev_multi.entry(b).or_default().insert(a);
+    }
+    let prev_map: HashMap<Address, Address> = prev_multi
+        .iter()
+        .filter_map(|(k, v)| {
+            if v.len() == 1 {
+                v.iter().next().map(|&only| (*k, only))
+            } else {
+                None
+            }
+        })
         .collect();
 
     let func_entries: HashSet<Address> = db
@@ -548,16 +571,18 @@ fn detect_vla(db: &mut DecompileDB) {
             }
         }
 
-        // Post-capture alignment ops (ADD/SHR/SHL/AND before base var store)
+        // Trim ADD/SHR/SHL/AND only when AT&T dst (op2) is the captured VLA result reg.
         for &fwd_addr in walk_forward(cap_addr, 6).iter() {
-            if let Some(&(_, _, _, mnem, _, _, _, _, _, _)) = insns.get(&fwd_addr) {
-                match mnem {
-                    "ADD" | "SHR" | "SHL" | "AND" => {
-                        trimmed.insert(fwd_addr);
-                    }
-                    _ => break,
-                }
+            let Some(&(_, _, _, mnem, _, op2, _, _, _, _)) = insns.get(&fwd_addr) else {
+                break;
+            };
+            if !matches!(mnem, "ADD" | "SHR" | "SHL" | "AND") {
+                break;
             }
+            if get_reg_name(op2) != Some(result_reg) {
+                break;
+            }
+            trimmed.insert(fwd_addr);
         }
     }
 
@@ -574,17 +599,16 @@ fn detect_vla(db: &mut DecompileDB) {
         );
     }
 
+    // Append-only: rel_push new trims rather than rel_set to preserve immutable-facts invariant.
     if !trimmed.is_empty() {
-        let existing: Vec<Address> = db.rel_iter::<(Address,)>("trim_instruction")
+        let existing: HashSet<Address> = db.rel_iter::<(Address,)>("trim_instruction")
             .map(|&(a,)| a)
             .collect();
-
-        let combined: ascent::boxcar::Vec<(Address,)> =
-            existing.into_iter().map(|a| (a,)).collect();
-        for addr in trimmed {
-            combined.push((addr,));
+        for addr in &trimmed {
+            if !existing.contains(addr) {
+                db.rel_push("trim_instruction", (*addr,));
+            }
         }
-        db.rel_set("trim_instruction", combined);
     }
 
     // Bridge next edges across trimmed ranges so downstream passes don't get orphan nodes.

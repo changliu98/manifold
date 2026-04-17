@@ -812,8 +812,12 @@ impl CshminorPass {
             impl_set.insert(impl_addr);
         }
 
-        for (jmp_node, targets) in &tables {
-            let impl_nodes = match impls.get(jmp_node) {
+        // Sort jump-table nodes and pick lowest RTLReg discriminant for determinism.
+        let mut jmp_nodes: Vec<Node> = tables.keys().copied().collect();
+        jmp_nodes.sort();
+        for jmp_node in jmp_nodes {
+            let targets = &tables[&jmp_node];
+            let impl_nodes = match impls.get(&jmp_node) {
                 Some(v) => v,
                 None => continue,
             };
@@ -821,48 +825,54 @@ impl CshminorPass {
                 Some(&e) => e,
                 None => continue,
             };
-            // Build a set of all nodes in the impl sequence + the JMP node
-            // so the bounds-check branch can target any of them.
             let impl_set_local: std::collections::HashSet<Node> = impl_nodes.iter().copied()
-                .chain(std::iter::once(*jmp_node))
+                .chain(std::iter::once(jmp_node))
                 .collect();
 
             let ordered_targets: Vec<Node> = targets.iter().map(|(_, t)| *t).collect();
 
-            let mut discriminant: Option<RTLReg> = None;
+            // Pick smallest RTLReg across plausible discriminants for deterministic output.
+            let mut candidates: Vec<RTLReg> = Vec::new();
             for (_node, stmt) in db.rel_iter::<(Node, CminorStmt)>("cminor_stmt") {
                 match stmt {
-                    CminorStmt::Sbranch(_, args, ifso, ifnot) => {
-                        if (impl_set_local.contains(ifso) || impl_set_local.contains(ifnot)) && args.len() == 1 {
-                            discriminant = Some(args[0]);
-                            break;
-                        }
-                    }
-                    CminorStmt::Sifthenelse(_, args, ifso, ifnot) => {
-                        if (impl_set_local.contains(ifso) || impl_set_local.contains(ifnot)) && args.len() == 1 {
-                            discriminant = Some(args[0]);
-                            break;
+                    CminorStmt::Sbranch(_, args, ifso, ifnot)
+                    | CminorStmt::Sifthenelse(_, args, ifso, ifnot) => {
+                        if (impl_set_local.contains(ifso) || impl_set_local.contains(ifnot))
+                            && args.len() == 1
+                        {
+                            candidates.push(args[0]);
                         }
                     }
                     _ => {}
                 }
             }
 
-            if discriminant.is_none() {
-                if let Some(&(_, cmp_addr)) = db.rel_iter::<(Node, Node)>("jump_table_cmp").find(|(j, _)| *j == *jmp_node) {
-                    if let Some(&(_, index_reg_name)) = db.rel_iter::<(Node, &'static str)>("jump_table_index_reg").find(|(j, _)| *j == *jmp_node) {
-                        let mreg = Mreg::from(index_reg_name);
+            if candidates.is_empty() {
+                let cmp_addrs: Vec<Node> = db
+                    .rel_iter::<(Node, Node)>("jump_table_cmp")
+                    .filter(|(j, _)| *j == jmp_node)
+                    .map(|(_, a)| *a)
+                    .collect();
+                let index_regs: Vec<&'static str> = db
+                    .rel_iter::<(Node, &'static str)>("jump_table_index_reg")
+                    .filter(|(j, _)| *j == jmp_node)
+                    .map(|(_, r)| *r)
+                    .collect();
+                for &cmp_addr in &cmp_addrs {
+                    for &idx_name in &index_regs {
+                        let mreg = Mreg::from(idx_name);
                         for &(addr, ref reg, rtl_reg) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl") {
                             if addr == cmp_addr && *reg == mreg {
-                                discriminant = Some(rtl_reg);
-                                break;
+                                candidates.push(rtl_reg);
                             }
                         }
                     }
                 }
             }
 
-            let reg = match discriminant {
+            candidates.sort();
+            candidates.dedup();
+            let reg = match candidates.into_iter().next() {
                 Some(r) => r,
                 None => continue,
             };
@@ -870,7 +880,9 @@ impl CshminorPass {
             db.rel_push("cminor_stmt", (entry, CminorStmt::Sjumptable(reg, Arc::new(ordered_targets))));
         }
 
-        for &node in &impl_set {
+        let mut impl_nodes_sorted: Vec<Node> = impl_set.into_iter().collect();
+        impl_nodes_sorted.sort();
+        for node in impl_nodes_sorted {
             db.rel_push("trim_jump_table_impl", (node,));
         }
     }

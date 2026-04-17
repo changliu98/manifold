@@ -24,7 +24,6 @@ fn chunk_byte_size(chunk: &MemoryChunk) -> usize {
 }
 
 const MAX_STACK_STRUCT_SIZE: i64 = 1024;
-const STRUCT_KEEP_RATIO: f64 = 1.0;
 
 
 // Pointer/stack/global struct detection via load/store offset analysis
@@ -96,11 +95,20 @@ ascent_par! {
     #[local] relation ptr_has_offset(RTLReg, i64);
     ptr_has_offset(reg, ofs) <-- ptr_deref(reg, ofs, _, _, _);
 
+    // Promote as struct on: 3+ distinct offsets, OR 2 offsets with differing chunks (can't be array).
     #[local] relation ptr_has_multiple_offsets(RTLReg);
     ptr_has_multiple_offsets(reg) <--
         ptr_has_offset(reg, a),
         ptr_has_offset(reg, b),
-        if a != b;
+        ptr_has_offset(reg, c),
+        if a != b,
+        if b != c,
+        if a != c;
+    ptr_has_multiple_offsets(reg) <--
+        ptr_deref(reg, a, chunk_a, _, _),
+        ptr_deref(reg, b, chunk_b, _, _),
+        if a != b,
+        if chunk_a != chunk_b;
 
     // Reject if ptr passed to extern expecting scalar
     #[local] relation ptr_rejected_as_struct(RTLReg);
@@ -220,18 +228,51 @@ ascent_par! {
     // (func, base_ofs, field_ofs, chunk, value_rtl_reg)
     relation stack_struct_field(Address, i64, i64, MemoryChunk, RTLReg);
 
+    // Guard: only count stack LEAs actually used as a load/store base, else +/-1024 slots fold into fake structs.
+    #[local] relation stack_lea_used_for_access(Address, i64, i64);
+    stack_lea_used_for_access(*func, *base_ofs, *inner_ofs) <--
+        stack_lea_reg(func, base_ofs, lea_dst),
+        rtl_inst(node, ?RTLInst::Iload(_, Addressing::Aindexed(inner_ofs), args, _)),
+        instr_in_function(node, func),
+        if args.len() >= 1 && args[0] == *lea_dst;
+    stack_lea_used_for_access(*func, *base_ofs, *inner_ofs) <--
+        stack_lea_reg(func, base_ofs, lea_dst),
+        rtl_inst(node, ?RTLInst::Istore(_, Addressing::Aindexed(inner_ofs), args, _)),
+        instr_in_function(node, func),
+        if args.len() >= 1 && args[0] == *lea_dst;
+    stack_lea_used_for_access(*func, *base_ofs, *inner_ofs) <--
+        stack_lea_reg(func, base_ofs, lea_dst),
+        rtl_inst(node, ?RTLInst::Iload(_, Addressing::Aindexed2(inner_ofs), args, _)),
+        instr_in_function(node, func),
+        if args.len() >= 1 && args[0] == *lea_dst;
+    stack_lea_used_for_access(*func, *base_ofs, *inner_ofs) <--
+        stack_lea_reg(func, base_ofs, lea_dst),
+        rtl_inst(node, ?RTLInst::Istore(_, Addressing::Aindexed2(inner_ofs), args, _)),
+        instr_in_function(node, func),
+        if args.len() >= 1 && args[0] == *lea_dst;
+
     stack_struct_field(*func, *base_ofs, *ofs - *base_ofs, *chunk, *rtl_reg) <--
         stack_lea_base(func, base_ofs),
+        stack_lea_used_for_access(func, base_ofs, _),
         stack_var(func, _, ofs, rtl_reg),
         stack_var_chunk(func, ofs, chunk),
         if *ofs >= *base_ofs && *ofs < *base_ofs + MAX_STACK_STRUCT_SIZE;
 
+    // Same promotion policy as ptr_has_multiple_offsets.
     relation stack_is_struct_candidate(Address, i64);
 
     stack_is_struct_candidate(func, base_ofs) <--
         stack_struct_field(func, base_ofs, a, _, _),
         stack_struct_field(func, base_ofs, b, _, _),
-        if a != b;
+        stack_struct_field(func, base_ofs, c, _, _),
+        if a != b,
+        if b != c,
+        if a != c;
+    stack_is_struct_candidate(func, base_ofs) <--
+        stack_struct_field(func, base_ofs, a, chunk_a, _),
+        stack_struct_field(func, base_ofs, b, chunk_b, _),
+        if a != b,
+        if chunk_a != chunk_b;
 
 
     // Global struct detection via constant-offset accesses
@@ -246,11 +287,20 @@ ascent_par! {
     #[local] relation global_has_offset(Ident, i64);
     global_has_offset(ident, ofs) <-- global_deref(ident, ofs, _, _);
 
+    // Global struct: 3+ offsets OR 2 offsets with differing chunks (pair-like).
     #[local] relation global_has_multiple_offsets(Ident);
     global_has_multiple_offsets(ident) <--
         global_has_offset(ident, a),
         global_has_offset(ident, b),
-        if a != b;
+        global_has_offset(ident, c),
+        if a != b,
+        if b != c,
+        if a != c;
+    global_has_multiple_offsets(ident) <--
+        global_deref(ident, a, chunk_a, _),
+        global_deref(ident, b, chunk_b, _),
+        if a != b,
+        if chunk_a != chunk_b;
 
     #[local] relation global_has_variable_index(Ident);
 
@@ -412,15 +462,27 @@ struct CandidateStruct {
 
 // Returns None if fields overlap or form a uniform-stride array
 fn try_build_layout(accesses: &[(i64, MemoryChunk)]) -> Option<Vec<InferredField>> {
-    let mut field_map: BTreeMap<i64, MemoryChunk> = BTreeMap::new();
+    // On conflicting chunks at one offset (union-like), widen to the largest rather than drop evidence.
+    let mut per_offset: BTreeMap<i64, Vec<MemoryChunk>> = BTreeMap::new();
     for &(ofs, chunk) in accesses {
-        let entry = field_map.entry(ofs).or_insert(chunk);
-        let new_size = chunk_byte_size(&chunk);
-        let old_size = chunk_byte_size(entry);
-        // Break size ties by Ord<MemoryChunk> so the winner is iteration-order independent.
-        if new_size > old_size || (new_size == old_size && chunk < *entry) {
-            *entry = chunk;
-        }
+        per_offset.entry(ofs).or_default().push(chunk);
+    }
+
+    let mut field_map: BTreeMap<i64, MemoryChunk> = BTreeMap::new();
+    for (ofs, chunks) in per_offset {
+        let first = chunks[0];
+        let all_same = chunks.iter().all(|c| *c == first);
+        let chosen = if all_same {
+            first
+        } else {
+            // Widest chunk: preserves width; drops signed/unsigned/int/float claim when not agreed.
+            chunks
+                .iter()
+                .copied()
+                .max_by_key(|c| chunk_byte_size(c))
+                .unwrap_or(first)
+        };
+        field_map.insert(ofs, chosen);
     }
 
     let fields: Vec<InferredField> = field_map
@@ -618,10 +680,7 @@ fn post_process_structs(db: &mut DecompileDB) {
             .then_with(|| a.fields.cmp(&b.fields))
     );
 
-    let cutoff = if candidates.is_empty() { 0 }
-    else if candidates.len() <= 5 { candidates.len() }
-    else { std::cmp::max(1, (candidates.len() as f64 * STRUCT_KEEP_RATIO) as usize) };
-    candidates.truncate(cutoff);
+    // Keep every candidate: popularity cutoff would drop real structs with few accesses.
 
     let mut next_struct_id: usize = 1;
     let mut hash_to_canonical: HashMap<u64, usize> = HashMap::new();

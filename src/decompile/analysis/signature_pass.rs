@@ -4,11 +4,263 @@ use std::sync::Arc;
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
 use crate::decompile::passes::rtl_pass::fresh_xtl_reg;
+use crate::run_pass;
 use crate::x86::mach::Mreg;
 use crate::x86::op::Addressing;
 use crate::x86::types::*;
+use ascent::ascent_par;
 
 const CALL_SITE_CONFIRM_THRESHOLD: f64 = 0.5;
+
+// Mode aggregator: value with highest count, ties broken by larger value.
+pub(crate) fn majority_usize<'a>(inp: impl Iterator<Item = (&'a usize,)>) -> impl Iterator<Item = usize> {
+    let mut counts: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    let mut total = 0usize;
+    for (&v,) in inp {
+        *counts.entry(v).or_insert(0) += 1;
+        total += 1;
+    }
+    let best = counts.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    best.map(|(v, _)| v).into_iter()
+}
+
+// Frequency of the mode returned by majority_usize.
+pub(crate) fn mode_freq_usize<'a>(inp: impl Iterator<Item = (&'a usize,)>) -> impl Iterator<Item = usize> {
+    let mut counts: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    for (&v,) in inp { *counts.entry(v).or_insert(0) += 1; }
+    counts.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0))).map(|(_, c)| c).into_iter()
+}
+
+pub(crate) fn max_plus_one_usize<'a>(inp: impl Iterator<Item = (&'a usize,)>) -> impl Iterator<Item = usize> {
+    inp.map(|(&v,)| v).max().map(|m| m + 1).into_iter()
+}
+
+pub(crate) fn count_items_sig<'a, T: 'a>(inp: impl Iterator<Item = (&'a T,)>) -> impl Iterator<Item = usize> {
+    std::iter::once(inp.count())
+}
+
+pub(crate) fn max_usize<'a>(inp: impl Iterator<Item = (&'a usize,)>) -> impl Iterator<Item = usize> {
+    inp.map(|(&v,)| v).max().into_iter()
+}
+
+// Declarative helpers consumed by reconcile_signatures below.
+ascent_par! {
+    #![measure_rule_times]
+
+    #[swap_db]
+    pub struct SignatureReconciliationProgram;
+
+    // Input relations (swapped in from the DB).
+    relation emit_function(Address, Symbol, Node);
+    relation func_has_param_evidence(Address, usize);
+    relation call_target_func(Node, Address);
+    relation call_arg(Node, usize, RTLReg);
+    relation call_has_arg_evidence(Node, usize);
+    relation call_args_collected_candidate(Node, Args);
+    relation call_float_args_collected(Node, Args);
+    relation emit_function_param_count_candidate(Address, usize);
+    relation emit_function_float_param_count(Address, usize);
+    relation emit_function_stack_param_count(Address, usize);
+    relation known_varargs_function(Symbol, usize);
+    relation emit_function_has_return_candidate(Address);
+    relation emit_function_void_candidate(Address);
+    relation emit_function_return_type_xtype_candidate(Address, XType);
+    relation call_returns_value(Address, Mreg);
+
+    // Calls that have precise per-position arg_mapping.
+    #[local] relation call_precise(Node);
+    call_precise(n) <-- call_arg(n, _, _);
+
+    // Per-call integer-position evidence; precise mapping wins.
+    #[local] relation call_int_pos(Node, usize);
+    call_int_pos(n, p) <-- call_arg(n, p, _);
+    // Fall back to call_has_arg_evidence only when no precise mapping exists for this call.
+    call_int_pos(n, p) <--
+        call_has_arg_evidence(n, p),
+        !call_precise(n);
+
+    // A call site is informative if it has any arg evidence for its target.
+    #[local] relation call_has_any_arg(Node);
+    call_has_any_arg(n) <-- call_int_pos(n, _);
+
+    // Per-(func, pos) call-site support counts.
+    #[local] relation call_pos_evidence(Address, Node, usize);
+    call_pos_evidence(target, n, p) <--
+        call_target_func(n, target),
+        call_int_pos(n, p);
+
+    #[local] relation informative_call(Address, Node);
+    informative_call(target, n) <--
+        call_target_func(n, target),
+        call_has_any_arg(n);
+
+    // Number of informative call sites per function
+    relation informative_call_count(Address, usize);
+    informative_call_count(f, c) <--
+        informative_call(f, _),
+        agg c = count_items_sig(n) in informative_call(f, n);
+
+    // Number of informative call sites that have evidence for a given position
+    #[local] relation call_pos_support(Address, usize, usize);
+    call_pos_support(f, p, c) <--
+        call_pos_evidence(f, _, p),
+        agg c = count_items_sig(n) in call_pos_evidence(f, n, p);
+
+    // Definition-side integer-position evidence.
+    #[local] relation def_int_pos(Address, usize);
+    def_int_pos(f, p) <-- func_has_param_evidence(f, p);
+
+    // Position confirmed if definition reads it, or informative-call coverage >= threshold. Positions 0..6.
+    #[local] relation int_pos_confirmed(Address, usize);
+
+    // (a) definition confirms
+    int_pos_confirmed(f, p) <--
+        def_int_pos(f, p),
+        if *p < 6;
+
+    // (b) call-site ratio confirms (only when there is at least one informative call)
+    int_pos_confirmed(f, p) <--
+        call_pos_support(f, p, c),
+        informative_call_count(f, total),
+        if *p < 6,
+        if *total > 0,
+        if (*c as f64) / (*total as f64) >= CALL_SITE_CONFIRM_THRESHOLD;
+
+    // Reconciled int count: max confirmed position + 1. Emits only when some confirmation exists.
+    relation reconciled_int_count(Address, usize);
+    reconciled_int_count(f, n) <--
+        int_pos_confirmed(f, _),
+        agg n = max_plus_one_usize(p) in int_pos_confirmed(f, p);
+
+    // Max of def_int_pos for fallback when all call sites failed backward reach.
+    relation def_int_count_max(Address, usize);
+    def_int_count_max(f, n) <--
+        def_int_pos(f, _),
+        agg n = max_plus_one_usize(p) in def_int_pos(f, p);
+
+    // Per-call-site arg counts: max int-args + float count (when non-empty).
+    #[local] relation call_int_arg_count_raw(Node, usize);
+    call_int_arg_count_raw(n, len) <--
+        call_args_collected_candidate(n, args),
+        let len = args.len();
+    #[local] relation call_int_arg_count(Node, usize);
+    call_int_arg_count(n, m) <--
+        call_int_arg_count_raw(n, _),
+        agg m = max_usize(l) in call_int_arg_count_raw(n, l);
+
+    #[local] relation call_float_arg_count(Node, usize);
+    call_float_arg_count(n, fc) <--
+        call_float_args_collected(n, args),
+        let fc = args.len(),
+        if fc > 0;
+
+    #[local] relation call_total_arg_count(Node, usize);
+    call_total_arg_count(n, ic) <--
+        call_int_arg_count(n, ic),
+        !call_float_arg_count(n, _);
+    call_total_arg_count(n, ic + fc) <--
+        call_int_arg_count(n, ic),
+        call_float_arg_count(n, fc);
+    // Calls with no int args entry but float args present still count floats.
+    call_total_arg_count(n, fc) <--
+        call_float_arg_count(n, fc),
+        !call_int_arg_count(n, _);
+
+    // Sample (target, arg_count) per call; 0 counted for calls with no arg evidence.
+    #[local] relation call_site_count_sample(Address, Node, usize);
+    call_site_count_sample(target, n, c) <--
+        call_target_func(n, target),
+        call_total_arg_count(n, c);
+    call_site_count_sample(target, n, 0) <--
+        call_target_func(n, target),
+        !call_total_arg_count(n, _);
+
+    // Total call sites per function (every call_target_func entry).
+    relation total_call_sites(Address, usize);
+    total_call_sites(f, c) <--
+        call_site_count_sample(f, _, _),
+        agg c = count_items_sig(n) in call_site_count_sample(f, n, _);
+
+    // Majority mode: arg-count with highest frequency, ties broken by larger value.
+    relation call_site_mode(Address, usize);
+    call_site_mode(f, m) <--
+        call_site_count_sample(f, _, _),
+        agg m = majority_usize(c) in call_site_count_sample(f, _, c);
+
+    relation call_site_mode_freq(Address, usize);
+    call_site_mode_freq(f, freq) <--
+        call_site_count_sample(f, _, _),
+        agg freq = mode_freq_usize(c) in call_site_count_sample(f, _, c);
+
+    // has_call_sites: any call_target_func entry for f.
+    relation has_call_sites(Address);
+    has_call_sites(f) <-- call_target_func(_, f);
+
+    // True when some call site targeting f has its return value consumed.
+    relation any_call_uses_return(Address);
+    any_call_uses_return(f) <--
+        call_target_func(n, f),
+        call_returns_value(n, _);
+
+    // Varargs: emit_function whose name is listed in known_varargs_function.
+    relation is_varargs_fn(Address);
+    is_varargs_fn(addr) <--
+        emit_function(addr, name, _),
+        known_varargs_function(name, _);
+
+    // main() detection by name only.
+    relation is_main_fn(Address);
+    is_main_fn(addr) <--
+        emit_function(addr, name, _),
+        if *name == "main";
+
+    // C++ mangled-name detection: _ZN prefix implies "this" is a pointer.
+    relation is_cpp_method_fn(Address);
+    is_cpp_method_fn(addr) <--
+        emit_function(addr, name, _),
+        if name.starts_with("_ZN");
+
+    // Return-type ladder. Case 7 (no info -> Xvoid) is implicit: no row emitted, caller reads Xvoid default.
+    relation reconciled_return_type(Address, XType);
+
+    // Case 1: definition says void -- always wins
+    reconciled_return_type(f, XType::Xvoid) <--
+        emit_function_void_candidate(f);
+
+    // Case 2: def has_return + explicit xtype
+    reconciled_return_type(f, ty) <--
+        emit_function_has_return_candidate(f),
+        emit_function_return_type_xtype_candidate(f, ty),
+        !emit_function_void_candidate(f);
+
+    // Case 3: def has_return but no xtype
+    reconciled_return_type(f, XType::Xany64) <--
+        emit_function_has_return_candidate(f),
+        !emit_function_return_type_xtype_candidate(f, _),
+        !emit_function_void_candidate(f);
+
+    // Case 4: def xtype present without has_return (unusual but preserves behavior)
+    reconciled_return_type(f, ty) <--
+        emit_function_return_type_xtype_candidate(f, ty),
+        !emit_function_has_return_candidate(f),
+        !emit_function_void_candidate(f);
+
+    // Case 5: call sites but none consume return -> Xvoid
+    reconciled_return_type(f, XType::Xvoid) <--
+        has_call_sites(f),
+        !any_call_uses_return(f),
+        !emit_function_void_candidate(f),
+        !emit_function_has_return_candidate(f),
+        !emit_function_return_type_xtype_candidate(f, _);
+
+    // Case 6: call sites and at least one consumes return -> Xany64
+    reconciled_return_type(f, XType::Xany64) <--
+        has_call_sites(f),
+        any_call_uses_return(f),
+        !emit_function_void_candidate(f),
+        !emit_function_has_return_candidate(f),
+        !emit_function_return_type_xtype_candidate(f, _);
+}
 
 fn arg_regs() -> &'static [Mreg] {
     &crate::x86::abi::abi_config().int_arg_regs
@@ -32,6 +284,8 @@ pub struct FunctionPrototype {
     pub param_types: Vec<XType>,
     pub return_type: XType,
     pub confidence: SignatureConfidence,
+    /// True for known varargs callees; param_count is the fixed prefix only.
+    pub is_varargs: bool,
 }
 
 pub struct SignatureReconciliationPass;
@@ -92,47 +346,7 @@ fn param_mreg_sort_key(mreg: Mreg) -> usize {
     }
 }
 
-/// Per-position reconciliation for integer arg registers (0..6): confirms each position if the definition reads it or informative call-site support >= threshold, returns max confirmed + 1.
-fn reconcile_int_positions(
-    def_evidence: &HashSet<usize>,
-    call_site_evidence: &[&HashSet<usize>],
-    total_call_sites: usize,
-) -> usize {
-    if def_evidence.is_empty() && call_site_evidence.is_empty() {
-        return 0;
-    }
-
-    if total_call_sites == 0 {
-        // No call sites at all -- trust definition entirely
-        return def_evidence.iter().max().map(|m| m + 1).unwrap_or(0);
-    }
-
-    // Only call sites that detected at least one arg are informative
-    let informative_sites = call_site_evidence.len();
-
-    if informative_sites == 0 {
-        // All call sites detected zero args (backward reach likely failed) -- trust definition, don't penalize.
-        return def_evidence.iter().max().map(|m| m + 1).unwrap_or(0);
-    }
-
-    let mut max_confirmed: Option<usize> = None;
-
-    for pos in 0..6 {
-        let def_has = def_evidence.contains(&pos);
-        let call_support = call_site_evidence.iter()
-            .filter(|s| s.contains(&pos))
-            .count();
-        let call_ratio = call_support as f64 / informative_sites as f64;
-
-        let confirmed = def_has || call_ratio >= CALL_SITE_CONFIRM_THRESHOLD;
-
-        if confirmed {
-            max_confirmed = Some(pos);
-        }
-    }
-
-    max_confirmed.map(|m| m + 1).unwrap_or(0)
-}
+// Per-position int arg confirmation is in Ascent (int_pos_confirmed / reconciled_int_count).
 
 fn reconcile_signatures(db: &mut DecompileDB) {
 
@@ -143,6 +357,54 @@ fn reconcile_signatures(db: &mut DecompileDB) {
     if functions.is_empty() {
         return;
     }
+
+    run_pass!(db, SignatureReconciliationProgram);
+
+    // Consume Ascent helper relations into per-function lookup maps.
+    let reconciled_int_count_map: HashMap<Address, usize> = db
+        .rel_iter::<(Address, usize)>("reconciled_int_count")
+        .map(|&(a, c)| (a, c))
+        .collect();
+    let def_int_count_max_map: HashMap<Address, usize> = db
+        .rel_iter::<(Address, usize)>("def_int_count_max")
+        .map(|&(a, c)| (a, c))
+        .collect();
+    let call_site_mode_map: HashMap<Address, usize> = db
+        .rel_iter::<(Address, usize)>("call_site_mode")
+        .map(|&(a, c)| (a, c))
+        .collect();
+    let call_site_mode_freq_map: HashMap<Address, usize> = db
+        .rel_iter::<(Address, usize)>("call_site_mode_freq")
+        .map(|&(a, c)| (a, c))
+        .collect();
+    let total_call_sites_map: HashMap<Address, usize> = db
+        .rel_iter::<(Address, usize)>("total_call_sites")
+        .map(|&(a, c)| (a, c))
+        .collect();
+    let has_call_sites_set: HashSet<Address> = db
+        .rel_iter::<(Address,)>("has_call_sites")
+        .map(|&(a,)| a)
+        .collect();
+    let any_call_uses_return_set: HashSet<Address> = db
+        .rel_iter::<(Address,)>("any_call_uses_return")
+        .map(|&(a,)| a)
+        .collect();
+    let is_varargs_fn_set: HashSet<Address> = db
+        .rel_iter::<(Address,)>("is_varargs_fn")
+        .map(|&(a,)| a)
+        .collect();
+    let is_main_fn_set: HashSet<Address> = db
+        .rel_iter::<(Address,)>("is_main_fn")
+        .map(|&(a,)| a)
+        .collect();
+    let is_cpp_method_fn_set: HashSet<Address> = db
+        .rel_iter::<(Address,)>("is_cpp_method_fn")
+        .map(|&(a,)| a)
+        .collect();
+    let reconciled_return_type_map: HashMap<Address, XType> = db
+        .rel_iter::<(Address, XType)>("reconciled_return_type")
+        .map(|&(a, ref t)| (a, t.clone()))
+        .collect();
 
     let extern_sigs: HashMap<Symbol, (usize, XType, Arc<Vec<XType>>)> = db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
         .map(|&(name, count, ref ret, ref params)| (name, (count, ret.clone(), params.clone())))
@@ -189,35 +451,10 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         .map(|&(addr, ref xtype)| (addr, xtype.clone()))
         .collect();
 
+    // call_targets is consumed by patch_db and the call-site arg-type lookup below.
     let call_targets: HashMap<Node, Address> = db.rel_iter::<(Node, Address)>("call_target_func")
         .map(|&(call_node, target)| (call_node, target))
         .collect();
-    let mut call_site_args: HashMap<Address, Vec<(Node, usize)>> = HashMap::new();
-    {
-        let mut call_args: HashMap<Node, usize> = HashMap::new();
-        for &(call_node, ref args) in db.rel_iter::<(Node, Args)>("call_args_collected_candidate") {
-            let entry = call_args.entry(call_node).or_insert(0);
-            *entry = (*entry).max(args.len());
-        }
-
-        // Add float args to the total count per call site
-        for &(call_node, ref float_args) in db.rel_iter::<(Node, Args)>("call_float_args_collected") {
-            if !float_args.is_empty() {
-                let entry = call_args.entry(call_node).or_insert(0);
-                *entry += float_args.len();
-            }
-        }
-
-        for (&call_node, &target) in &call_targets {
-            let arg_count = call_args.get(&call_node).copied().unwrap_or(0);
-            call_site_args.entry(target).or_default().push((call_node, arg_count));
-        }
-    }
-
-    let call_returns: std::collections::HashSet<Address> = db.rel_iter::<(Address, Mreg)>("call_returns_value")
-        .map(|&(addr, _)| addr)
-        .collect();
-
 
     let emit_var_types: HashMap<RTLReg, Vec<XType>> = {
         let mut map: HashMap<RTLReg, Vec<XType>> = HashMap::new();
@@ -261,23 +498,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         }
     }
 
-    // Raw position-level evidence (before contiguous fill) from RTL pass
-    let mut def_int_evidence: HashMap<Address, HashSet<usize>> = HashMap::new();
-    for &(func_addr, pos) in db.rel_iter::<(Address, usize)>("func_has_param_evidence") {
-        def_int_evidence.entry(func_addr).or_default().insert(pos);
-    }
-
-    let mut call_int_evidence: HashMap<Node, HashSet<usize>> = HashMap::new();
-    let mut calls_with_precise_arg_mapping: HashSet<Node> = HashSet::new();
-    for &(call_node, pos, _) in db.rel_iter::<(Node, usize, RTLReg)>("call_arg") {
-        call_int_evidence.entry(call_node).or_default().insert(pos);
-        calls_with_precise_arg_mapping.insert(call_node);
-    }
-    for &(call_node, pos) in db.rel_iter::<(Node, usize)>("call_has_arg_evidence") {
-        if !calls_with_precise_arg_mapping.contains(&call_node) {
-            call_int_evidence.entry(call_node).or_default().insert(pos);
-        }
-    }
+    // Position-level int-arg evidence lives in the Ascent program above.
 
     let float_param_counts: HashMap<Address, usize> = db
         .rel_iter::<(Address, usize)>("emit_function_float_param_count")
@@ -325,13 +546,10 @@ fn reconcile_signatures(db: &mut DecompileDB) {
 
     let mut prototypes: Vec<FunctionPrototype> = Vec::new();
 
-    // Only force known extern sigs for variadic functions; non-variadic may be custom implementations.
-    let varargs_names: HashSet<&str> = db.rel_iter::<(Symbol, usize)>("known_varargs_function")
-        .map(|(name, _)| *name)
-        .collect();
-
     for (&func_addr, &func_name) in &functions {
-        if varargs_names.contains(func_name) {
+        // Varargs detection: declarative via SignatureReconciliationProgram.
+        let is_va = is_varargs_fn_set.contains(&func_addr);
+        if is_va {
             if let Some((param_count, ret_type, param_types)) = extern_sigs.get(func_name) {
                 // Variadic internal function: force known param count to avoid materializing register dumps.
                 prototypes.push(FunctionPrototype {
@@ -341,56 +559,44 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                     param_types: (**param_types).clone(),
                     return_type: *ret_type,
                     confidence: SignatureConfidence::KnownExtern,
+                    is_varargs: true,
+                });
+                continue;
+            }
+            // Varargs known but no extern sig: fall through, remember is_va so call sites keep extra args.
+        }
+
+        // Hardcode int main(int argc, char **argv) when is_main_fn fires.
+        if is_main_fn_set.contains(&func_addr) {
+            if let Some((param_count, ret_type, param_types)) = known_internal_sigs.get(func_name) {
+                prototypes.push(FunctionPrototype {
+                    address: func_addr,
+                    name: func_name,
+                    param_count: *param_count,
+                    param_types: param_types.clone(),
+                    return_type: *ret_type,
+                    confidence: SignatureConfidence::HighConfidence,
+                    is_varargs: is_va,
                 });
                 continue;
             }
         }
 
-        if let Some((param_count, ret_type, param_types)) = known_internal_sigs.get(func_name) {
-            prototypes.push(FunctionPrototype {
-                address: func_addr,
-                name: func_name,
-                param_count: *param_count,
-                param_types: param_types.clone(),
-                return_type: *ret_type,
-                confidence: SignatureConfidence::HighConfidence,
-            });
-            continue;
-        }
-
         let def_count = def_param_counts.get(&func_addr).copied().unwrap_or(0);
 
-        let site_args = call_site_args.get(&func_addr);
-        let has_call_sites = site_args.map(|s| !s.is_empty()).unwrap_or(false);
-
-        let total_sites = site_args.map(|s| s.len()).unwrap_or(0);
-        let (call_site_mode, mode_freq) = site_args.map(|sites| {
-            if sites.is_empty() { return (0, 0); }
-            let mut counts: HashMap<usize, usize> = HashMap::new();
-            for &(_, c) in sites {
-                *counts.entry(c).or_insert(0) += 1;
-            }
-            let (mode, freq) = counts.into_iter()
-                .max_by_key(|&(count, freq)| (freq, count))
-                .unwrap_or((0, 0));
-            (mode, freq)
-        }).unwrap_or((0, 0));
+        // has_call_sites, total_sites, mode, mode_freq are Ascent-derived.
+        let has_call_sites = has_call_sites_set.contains(&func_addr);
+        let total_sites = total_call_sites_map.get(&func_addr).copied().unwrap_or(0);
+        let call_site_mode = call_site_mode_map.get(&func_addr).copied().unwrap_or(0);
+        let mode_freq = call_site_mode_freq_map.get(&func_addr).copied().unwrap_or(0);
         let consensus_ratio = if total_sites > 0 {
             mode_freq as f64 / total_sites as f64
         } else {
             0.0
         };
 
-        // Position-level reconciliation for integer arguments
-        let def_positions = def_int_evidence.get(&func_addr).cloned().unwrap_or_default();
-        let call_positions: Vec<&HashSet<usize>> = site_args
-            .map(|sites| {
-                sites.iter()
-                    .filter_map(|(call_node, _)| call_int_evidence.get(call_node))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let reconciled_int = reconcile_int_positions(&def_positions, &call_positions, total_sites);
+        // reconciled_int_count: declarative; absent row means 0 (matches old base case).
+        let reconciled_int = reconciled_int_count_map.get(&func_addr).copied().unwrap_or(0);
         let float_count = float_param_counts.get(&func_addr).copied().unwrap_or(0);
         let stack_count = stack_param_counts.get(&func_addr).copied().unwrap_or(0);
         let position_based_count = reconciled_int + float_count + stack_count;
@@ -577,11 +783,12 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                 }
             }
 
-            param_types.push(resolved_type.unwrap_or(XType::Xint));
+            // Default to Xany64 (register-width floor), not Xint (which would lie about ptrs/longs).
+            param_types.push(resolved_type.unwrap_or(XType::Xany64));
         }
 
-        // C++ method detection: _ZN-mangled names get Xptr for implicit `this` (param 0).
-        if func_name.starts_with("_ZN") && !param_types.is_empty() {
+        // C++ method: _ZN-mangled names upgrade param 0 (this) to Xptr.
+        if is_cpp_method_fn_set.contains(&func_addr) && !param_types.is_empty() {
             let needs_upgrade = matches!(
                 param_types[0],
                 XType::Xint | XType::Xintunsigned | XType::Xlong | XType::Xlongunsigned |
@@ -592,25 +799,13 @@ fn reconcile_signatures(db: &mut DecompileDB) {
             }
         }
 
-        let has_any_return_evidence = def_has_return.contains(&func_addr);
-        let any_call_uses_return = site_args
-            .map(|sites| sites.iter().any(|(call_node, _)| call_returns.contains(call_node)))
-            .unwrap_or(false);
         let def_ret_type = def_return_types.get(&func_addr);
 
-        let return_type = if has_call_sites {
-            if any_call_uses_return {
-                def_ret_type.cloned().unwrap_or(XType::Xint)
-            } else {
-                XType::Xvoid
-            }
-        } else if def_void.contains(&func_addr) {
-            XType::Xvoid
-        } else if has_any_return_evidence {
-            def_ret_type.cloned().unwrap_or(XType::Xint)
-        } else {
-            XType::Xvoid
-        };
+        // reconciled_return_type: Ascent-derived. Absent row defaults to Xvoid.
+        let return_type = reconciled_return_type_map
+            .get(&func_addr)
+            .cloned()
+            .unwrap_or(XType::Xvoid);
 
         let count_changed = reconciled_count != def_count;
         let current_param_types: Vec<XType> = (0..reconciled_count)
@@ -619,7 +814,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                     .and_then(|params| params.get(i))
                     .and_then(|reg| existing_types.and_then(|types| types.get(reg)))
                     .cloned()
-                    .unwrap_or(XType::Xint)
+                    .unwrap_or(XType::Xany64)
             })
             .collect();
         let param_types_changed = current_param_types != param_types;
@@ -638,6 +833,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                 param_types,
                 return_type,
                 confidence,
+                is_varargs: is_va,
             });
         }
     }
@@ -707,7 +903,7 @@ fn patch_db(
                         let synthetic_reg = fresh_xtl_reg(proto.address, arg_regs()[i]);
                         new_params.push((proto.address, synthetic_reg));
 
-                        let xtype = proto.param_types.get(i).cloned().unwrap_or(XType::Xlong);
+                        let xtype = proto.param_types.get(i).cloned().unwrap_or(XType::Xany64);
                         db.rel_push("emit_function_param_type_candidate", (proto.address, synthetic_reg, xtype));
                     }
                 }
@@ -742,7 +938,7 @@ fn patch_db(
         for proto in prototypes {
             if let Some(params) = existing_params.get(&proto.address) {
                 for (i, &reg) in params.iter().enumerate().take(proto.param_count) {
-                    let xtype = proto.param_types.get(i).cloned().unwrap_or(XType::Xint);
+                    let xtype = proto.param_types.get(i).cloned().unwrap_or(XType::Xany64);
                     new_param_types.push((proto.address, reg, xtype));
                 }
             }
@@ -920,6 +1116,7 @@ fn patch_db(
             }
 
             if args.len() > proto.param_count {
+                // Truncate unconditionally: Signature/FuncDef/FuncDecl model only fixed-arity sigs.
                 let trimmed: Vec<RTLReg> = args.iter().take(proto.param_count).cloned().collect();
                 new_call_args.push((call_node, Arc::new(trimmed)));
                 patched_calls.insert(call_node);

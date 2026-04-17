@@ -41,26 +41,26 @@ ascent_par! {
         allocation_site(node, result_reg, _),
         let provenance_id = compute_provenance_id(*func, *result_reg);
 
-    // Embed edges from LEA/add-immediate with offset in [0, 2048)
+    // 64KiB window: permits negative offsets (container_of, C++ upcast) without pulling in unrelated arithmetic.
     provenance_edge(func, src, dst, EdgeType::Embed, offset) <--
         instr_in_function(node, func),
         rtl_inst(node, ?RTLInst::Iop(Operation::Olea(Addressing::Aindexed(offset)), args, dst)),
         if args.len() >= 1,
-        if *offset >= 0 && *offset < 2048,
+        if offset.abs() < 65536,
         let src = args[0];
 
     provenance_edge(func, src, dst, EdgeType::Embed, offset) <--
         instr_in_function(node, func),
         rtl_inst(node, ?RTLInst::Iop(Operation::Oleal(Addressing::Aindexed(offset)), args, dst)),
         if args.len() >= 1,
-        if *offset >= 0 && *offset < 2048,
+        if offset.abs() < 65536,
         let src = args[0];
 
     provenance_edge(func, src, dst, EdgeType::Embed, offset) <--
         instr_in_function(node, func),
         rtl_inst(node, ?RTLInst::Iop(Operation::Oaddlimm(offset), args, dst)),
         if args.len() >= 1,
-        if *offset >= 0 && *offset < 2048,
+        if offset.abs() < 65536,
         let src = args[0];
 
     // Embed edges from LEA with indexed2 addressing (base + index + offset)
@@ -68,14 +68,14 @@ ascent_par! {
         instr_in_function(node, func),
         rtl_inst(node, ?RTLInst::Iop(Operation::Olea(Addressing::Aindexed2(offset)), args, dst)),
         if args.len() >= 1,
-        if *offset >= 0 && *offset < 2048,
+        if offset.abs() < 65536,
         let src = args[0];
 
     provenance_edge(func, src, dst, EdgeType::Embed, offset) <--
         instr_in_function(node, func),
         rtl_inst(node, ?RTLInst::Iop(Operation::Oleal(Addressing::Aindexed2(offset)), args, dst)),
         if args.len() >= 1,
-        if *offset >= 0 && *offset < 2048,
+        if offset.abs() < 65536,
         let src = args[0];
 
     // Embed edges from LEA with scaled indexed addressing (base + index*scale + offset)
@@ -83,25 +83,24 @@ ascent_par! {
         instr_in_function(node, func),
         rtl_inst(node, ?RTLInst::Iop(Operation::Olea(Addressing::Aindexed2scaled(_, offset)), args, dst)),
         if args.len() >= 1,
-        if *offset >= 0 && *offset < 2048,
+        if offset.abs() < 65536,
         let src = args[0];
 
     provenance_edge(func, src, dst, EdgeType::Embed, offset) <--
         instr_in_function(node, func),
         rtl_inst(node, ?RTLInst::Iop(Operation::Oleal(Addressing::Aindexed2scaled(_, offset)), args, dst)),
         if args.len() >= 1,
-        if *offset >= 0 && *offset < 2048,
+        if offset.abs() < 65536,
         let src = args[0];
 
-    // Embed edges from Oaddl (variable pointer addition, offset unknown -> 0)
-    provenance_edge(func, src, dst, EdgeType::Embed, 0) <--
+    // Oaddl/Osubl have non-constant RHS: use Assign (alias-only) so acc_ofs stays honest.
+    provenance_edge(func, src, dst, EdgeType::Assign, 0) <--
         instr_in_function(node, func),
         rtl_inst(node, ?RTLInst::Iop(Operation::Oaddl, args, dst)),
         if args.len() >= 1,
         let src = args[0];
 
-    // Embed edges from Osubl (pointer subtraction, offset unknown -> 0)
-    provenance_edge(func, src, dst, EdgeType::Embed, 0) <--
+    provenance_edge(func, src, dst, EdgeType::Assign, 0) <--
         instr_in_function(node, func),
         rtl_inst(node, ?RTLInst::Iop(Operation::Osubl, args, dst)),
         if args.len() >= 1,
@@ -113,7 +112,7 @@ ascent_par! {
         rtl_inst(node, ?RTLInst::Iload(chunk, Addressing::Aindexed(offset), args, dst)),
         if *chunk == MemoryChunk::MAny64 || *chunk == MemoryChunk::MInt64,
         if args.len() >= 1,
-        if *offset >= 0 && *offset < 2048,
+        if offset.abs() < 65536,
         let src = args[0];
 
     // Assign edges from Omove (register copy)
@@ -123,25 +122,25 @@ ascent_par! {
         if args.len() == 1,
         let src = args[0];
 
-    // Chain propagation from roots, depth-limited to 3
+    // Depth bound 6: captures most real chains; previously 3 truncated ptr->field->field->field.
     provenance_chain(func, reg, reg, prov_id, 0, 0) <--
         provenance_root(func, reg, prov_id);
 
     provenance_chain(func, dst, root, prov_id, acc_ofs + offset, depth + 1) <--
         provenance_chain(func, src, root, prov_id, acc_ofs, depth),
         provenance_edge(func, src, dst, ?EdgeType::Embed, offset),
-        if *depth < 3;
+        if *depth < 6;
 
     provenance_chain(func, dst, root, prov_id, acc_ofs, depth + 1) <--
         provenance_chain(func, src, root, prov_id, acc_ofs, depth),
         provenance_edge(func, src, dst, ?EdgeType::Assign, _),
-        if *depth < 3;
+        if *depth < 6;
 
     // Deref links connect parent provenance chains to child roots
     provenance_deref_link(func, dst, child_prov_id, root, parent_prov_id, acc_ofs + offset) <--
         provenance_chain(func, src, root, parent_prov_id, acc_ofs, depth),
         provenance_edge(func, src, dst, ?EdgeType::Deref, offset),
-        if *depth < 3,
+        if *depth < 6,
         let child_prov_id = compute_provenance_id(*func, *dst);
 
     // A chain has pointer evidence when any member has an outgoing Embed or Deref edge.
@@ -268,14 +267,19 @@ fn emit_provenance_ptr_types(db: &mut DecompileDB) {
     for (reg, chunks) in &reg_deref_chunks {
         if chunks.is_empty() { continue; }
         let first = chunks[0];
-        if !chunks.iter().all(|c| *c == first) { continue; }
+        let all_same = chunks.iter().all(|c| *c == first);
 
-        let xtype = match first {
-            MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned | MemoryChunk::MBool => XType::Xcharptr,
-            MemoryChunk::MInt32 | MemoryChunk::MAny32 => XType::Xintptr,
-            MemoryChunk::MFloat64 => XType::Xfloatptr,
-            MemoryChunk::MFloat32 => XType::Xsingleptr,
-            _ => continue,
+        // Agreeing chunks pick a specific pointee type; disagreeing chunks fall back to Xptr rather than dropped.
+        let xtype = if all_same {
+            match first {
+                MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned | MemoryChunk::MBool => XType::Xcharptr,
+                MemoryChunk::MInt32 | MemoryChunk::MAny32 => XType::Xintptr,
+                MemoryChunk::MFloat64 => XType::Xfloatptr,
+                MemoryChunk::MFloat32 => XType::Xsingleptr,
+                _ => XType::Xptr,
+            }
+        } else {
+            XType::Xptr
         };
         db.rel_push("emit_var_type_candidate", (*reg, xtype));
     }

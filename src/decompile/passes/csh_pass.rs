@@ -146,8 +146,16 @@ pub fn default_int_type() -> ClightType {
     ClightType::Tint(ClightIntSize::I32, ClightSignedness::Signed, default_attr())
 }
 
+pub fn default_uint_type() -> ClightType {
+    ClightType::Tint(ClightIntSize::I32, ClightSignedness::Unsigned, default_attr())
+}
+
 pub fn default_long_type() -> ClightType {
     ClightType::Tlong(ClightSignedness::Signed, default_attr())
+}
+
+pub fn default_ulong_type() -> ClightType {
+    ClightType::Tlong(ClightSignedness::Unsigned, default_attr())
 }
 
 pub fn default_single_type() -> ClightType {

@@ -930,9 +930,17 @@ fn function_standalone_search(
             if let Some((best, best_err, _, _)) = beam.into_iter().next() {
                 if best_err <= current_errors {
                     state = best;
+                    current_errors = best_err;
                 }
             }
         }
+    }
+
+    if current_errors > 0 {
+        log::warn!(
+            "clight_select: function 0x{:x} emitted with {} clang errors remaining after {} steps (budget {})",
+            func.address, current_errors, steps, step_budget
+        );
     }
 
     state

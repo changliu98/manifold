@@ -488,10 +488,24 @@ impl IRPass for ClightEmitPass {
                 })
                 .or_insert_with(|| name_str);
         }
-        // ELF symbols override ident_to_symbol.
-        for (addr, name, _) in db.rel_iter::<(Address, Symbol, Symbol)>("symbols") {
-            let id = *addr as usize;
-            id_to_name.insert(id, name.to_string());
+        // For symbol aliases at one address, deterministically keep the lex-smallest name.
+        let mut sym_tuples: Vec<(Address, Symbol)> = db
+            .rel_iter::<(Address, Symbol, Symbol)>("symbols")
+            .map(|(a, n, _)| (*a, *n))
+            .collect();
+        sym_tuples.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (addr, name) in sym_tuples {
+            let id = addr as usize;
+            // Keep the lex-smallest name across aliases rather than relying on last-write.
+            id_to_name
+                .entry(id)
+                .and_modify(|existing| {
+                    let candidate = name.to_string();
+                    if candidate.as_str() < existing.as_str() {
+                        *existing = candidate;
+                    }
+                })
+                .or_insert_with(|| name.to_string());
         }
         for func in &selected_functions {
             id_to_name
@@ -675,16 +689,17 @@ impl IRPass for ClightEmitPass {
         {
             let internal_addrs: HashSet<u64> =
                 internal_functions.iter().map(|f| f.address).collect();
-            let node_to_func: HashMap<u64, u64> = db
-                .rel_iter::<(Node, Address)>("instr_in_function")
-                .map(|(n, f)| (*n, *f))
-                .collect();
+            // instr_in_function is multi-valued (shared PLT nodes); use HashMap<_, HashSet>.
+            let mut node_to_funcs: HashMap<u64, HashSet<u64>> = HashMap::new();
+            for (n, f) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+                node_to_funcs.entry(*n).or_default().insert(*f);
+            }
             let called_addrs: HashSet<u64> = db
                 .rel_iter::<(Address, Address)>("direct_call")
                 .filter(|(caller, _)| {
-                    node_to_func
+                    node_to_funcs
                         .get(caller)
-                        .map_or(false, |f| internal_addrs.contains(f))
+                        .map_or(false, |funcs| funcs.iter().any(|f| internal_addrs.contains(f)))
                 })
                 .map(|(_, callee)| *callee)
                 .collect();

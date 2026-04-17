@@ -23,7 +23,8 @@ fn chunk_xtype(chunk: &MemoryChunk) -> XType {
         MemoryChunk::MInt64 | MemoryChunk::MAny64 => XType::Xany64,
         MemoryChunk::MFloat32 => XType::Xsingle,
         MemoryChunk::MFloat64 => XType::Xfloat,
-        MemoryChunk::Unknown => XType::Xlong,
+        // Xany64 is a width floor; Xlong would falsely claim signed-64.
+        MemoryChunk::Unknown => XType::Xany64,
     }
 }
 
@@ -453,6 +454,9 @@ ascent_par! {
     // Directed relations: track store sources and load destinations separately
     relation ptr_store(RTLReg, RTLReg); // ptr_store(ptr, src) -- *ptr = src
     relation ptr_load(RTLReg, RTLReg);  // ptr_load(ptr, dst) -- dst = *ptr
+    // Chunked variants: store->load propagation verifies same access width.
+    relation ptr_store_chunk(RTLReg, RTLReg, MemoryChunk);
+    relation ptr_load_chunk(RTLReg, RTLReg, MemoryChunk);
 
     // Load: dst = *p
     ptr_deref(base_rtl, dst_rtl) <--
@@ -466,6 +470,15 @@ ascent_par! {
 
     ptr_load(base_rtl, dst_rtl) <--
         ltl_inst(node, ?LTLInst::Lload(_, addr, args, dst_mreg)),
+        if matches!(addr, Addressing::Aindexed(_) | Addressing::Aindexed2(_) | Addressing::Aindexed2scaled(_, _)),
+        if !args.is_empty(),
+        let base_mreg = args[0],
+        if base_mreg != *dst_mreg,
+        reg_rtl(node, base_mreg, base_rtl),
+        reg_rtl(node, *dst_mreg, dst_rtl);
+
+    ptr_load_chunk(base_rtl, dst_rtl, *chunk) <--
+        ltl_inst(node, ?LTLInst::Lload(chunk, addr, args, dst_mreg)),
         if matches!(addr, Addressing::Aindexed(_) | Addressing::Aindexed2(_) | Addressing::Aindexed2scaled(_, _)),
         if !args.is_empty(),
         let base_mreg = args[0],
@@ -492,6 +505,15 @@ ascent_par! {
         reg_rtl(node, base_mreg, base_rtl),
         reg_rtl(node, *src_mreg, src_rtl);
 
+    ptr_store_chunk(base_rtl, src_rtl, *chunk) <--
+        ltl_inst(node, ?LTLInst::Lstore(chunk, addr, args, src_mreg)),
+        if matches!(addr, Addressing::Aindexed(_) | Addressing::Aindexed2(_) | Addressing::Aindexed2scaled(_, _)),
+        if !args.is_empty(),
+        let base_mreg = args[0],
+        if base_mreg != *src_mreg,
+        reg_rtl(node, base_mreg, base_rtl),
+        reg_rtl(node, *src_mreg, src_rtl);
+
     // Aliased pointers share deref targets (invariance for mutable pointers)
     ptr_deref(q, x) <-- ptr_deref(p, x), alias_edge(p, q);
     ptr_deref(p, x) <-- ptr_deref(q, x), alias_edge(p, q);
@@ -499,12 +521,16 @@ ascent_par! {
     ptr_store(p, x) <-- ptr_store(q, x), alias_edge(p, q);
     ptr_load(q, x) <-- ptr_load(p, x), alias_edge(p, q);
     ptr_load(p, x) <-- ptr_load(q, x), alias_edge(p, q);
+    ptr_store_chunk(q, x, c) <-- ptr_store_chunk(p, x, c), alias_edge(p, q);
+    ptr_store_chunk(p, x, c) <-- ptr_store_chunk(q, x, c), alias_edge(p, q);
+    ptr_load_chunk(q, x, c) <-- ptr_load_chunk(p, x, c), alias_edge(p, q);
+    ptr_load_chunk(p, x, c) <-- ptr_load_chunk(q, x, c), alias_edge(p, q);
 
-    // Store->load type propagation: if *p = x and y = *p, y inherits x's type candidates.
+    // Store->load type propagation; matching chunk guard prevents width mismatch pollution.
     emit_var_type_candidate(dst, ty) <--
         emit_var_type_candidate(src, ty),
-        ptr_store(p, src),
-        ptr_load(p, dst);
+        ptr_store_chunk(p, src, chunk),
+        ptr_load_chunk(p, dst, chunk);
 
 
     // 6. Emit type candidates from known function signatures (extern and internal) into emit_var_type_candidate

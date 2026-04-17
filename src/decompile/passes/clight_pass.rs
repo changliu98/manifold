@@ -2605,16 +2605,27 @@ pub(crate) fn check_clight_stmt(stmt: &ClightStmt) -> Option<ClightStmt> {
     }
 }
 
-fn force_int_type_for_32bit_cmp(expr: ClightExpr) -> ClightExpr {
+fn force_int_type_for_32bit_cmp(expr: ClightExpr, signed: bool) -> ClightExpr {
     let ty = clight_expr_type(&expr);
     if !matches!(ty, ClightType::Tpointer(_, _)) {
-        return expr;
+        // Preserve signedness on non-pointer operands: rewrap int types if needed.
+        return match (expr, signed) {
+            (ClightExpr::Etempvar(id, t), s) if is_int32_type(&t) => {
+                ClightExpr::Etempvar(id, if s { default_int_type() } else { default_uint_type() })
+            }
+            (ClightExpr::Evar(id, t), s) if is_int32_type(&t) => {
+                ClightExpr::Evar(id, if s { default_int_type() } else { default_uint_type() })
+            }
+            (other, _) => other,
+        };
     }
-    match expr {
-        ClightExpr::Etempvar(id, _) => ClightExpr::Etempvar(id, default_int_type()),
-        ClightExpr::Evar(id, _) => ClightExpr::Evar(id, default_int_type()),
-        other => ClightExpr::Ecast(Box::new(other), default_int_type()),
-    }
+    // Pointer: cast to signed/unsigned long (64-bit); truncating to 32-bit would lose address bits.
+    let long_ty = if signed { default_long_type() } else { default_ulong_type() };
+    ClightExpr::Ecast(Box::new(expr), long_ty)
+}
+
+fn is_int32_type(ty: &ClightType) -> bool {
+    matches!(ty, ClightType::Tint(ClightIntSize::I32, _, _))
 }
 
 pub(crate) fn clight_condition_expr_with_types(
@@ -2633,7 +2644,11 @@ pub(crate) fn clight_condition_expr_with_types(
                 let lhs = clight_expr_from_csharp_with_multi_types(&args[0], var_types);
                 let rhs = clight_expr_from_csharp_with_multi_types(&args[1], var_types);
                 let (lhs, rhs) = if matches!(cond, Condition::Ccomp(_) | Condition::Ccompu(_)) {
-                    (force_int_type_for_32bit_cmp(lhs), force_int_type_for_32bit_cmp(rhs))
+                    let signed = matches!(cond, Condition::Ccomp(_));
+                    (
+                        force_int_type_for_32bit_cmp(lhs, signed),
+                        force_int_type_for_32bit_cmp(rhs, signed),
+                    )
                 } else {
                     (lhs, rhs)
                 };
@@ -2730,10 +2745,12 @@ pub(crate) fn clight_condition_expr_with_types(
         }
         Condition::Ccompimm(comp, imm) | Condition::Ccompuimm(comp, imm) => {
             if !args.is_empty() {
+                let signed = matches!(cond, Condition::Ccompimm(_, _));
+                let imm_ty = if signed { default_int_type() } else { default_uint_type() };
                 let lhs = clight_expr_from_csharp_with_multi_types(&args[0], var_types);
-                let lhs_final = force_int_type_for_32bit_cmp(lhs);
+                let lhs_final = force_int_type_for_32bit_cmp(lhs, signed);
                 let rhs_final = normalize_const_expr(
-                    ClightExpr::EconstInt(*imm as i32, default_int_type()),
+                    ClightExpr::EconstInt(*imm as i32, imm_ty),
                 );
                 Some(ClightExpr::Ebinop(
                     clight_cmp_from_condition(comp),
@@ -2747,25 +2764,27 @@ pub(crate) fn clight_condition_expr_with_types(
         }
         Condition::Ccomplimm(comp, imm) | Condition::Ccompluimm(comp, imm) => {
             if !args.is_empty() {
+                let signed = matches!(cond, Condition::Ccomplimm(_, _));
+                let long_ty = if signed { default_long_type() } else { default_ulong_type() };
                 let lhs = clight_expr_from_csharp_with_multi_types(&args[0], var_types);
                 let lhs_ty = clight_expr_type(&lhs);
                 let mut lhs_final = lhs.clone();
                 let rhs_final = if *imm == 0 {
                     if matches!(lhs_ty, ClightType::Tpointer(_, _)) {
                         ClightExpr::Ecast(
-                            Box::new(ClightExpr::EconstLong(0, default_long_type())),
+                            Box::new(ClightExpr::EconstLong(0, long_ty.clone())),
                             lhs_ty.clone(),
                         )
                     } else {
-                        ClightExpr::EconstLong(0, default_long_type())
+                        ClightExpr::EconstLong(0, long_ty.clone())
                     }
                 } else {
                     if matches!(lhs_ty, ClightType::Tpointer(_, _)) {
                         let lhs_cast =
-                            ClightExpr::Ecast(Box::new(lhs_final.clone()), default_long_type());
+                            ClightExpr::Ecast(Box::new(lhs_final.clone()), long_ty.clone());
                         lhs_final = lhs_cast;
                     }
-                    normalize_const_expr(ClightExpr::EconstLong(*imm, default_long_type()))
+                    normalize_const_expr(ClightExpr::EconstLong(*imm, long_ty.clone()))
                 };
                 Some(ClightExpr::Ebinop(
                     clight_cmp_from_condition(comp),

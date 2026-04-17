@@ -54,16 +54,13 @@ ascent_par! {
         base_ident_to_symbol(ident, name),
         if *sym_name == *name;
 
-    // Use symbol_size when known, otherwise 65536 heuristic
+    // Only coalesce when symbol_size is known; no 64KiB fallback (it folded unrelated globals).
     relation base_effective_bound(Ident, i64);
 
     base_effective_bound(ident, *size as i64) <--
         symbol_address(ident, addr),
         symbol_size(addr, size, _),
         if *size > 0;
-
-    base_effective_bound(ident, 65536) <--
-        accessed_global(ident);
 
     relation base_coalesce_limit(Ident, i64);
 
@@ -188,13 +185,13 @@ ascent_par! {
         global_distinct_offset(ident, _),
         agg max_ofs = max_i64(ofs) in global_distinct_offset(ident, ofs);
 
-    // Array confirmed: 2+ offsets with consistent stride and non-negative base
+    // Require 3+ offsets: 2 could be a two-field struct or accidental adjacency.
     relation is_global_array(Ident, usize, usize);
 
     is_global_array(ident, elem_size, count) <--
         inferred_element_size(ident, elem_size),
         array_offset_count(ident, ofs_count),
-        if *ofs_count >= 2,
+        if *ofs_count >= 3,
         array_max_offset(ident, max_ofs),
         array_min_offset(ident, min_ofs),
         if *min_ofs >= 0,
