@@ -899,13 +899,18 @@ fn patch_db(
 
             if proto.param_count > current_count {
                 for i in current_count..proto.param_count {
-                    if i < arg_regs().len() {
-                        let synthetic_reg = fresh_xtl_reg(proto.address, arg_regs()[i]);
-                        new_params.push((proto.address, synthetic_reg));
+                    let synthetic_reg = if i < arg_regs().len() {
+                        fresh_xtl_reg(proto.address, arg_regs()[i])
+                    } else {
+                        crate::decompile::passes::rtl_pass::fresh_stack_param_reg(
+                            proto.address,
+                            i - arg_regs().len(),
+                        )
+                    };
+                    new_params.push((proto.address, synthetic_reg));
 
-                        let xtype = proto.param_types.get(i).cloned().unwrap_or(XType::Xany64);
-                        db.rel_push("emit_function_param_type_candidate", (proto.address, synthetic_reg, xtype));
-                    }
+                    let xtype = proto.param_types.get(i).cloned().unwrap_or(XType::Xany64);
+                    db.rel_push("emit_function_param_type_candidate", (proto.address, synthetic_reg, xtype));
                 }
             }
         }

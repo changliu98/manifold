@@ -3939,6 +3939,45 @@ ascent_par! {
         for arg in args.iter(),
         if *arg == Mreg::BP && *ofs > 0;
 
+    // Detect functions that use BP as an indexed-addressing base (framed functions)
+    #[local] relation func_uses_bp_base(Address);
+    func_uses_bp_base(func_start) <--
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lload(_, Addressing::Aindexed(_), args, _)),
+        for arg in args.iter(),
+        if *arg == Mreg::BP;
+    func_uses_bp_base(func_start) <--
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Aindexed(_), args, _)),
+        for arg in args.iter(),
+        if *arg == Mreg::BP;
+
+    stack_passed_param(func_start, *ofs) <--
+        instr_in_function(addr, func_start),
+        function_entry_count(func_start, addr, count),
+        if *count < 512,
+        ltl_inst(addr, ?LTLInst::Lload(_, Addressing::Aindexed(ofs), args, _)),
+        for arg in args.iter(),
+        if *arg == Mreg::SP && *ofs >= 8,
+        !func_uses_bp_base(func_start);
+
+    // Memory-operand arithmetic like `add 0x8(%rsp), %eax` is lifted via
+    // arith_load_op
+    stack_passed_param(func_start, *ofs) <--
+        instr_in_function(addr, func_start),
+        function_entry_count(func_start, addr, count),
+        if *count < 512,
+        arith_load_op(addr, _, _, base, ofs, _),
+        if *base == Mreg::SP && *ofs >= 8,
+        !func_uses_bp_base(func_start);
+
+    stack_passed_param(func_start, *ofs) <--
+        instr_in_function(addr, func_start),
+        function_entry_count(func_start, addr, count),
+        if *count < 512,
+        arith_load_op(addr, _, _, base, ofs, _),
+        if *base == Mreg::BP && *ofs > 0;
+
     relation emit_function_stack_param_count(Address, usize);
 
     emit_function_stack_param_count(func_start, count) <--

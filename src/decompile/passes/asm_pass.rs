@@ -1023,6 +1023,11 @@ ascent_par! {
         symbols(addr, _, _),
         let ident = *addr as Ident;
 
+    #[local] relation nonzero_symbol(Address);
+    nonzero_symbol(addr) <--
+        symbols(addr, _, _),
+        if *addr != 0;
+
     resolved_addr_to_symbol(immediate_addr, ident, offset) <--
         addr_requiring_symbol(immediate_addr),
         func_span(_, start, end),
@@ -2775,6 +2780,7 @@ ascent_par! {
         let res_ireg = Ireg::from(res_str),
         ireg_of(preg_of_r, res_ireg),
         preg_of(res, preg_of_r),
+        !nonzero_symbol(*imm_str as Address),
         let args = vec![];
 
     mach_inst(address, MachInst::Mop(Operation::Olongconst(imm_int), Arc::new(args), *res)) <--
@@ -2786,6 +2792,7 @@ ascent_par! {
         let res_ireg = Ireg::from(res_str),
         ireg_of(preg_of_r, res_ireg),
         preg_of(res, preg_of_r),
+        !nonzero_symbol(*imm_str as Address),
         let args = vec![];
 
     mach_inst(address, MachInst::Mop(Operation::Ointconst(0), Arc::new(args), *res)) <--
@@ -2848,6 +2855,7 @@ ascent_par! {
         let res_ireg = Ireg::from(res_str),
         ireg_of(preg_of_r, res_ireg),
         preg_of(res, preg_of_r),
+        !nonzero_symbol(*imm_str as Address),
         let args = vec![];
 
     mach_inst(address, MachInst::Mop(Operation::Olongconst(*imm_str as i64), Arc::new(args), *res)) <--
@@ -2858,6 +2866,7 @@ ascent_par! {
         let res_ireg = Ireg::from(res_str),
         ireg_of(preg_of_r, res_ireg),
         preg_of(res, preg_of_r),
+        !nonzero_symbol(*imm_str as Address),
         let args = vec![];
 
     mach_inst(address, MachInst::Mop(Operation::Ointconst(*imm_str), Arc::new(args), *res)) <--
@@ -2869,7 +2878,7 @@ ascent_par! {
         ireg_of(preg_of_r, res_ireg),
         preg_of(res, preg_of_r),
         if *imm_str != 0,
-        !symbols(*imm_str as Address, _, _),
+        !nonzero_symbol(*imm_str as Address),
         let args = vec![];
 
     mach_inst(address, MachInst::Mop(Operation::Olongconst(*imm_str), Arc::new(args), *res)) <--
@@ -2881,7 +2890,7 @@ ascent_par! {
         ireg_of(preg_of_r, res_ireg),
         preg_of(res, preg_of_r),
         if *imm_str != 0,
-        !symbols(*imm_str as Address, _, _),
+        !nonzero_symbol(*imm_str as Address),
         let args = vec![];
 
     mach_inst(address, MachInst::Mop(cast_op, Arc::new(args.clone()), *res)) <--
@@ -3078,24 +3087,26 @@ ascent_par! {
         let addressing = Addressing::Ainstack(rsp_ofs.0),
         let empty_args = vec![];
 
-    mach_inst(address, MachInst::Mop(Operation::Ointconst(*symbol_addr), Arc::new(empty_args), *res)) <--
+    mach_inst(address, MachInst::Mop(Operation::Oindirectsymbol(*ident as usize), Arc::new(empty_args), *res)) <--
         pmov(address, dst_reg, src_addr),
         op_register(dst_reg, dst_str),
         op_immediate(src_addr, symbol_addr, _),
         !reg_64(dst_str),
         ireg_of(preg_of_dst, Ireg::from(dst_str)),
         preg_of(res, preg_of_dst),
-        symbols(*symbol_addr as Address, _, _),
+        resolved_addr_to_symbol(*symbol_addr as Address, ident, _offset),
+        if *ident != 0,
         let empty_args = vec![];
 
-    mach_inst(address, MachInst::Mop(Operation::Olongconst(*symbol_addr), Arc::new(empty_args), *res)) <--
+    mach_inst(address, MachInst::Mop(Operation::Oindirectsymbol(*ident as usize), Arc::new(empty_args), *res)) <--
         pmov(address, dst_reg, src_addr),
         op_register(dst_reg, dst_str),
         op_immediate(src_addr, symbol_addr, _),
         reg_64(dst_str),
         ireg_of(preg_of_dst, Ireg::from(dst_str)),
         preg_of(res, preg_of_dst),
-        symbols(*symbol_addr as Address, _, _),
+        resolved_addr_to_symbol(*symbol_addr as Address, ident, _offset),
+        if *ident != 0,
         let empty_args = vec![];
 
     mach_inst(addr, MachInst::Mcall(Either::Right(Either::Left(symbol_name)))) <--
