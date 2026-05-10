@@ -295,12 +295,16 @@ ascent_par! {
         !dominates(node, t),
         !dominates(node, f);
 
-    // Join point: minimum node reachable from both targets that is dominated by the branch
+    // Join point: min node reachable from both branch targets, dominated by branch; self-reach is allowed only for terminal targets (avoids collapsing nested control via loop back-edges).
+    relation reaches_or_eq(Node, Node);
+    reaches_or_eq(*a, *b) <-- reaches(a, b);
+    reaches_or_eq(*t, *t) <-- scond_node(_, t, _), is_terminal(t);
+    reaches_or_eq(*f, *f) <-- scond_node(_, _, f), is_terminal(f);
     relation join_candidate(Node, Node);
     join_candidate(*branch, *node) <--
         scond_node(branch, t, f),
-        reaches(t, node),
-        reaches(f, node),
+        reaches_or_eq(t, node),
+        reaches_or_eq(f, node),
         dominates(node, branch);
 
     lattice join_point(Node, ascent::Dual<Node>);
@@ -585,13 +589,7 @@ ascent_par! {
     switch_chain(*node, *node, *reg, *val, *t) <--
         compares_eq(node, reg, val, t, _);
 
-    // Direct chain only: false branch of prev is a compares_eq on the same register.
-    // Bridge rules (crossing a non-Ceq Scond) are intentionally removed: they formed
-    // chains that later dead-coded interior Ceq members, but the bridge's Scond stayed
-    // alive and its ifso/ifnot could point to those dead members. Taking the bridge
-    // then fell through via skip labels to the wrong block. Without bridge rules, GCC
-    // range-guarded switches are not recovered as switches, but the emitted control
-    // flow is correct.
+    // Direct chain only: false branch of prev is a compares_eq on the same register. Bridge rules across non-Ceq Sconds were removed because their Scond outlived the dead-coded chain and jumped to dropped members.
     switch_chain(*head, *f, *reg, *next_val, *next_t) <--
         switch_chain(head, prev, reg, _, _),
         compares_eq(prev, _, _, _, f),
@@ -998,16 +996,41 @@ fn detect_comparison_tree_switches(
     ) {
         if !visited.insert(node) { return; }
 
+        // Match Scond with arg either Evar(reg) or Ebinop(Oaddl/Oadd, Evar(reg), Econst(offset))
+        // (the inline-temp pattern that GCC/clang emits for `(disc - K) <op> imm`).
         let cmp = match stmt_map.get(&node) {
             Some(CsharpminorStmt::Scond(cond, args, ifso, ifnot)) if args.len() == 1 => {
-                if let CsharpminorExpr::Evar(reg) = &args[0] {
-                    Some((*reg, *cond, *ifso, *ifnot))
-                } else { None }
+                let (reg_opt, inline_off) = match &args[0] {
+                    CsharpminorExpr::Evar(reg) => (Some(*reg), 0i64),
+                    CsharpminorExpr::Ebinop(op, lhs, rhs) => {
+                        if let (CsharpminorExpr::Evar(reg), CsharpminorExpr::Econst(cst))
+                            = (lhs.as_ref(), rhs.as_ref())
+                        {
+                            let off = match (op, cst) {
+                                (crate::x86::types::CminorBinop::Oaddl, Constant::Olongconst(v)) => Some(*v),
+                                (crate::x86::types::CminorBinop::Oadd, Constant::Ointconst(v)) => Some(*v),
+                                (crate::x86::types::CminorBinop::Oaddl, Constant::Ointconst(v)) => Some(*v),
+                                (crate::x86::types::CminorBinop::Oadd, Constant::Olongconst(v)) => Some(*v),
+                                (crate::x86::types::CminorBinop::Osubl, Constant::Olongconst(v)) => Some(-*v),
+                                (crate::x86::types::CminorBinop::Osub, Constant::Ointconst(v)) => Some(-*v),
+                                _ => None,
+                            };
+                            match off {
+                                Some(o) => (Some(*reg), o),
+                                None => (None, 0),
+                            }
+                        } else {
+                            (None, 0)
+                        }
+                    }
+                    _ => (None, 0),
+                };
+                reg_opt.map(|reg| (reg, inline_off, *cond, *ifso, *ifnot))
             }
             _ => None,
         };
 
-        let (reg, cond, ifso, ifnot) = match cmp {
+        let (reg, inline_off, cond, ifso, ifnot) = match cmp {
             Some(c) => c,
             None => {
                 // Follow sequential successor
@@ -1018,7 +1041,8 @@ fn detect_comparison_tree_switches(
             }
         };
 
-        let (root_reg, offset) = resolve_reg(reg);
+        let (root_reg, derive_off) = resolve_reg(reg);
+        let offset = derive_off + inline_off;
         let is_disc = root_reg == disc_reg;
 
         match cond {
@@ -1042,20 +1066,44 @@ fn detect_comparison_tree_switches(
                 walk_tree(ifso, disc_reg, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
             }
 
-            // Range guards on the discriminant: partition the disc space, do not bind any
-            // case value. Recurse into both branches; cases come only from Ceq/Cne leaves.
+            // Unsigned `disc < bound` with `disc + offset` (offset <= 0) enumerates range [-offset, bound-offset-1] for the true branch; bounded to keep Sswitch table small.
+            Condition::Ccompuimm(Comparison::Clt, bound)
+            | Condition::Ccompluimm(Comparison::Clt, bound) if is_disc => {
+                let disc_lower = -offset;
+                let disc_upper = bound - offset - 1;
+                if disc_lower >= 0 && disc_upper >= disc_lower && (disc_upper - disc_lower) < 32 {
+                    for v in disc_lower..=disc_upper {
+                        cases.push((v, ifso, node));
+                    }
+                }
+                walk_tree(ifso, disc_reg, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
+                walk_tree(ifnot, disc_reg, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
+            }
+
+            // Unsigned `disc <= bound`: similar but inclusive upper bound.
+            Condition::Ccompuimm(Comparison::Cle, bound)
+            | Condition::Ccompluimm(Comparison::Cle, bound) if is_disc => {
+                let disc_lower = -offset;
+                let disc_upper = bound - offset;
+                if disc_lower >= 0 && disc_upper >= disc_lower && (disc_upper - disc_lower) < 32 {
+                    for v in disc_lower..=disc_upper {
+                        cases.push((v, ifso, node));
+                    }
+                }
+                walk_tree(ifso, disc_reg, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
+                walk_tree(ifnot, disc_reg, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
+            }
+
+            // Other range guards on the discriminant: partition the disc space without
+            // binding case values; cases come only from Ceq/Cne leaves below.
             Condition::Ccompimm(Comparison::Cgt, _)
             | Condition::Ccompuimm(Comparison::Cgt, _)
             | Condition::Ccomplimm(Comparison::Cgt, _)
             | Condition::Ccompluimm(Comparison::Cgt, _)
             | Condition::Ccompimm(Comparison::Cle, _)
-            | Condition::Ccompuimm(Comparison::Cle, _)
             | Condition::Ccomplimm(Comparison::Cle, _)
-            | Condition::Ccompluimm(Comparison::Cle, _)
             | Condition::Ccompimm(Comparison::Clt, _)
-            | Condition::Ccompuimm(Comparison::Clt, _)
             | Condition::Ccomplimm(Comparison::Clt, _)
-            | Condition::Ccompluimm(Comparison::Clt, _)
             | Condition::Ccompimm(Comparison::Cge, _)
             | Condition::Ccompuimm(Comparison::Cge, _)
             | Condition::Ccomplimm(Comparison::Cge, _)
@@ -1072,25 +1120,35 @@ fn detect_comparison_tree_switches(
         }
     }
 
-    // Find switch roots: Ceq or Cne compares on a register. Both bind a specific case
-    // value to a target. Range guards are NOT seeded as heads because their out-of-range
-    // branch would be silently discarded (the emitted Sswitch has no default export).
+    // Find switch roots (Ceq/Cne/range-guard on a register, possibly via offset binop) and walk to enumerate cases; out-of-range branches reach a Ceq/Cne leaf or fall through to default.
     let mut results: Vec<(Node, u64, Vec<(i64, Node, Node)>)> = Vec::new();
     let mut used_heads: HashSet<Node> = HashSet::new();
 
     for (node, s) in stmts {
         if let CsharpminorStmt::Scond(cond, args, _, _) = s {
             if args.len() != 1 { continue; }
-            if let CsharpminorExpr::Evar(reg) = &args[0] {
-                let is_eq_or_ne = matches!(cond,
-                    Condition::Ccompimm(Comparison::Ceq | Comparison::Cne, _)
-                    | Condition::Ccompuimm(Comparison::Ceq | Comparison::Cne, _)
-                    | Condition::Ccomplimm(Comparison::Ceq | Comparison::Cne, _)
-                    | Condition::Ccompluimm(Comparison::Ceq | Comparison::Cne, _)
+            // Extract reg (possibly through Oaddl/Osubl with constant inline offset)
+            let reg_opt: Option<RTLReg> = match &args[0] {
+                CsharpminorExpr::Evar(reg) => Some(*reg),
+                CsharpminorExpr::Ebinop(_, lhs, rhs) => {
+                    if let (CsharpminorExpr::Evar(reg), CsharpminorExpr::Econst(_))
+                        = (lhs.as_ref(), rhs.as_ref())
+                    {
+                        Some(*reg)
+                    } else { None }
+                }
+                _ => None,
+            };
+            if let Some(reg) = reg_opt {
+                let is_disc_compare = matches!(cond,
+                    Condition::Ccompimm(_, _)
+                    | Condition::Ccompuimm(_, _)
+                    | Condition::Ccomplimm(_, _)
+                    | Condition::Ccompluimm(_, _)
                 );
-                if !is_eq_or_ne { continue; }
+                if !is_disc_compare { continue; }
 
-                let (root_reg, _) = resolve_reg(*reg);
+                let (root_reg, _) = resolve_reg(reg);
                 if used_heads.contains(node) { continue; }
 
                 let mut cases: Vec<(i64, Node, Node)> = Vec::new();

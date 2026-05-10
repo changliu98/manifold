@@ -472,9 +472,40 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                     || optimized_node_to_func.get(n) == Some(&func_addr)
             })
             .collect();
-        
+
+        // sseq bundling drops bundle members but their clight_succ edges still point at them; narrowly remap member->synth edges to the head so synth nodes (e.g. SP-indexed-load assignments) stay reachable via DFS. Restricted to synth targets only: broader remap breaks loop structuring (smoke::for_loop).
+        let mut sseq_member_to_head: HashMap<crate::x86::types::Node, crate::x86::types::Node> = HashMap::new();
+        for (&head, members) in &func.sseq_groups {
+            for &m in members {
+                if m != head {
+                    sseq_member_to_head.insert(m, head);
+                }
+            }
+        }
+        const SYNTH_BIT: u64 = 1u64 << 62;
+        let remapped_edges: Vec<(crate::x86::types::Node, crate::x86::types::Node)> = edges.iter()
+            .flat_map(|&(s, d)| {
+                let mut out: Vec<(crate::x86::types::Node, crate::x86::types::Node)> = vec![(s, d)];
+                let dst_is_synth = (d & SYNTH_BIT) != 0;
+                let src_is_synth = (s & SYNTH_BIT) != 0;
+                // synth-targeted edge from a bundle member: also publish from the head
+                if dst_is_synth {
+                    if let Some(&head) = sseq_member_to_head.get(&s) {
+                        if head != s {
+                            out.push((head, d));
+                        }
+                    }
+                }
+                // synth-source edge to an external (non-bundle) consumer: keep as-is
+                // (synth nodes aren't bundle members, so no remap needed for src).
+                let _ = src_is_synth;
+                out
+            })
+            .filter(|(s, d)| s != d)
+            .collect();
+
         let entry_node = func.address as crate::x86::types::Node;
-        let nodes = order_nodes_dfs(entry_node, &nodes_set, edges);
+        let nodes = order_nodes_dfs(entry_node, &nodes_set, &remapped_edges);
 
         let mut body_items = Vec::new();
         let mut body_terminated = false;
@@ -2251,8 +2282,8 @@ pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> C
             for s in stmts {
                 let c = convert_stmt(s, ctx);
                 if terminated {
-                    // After unconditional exit, only keep statements with named labels (goto targets).
-                    if contains_named_label(&c) {
+                    // After unconditional exit, keep named-label stmts (goto targets) and loop/switch constructs (bodies may host code reachable via gotos/cases).
+                    if contains_named_label(&c) || is_control_flow_construct(&c) {
                         let exits = is_unconditional_exit(&c);
                         converted.push(CBlockItem::Stmt(c));
                         // A preserved label can restart reachability for following fallthrough code.
@@ -2835,6 +2866,7 @@ fn simplify_xor_self_in_stmt(stmt: &mut CStmt) {
         _ => {}
     }
 }
+
 
 fn strip_dead_expr_stmts(stmt: &mut CStmt) {
     if let CStmt::Expr(e) = &*stmt {

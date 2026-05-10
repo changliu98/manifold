@@ -150,6 +150,9 @@ ascent_par! {
     relation rtl_succ_candidate(Node, Node);
 
     relation rtl_edge_negated(Node, Node);
+    // Memory-indirect call: CALL with op_indirect operand whose disp/index makes it a true memory load.
+    // Tuple: (call_addr, base_reg_str, idx_reg_str, scale, disp)
+    relation call_through_memory(Address, &'static str, &'static str, i64, i64);
     // Addresses with a real LTL operation (not just a label/branch fallback)
     relation has_ltl_op(Node);
     relation is_arg_reg(Mreg);
@@ -198,6 +201,12 @@ ascent_par! {
     // SP-indexed load/store detection: loads/stores with 2 mregs where mregs[0] == SP
     #[local] relation sp_indexed_load(Node);
     #[local] relation sp_indexed_store(Node);
+
+    // sp_synth_skip_to_ltl(start, func, dst): start has no ltl_inst; walking next within func reaches dst with one. Function-bounded; used ONLY by SP-indexed-load/store synth so it doesn't affect ltl_fallthrough.
+    #[local] relation sp_synth_skip_to_ltl(Address, Address, Node);
+
+    // synth_only_addr(addr): addr has no ltl_inst (machine instr fused into a synth chain by an upstream rule like arith_load_op/arith_store_*/mach_imm_*/SP-indexed-load/store) yet exists in rtl as synth at addr (and `addr | 1<<62` / `1<<63`). Bridges the predecessor-side edge (real ltl_inst whose next() lands on a missing ltl_inst) without resurrecting the broken global skip-over.
+    #[local] relation synth_only_addr(Address);
 
 
     ltl_inst_uses_mreg(addr, mreg) <--
@@ -260,11 +269,32 @@ ascent_par! {
         ltl_inst(call_addr, ?LTLInst::Lcall(_)),
         agg args = build_call_args(pos, reg) in call_arg_mapping(call_addr, pos, reg);
 
+    // Memory-indirect call detection: op_indirect on a CALL means callee is loaded from memory (register-direct CALLs use op_register).
+    call_through_memory(*addr, base_str, idx_str, *scale, *disp) <--
+        instruction(addr, _, _, "CALL", dst, _, _, _, _, _),
+        op_indirect(dst, _, base_str, idx_str, scale, disp, _),
+        if *base_str != "NONE";
+
 
     op_arg_mapping(addr, pos, arg_rtl) <--
-        ltl_inst(addr, ?LTLInst::Lop(_, mregs, _)),
+        ltl_inst(addr, ?LTLInst::Lop(_, mregs, dst_reg)),
         for (pos, arg) in mregs.iter().enumerate(),
+        if arg != dst_reg,
         reg_rtl(addr, *arg, arg_rtl);
+
+    op_arg_mapping(addr, pos, arg_rtl) <--
+        ltl_inst(addr, ?LTLInst::Lop(_, mregs, dst_reg)),
+        for (pos, arg) in mregs.iter().enumerate(),
+        if arg == dst_reg,
+        !lop_overwrites_input(addr, *dst_reg),
+        reg_rtl(addr, *arg, arg_rtl);
+
+    op_arg_mapping(addr, pos, arg_rtl_use) <--
+        ltl_inst(addr, ?LTLInst::Lop(_, mregs, dst_reg)),
+        for (pos, arg) in mregs.iter().enumerate(),
+        if arg == dst_reg,
+        lop_overwrite_use_id(addr, *dst_reg, src_xtl),
+        xtl_canonical(src_xtl, arg_rtl_use);
 
 
     op_args_collected(addr, args) <--
@@ -498,6 +528,7 @@ ascent_par! {
         ltl_inst(head_addr, ?LTLInst::Lop(_, mregs, _)),
         for mreg in mregs.iter(),
         reg_def_used(defaddr, *mreg, *head_addr),
+        !lop_overwrites_input(head_addr, mreg),
         !load_overwrites_base(defaddr, mreg),
         reg_xtl(defaddr, *mreg, arg_id);
 
@@ -505,6 +536,7 @@ ascent_par! {
         ltl_inst(head_addr, ?LTLInst::Lop(_, mregs, _)),
         for mreg in mregs.iter(),
         reg_def_used(defaddr, *mreg, *head_addr),
+        !lop_overwrites_input(head_addr, mreg),
         load_overwrites_base(defaddr, mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *mreg, arg_id);
@@ -676,6 +708,36 @@ ascent_par! {
 
     rtl_succ_candidate(src, dst) <-- rtl_next(src, dst), !rtl_edge_negated(src, dst);
 
+    // True for cmps with a non-BP/non-SP mem base; these fold into an Icond at the jcc address (not the cmp), so the cmp -> jcc edge must remain to reach the Icond.
+    relation cmp_has_non_stack_mem(Address);
+    cmp_has_non_stack_mem(*addr) <--
+        pcmp(addr, _, sym),
+        op_indirect(sym, _, base_str, _, _, _, _),
+        if !base_str.ends_with("BP") && !base_str.ends_with("SP");
+    cmp_has_non_stack_mem(*addr) <--
+        pcmp(addr, sym, _),
+        op_indirect(sym, _, base_str, _, _, _, _),
+        if !base_str.ends_with("BP") && !base_str.ends_with("SP");
+
+    // cmp+jcc fold: when fused into one Icond AT the cmp addr (BP-relative mem / Lcond->Icond), kill the cmp->jcc edge and replace with edges to Icond's true target and fallthrough; else liveness misses cross-cmp use and DSE nops the loop. Must NOT fire for non-stack-mem cmps (Icond at jcc_addr).
+    rtl_edge_negated(addr, *jcc_addr) <--
+        pcmp(addr, _, _),
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, _, _),
+        !cmp_has_non_stack_mem(*addr);
+    rtl_succ_candidate(*addr, *target_addr) <--
+        pcmp(addr, _, _),
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, _, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        !cmp_has_non_stack_mem(*addr);
+    rtl_succ_candidate(*addr, *fallthrough) <--
+        pcmp(addr, _, _),
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, _, _),
+        next(jcc_addr, fallthrough),
+        !cmp_has_non_stack_mem(*addr);
+
     has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lop(_, _, _));
     has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lload(_, _, _, _));
     has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lstore(_, _, _, _));
@@ -727,41 +789,95 @@ ascent_par! {
         let synthetic_addr = *addr | (1u64 << 62),
         next(addr, next);
 
-    // reg_xtl for arith addresses: chains from reg_def_used definition site when no real ltl op exists.
+    // reg_xtl for arith addresses: chains from the reg_def_used def site when no real ltl op exists. For loads that overwrite their base reg, propagate only def_id; otherwise use_id leaks past, canonicalizer merges I/O into one RTL reg, and copy_propagation/dead_store wipes the whole load chain (including struct field accesses).
     reg_xtl(*addr, *base_mreg, arg_id) <--
         arith_load_op(addr, _, _, base_mreg, _, _),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *base_mreg, *addr),
+        !load_overwrites_base(defaddr, base_mreg),
+        reg_xtl(defaddr, *base_mreg, arg_id);
+
+    reg_xtl(*addr, *base_mreg, arg_id) <--
+        arith_load_op(addr, _, _, base_mreg, _, _),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *base_mreg, *addr),
+        load_overwrites_base(defaddr, base_mreg),
+        is_def(defaddr, arg_id),
         reg_xtl(defaddr, *base_mreg, arg_id);
 
     reg_xtl(*addr, *dst_mreg, arg_id) <--
         arith_load_op(addr, _, _, _, _, dst_mreg),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *dst_mreg, *addr),
+        !load_overwrites_base(defaddr, dst_mreg),
+        reg_xtl(defaddr, *dst_mreg, arg_id);
+
+    reg_xtl(*addr, *dst_mreg, arg_id) <--
+        arith_load_op(addr, _, _, _, _, dst_mreg),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *dst_mreg, *addr),
+        load_overwrites_base(defaddr, dst_mreg),
+        is_def(defaddr, arg_id),
         reg_xtl(defaddr, *dst_mreg, arg_id);
 
     reg_xtl(*addr, *base_mreg, arg_id) <--
         arith_store_reg(addr, _, _, base_mreg, _, _),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *base_mreg, *addr),
+        !load_overwrites_base(defaddr, base_mreg),
+        reg_xtl(defaddr, *base_mreg, arg_id);
+
+    reg_xtl(*addr, *base_mreg, arg_id) <--
+        arith_store_reg(addr, _, _, base_mreg, _, _),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *base_mreg, *addr),
+        load_overwrites_base(defaddr, base_mreg),
+        is_def(defaddr, arg_id),
         reg_xtl(defaddr, *base_mreg, arg_id);
 
     reg_xtl(*addr, *src_mreg, arg_id) <--
         arith_store_reg(addr, _, _, _, _, src_mreg),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *src_mreg, *addr),
+        !load_overwrites_base(defaddr, src_mreg),
+        reg_xtl(defaddr, *src_mreg, arg_id);
+
+    reg_xtl(*addr, *src_mreg, arg_id) <--
+        arith_store_reg(addr, _, _, _, _, src_mreg),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *src_mreg, *addr),
+        load_overwrites_base(defaddr, src_mreg),
+        is_def(defaddr, arg_id),
         reg_xtl(defaddr, *src_mreg, arg_id);
 
     reg_xtl(*addr, *base_mreg, arg_id) <--
         arith_store_imm(addr, _, _, base_mreg, _),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *base_mreg, *addr),
+        !load_overwrites_base(defaddr, base_mreg),
+        reg_xtl(defaddr, *base_mreg, arg_id);
+
+    reg_xtl(*addr, *base_mreg, arg_id) <--
+        arith_store_imm(addr, _, _, base_mreg, _),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *base_mreg, *addr),
+        load_overwrites_base(defaddr, base_mreg),
+        is_def(defaddr, arg_id),
         reg_xtl(defaddr, *base_mreg, arg_id);
 
     reg_xtl(*addr, *src_mreg, arg_id) <--
         arith_store_abs_reg(addr, _, _, _, _, src_mreg),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *src_mreg, *addr),
+        !load_overwrites_base(defaddr, src_mreg),
+        reg_xtl(defaddr, *src_mreg, arg_id);
+
+    reg_xtl(*addr, *src_mreg, arg_id) <--
+        arith_store_abs_reg(addr, _, _, _, _, src_mreg),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *src_mreg, *addr),
+        load_overwrites_base(defaddr, src_mreg),
+        is_def(defaddr, arg_id),
         reg_xtl(defaddr, *src_mreg, arg_id);
 
     // arith_load_op: memory-source arithmetic (e.g. add [mem], reg); only fires without a real ltl op.
@@ -1026,6 +1142,7 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
         if !mregs.is_empty(),
+        !lop_overwrites_input(addr, dst_reg),
         reg_rtl(addr, *dst_reg, dst_rtl),
         op_args_collected(addr, args),
         let inst = RTLInst::Iop(op.clone(), args.clone(), *dst_rtl);
@@ -1037,6 +1154,36 @@ ascent_par! {
         let dst_rtl = fresh_xtl_reg(*addr, *dst_reg),
         op_args_collected(addr, args),
         let inst = RTLInst::Iop(op.clone(), args.clone(), dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
+        if !mregs.is_empty(),
+        lop_overwrites_input(addr, dst_reg),
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        op_args_collected(addr, args),
+        let inst = RTLInst::Iop(op.clone(), args.clone(), *dst_rtl);
+
+    // Lop with dst shadowing an input mreg, restricted to Osel (preserve semantics: cmov fall-through, abs idiom); other self-mod ops (e.g. `add reg,imm` dst==src) need the original emission for SSA coalescing.
+    relation lop_overwrites_input(Node, Mreg);
+    lop_overwrites_input(addr, *dst_reg) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Osel(_, _), mregs, dst_reg)),
+        for src in mregs.iter(),
+        if src == dst_reg;
+
+    // Osel reads dst as the false-branch preserve value; capstone doesn't always mark cmov dst readable, so add the use here to drive reg_def_used for the prior-def site.
+    reg_use(addr, *dst_reg) <--
+        lop_overwrites_input(addr, dst_reg);
+
+    // Use-side xtl id for shadow position (mirrors load_overwrite_use_id below): Osel dst-position arg uses this canonical, leaving fresh def_id for the dst itself.
+    relation lop_overwrite_use_id(Node, Mreg, RTLReg);
+    lop_overwrite_use_id(addr, *dst_reg, use_id) <--
+        lop_overwrites_input(addr, dst_reg),
+        let use_id = fresh_xtl_reg(*addr, *dst_reg) | (1u64 << 62);
+
+    reg_xtl(addr, *dst_reg, use_id) <--
+        lop_overwrite_use_id(addr, dst_reg, use_id);
 
     reg_def_site(addr, Mreg::AX) <--
         pdiv(addr, _, _);
@@ -1266,10 +1413,26 @@ ascent_par! {
         sp_indexed_load(addr),
         let synth = *addr | (1u64 << 62);
 
-    rtl_succ_candidate(synth, next), instr_in_function(synth, func_start) <--
+    // Place synth Iload's instr_in_function via addr's func membership (not ltl_succ): when raw fallthrough lacks ltl_inst (fused `add mem,reg`), ltl_succ is missing and the synth was being dropped from func.inst.
+    instr_in_function(synth, func_start) <--
+        sp_indexed_load(addr),
+        instr_in_function(addr, func_start),
+        let synth = *addr | (1u64 << 62);
+
+    // Synth -> next via ltl_succ when available (normal case).
+    rtl_succ_candidate(synth, next) <--
         sp_indexed_load(addr),
         ltl_succ(addr, next),
+        let synth = *addr | (1u64 << 62);
+
+    // Synth -> next via function-bounded skip walk when raw next has no ltl_inst (ltl_succ missing); scoped replacement for the global next_skips_to_ltl, applied only to SP-indexed-load synth nodes.
+    rtl_succ_candidate(synth, dst) <--
+        sp_indexed_load(addr),
         instr_in_function(addr, func_start),
+        next(addr, mid),
+        !ltl_inst(*mid, _),
+        instr_in_function(*mid, func_start),
+        sp_synth_skip_to_ltl(*mid, *func_start, dst),
         let synth = *addr | (1u64 << 62);
 
     // SP-indexed store: Aindexed2scaled/Aindexed2 with [SP, idx] -> expand similarly
@@ -1309,11 +1472,84 @@ ascent_par! {
         sp_indexed_store(addr),
         let synth = *addr | (1u64 << 62);
 
-    rtl_succ_candidate(synth, next), instr_in_function(synth, func_start) <--
+    // Place the synthetic Istore's instr_in_function directly off addr's
+    // function membership (parallel to the SP-load case above).
+    instr_in_function(synth, func_start) <--
         sp_indexed_store(addr),
-        ltl_succ(addr, next),
         instr_in_function(addr, func_start),
         let synth = *addr | (1u64 << 62);
+
+    // Synth -> next via ltl_succ when available (normal case).
+    rtl_succ_candidate(synth, next) <--
+        sp_indexed_store(addr),
+        ltl_succ(addr, next),
+        let synth = *addr | (1u64 << 62);
+
+    // Synth -> next via the function-bounded skip walk when the store's
+    // raw next address has no ltl_inst (parallel to the SP-load case).
+    rtl_succ_candidate(synth, dst) <--
+        sp_indexed_store(addr),
+        instr_in_function(addr, func_start),
+        next(addr, mid),
+        !ltl_inst(*mid, _),
+        instr_in_function(*mid, func_start),
+        sp_synth_skip_to_ltl(*mid, *func_start, dst),
+        let synth = *addr | (1u64 << 62);
+
+    // Function-bounded skip walk: from a non-ltl-inst addr, walk `next` within the func until hitting one with ltl_inst. Only consumed by SP-indexed synth rules above.
+    sp_synth_skip_to_ltl(start, func, dst) <--
+        instr_in_function(start, func),
+        next(start, dst),
+        instr_in_function(dst, func),
+        ltl_inst(*dst, _);
+
+    sp_synth_skip_to_ltl(start, func, dst) <--
+        instr_in_function(start, func),
+        next(start, mid),
+        !ltl_inst(*mid, _),
+        instr_in_function(*mid, func),
+        sp_synth_skip_to_ltl(*mid, *func, dst);
+
+    // synth_only_addr members: addresses with RTL synth chains but no ltl_inst.
+    synth_only_addr(addr) <-- arith_load_op(addr, _, _, _, _, _), !has_ltl_op(addr);
+    synth_only_addr(addr) <-- arith_store_reg(addr, _, _, _, _, _), !has_ltl_op(addr);
+    synth_only_addr(addr) <-- arith_store_imm(addr, _, _, _, _), !has_ltl_op(addr);
+    synth_only_addr(addr) <-- arith_store_abs_reg(addr, _, _, _, _, _), !has_ltl_op(addr);
+    synth_only_addr(addr) <-- arith_store_abs_imm(addr, _, _, _, _), !has_ltl_op(addr);
+    synth_only_addr(addr) <-- mach_imm_indirect_store(addr, _, _, _, _);
+    synth_only_addr(addr) <-- mach_imm_stack_init(addr, _, _, _);
+
+    // Bridge real ltl_inst's natural fallthrough into the first synth-only addr in a contiguous synth-only run; without this, ltl_fallthrough (which needs ltl_inst at next) drops the edge and erases the function body. Bounded by instr_in_function on both ends to never cross function boundaries.
+    rtl_succ_candidate(prev, addr) <--
+        ltl_inst(prev, prev_inst),
+        if crate::decompile::passes::linear_pass::has_fallthrough(&prev_inst, *prev),
+        instr_in_function(prev, func),
+        next(prev, addr),
+        !ltl_inst(*addr, _),
+        synth_only_addr(*addr),
+        instr_in_function(*addr, func);
+
+    // Tail-bridge: if a synth-only addr's next() is neither ltl_inst nor synth-only (e.g. fused `pop %rbp` of pfreeframe), walk past it to the next live ltl_inst in-func. Producers emit `synth_last -> next(addr)`; when that lands on a dropped node we add a parallel edge to the post-skip target (cminor drops the dangling one).
+    rtl_succ_candidate(synth_last, dst) <--
+        synth_only_addr(addr),
+        instr_in_function(addr, func),
+        next(addr, mid),
+        !ltl_inst(*mid, _),
+        !synth_only_addr(*mid),
+        instr_in_function(*mid, func),
+        sp_synth_skip_to_ltl(*mid, *func, dst),
+        let synth_last = (*addr | (1u64 << 62)) | (1u64 << 63);
+
+    // Some synth-only producers emit only a single synth (bit 62), not the double (62+63); tail is `addr | (1<<62)`, emit bridging edge from that synth too.
+    rtl_succ_candidate(synth_last, dst) <--
+        synth_only_addr(addr),
+        instr_in_function(addr, func),
+        next(addr, mid),
+        !ltl_inst(*mid, _),
+        !synth_only_addr(*mid),
+        instr_in_function(*mid, func),
+        sp_synth_skip_to_ltl(*mid, *func, dst),
+        let synth_last = *addr | (1u64 << 62);
 
     ltl_lstore_has_regvar(addr, src_reg, src_rtl) <--
         ltl_inst(addr, ?LTLInst::Lstore(_chunk, _addressing, _mregs, src_reg)),
@@ -1324,30 +1560,23 @@ ascent_par! {
         ltl_succ(addr, next_addr);
 
 
-    temp_cmp_mreg_args(addr, pos, mreg) <--
-        instruction(addr, _, mnem, dst, src, _, _, _, _, _),
-        if mnem.starts_with("CMP"),
-        op_indirect(dst, _, base_str, _, _, disp, _),
-        let addrmode = Addrmode {
-             base: Some(Ireg::from(base_str)),
-             index: None,
-             disp: Displacement::from(*disp), 
-        },
-        let res = transl_addressing_rev(addrmode, None),
-        if res.is_ok(),
-        let (_, mreg_vec) = res.unwrap(),
-        for (pos, mreg) in mreg_vec.into_iter().enumerate();
+    // CMP+JCC for [mem]+imm with non-stack base (e.g. [rax+rcx*4]); stack-based cmp[mem],imm (BP/SP) handled by stack_var rules near line 2115 (skip here to avoid competing candidates). Original rules using col 3 as mnem were dead (col 3 is prefix); fixed column ordering plus non-BP/non-SP restriction avoids stack-cmp collision. Capstone Intel order for `cmp [mem],imm` is op[0]=mem,op[1]=imm; after op_ids.swap(0,1) in instruction.rs, dst=imm,src=mem; rule pattern: `op_immediate(dst), op_indirect(src)`.
 
-    temp_cmp_mreg_args(addr, pos, mreg) <--
-        instruction(addr, _, mnem, dst, src, _, _, _, _, _),
+    temp_cmp_reg(addr, fresh_reg) <--
+        instruction(addr, _, _, mnem, dst, src, _, _, _, _),
         if mnem.starts_with("CMP"),
         op_immediate(dst, _, _),
-        op_indirect(src, _, base_str, _, _, disp, _),
-        let addrmode = Addrmode {
-             base: Some(Ireg::from(base_str)),
-             index: None,
-             disp: Displacement::from(*disp), 
-        },
+        op_indirect(src, _, base_str, _, _, _, _),
+        if !base_str.ends_with("BP") && !base_str.ends_with("SP"),
+        let fresh_reg = fresh_xtl_reg(*addr, Mreg::from("RTEMP"));
+
+    temp_cmp_mreg_args(addr, pos, mreg) <--
+        instruction(addr, _, _, mnem, dst, src, _, _, _, _),
+        if mnem.starts_with("CMP"),
+        op_immediate(dst, _, _),
+        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        if !base_str.ends_with("BP") && !base_str.ends_with("SP"),
+        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
         let res = transl_addressing_rev(addrmode, None),
         if res.is_ok(),
         let (_, mreg_vec) = res.unwrap(),
@@ -1360,43 +1589,44 @@ ascent_par! {
     ltl_inst_uses_mreg(addr, mreg) <--
         temp_cmp_mreg_args(addr, _, mreg);
 
-    reg_rtl(next_addr, mreg, rtl_reg) <--
-        instruction(addr, _, mnem, _, _, _, _, _, _, _),
-        if mnem.starts_with("CMP"),
-        next(addr, next_addr),
-        reg_rtl(addr, mreg, rtl_reg);
+    // Propagate reg_xtl into CMP address from prior def of regs CMP uses; CMP has no LTL/MachInst entry (fused into Icond at RTL synth), so ltl_inst-based propagation doesn't fire and temp_cmp_args_rtl can't resolve base/index regs.
+    reg_xtl(cmp_addr, mreg, arg_id) <--
+        temp_cmp_mreg_args(cmp_addr, _, mreg),
+        reg_def_used(defaddr, mreg, cmp_addr),
+        !load_overwrites_base(defaddr, mreg),
+        reg_xtl(defaddr, mreg, arg_id);
 
-    temp_cmp_reg(addr, fresh_reg) <--
-        instruction(addr, _, mnem, dst, src, _, _, _, _, _),
-        if mnem.starts_with("CMP"),
-        op_indirect(dst, _, base_str, _, _, disp, _),
-        op_immediate(src, _, _),
-        let fresh_reg = fresh_xtl_reg(*addr, Mreg::from("RTEMP"));
+    reg_xtl(cmp_addr, mreg, arg_id) <--
+        temp_cmp_mreg_args(cmp_addr, _, mreg),
+        reg_def_used(defaddr, mreg, cmp_addr),
+        load_overwrites_base(defaddr, mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, mreg, arg_id);
 
     rtl_inst_candidate(addr, RTLInst::Iload(chunk, addressing.clone(), mreg_args, *fresh_reg)) <--
-        instruction(addr, _, mnem, dst, src, _, _, _, _, _),
+        instruction(addr, _, _, mnem, dst, src, _, _, _, _),
         if mnem.starts_with("CMP"),
-        op_indirect(dst, _, base_str, _, _, disp, _),
-        op_immediate(src, _, _),
+        op_immediate(dst, _, _),
+        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        if !base_str.ends_with("BP") && !base_str.ends_with("SP"),
         temp_cmp_reg(addr, fresh_reg),
-        let addrmode = Addrmode {
-             base: Some(Ireg::from(base_str)),
-             index: None,
-             disp: Displacement::from(*disp), 
-        },
+        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
         let res = transl_addressing_rev(addrmode, None),
         if res.is_ok(),
         let (addressing, _) = res.unwrap(),
         agg mreg_args = build_call_args(pos, rtl_reg) in temp_cmp_args_rtl(addr, pos, rtl_reg),
-        let chunk = if mnem.ends_with("L") { MemoryChunk::MInt32 } 
+        if !mreg_args.is_empty(),
+        let chunk = if mnem.ends_with("L") { MemoryChunk::MInt32 }
                    else if mnem.ends_with("Q") { MemoryChunk::MInt64 }
                    else { MemoryChunk::MInt32 };
 
-    rtl_inst_candidate(*next_addr, RTLInst::Icond(cond, args.clone(), Either::Right(*target_addr), Either::Right(*next_addr))) <--
-        instruction(addr, _, mnem, dst, src, _, _, _, _, _),
+    // Icond from cmp[mem],imm placed at JCC (CMP/JCC sequential); false target is JCC's fallthrough (not next_addr=JCC) to avoid self-loop on false branch. Mirrors patterns at 1766/1782/1834.
+    rtl_inst_candidate(*next_addr, RTLInst::Icond(cond, args.clone(), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
+        instruction(addr, _, _, mnem, dst, src, _, _, _, _),
         if mnem.starts_with("CMP"),
-        op_indirect(dst, _, _, _, _, _, _),
-        op_immediate(src, imm_sym, _),
+        op_immediate(dst, imm_sym, _),
+        op_indirect(src, _, base_str, _, _, _, _),
+        if !base_str.ends_with("BP") && !base_str.ends_with("SP"),
         let imm_val = *imm_sym as i64,
         next(addr, next_addr),
         pjcc(next_addr, test_cond, lbl),
@@ -1405,91 +1635,7 @@ ascent_par! {
         instr_in_function(target_addr, target_func_start),
         instr_in_function(next_addr, my_func_start),
         if target_func_start == my_func_start,
-        
-        let cond = match test_cond {
-             TestCond::CondG  => Condition::Ccompimm(Comparison::Cgt, imm_val),
-             TestCond::CondL  => Condition::Ccompimm(Comparison::Clt, imm_val),
-             TestCond::CondGe => Condition::Ccompimm(Comparison::Cge, imm_val),
-             TestCond::CondLe => Condition::Ccompimm(Comparison::Cle, imm_val),
-             TestCond::CondE  => Condition::Ccompimm(Comparison::Ceq, imm_val),
-             TestCond::CondNe => Condition::Ccompimm(Comparison::Cne, imm_val),
-             TestCond::CondA  => Condition::Ccompuimm(Comparison::Cgt, imm_val),
-             TestCond::CondB  => Condition::Ccompuimm(Comparison::Clt, imm_val),
-             TestCond::CondAe => Condition::Ccompuimm(Comparison::Cge, imm_val),
-             TestCond::CondBe => Condition::Ccompuimm(Comparison::Cle, imm_val),
-             _ => Condition::Ccomp(Comparison::Unknown) 
-        },
-        let args = Arc::new(vec![*fresh_reg]);
-
-    temp_cmp_reg(addr, fresh_reg) <--
-        instruction(addr, _, mnem, dst, src, _, _, _, _, _),
-        if mnem.starts_with("CMP"),
-        op_immediate(dst, _, _),
-        op_indirect(src, _, base_str, _, _, disp, _),
-        let fresh_reg = fresh_xtl_reg(*addr, Mreg::from("RTEMP"));
-
-    rtl_inst_candidate(addr, RTLInst::Iload(chunk, addressing.clone(), mreg_args, *fresh_reg)) <--
-        instruction(addr, _, mnem, dst, src, _, _, _, _, _),
-        if mnem.starts_with("CMP"),
-        op_immediate(dst, _, _),
-        op_indirect(src, _, base_str, _, _, disp, _),
-        temp_cmp_reg(addr, fresh_reg),
-        let addrmode = Addrmode {
-             base: Some(Ireg::from(base_str)),
-             index: None,
-             disp: Displacement::from(*disp), 
-        },
-        let res = transl_addressing_rev(addrmode, None),
-        if res.is_ok(),
-        let (addressing, _) = res.unwrap(),
-        agg mreg_args = build_call_args(pos, rtl_reg) in temp_cmp_args_rtl(addr, pos, rtl_reg),
-        let chunk = if mnem.ends_with("L") { MemoryChunk::MInt32 } 
-                   else if mnem.ends_with("Q") { MemoryChunk::MInt64 }
-                   else { MemoryChunk::MInt32 };
-
-    rtl_inst_candidate(*next_addr, RTLInst::Icond(cond, args.clone(), Either::Right(*target_addr), Either::Right(*next_addr))) <--
-        instruction(addr, _, mnem, dst, src, _, _, _, _, _),
-        if mnem.starts_with("CMP"),
-        op_immediate(dst, imm_sym, _),
-        op_indirect(src, _, _, _, _, _, _),
-        let imm_val = *imm_sym as i64,
-        next(addr, next_addr),
-        pjcc(next_addr, test_cond, lbl),
-        temp_cmp_reg(addr, fresh_reg),
-        symbol_resolved_addr(*lbl, target_addr),
-        instr_in_function(target_addr, target_func_start),
-        instr_in_function(next_addr, my_func_start),
-        if target_func_start == my_func_start,
-
-        let cond = match test_cond {
-             TestCond::CondG  => Condition::Ccompimm(Comparison::Clt, imm_val),
-             TestCond::CondL  => Condition::Ccompimm(Comparison::Cgt, imm_val),
-             TestCond::CondGe => Condition::Ccompimm(Comparison::Cle, imm_val),
-             TestCond::CondLe => Condition::Ccompimm(Comparison::Cge, imm_val),
-             TestCond::CondE  => Condition::Ccompimm(Comparison::Ceq, imm_val),
-             TestCond::CondNe => Condition::Ccompimm(Comparison::Cne, imm_val),
-             TestCond::CondA  => Condition::Ccompuimm(Comparison::Clt, imm_val), 
-             TestCond::CondB  => Condition::Ccompuimm(Comparison::Cgt, imm_val),
-             TestCond::CondAe => Condition::Ccompuimm(Comparison::Cle, imm_val),
-             TestCond::CondBe => Condition::Ccompuimm(Comparison::Cge, imm_val),
-             _ => Condition::Ccomp(Comparison::Unknown) 
-        },
-        let args = Arc::new(vec![*fresh_reg]);
-
-    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, args.clone(), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
-        instruction(addr, _, mnem, dst, src, _, _, _, _, _),
-        if mnem.starts_with("CMP"),
-        op_immediate(dst, imm_sym, _),
-        op_indirect(src, _, _, _, _, _, _),
-        let imm_val = *imm_sym as i64,
-        flags_and_jump_pair(addr, jcc_addr, _),
-        pjcc(jcc_addr, test_cond, lbl),
-        temp_cmp_reg(addr, fresh_reg),
-        symbol_resolved_addr(*lbl, target_addr),
-        instr_in_function(target_addr, target_func_start),
-        instr_in_function(jcc_addr, my_func_start),
-        if target_func_start == my_func_start,
-        next(jcc_addr, fallthrough),
+        next(next_addr, fallthrough),
         let cond = match test_cond {
              TestCond::CondG  => Condition::Ccompimm(Comparison::Clt, imm_val),
              TestCond::CondL  => Condition::Ccompimm(Comparison::Cgt, imm_val),
@@ -1687,6 +1833,7 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lcall(callee)),
         if let Either::Left(mreg) = callee,
+        !call_through_memory(addr, _, _, _, _),
         reg_rtl(addr, *mreg, callee_rtl),
         call_args_collected_candidate(addr, args),
         call_return_reg(addr, _ret_rtl),
@@ -1698,6 +1845,7 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lcall(callee)),
         if let Either::Left(mreg) = callee,
+        !call_through_memory(addr, _, _, _, _),
         reg_rtl(addr, *mreg, callee_rtl),
         call_args_collected_candidate(addr, args),
         !call_return_reg(addr, _),
@@ -1709,6 +1857,7 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lcall(callee)),
         if let Either::Left(mreg) = callee,
+        !call_through_memory(addr, _, _, _, _),
         !reg_rtl(addr, *mreg, _),
         call_args_collected_candidate(addr, args),
         call_return_reg(addr, _ret_rtl),
@@ -1721,6 +1870,7 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lcall(callee)),
         if let Either::Left(mreg) = callee,
+        !call_through_memory(addr, _, _, _, _),
         !reg_rtl(addr, *mreg, _),
         call_args_collected_candidate(addr, args),
         !call_return_reg(addr, _),
@@ -1728,6 +1878,61 @@ ascent_par! {
         let fresh_callee = fresh_xtl_reg(*addr, *mreg),
         let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
         let inst = RTLInst::Icall(Some(inferred_sig), Either::Left(fresh_callee), args.clone(), None, *next_addr);
+
+    // Memory-indirect call: Mcall(Left(base_mreg)) loses disp/idx; re-emit Icall with a fresh RTL reg callee. The fresh reg is inlined as Eload by cshminor so the C renders as `(*(disp(base)))(args)`, not a direct call to base.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Left(_))),
+        call_through_memory(addr, _, _, _, _),
+        call_args_collected_candidate(addr, args),
+        call_return_reg(addr, _ret_rtl),
+        reg_rtl(addr, Mreg::AX, final_ret),
+        next(addr, next_addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::from("RCALL_TGT")),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Left(temp), args.clone(), Some(*final_ret), *next_addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Left(_))),
+        call_through_memory(addr, _, _, _, _),
+        call_args_collected_candidate(addr, args),
+        !call_return_reg(addr, _),
+        next(addr, next_addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::from("RCALL_TGT")),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Left(temp), args.clone(), None, *next_addr);
+
+    // Surface the mem-indirect call's load addressing for cshminor Eload rendering: base->Aindexed(disp); base+idx->Aindexed2(disp); base+idx*scale->Aindexed2scaled(scale,disp). Temp reg matches the Icall callee above.
+    relation call_through_memory_load(Node, RTLReg, MemoryChunk, Addressing, Args);
+
+    call_through_memory_load(*addr, temp, MemoryChunk::MInt64, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl])) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Left(_))),
+        call_through_memory(addr, base_str, idx_str, _scale, disp),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        let base_mreg = Mreg::from(*base_str),
+        reg_rtl(addr, base_mreg, base_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::from("RCALL_TGT"));
+
+    call_through_memory_load(*addr, temp, MemoryChunk::MInt64, Addressing::Aindexed2(*disp), Arc::new(vec![*base_rtl, *idx_rtl])) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Left(_))),
+        call_through_memory(addr, base_str, idx_str, scale, disp),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *scale <= 1,
+        let base_mreg = Mreg::from(*base_str),
+        let idx_mreg = Mreg::from(*idx_str),
+        reg_rtl(addr, base_mreg, base_rtl),
+        reg_rtl(addr, idx_mreg, idx_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::from("RCALL_TGT"));
+
+    call_through_memory_load(*addr, temp, MemoryChunk::MInt64, Addressing::Aindexed2scaled(*scale, *disp), Arc::new(vec![*base_rtl, *idx_rtl])) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Left(_))),
+        call_through_memory(addr, base_str, idx_str, scale, disp),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *scale > 1,
+        let base_mreg = Mreg::from(*base_str),
+        let idx_mreg = Mreg::from(*idx_str),
+        reg_rtl(addr, base_mreg, base_rtl),
+        reg_rtl(addr, idx_mreg, idx_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::from("RCALL_TGT"));
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lcall(callee)),
@@ -2109,6 +2314,7 @@ ascent_par! {
         stack_var(func_start, addr, *disp, arg_rtl),
         let inst = RTLInst::Icond(cond_with_imm, Arc::new(vec![*arg_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough));
 
+
     rtl_inst_candidate(addr, inst) <--
         pcmp(addr, sym1, sym2),
         op_immediate(sym1, imm_val, _),
@@ -2130,6 +2336,7 @@ ascent_par! {
         },
         stack_var(func_start, addr, *disp, arg_rtl),
         let inst = RTLInst::Icond(cond_with_imm, Arc::new(vec![*arg_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough));
+
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Ljumptable(arg_reg, targets)),
@@ -2539,6 +2746,7 @@ ascent_par! {
         reg_xtl(node, mreg, id2),
         if id1 != id2,
         !load_overwrites_base(node, mreg),
+        !lop_overwrites_input(node, mreg),
         !is_def(node, id1),
         !is_def(node, id2);
 
@@ -2643,6 +2851,14 @@ ascent_par! {
         is_def(defaddr, def_id),
         reg_xtl(defaddr, mreg, def_id),
         load_overwrite_use_id(useaddr, mreg, use_id),
+        if def_id != use_id,
+        !has_intervening_def(defaddr, useaddr, mreg);
+
+    alias_edge(def_id, use_id) <--
+        reg_def_used(defaddr, mreg, useaddr),
+        is_def(defaddr, def_id),
+        reg_xtl(defaddr, mreg, def_id),
+        lop_overwrite_use_id(useaddr, mreg, use_id),
         if def_id != use_id,
         !has_intervening_def(defaddr, useaddr, mreg);
 
@@ -5316,6 +5532,20 @@ pub fn build_call_args<'a>(
     std::iter::once(Arc::new(args))
 }
 
+/// Build an Addrmode for a CMP/Iload operand that may have base, index, and scale.
+/// Falls back to base-only when the index register is absent.
+pub fn build_cmp_addrmode(base_str: &str, idx_str: &str, scale: i64, disp: i64) -> Addrmode {
+    let has_base = base_str != "NONE" && !base_str.is_empty();
+    let has_idx = idx_str != "NONE" && !idx_str.is_empty();
+    let base = if has_base { Some(Ireg::from(base_str)) } else { None };
+    let index = if has_idx { Some((Ireg::from(idx_str), scale)) } else { None };
+    Addrmode {
+        base,
+        index,
+        disp: Displacement::from(disp),
+    }
+}
+
 pub(crate) fn fresh_xtl_reg(node: Node, reg: Mreg) -> RTLReg {
     let mreg_id = mreg_discriminant(reg);
     (1u64 << 63) | (node << 6) | (mreg_id & 0x3F)
@@ -6016,9 +6246,7 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
                 self_zero_missing.len(), self_zero_extra.len()
             );
         }
-        // imp_dead_store_all captures union of copy-eliminated and dead-store nodes
-        // (both collapse to Inop in iteration 1). Compare against the same union
-        // from the Ascent program.
+        // imp_dead_store_all = union of copy-eliminated and dead-store nodes (both Inop in iter 1); compare against the same Ascent union.
         let ds_missing: Vec<_> = imp_dead_store_all.difference(&ascent_dead_or_copy_eliminated).copied().collect();
         let ds_extra: Vec<_> = ascent_dead_or_copy_eliminated.difference(&imp_dead_store_all).copied().collect();
         if !ds_missing.is_empty() || !ds_extra.is_empty() {
@@ -6246,6 +6474,7 @@ impl PassContext {
                 } else {
                     let mut candidates = candidates;
                     candidates.sort_by_cached_key(|inst| format!("{:?}", inst));
+    // Bias selection toward Icond when both Icond and Iop coexist (fused flag-setter+jcc: cmp/test/sub/and+jcc; Iop is side-effect-only, Icond carries the CFG edge); without this Iop wins tie-break and the branch is dropped. reg_usage_count is a secondary tie-breaker for fused-flag and call-arg disambiguation cases beyond cmov shadow (now resolved upstream by lop_overwrite_use_id).
                     let best = candidates.into_iter().max_by_key(|inst| {
                         let mut regs = HashSet::new();
                         collect_inst_regs(inst, &mut regs);
@@ -6258,7 +6487,8 @@ impl PassContext {
                             RTLInst::Icond(_, args, _, _) if !args.is_empty() => 1,
                             _ => 0,
                         };
-                        score + arg_bonus
+                        let cond_bonus = if matches!(inst, RTLInst::Icond(..)) { 100 } else { 0 };
+                        score + arg_bonus + cond_bonus
                     }).unwrap();
                     insts.insert(node, best);
                 }

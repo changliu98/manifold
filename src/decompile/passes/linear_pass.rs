@@ -381,6 +381,8 @@ ascent_par! {
         ltl_canonical_node(ft, dst),
         ltl_inst(dst, _);
 
+    // Do not reintroduce a global ltl_fallthrough skip-over for missing-ltl_inst addresses: the SP-indexed-load synth case is now handled scoped in rtl_pass.rs (sp_synth_skip_to_ltl); the global form broke loop-detection across many unrelated tests.
+
     ltl_branch_target(src, dst) <--
         ltl_inst(src, ltlinst),
         if let LTLInst::Lbranch(Either::Right(target)) = ltlinst,

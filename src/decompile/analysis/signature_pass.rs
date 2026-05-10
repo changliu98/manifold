@@ -321,6 +321,7 @@ impl IRPass for SignatureReconciliationPass {
             "emit_function_signature", "call_args_collected",
             "emit_var_is_struct", "emit_function_param_is_pointer",
             "func_param_struct_type",
+            "rtl_inst",
         ]
     }
 }
@@ -1157,6 +1158,83 @@ fn patch_db(
         if !patched_calls.is_empty() {
             log::info!("SignatureReconciliation: widened args at {} call sites", patched_calls.len());
             db.rel_set("call_args_collected", new_call_args.into_iter().collect::<ascent::boxcar::Vec<_>>());
+        }
+    }
+
+    // Patch rtl_inst Icall sigs to reconciled return/param types; otherwise stale Xvoid guesses make clight drop the dst reg and DCE the call.
+    {
+        let mut new_insts: Vec<(Node, RTLInst)> = Vec::new();
+        let mut patched_insts: usize = 0;
+        for &(node, ref inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+            match inst {
+                RTLInst::Icall(sig_opt, callee, args, dst, succ) => {
+                    let target = match callee {
+                        either::Either::Right(either::Either::Left(addr)) => Some(*addr),
+                        _ => None,
+                    };
+                    let proto = target.and_then(|t| proto_map.get(&t).copied());
+                    if let Some(proto) = proto {
+                        let new_sig = Signature {
+                            sig_args: Arc::new(proto.param_types.clone()),
+                            sig_res: proto.return_type,
+                            sig_cc: sig_opt.as_ref().map(|s| s.sig_cc.clone()).unwrap_or_default(),
+                        };
+                        let needs_patch = sig_opt.as_ref()
+                            .map(|s| s.sig_res != new_sig.sig_res
+                                  || s.sig_args.as_slice() != new_sig.sig_args.as_slice())
+                            .unwrap_or(true);
+                        if needs_patch {
+                            let new_inst = RTLInst::Icall(
+                                Some(new_sig),
+                                callee.clone(),
+                                args.clone(),
+                                *dst,
+                                *succ,
+                            );
+                            new_insts.push((node, new_inst));
+                            patched_insts += 1;
+                            continue;
+                        }
+                    }
+                    new_insts.push((node, inst.clone()));
+                }
+                RTLInst::Itailcall(sig_opt, callee, args) => {
+                    let target = match callee {
+                        either::Either::Right(either::Either::Left(addr)) => Some(*addr),
+                        _ => None,
+                    };
+                    let proto = target.and_then(|t| proto_map.get(&t).copied());
+                    if let Some(proto) = proto {
+                        let new_sig = Signature {
+                            sig_args: Arc::new(proto.param_types.clone()),
+                            sig_res: proto.return_type,
+                            sig_cc: sig_opt.as_ref().map(|s| s.sig_cc.clone()).unwrap_or_default(),
+                        };
+                        let needs_patch = sig_opt.as_ref()
+                            .map(|s| s.sig_res != new_sig.sig_res
+                                  || s.sig_args.as_slice() != new_sig.sig_args.as_slice())
+                            .unwrap_or(true);
+                        if needs_patch {
+                            let new_inst = RTLInst::Itailcall(
+                                Some(new_sig),
+                                callee.clone(),
+                                args.clone(),
+                            );
+                            new_insts.push((node, new_inst));
+                            patched_insts += 1;
+                            continue;
+                        }
+                    }
+                    new_insts.push((node, inst.clone()));
+                }
+                _ => {
+                    new_insts.push((node, inst.clone()));
+                }
+            }
+        }
+        if patched_insts > 0 {
+            log::info!("SignatureReconciliation: patched {} call signatures in rtl_inst", patched_insts);
+            db.rel_set("rtl_inst", new_insts.into_iter().collect::<ascent::boxcar::Vec<_>>());
         }
     }
 }

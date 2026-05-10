@@ -57,6 +57,36 @@ fn recover_signed_divisor(magic: i64, total_shift: i64) -> Option<i64> {
     }
 }
 
+/// Recover signed divisor d from a compensating magic (effective_magic = magic_low32 + 2^32; compiler emits `add result, input` for the wrap).
+fn recover_signed_divisor_compensating(magic_signed_i32: i64, total_shift: i64) -> Option<i64> {
+    if total_shift < 32 || total_shift > 63 {
+        return None;
+    }
+    // magic_signed_i32 came from a 32-bit immediate; interpret as i32 then add 2^32.
+    let m_low = (magic_signed_i32 as i32) as i64;
+    if m_low >= 0 {
+        // Non-compensating already handled by recover_signed_divisor.
+        return None;
+    }
+    let effective = (m_low as i64).wrapping_add(1i64 << 32);
+    if effective <= 0 {
+        return None;
+    }
+    let mag = effective as u128;
+    let num = 1u128 << total_shift as u32;
+    let d = (num + (mag / 2)) / mag;
+    if d <= 1 || d > i64::MAX as u128 {
+        return None;
+    }
+    let check = num / d;
+    let check_i = check as i64;
+    if (check_i - effective).unsigned_abs() <= 1 {
+        Some(d as i64)
+    } else {
+        None
+    }
+}
+
 /// Recover unsigned divisor d from magic-multiply constant: d = round(2^total_shift / magic).
 fn recover_unsigned_divisor(magic: i64, total_shift: i64) -> Option<i64> {
     if total_shift < 32 {
@@ -71,8 +101,16 @@ fn recover_unsigned_divisor(magic: i64, total_shift: i64) -> Option<i64> {
     if d <= 1 || d > i64::MAX as u128 {
         return None;
     }
+    // Verify: |2^total_shift / d - magic| <= 1 (the magic is rounded either way).
     let check = num / d;
-    if (check as u64).wrapping_sub(magic as u64) <= 1 {
+    let mag_u64 = magic as u64;
+    let check_u64 = check as u64;
+    let diff = if check_u64 >= mag_u64 {
+        check_u64 - mag_u64
+    } else {
+        mag_u64 - check_u64
+    };
+    if diff <= 1 {
         Some(d as i64)
     } else {
         None
@@ -1148,6 +1186,31 @@ ascent_par! {
         if *disp > 0,
         let target = *disp as Address;
 
+    // Scaled-index absolute addressing (clang -fno-pie const-table load): base=NONE, idx=non-NONE scaled, disp>0 is the rodata table base.
+    abs_target_addr(addr, target) <--
+        pmov(addr, _, am),
+        op_indirect(am, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
+    abs_target_addr(addr, target) <--
+        pmov(addr, am, _),
+        op_indirect(am, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
+    abs_target_addr(addr, target) <--
+        plea(addr, _, am),
+        op_indirect(am, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
     resolved_addr_to_symbol(target, ident, 0) <--
         rip_target_addr(_, target),
         symbols(target, _, _),
@@ -1211,6 +1274,16 @@ ascent_par! {
         !function_symbol(target_addr, _),
         !plt_entry(target_addr, _),
         let name_string = format!("SUB_{:x}", target_addr),
+        let name_sym = Box::leak(name_string.into_boxed_str()) as &'static str;
+
+    // Synthesise a global symbol for absolute-addressed targets (clang -fno-pie const-table loads) so the table base resolves to Aglobal instead of `&0`.
+    global_symbol(target_addr, name_sym) <--
+        abs_target_addr(_, target_addr),
+        if *target_addr > 0,
+        !symbol_table(target_addr, _, _, _, _, _, _, _, _),
+        !function_symbol(target_addr, _),
+        !plt_entry(target_addr, _),
+        let name_string = format!("TABLE_{:x}", target_addr),
         let name_sym = Box::leak(name_string.into_boxed_str()) as &'static str;
 
     symbols(addr, name, name) <--
@@ -2033,6 +2106,27 @@ ascent_par! {
         flags_and_jump_pair(addr0, addr1, _),
         psub(addr0, _, _);
 
+    // SUB -> 1 non-flag-clobbering instruction -> JCC (e.g. SUB + MOV mem + JCC)
+    sub_jcc_link(addr0, addr2) <--
+        psub(addr0, _, _),
+        next(addr0, addr1),
+        instruction(addr1, _, _, mnem1, _, _, _, _, _, _),
+        if !is_flag_setting(mnem1),
+        next(addr1, addr2),
+        pjcc(addr2, _, _);
+
+    // SUB -> 2 non-flag-clobbering instructions -> JCC
+    sub_jcc_link(addr0, addr3) <--
+        psub(addr0, _, _),
+        next(addr0, addr1),
+        instruction(addr1, _, _, mnem1, _, _, _, _, _, _),
+        if !is_flag_setting(mnem1),
+        next(addr1, addr2),
+        instruction(addr2, _, _, mnem2, _, _, _, _, _, _),
+        if !is_flag_setting(mnem2),
+        next(addr2, addr3),
+        pjcc(addr3, _, _);
+
     mach_inst(addr0, MachInst::Mcond(condition, Arc::new(vec![*arg1]), lbl)) <--
         psub(addr0, r1, r2),
         op_register(r1, reg_str1),
@@ -2073,6 +2167,27 @@ ascent_par! {
     and_jcc_link(addr0, addr1) <--
         flags_and_jump_pair(addr0, addr1, _),
         pand(addr0, _, _);
+
+    // AND -> 1 non-flag-clobbering instruction -> JCC (e.g. AND + MOV mem + JCC)
+    and_jcc_link(addr0, addr2) <--
+        pand(addr0, _, _),
+        next(addr0, addr1),
+        instruction(addr1, _, _, mnem1, _, _, _, _, _, _),
+        if !is_flag_setting(mnem1),
+        next(addr1, addr2),
+        pjcc(addr2, _, _);
+
+    // AND -> 2 non-flag-clobbering instructions -> JCC
+    and_jcc_link(addr0, addr3) <--
+        pand(addr0, _, _),
+        next(addr0, addr1),
+        instruction(addr1, _, _, mnem1, _, _, _, _, _, _),
+        if !is_flag_setting(mnem1),
+        next(addr1, addr2),
+        instruction(addr2, _, _, mnem2, _, _, _, _, _, _),
+        if !is_flag_setting(mnem2),
+        next(addr2, addr3),
+        pjcc(addr3, _, _);
 
     mach_inst(addr0, MachInst::Mcond(Condition::Cmaskzero(*mask_val), Arc::new(vec![*arg1]), lbl)) <--
         pand(addr0, r1, r2),
@@ -2348,31 +2463,443 @@ ascent_par! {
         pimul3(addr1, imul_dst, imul_src, imul_imm),
         op_register(imul_dst, imul_dst_str),
         op_register(imul_src, imul_src_str),
-        if imul_src_str == temp_str,
+        if Ireg::from(imul_src_str) == Ireg::from(temp_str),
         op_immediate(imul_imm, magic, _),
         next(addr1, addr2),
         pshift_right(addr2, sar_dst, sar_src),
         op_register(sar_dst, sar_dst_str),
-        if sar_dst_str == imul_dst_str,
+        if Ireg::from(sar_dst_str) == Ireg::from(imul_dst_str),
         op_immediate(sar_src, shift_n, _),
         if *shift_n >= 32;
 
-    // Magic multiply via MOV + 2-operand IMUL: mov $MAGIC, tmp; imul tmp, reg
-    #[local] relation div_magic_64(Address, Address, i64, i64, Ireg);
-    div_magic_64(addr0, addr2, *magic, *shift_n, Ireg::from(input_str)) <--
+    // GCC signed-div with COMPENSATING magic (e.g. -O1 n/7, n/11): movsxd; imul3 NEG_MAGIC; shr 0x20; add result,input; sar K; sar input,0x1f; sub result,input. Tuple: (movsxd_addr, imul_addr, magic_low32, total_shift, input_ireg, result_ireg).
+    #[local] relation div_magic_32_compensating_gcc(Address, Address, i64, i64, Ireg, Ireg);
+    div_magic_32_compensating_gcc(addr0, addr1, *magic, 32 + *post_shift, Ireg::from(input_str), Ireg::from(result_str)) <--
+        pmov(addr0, movsxd_dst, movsxd_src),
+        instruction(addr0, _, _, mnem0, _, _, _, _, _, _),
+        if *mnem0 == "MOVSXD",
+        op_register(movsxd_dst, result_str),
+        op_register(movsxd_src, input_str),
+        next(addr0, addr1),
+        // imul3 result, result, NEG_MAGIC (in-place)
+        pimul3(addr1, imul_dst, imul_src, imul_imm),
+        op_register(imul_dst, imul_dst_str),
+        op_register(imul_src, imul_src_str),
+        if Ireg::from(imul_dst_str) == Ireg::from(result_str),
+        if Ireg::from(imul_src_str) == Ireg::from(result_str),
+        op_immediate(imul_imm, magic, _),
+        if (*magic as i32) < 0,
+        next(addr1, addr2),
+        // SHR result, 0x20 (logical)
+        pshr(addr2, shr1_dst, shr1_src),
+        op_register(shr1_dst, shr1_dst_str),
+        if Ireg::from(shr1_dst_str) == Ireg::from(result_str),
+        op_immediate(shr1_src, shr1_n, _),
+        if *shr1_n == 32,
+        next(addr2, addr3),
+        // ADD result, input (compensation with ORIGINAL input register)
+        padd(addr3, add1_dst, add1_src),
+        op_register(add1_dst, add1_dst_str),
+        op_register(add1_src, add1_src_str),
+        if Ireg::from(add1_dst_str) == Ireg::from(result_str),
+        if Ireg::from(add1_src_str) == Ireg::from(input_str),
+        next(addr3, addr4),
+        // SAR result, K (arithmetic post-shift)
+        psar(addr4, sar_dst, sar_src),
+        op_register(sar_dst, sar_dst_str),
+        if Ireg::from(sar_dst_str) == Ireg::from(result_str),
+        op_immediate(sar_src, post_shift, _),
+        if *post_shift > 0 && *post_shift <= 31,
+        next(addr4, addr5),
+        // SAR input, 0x1f (sign extraction via arithmetic shift, clobbers input)
+        psar(addr5, sarsign_dst, sarsign_src),
+        op_register(sarsign_dst, sarsign_dst_str),
+        if Ireg::from(sarsign_dst_str) == Ireg::from(input_str),
+        op_immediate(sarsign_src, sign_shift, _),
+        if *sign_shift == 31,
+        next(addr5, addr6),
+        // SUB result, input
+        psub(addr6, sub_dst, sub_src),
+        op_register(sub_dst, sub_dst_str),
+        op_register(sub_src, sub_src_str),
+        if Ireg::from(sub_dst_str) == Ireg::from(result_str),
+        if Ireg::from(sub_src_str) == Ireg::from(input_str);
+
+    mach_inst(movsxd_addr, MachInst::Mop(op.clone(), Arc::new(args.clone()), *result_mreg)) <--
+        div_magic_32_compensating_gcc(movsxd_addr, _imul_addr, magic, total_shift, input_ireg, result_ireg),
+        let divisor_opt = recover_signed_divisor_compensating(*magic, *total_shift),
+        if divisor_opt.is_some(),
+        let divisor = divisor_opt.unwrap(),
+        ireg_of(preg_of_input, input_ireg),
+        preg_of(input_mreg, preg_of_input),
+        ireg_of(preg_of_result, result_ireg),
+        preg_of(result_mreg, preg_of_result),
+        let args = vec![*input_mreg],
+        let op = Operation::Odivimm(divisor);
+
+    div_consumed(addr) <--
+        div_magic_32_compensating_gcc(movsxd_addr, _, _, _, _, _),
+        let addr = movsxd_addr;
+    div_consumed(addr) <--
+        div_magic_32_compensating_gcc(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, addr);
+    div_consumed(addr) <--
+        div_magic_32_compensating_gcc(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, a1),
+        next(a1, addr);
+    div_consumed(addr) <--
+        div_magic_32_compensating_gcc(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, a1),
+        next(a1, a2),
+        next(a2, addr);
+    div_consumed(addr) <--
+        div_magic_32_compensating_gcc(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, a1),
+        next(a1, a2),
+        next(a2, a3),
+        next(a3, addr);
+    div_consumed(addr) <--
+        div_magic_32_compensating_gcc(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, a1),
+        next(a1, a2),
+        next(a2, a3),
+        next(a3, a4),
+        next(a4, addr);
+    div_consumed(addr) <--
+        div_magic_32_compensating_gcc(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, a1),
+        next(a1, a2),
+        next(a2, a3),
+        next(a3, a4),
+        next(a4, a5),
+        next(a5, addr);
+
+    // Clang signed-div with COMPENSATING magic (neg i32, e.g. n/7, n/11): movsxd; imul3 NEG_MAGIC; shr 0x20; add result,partial; mov sign,result; shr sign,0x1f; sar K; add result,sign. Tuple: (movsxd_addr, imul_addr, magic_low32_signed, total_shift, input_ireg, result_ireg).
+    #[local] relation div_magic_32_compensating(Address, Address, i64, i64, Ireg, Ireg);
+    div_magic_32_compensating(addr0, addr1, *magic, 32 + *post_shift, Ireg::from(input_str), Ireg::from(result_str)) <--
+        pmov(addr0, movsxd_dst, movsxd_src),
+        instruction(addr0, _, _, mnem0, _, _, _, _, _, _),
+        if *mnem0 == "MOVSXD",
+        op_register(movsxd_dst, result_str),
+        op_register(movsxd_src, input_str),
+        next(addr0, addr1),
+        // imul3 partial, result, NEG_MAGIC
+        pimul3(addr1, imul_dst, imul_src, imul_imm),
+        op_register(imul_dst, partial_str),
+        op_register(imul_src, imul_src_str),
+        if Ireg::from(imul_src_str) == Ireg::from(result_str),
+        if Ireg::from(partial_str) != Ireg::from(result_str),
+        op_immediate(imul_imm, magic, _),
+        if (*magic as i32) < 0,
+        next(addr1, addr2),
+        // SHR partial, 0x20 (logical)
+        pshr(addr2, shr1_dst, shr1_src),
+        op_register(shr1_dst, shr1_dst_str),
+        if Ireg::from(shr1_dst_str) == Ireg::from(partial_str),
+        op_immediate(shr1_src, shr1_n, _),
+        if *shr1_n == 32,
+        next(addr2, addr3),
+        // ADD result, partial (compensation)
+        padd(addr3, add1_dst, add1_src),
+        op_register(add1_dst, add1_dst_str),
+        op_register(add1_src, add1_src_str),
+        if Ireg::from(add1_dst_str) == Ireg::from(result_str),
+        if Ireg::from(add1_src_str) == Ireg::from(partial_str),
+        next(addr3, addr4),
+        // MOV sign_reg, result
+        pmov(addr4, mov_dst, mov_src),
+        op_register(mov_dst, sign_reg_str),
+        op_register(mov_src, mov_src_str),
+        if Ireg::from(mov_src_str) == Ireg::from(result_str),
+        if Ireg::from(sign_reg_str) != Ireg::from(result_str),
+        next(addr4, addr5),
+        // SHR sign_reg, 0x1f (logical)
+        pshr(addr5, shrsign_dst, shrsign_src),
+        op_register(shrsign_dst, shrsign_dst_str),
+        if Ireg::from(shrsign_dst_str) == Ireg::from(sign_reg_str),
+        op_immediate(shrsign_src, sign_shift, _),
+        if *sign_shift == 31,
+        next(addr5, addr6),
+        // SAR result, K (arithmetic)
+        psar(addr6, sar_dst, sar_src),
+        op_register(sar_dst, sar_dst_str),
+        if Ireg::from(sar_dst_str) == Ireg::from(result_str),
+        op_immediate(sar_src, post_shift, _),
+        if *post_shift > 0 && *post_shift <= 31,
+        next(addr6, addr7),
+        // ADD result, sign_reg
+        padd(addr7, add2_dst, add2_src),
+        op_register(add2_dst, add2_dst_str),
+        op_register(add2_src, add2_src_str),
+        if Ireg::from(add2_dst_str) == Ireg::from(result_str),
+        if Ireg::from(add2_src_str) == Ireg::from(sign_reg_str);
+
+    // Emit divide at the MOVSXD address: capstone reports reg_use=[input] and
+    // reg_def=[result] there, which exactly matches our Lop's I/O.
+    mach_inst(movsxd_addr, MachInst::Mop(op.clone(), Arc::new(args.clone()), *result_mreg)) <--
+        div_magic_32_compensating(movsxd_addr, _imul_addr, magic, total_shift, input_ireg, result_ireg),
+        let divisor_opt = recover_signed_divisor_compensating(*magic, *total_shift),
+        if divisor_opt.is_some(),
+        let divisor = divisor_opt.unwrap(),
+        ireg_of(preg_of_input, input_ireg),
+        preg_of(input_mreg, preg_of_input),
+        ireg_of(preg_of_result, result_ireg),
+        preg_of(result_mreg, preg_of_result),
+        let args = vec![*input_mreg],
+        let op = Operation::Odivimm(divisor);
+
+    // Mark all 8 instructions of the compensating idiom as div-consumed.
+    div_consumed(addr) <--
+        div_magic_32_compensating(movsxd_addr, _, _, _, _, _),
+        let addr = movsxd_addr;
+    div_consumed(addr) <--
+        div_magic_32_compensating(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, addr);
+    div_consumed(addr) <--
+        div_magic_32_compensating(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, a1),
+        next(a1, addr);
+    div_consumed(addr) <--
+        div_magic_32_compensating(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, a1),
+        next(a1, a2),
+        next(a2, addr);
+    div_consumed(addr) <--
+        div_magic_32_compensating(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, a1),
+        next(a1, a2),
+        next(a2, a3),
+        next(a3, addr);
+    div_consumed(addr) <--
+        div_magic_32_compensating(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, a1),
+        next(a1, a2),
+        next(a2, a3),
+        next(a3, a4),
+        next(a4, addr);
+    div_consumed(addr) <--
+        div_magic_32_compensating(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, a1),
+        next(a1, a2),
+        next(a2, a3),
+        next(a3, a4),
+        next(a4, a5),
+        next(a5, addr);
+    div_consumed(addr) <--
+        div_magic_32_compensating(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, a1),
+        next(a1, a2),
+        next(a2, a3),
+        next(a3, a4),
+        next(a4, a5),
+        next(a5, a6),
+        next(a6, addr);
+
+    // Clang signed-div with separate partial reg (e.g. n/10): movsxd; imul3 POS_MAGIC partial!=result; mov sign,partial; shr sign,0x3f; sar partial,K; add partial,sign. Tuple: (movsxd_addr, imul_addr, magic, total_shift, result_ireg=movsxd dst, partial_ireg=imul dst).
+    #[local] relation div_magic_32_signbias_partial(Address, Address, i64, i64, Ireg, Ireg);
+    div_magic_32_signbias_partial(addr0, addr1, *magic, *post_shift, Ireg::from(result_str), Ireg::from(partial_str)) <--
+        pmov(addr0, movsxd_dst, _movsxd_src),
+        instruction(addr0, _, _, mnem0, _, _, _, _, _, _),
+        if *mnem0 == "MOVSXD",
+        op_register(movsxd_dst, result_str),
+        next(addr0, addr1),
+        // imul3 partial, result, POS_MAGIC
+        pimul3(addr1, imul_dst, imul_src, imul_imm),
+        op_register(imul_dst, partial_str),
+        op_register(imul_src, imul_src_str),
+        if Ireg::from(imul_src_str) == Ireg::from(result_str),
+        if Ireg::from(partial_str) != Ireg::from(result_str),
+        op_immediate(imul_imm, magic, _),
+        if *magic > 0 && *magic <= i32::MAX as i64,
+        next(addr1, addr2),
+        // MOV sign_reg, partial
+        pmov(addr2, mov_dst, mov_src),
+        op_register(mov_dst, sign_reg_str),
+        op_register(mov_src, mov_src_str),
+        if Ireg::from(mov_src_str) == Ireg::from(partial_str),
+        if Ireg::from(sign_reg_str) != Ireg::from(partial_str),
+        next(addr2, addr3),
+        // SHR sign_reg, 0x3f
+        pshr(addr3, shrsign_dst, shrsign_src),
+        op_register(shrsign_dst, shrsign_dst_str),
+        if Ireg::from(shrsign_dst_str) == Ireg::from(sign_reg_str),
+        op_immediate(shrsign_src, sign_shift, _),
+        if *sign_shift == 63,
+        next(addr3, addr4),
+        // SAR partial, K (arithmetic; total_shift = K)
+        psar(addr4, sar_dst, sar_src),
+        op_register(sar_dst, sar_dst_str),
+        if Ireg::from(sar_dst_str) == Ireg::from(partial_str),
+        op_immediate(sar_src, post_shift, _),
+        if *post_shift >= 32 && *post_shift <= 63,
+        next(addr4, addr5),
+        // ADD partial, sign_reg
+        padd(addr5, add_dst, add_src),
+        op_register(add_dst, add_dst_str),
+        op_register(add_src, add_src_str),
+        if Ireg::from(add_dst_str) == Ireg::from(partial_str),
+        if Ireg::from(add_src_str) == Ireg::from(sign_reg_str);
+
+    // Emit divide at IMUL address: capstone reg_use=[result]/reg_def=[partial] matches Lop I/O; movsxd's Ocast32signed stays live.
+    mach_inst(imul_addr, MachInst::Mop(op.clone(), Arc::new(args.clone()), *partial_mreg)) <--
+        div_magic_32_signbias_partial(_movsxd_addr, imul_addr, magic, total_shift, input_ireg, partial_ireg),
+        let divisor_opt = recover_signed_divisor(*magic, *total_shift),
+        if divisor_opt.is_some(),
+        let divisor = divisor_opt.unwrap(),
+        ireg_of(preg_of_input, input_ireg),
+        preg_of(input_mreg, preg_of_input),
+        ireg_of(preg_of_partial, partial_ireg),
+        preg_of(partial_mreg, preg_of_partial),
+        let args = vec![*input_mreg],
+        let op = Operation::Odivimm(divisor);
+
+    // Consume IMUL through final ADD (imul, mov, shr, sar, add); MOVSXD's Ocast32signed Mop is preserved.
+    div_consumed(addr) <--
+        div_magic_32_signbias_partial(_, addr, _, _, _, _);
+    div_consumed(addr) <--
+        div_magic_32_signbias_partial(_, imul_addr, _, _, _, _),
+        next(imul_addr, addr);
+    div_consumed(addr) <--
+        div_magic_32_signbias_partial(_, imul_addr, _, _, _, _),
+        next(imul_addr, a1),
+        next(a1, addr);
+    div_consumed(addr) <--
+        div_magic_32_signbias_partial(_, imul_addr, _, _, _, _),
+        next(imul_addr, a1),
+        next(a1, a2),
+        next(a2, addr);
+    div_consumed(addr) <--
+        div_magic_32_signbias_partial(_, imul_addr, _, _, _, _),
+        next(imul_addr, a1),
+        next(a1, a2),
+        next(a2, a3),
+        next(a3, addr);
+
+    // Clang signed-div (small pos magic, e.g. n/3, n/5): movsxd; imul3 MAGIC; mov sign,result; shr sign,0x3f; shr result,0x20; add result,sign. Tuple: (movsxd_addr, imul_addr, magic, total_shift=32, input_ireg, result_ireg).
+    #[local] relation div_magic_32_signbias(Address, Address, i64, i64, Ireg, Ireg);
+    div_magic_32_signbias(addr0, addr1, *magic, 32, Ireg::from(input_str), Ireg::from(result_str)) <--
+        pmov(addr0, movsxd_dst, movsxd_src),
+        instruction(addr0, _, _, mnem0, _, _, _, _, _, _),
+        if *mnem0 == "MOVSXD",
+        op_register(movsxd_dst, result_str),
+        op_register(movsxd_src, input_str),
+        next(addr0, addr1),
+        pimul3(addr1, imul_dst, imul_src, imul_imm),
+        op_register(imul_dst, imul_dst_str),
+        op_register(imul_src, imul_src_str),
+        if Ireg::from(imul_dst_str) == Ireg::from(result_str),
+        if Ireg::from(imul_src_str) == Ireg::from(result_str),
+        op_immediate(imul_imm, magic, _),
+        if *magic > 0 && *magic <= i32::MAX as i64,
+        next(addr1, addr2),
+        // MOV sign_reg, result
+        pmov(addr2, mov_dst, mov_src),
+        op_register(mov_dst, sign_reg_str),
+        op_register(mov_src, mov_src_str),
+        if Ireg::from(mov_src_str) == Ireg::from(result_str),
+        if Ireg::from(sign_reg_str) != Ireg::from(result_str),
+        next(addr2, addr3),
+        // SHR sign_reg, 0x3f (logical, must be SHR)
+        pshr(addr3, shrsign_dst, shrsign_src),
+        op_register(shrsign_dst, shrsign_dst_str),
+        if Ireg::from(shrsign_dst_str) == Ireg::from(sign_reg_str),
+        op_immediate(shrsign_src, sign_shift, _),
+        if *sign_shift == 63,
+        next(addr3, addr4),
+        // SHR result, 0x20 (logical, must be SHR)
+        pshr(addr4, shrres_dst, shrres_src),
+        op_register(shrres_dst, shrres_dst_str),
+        if Ireg::from(shrres_dst_str) == Ireg::from(result_str),
+        op_immediate(shrres_src, res_shift, _),
+        if *res_shift == 32,
+        next(addr4, addr5),
+        // ADD result_lo, sign_reg_lo
+        padd(addr5, add_dst, add_src),
+        op_register(add_dst, add_dst_str),
+        op_register(add_src, add_src_str),
+        if Ireg::from(add_dst_str) == Ireg::from(result_str),
+        if Ireg::from(add_src_str) == Ireg::from(sign_reg_str);
+
+    // Emit the divide Mop at the MOVSXD address (capstone reg_use covers the input).
+    mach_inst(movsxd_addr, MachInst::Mop(op.clone(), Arc::new(args.clone()), *result_mreg)) <--
+        div_magic_32_signbias(movsxd_addr, _imul_addr, magic, total_shift, input_ireg, result_ireg),
+        let divisor_opt = recover_signed_divisor(*magic, *total_shift),
+        if divisor_opt.is_some(),
+        let divisor = divisor_opt.unwrap(),
+        ireg_of(preg_of_input, input_ireg),
+        preg_of(input_mreg, preg_of_input),
+        ireg_of(preg_of_result, result_ireg),
+        preg_of(result_mreg, preg_of_result),
+        let args = vec![*input_mreg],
+        let op = Operation::Odivimm(divisor);
+
+    // Mark the entire idiom as div-consumed so the raw instructions are suppressed.
+    div_consumed(addr) <--
+        div_magic_32_signbias(movsxd_addr, _, _, _, _, _),
+        let addr = movsxd_addr;
+    div_consumed(addr) <--
+        div_magic_32_signbias(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, addr);
+    div_consumed(addr) <--
+        div_magic_32_signbias(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, a1),
+        next(a1, addr);
+    div_consumed(addr) <--
+        div_magic_32_signbias(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, a1),
+        next(a1, a2),
+        next(a2, addr);
+    div_consumed(addr) <--
+        div_magic_32_signbias(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, a1),
+        next(a1, a2),
+        next(a2, a3),
+        next(a3, addr);
+    div_consumed(addr) <--
+        div_magic_32_signbias(movsxd_addr, _, _, _, _, _),
+        next(movsxd_addr, a1),
+        next(a1, a2),
+        next(a2, a3),
+        next(a3, a4),
+        next(a4, addr);
+
+    // Magic multiply via MOV + 2-operand IMUL: `mov $MAGIC, tmp; imul reg, tmp`. Tuple: (mov_addr, shift_addr, magic, shift_n, input_ireg dividend src, result_ireg IMUL/SHR dst). IMUL is operand-symmetric: magic reg may be src or dst.
+    #[local] relation div_magic_64(Address, Address, i64, i64, Ireg, Ireg);
+
+    // Variant A: magic is the IMUL's src; magic-holding reg IS the IMUL's dst (and SHR target), i.e. it held the input before being clobbered.
+    div_magic_64(addr0, addr2, *magic, *shift_n, Ireg::from(imul_dst_str), Ireg::from(imul_dst_str)) <--
         pmov(addr0, mov_dst, mov_src),
         op_register(mov_dst, temp_str),
         op_immediate(mov_src, magic, _),
         if *magic != 0,
         next(addr0, addr1),
         pimul(addr1, imul_dst, imul_src),
-        op_register(imul_dst, input_str),
+        op_register(imul_dst, imul_dst_str),
         op_register(imul_src, imul_src_str),
-        if imul_src_str == temp_str,
+        if Ireg::from(imul_src_str) == Ireg::from(temp_str),
         next(addr1, addr2),
         pshift_right(addr2, shr_dst, shr_src),
         op_register(shr_dst, shr_dst_str),
-        if shr_dst_str == input_str,
+        if Ireg::from(shr_dst_str) == Ireg::from(imul_dst_str),
+        op_immediate(shr_src, shift_n, _),
+        if *shift_n >= 32;
+
+    // Variant B (clang udiv): magic loaded into IMUL dst, input held in IMUL src. `mov ecx,edi; mov eax,MAGIC; imul rax,rcx; shr rax,k`.
+    div_magic_64(addr0, addr2, *magic, *shift_n, Ireg::from(imul_src_str), Ireg::from(imul_dst_str)) <--
+        pmov(addr0, mov_dst, mov_src),
+        op_register(mov_dst, temp_str),
+        op_immediate(mov_src, magic, _),
+        if *magic != 0,
+        next(addr0, addr1),
+        pimul(addr1, imul_dst, imul_src),
+        op_register(imul_dst, imul_dst_str),
+        op_register(imul_src, imul_src_str),
+        if Ireg::from(imul_dst_str) == Ireg::from(temp_str),
+        if Ireg::from(imul_src_str) != Ireg::from(temp_str),
+        next(addr1, addr2),
+        pshift_right(addr2, shr_dst, shr_src),
+        op_register(shr_dst, shr_dst_str),
+        if Ireg::from(shr_dst_str) == Ireg::from(imul_dst_str),
         op_immediate(shr_src, shift_n, _),
         if *shift_n >= 32;
 
@@ -2407,9 +2934,70 @@ ascent_par! {
         let args = vec![*input_mreg],
         let op = Operation::Odivimm(divisor);
 
-    // Signed div (64-bit): MOV $MAGIC -> IMUL -> SAR -> sign_correction
-    mach_inst(addr0, MachInst::Mop(op.clone(), Arc::new(args.clone()), *input_mreg)) <--
-        div_magic_64(addr0, shift_addr, magic, shift_n, input_ireg),
+    // Signed div (32-bit): MOVSXD -> IMUL3 -> SAR -> MOV copy,input -> SAR copy,31 -> SUB result,copy. GCC -O1 sign-extracts via a *copy* of the input (scheduling places copy inside sign-correction).
+    mach_inst(addr0, MachInst::Mop(op.clone(), Arc::new(args.clone()), *result_mreg)) <--
+        div_magic_32(addr0, shift_addr, magic, shift_n, input_ireg, result_ireg),
+        // input_copy = input
+        next(shift_addr, mov_addr),
+        pmov(mov_addr, mov_dst, mov_src),
+        op_register(mov_dst, copy_str),
+        op_register(mov_src, copy_src_str),
+        if Ireg::from(copy_src_str) == *input_ireg,
+        if Ireg::from(copy_str) != *input_ireg,
+        next(mov_addr, sar_addr),
+        sign_correction(sar_addr, _sub_addr, sign_ireg, sub_dst_ireg, 31),
+        if *sign_ireg == Ireg::from(copy_str),
+        if sub_dst_ireg == result_ireg,
+        let divisor_opt = recover_signed_divisor(*magic, *shift_n),
+        if divisor_opt.is_some(),
+        let divisor = divisor_opt.unwrap(),
+        ireg_of(preg_of_input, input_ireg),
+        preg_of(input_mreg, preg_of_input),
+        ireg_of(preg_of_result, sub_dst_ireg),
+        preg_of(result_mreg, preg_of_result),
+        let args = vec![*input_mreg],
+        let op = Operation::Odivimm(divisor);
+
+    // Mark the input-copy MOV and the SAR after it as div_consumed too, so the
+    // raw mov/sar emissions are suppressed.
+    div_consumed(mov_addr) <--
+        div_magic_32(_, shift_addr, _, _, in_ireg, _),
+        next(shift_addr, mov_addr),
+        pmov(mov_addr, mov_dst, mov_src),
+        op_register(mov_dst, copy_str),
+        op_register(mov_src, copy_src_str),
+        if Ireg::from(copy_src_str) == *in_ireg,
+        if Ireg::from(copy_str) != *in_ireg,
+        next(mov_addr, sar_addr),
+        sign_correction(sar_addr, _, sign_ireg, _, 31),
+        if *sign_ireg == Ireg::from(copy_str);
+    div_consumed(sar_addr) <--
+        div_magic_32(_, shift_addr, _, _, in_ireg, _),
+        next(shift_addr, mov_addr),
+        pmov(mov_addr, mov_dst, mov_src),
+        op_register(mov_dst, copy_str),
+        op_register(mov_src, copy_src_str),
+        if Ireg::from(copy_src_str) == *in_ireg,
+        if Ireg::from(copy_str) != *in_ireg,
+        next(mov_addr, sar_addr),
+        sign_correction(sar_addr, _, sign_ireg, _, 31),
+        if *sign_ireg == Ireg::from(copy_str);
+    div_consumed(sub_addr) <--
+        div_magic_32(_, shift_addr, _, _, in_ireg, _),
+        next(shift_addr, mov_addr),
+        pmov(mov_addr, mov_dst, mov_src),
+        op_register(mov_dst, copy_str),
+        op_register(mov_src, copy_src_str),
+        if Ireg::from(copy_src_str) == *in_ireg,
+        if Ireg::from(copy_str) != *in_ireg,
+        next(mov_addr, sar_addr),
+        sign_correction(sar_addr, sub_addr, sign_ireg, _, 31),
+        if *sign_ireg == Ireg::from(copy_str);
+
+    // Signed div (64-bit): MOV $MAGIC -> IMUL -> SAR -> sign_correction. Emit Mop at IMUL address (capstone reports reg_use of both IMUL operands there).
+    mach_inst(imul_addr, MachInst::Mop(op.clone(), Arc::new(args.clone()), *result_mreg)) <--
+        div_magic_64(addr0, shift_addr, magic, shift_n, input_ireg, result_ireg),
+        next(addr0, imul_addr),
         next(shift_addr, sign_addr),
         sign_correction(sign_addr, _sub_addr, _sign_ireg, _sub_dst_ireg, 63),
         let divisor_opt = recover_signed_divisor(*magic, *shift_n),
@@ -2417,18 +3005,23 @@ ascent_par! {
         let divisor = divisor_opt.unwrap(),
         ireg_of(preg_of_input, input_ireg),
         preg_of(input_mreg, preg_of_input),
+        ireg_of(preg_of_result, result_ireg),
+        preg_of(result_mreg, preg_of_result),
         let args = vec![*input_mreg],
         let op = Operation::Odivlimm(divisor);
 
-    // Unsigned div: MOV $MAGIC -> IMUL -> SHR (no sign correction)
-    mach_inst(addr0, MachInst::Mop(op.clone(), Arc::new(args.clone()), *input_mreg)) <--
-        div_magic_64(addr0, _shift_addr, magic, shift_n, input_ireg),
+    // Unsigned div: MOV $MAGIC -> IMUL -> SHR (no sign correction).
+    mach_inst(imul_addr, MachInst::Mop(op.clone(), Arc::new(args.clone()), *result_mreg)) <--
+        div_magic_64(addr0, _shift_addr, magic, shift_n, input_ireg, result_ireg),
+        next(addr0, imul_addr),
         // Unsigned: the SHR is logical (already in div_magic_64) and no sign_correction follows
         let divisor_opt = recover_unsigned_divisor(*magic, *shift_n),
         if divisor_opt.is_some(),
         let divisor = divisor_opt.unwrap(),
         ireg_of(preg_of_input, input_ireg),
         preg_of(input_mreg, preg_of_input),
+        ireg_of(preg_of_result, result_ireg),
+        preg_of(result_mreg, preg_of_result),
         let args = vec![*input_mreg],
         let op = Operation::Odivuimm(divisor);
 
@@ -2436,7 +3029,9 @@ ascent_par! {
     // Mark div-magic-consumed instructions so generic rules skip them.
     #[local] relation div_consumed(Address);
 
-    // 32-bit: MOVSXD(addr0) -> IMUL(addr1) -> SHIFT(addr2) -> SAR(addr3) -> SUB(addr4)
+    // 32-bit: MOVSXD(addr0) -> IMUL(addr1) -> SHIFT(addr2) -> SAR(addr3) -> SUB(addr4); MOVSXD also marked consumed since the Odivimm Mop is re-emitted there (suppress its raw Ocast32signed).
+    div_consumed(movsxd_addr) <--
+        div_magic_32(movsxd_addr, _, _, _, _, _);
     div_consumed(imul_addr) <--
         div_magic_32(movsxd_addr, _, _, _, _, _),
         next(movsxd_addr, imul_addr);
@@ -2451,18 +3046,277 @@ ascent_par! {
         next(sar_addr, sub_addr);
 
     // 64-bit: MOV(addr0) -> IMUL(addr1) -> SHIFT(addr2) [-> SAR(addr3) -> SUB(addr4)]
+    div_consumed(mov_addr) <--
+        div_magic_64(mov_addr, _, _, _, _, _);
     div_consumed(imul_addr) <--
-        div_magic_64(mov_addr, _, _, _, _),
+        div_magic_64(mov_addr, _, _, _, _, _),
         next(mov_addr, imul_addr);
     div_consumed(shift_addr) <--
-        div_magic_64(_, shift_addr, _, _, _);
+        div_magic_64(_, shift_addr, _, _, _, _);
     div_consumed(sar_addr) <--
-        div_magic_64(_, shift_addr, _, _, _),
+        div_magic_64(_, shift_addr, _, _, _, _),
         next(shift_addr, sar_addr);
     div_consumed(sub_addr) <--
-        div_magic_64(_, shift_addr, _, _, _),
+        div_magic_64(_, shift_addr, _, _, _, _),
         next(shift_addr, sar_addr),
         next(sar_addr, sub_addr);
+
+    // Magic-modulo recognition: x86-64 lowers `n % K` as q = magic-divide(n, K); t = q * K (1-3 LEA/ADD/IMUL); r = n - t. Synthesize one Omodimm/Omodlimm Mop at the SUB; upstream Odivimm/Odivlimm stays for sources using both q and r.
+
+    // divide_q records each div_magic_* chain endpoint and the quotient reg there. Tuple: (end_addr last instr, q_ireg quotient reg, divisor K, input_ireg dividend, is_long false=Omodimm/true=Omodlimm).
+    #[local] relation divide_q(Address, Ireg, i64, Ireg, bool);
+
+    // div_magic_32 variant 1: MOVSXD->IMUL3->SAR->sign_correction(SAR31, SUB).
+    divide_q(sub_addr, *result_ireg, divisor, *input_ireg, false) <--
+        div_magic_32(_addr0, shift_addr, magic, shift_n, input_ireg, result_ireg),
+        let divisor_opt = recover_signed_divisor(*magic, *shift_n),
+        if divisor_opt.is_some(),
+        let divisor = divisor_opt.unwrap(),
+        next(shift_addr, sign_addr),
+        sign_correction(sign_addr, sub_addr, sign_ireg, sub_dst_ireg, 31),
+        if sign_ireg == input_ireg,
+        if sub_dst_ireg == result_ireg;
+
+    // div_magic_32 variant 2: MOVSXD->IMUL3->SAR->MOV(copy)->SAR->SUB.
+    divide_q(sub_addr, *result_ireg, divisor, *input_ireg, false) <--
+        div_magic_32(_addr0, shift_addr, magic, shift_n, input_ireg, result_ireg),
+        let divisor_opt = recover_signed_divisor(*magic, *shift_n),
+        if divisor_opt.is_some(),
+        let divisor = divisor_opt.unwrap(),
+        next(shift_addr, mov_addr),
+        pmov(mov_addr, mov_dst, mov_src),
+        op_register(mov_dst, copy_str),
+        op_register(mov_src, copy_src_str),
+        if Ireg::from(*copy_src_str) == *input_ireg,
+        if Ireg::from(*copy_str) != *input_ireg,
+        next(mov_addr, sar_addr),
+        sign_correction(sar_addr, sub_addr, sign_ireg, sub_dst_ireg, 31),
+        if *sign_ireg == Ireg::from(*copy_str),
+        if sub_dst_ireg == result_ireg;
+
+    // div_magic_32_compensating_gcc: 7 instructions ending at the SUB.
+    divide_q(addr6, *result_ireg, divisor, *input_ireg, false) <--
+        div_magic_32_compensating_gcc(addr0, _, magic, total_shift, input_ireg, result_ireg),
+        let divisor_opt = recover_signed_divisor_compensating(*magic, *total_shift),
+        if divisor_opt.is_some(),
+        let divisor = divisor_opt.unwrap(),
+        next(addr0, a1),
+        next(a1, a2),
+        next(a2, a3),
+        next(a3, a4),
+        next(a4, a5),
+        next(a5, addr6);
+
+    // div_magic_32_compensating (clang): 8 instructions ending at the final ADD.
+    divide_q(addr7, *result_ireg, divisor, *input_ireg, false) <--
+        div_magic_32_compensating(addr0, _, magic, total_shift, input_ireg, result_ireg),
+        let divisor_opt = recover_signed_divisor_compensating(*magic, *total_shift),
+        if divisor_opt.is_some(),
+        let divisor = divisor_opt.unwrap(),
+        next(addr0, a1),
+        next(a1, a2),
+        next(a2, a3),
+        next(a3, a4),
+        next(a4, a5),
+        next(a5, a6),
+        next(a6, addr7);
+
+    // div_magic_32_signbias_partial (clang n/10 partial-reg): 6 instrs (movsxd + 5), end at ADD; q in partial_ireg. The relation's 5th field is MOVSXD's dst; use MOVSXD's src for divide_q so the mod Mop's input is the original param, not the suppressed cast dst.
+    divide_q(addr5, *partial_ireg, divisor, Ireg::from(*movsxd_src_str), false) <--
+        div_magic_32_signbias_partial(movsxd_addr, imul_addr, magic, total_shift, _result_ireg, partial_ireg),
+        let divisor_opt = recover_signed_divisor(*magic, *total_shift),
+        if divisor_opt.is_some(),
+        let divisor = divisor_opt.unwrap(),
+        pmov(movsxd_addr, _movsxd_dst, movsxd_src),
+        op_register(movsxd_src, movsxd_src_str),
+        next(imul_addr, a2),
+        next(a2, a3),
+        next(a3, a4),
+        next(a4, addr5);
+
+    // div_magic_32_signbias (clang small magic, n/3 etc.): 6 instrs ending at ADD.
+    divide_q(addr5, *result_ireg, divisor, *input_ireg, false) <--
+        div_magic_32_signbias(addr0, _, magic, total_shift, input_ireg, result_ireg),
+        let divisor_opt = recover_signed_divisor(*magic, *total_shift),
+        if divisor_opt.is_some(),
+        let divisor = divisor_opt.unwrap(),
+        next(addr0, a1),
+        next(a1, a2),
+        next(a2, a3),
+        next(a3, a4),
+        next(a4, addr5);
+
+    // div_magic_64 (signed): MOV->IMUL->SHR/SAR->sign_correction(SAR63, SUB).
+    divide_q(sub_addr, *result_ireg, divisor, *input_ireg, true) <--
+        div_magic_64(_addr0, shift_addr, magic, shift_n, input_ireg, result_ireg),
+        let divisor_opt = recover_signed_divisor(*magic, *shift_n),
+        if divisor_opt.is_some(),
+        let divisor = divisor_opt.unwrap(),
+        next(shift_addr, sign_addr),
+        sign_correction(sign_addr, sub_addr, _, _, 63);
+
+    // q_factor(addr, ireg, factor, input_ireg, divisor, is_long): after addr, `ireg` holds factor * (input_ireg / divisor). Invariant carried only through LEA/ADD/IMUL3/MOV; other writers drop the entry.
+    #[local] relation q_factor(Address, Ireg, i64, Ireg, i64, bool);
+
+    // Bootstrap: divide endpoint contributes q_factor=1 for the q register.
+    q_factor(end_addr, *q_ireg, 1, *input_ireg, *divisor, *is_long) <--
+        divide_q(end_addr, q_ireg, divisor, input_ireg, is_long);
+
+    // Generation: LEA dst, [r,r,scale] with disp=0  =>  dst = factor * (scale+1).
+    q_factor(lea_addr, dst_ireg, new_factor, *input, *divisor, *is_long) <--
+        q_factor(prev_addr, base_ireg, factor, input, divisor, is_long),
+        next(prev_addr, lea_addr),
+        plea(lea_addr, lea_dst, lea_src),
+        op_indirect(lea_src, _, base_str, idx_str, scale, 0, _),
+        if Ireg::from(*base_str) == *base_ireg,
+        if Ireg::from(*idx_str) == *base_ireg,
+        if *scale >= 1 && *scale <= 8,
+        let new_factor = factor.checked_mul(scale + 1).unwrap_or(0),
+        if new_factor != 0,
+        op_register(lea_dst, dst_str),
+        let dst_ireg = Ireg::from(*dst_str);
+
+    // Generation: ADD dst, src (both regs hold q-factors)  =>  dst gets f_dst + f_src.
+    q_factor(add_addr, dst_ireg, new_factor, *input, *divisor, *is_long) <--
+        q_factor(prev_addr, dst_ireg, f_dst, input, divisor, is_long),
+        q_factor(prev_addr, src_ireg, f_src, input, divisor, is_long),
+        next(prev_addr, add_addr),
+        padd(add_addr, dst_sym, src_sym),
+        op_register(dst_sym, dst_str),
+        op_register(src_sym, src_str),
+        if Ireg::from(*dst_str) == *dst_ireg,
+        if Ireg::from(*src_str) == *src_ireg,
+        let new_factor = f_dst.checked_add(*f_src).unwrap_or(0),
+        if new_factor != 0;
+
+    // Generation: IMUL3 dst, src, imm  =>  dst = f_src * imm.
+    q_factor(imul_addr, dst_ireg, new_factor, *input, *divisor, *is_long) <--
+        q_factor(prev_addr, src_ireg, f_src, input, divisor, is_long),
+        next(prev_addr, imul_addr),
+        pimul3(imul_addr, imul_dst, imul_src, imul_imm),
+        op_register(imul_src, src_str),
+        if Ireg::from(*src_str) == *src_ireg,
+        op_immediate(imul_imm, imm, _),
+        let new_factor = f_src.checked_mul(*imm).unwrap_or(0),
+        if new_factor != 0,
+        op_register(imul_dst, dst_str),
+        let dst_ireg = Ireg::from(*dst_str);
+
+    // Generation: MOV dst, src (reg-to-reg copy)  =>  dst gets f_src.
+    q_factor(mov_addr, dst_ireg, factor, *input, *divisor, *is_long) <--
+        q_factor(prev_addr, src_ireg, factor, input, divisor, is_long),
+        next(prev_addr, mov_addr),
+        pmov(mov_addr, mov_dst, mov_src),
+        op_register(mov_src, src_str),
+        if Ireg::from(*src_str) == *src_ireg,
+        op_register(mov_dst, dst_str),
+        let dst_ireg = Ireg::from(*dst_str),
+        if dst_ireg != *src_ireg;
+
+    // Carry-forward: LEA/ADD/IMUL3/MOV (the four q*K participants) preserve q_factor when they don't overwrite ireg.
+    q_factor(lea_addr, *ireg, factor, *input, *divisor, *is_long) <--
+        q_factor(prev_addr, ireg, factor, input, divisor, is_long),
+        next(prev_addr, lea_addr),
+        plea(lea_addr, lea_dst, _),
+        op_register(lea_dst, dst_str),
+        if Ireg::from(*dst_str) != *ireg;
+
+    q_factor(add_addr, *ireg, factor, *input, *divisor, *is_long) <--
+        q_factor(prev_addr, ireg, factor, input, divisor, is_long),
+        next(prev_addr, add_addr),
+        padd(add_addr, add_dst, _),
+        op_register(add_dst, dst_str),
+        if Ireg::from(*dst_str) != *ireg;
+
+    q_factor(imul_addr, *ireg, factor, *input, *divisor, *is_long) <--
+        q_factor(prev_addr, ireg, factor, input, divisor, is_long),
+        next(prev_addr, imul_addr),
+        pimul3(imul_addr, imul_dst, _, _),
+        op_register(imul_dst, dst_str),
+        if Ireg::from(*dst_str) != *ireg;
+
+    q_factor(mov_addr, *ireg, factor, *input, *divisor, *is_long) <--
+        q_factor(prev_addr, ireg, factor, input, divisor, is_long),
+        next(prev_addr, mov_addr),
+        pmov(mov_addr, mov_dst, _),
+        op_register(mov_dst, dst_str),
+        if Ireg::from(*dst_str) != *ireg;
+
+    // Memory-store MOV (`mov %reg, [mem]`) writes to memory, not to any
+    // register, so q_factor for every register is preserved.
+    q_factor(mov_addr, *ireg, factor, *input, *divisor, *is_long) <--
+        q_factor(prev_addr, ireg, factor, input, divisor, is_long),
+        next(prev_addr, mov_addr),
+        pmov(mov_addr, mov_dst, _),
+        !op_register(mov_dst, _);
+
+    // Modulo synthesis: SUB n, qK_reg where qK_reg holds factor=K * q.
+    // Tuple: (sub_addr, dst_mreg, input_mreg, divisor, is_long).
+    #[local] relation mod_synth(Address, Mreg, Mreg, i64, bool);
+
+    // Dividend value tracking: which regs hold input_ireg at sub_addr. Simple sub_dst==input_ireg misses MOVSXD-then-SUB cases (e.g. `movsxd rax,edi; sub eax,ecx` where EAX is a different Ireg from EDI).
+    #[local] relation dividend_holder(Address, Ireg, Ireg, i64, bool);
+
+    dividend_holder(*sub_addr, *input_ireg, *input_ireg, *divisor, *is_long) <--
+        psub(sub_addr, _, _),
+        divide_q(_, _, divisor, input_ireg, is_long);
+
+    // low-32 alias of any MOVSXD/MOV 
+    dividend_holder(*sub_addr, low32_ireg, *input_ireg, *divisor, *is_long) <--
+        psub(sub_addr, _, _),
+        divide_q(_, _, divisor, input_ireg, is_long),
+        pmov(_mov_addr, mov_dst_sym, mov_src_sym),
+        op_register(mov_dst_sym, mov_dst_str),
+        op_register(mov_src_sym, mov_src_str),
+        if Ireg::from(*mov_src_str) == *input_ireg,
+        let low32_ireg = Ireg::from(reg_low32_alias(*mov_dst_str));
+
+    // full-width MOVSXD dst (e.g., RAX itself when source is EDI).
+    dividend_holder(*sub_addr, mov_dst_full_ireg, *input_ireg, *divisor, *is_long) <--
+        psub(sub_addr, _, _),
+        divide_q(_, _, divisor, input_ireg, is_long),
+        pmov(_mov_addr, mov_dst_sym, mov_src_sym),
+        op_register(mov_dst_sym, mov_dst_str),
+        op_register(mov_src_sym, mov_src_str),
+        if Ireg::from(*mov_src_str) == *input_ireg,
+        let mov_dst_full_ireg = Ireg::from(*mov_dst_str);
+
+    mod_synth(sub_addr, *result_mreg, *input_mreg, *divisor, *is_long) <--
+        psub(sub_addr, sub_dst_sym, sub_src_sym),
+        op_register(sub_src_sym, sub_src_str),
+        op_register(sub_dst_sym, sub_dst_str),
+        let sub_src_ireg = Ireg::from(*sub_src_str),
+        let sub_dst_ireg = Ireg::from(*sub_dst_str),
+        prev_instr(sub_addr, prev_addr),
+        q_factor(prev_addr, sub_src_ireg, divisor, input_ireg, divisor_q, is_long),
+        if *divisor == *divisor_q,
+        dividend_holder(*sub_addr, sub_dst_ireg, input_ireg, divisor, is_long),
+        ireg_of(preg_of_input, input_ireg),
+        preg_of(input_mreg, preg_of_input),
+        ireg_of(preg_of_result, &sub_dst_ireg),
+        preg_of(result_mreg, preg_of_result);
+
+    // Emit the modulus Mop at the SUB address.
+    mach_inst(sub_addr, MachInst::Mop(op, Arc::new(args.clone()), *result_mreg)) <--
+        mod_synth(sub_addr, result_mreg, input_mreg, divisor, is_long),
+        let args = vec![*input_mreg],
+        let op = if *is_long { Operation::Omodlimm(*divisor) } else { Operation::Omodimm(*divisor) };
+
+    // Suppress generic Mop emission for the SUB and the q*K chain back to (but excluding) the divide_q endpoint. Bounded search.
+    div_consumed(sub_addr) <-- mod_synth(sub_addr, _, _, _, _);
+
+    #[local] relation mod_chain_back(Address, Address, usize);
+
+    mod_chain_back(sub_addr, sub_addr, 0) <--
+        mod_synth(sub_addr, _, _, _, _);
+
+    mod_chain_back(sub_addr, prev_addr, h+1) <--
+        mod_chain_back(sub_addr, cur_addr, h),
+        if *h < 6,
+        prev_instr(cur_addr, prev_addr),
+        !divide_q(prev_addr, _, _, _, _);
+
+    div_consumed(addr) <-- mod_chain_back(_, addr, h), if *h > 0;
 
     mach_inst(addr0, MachInst::Mcond(
         Condition::Cnotcompf(Comparison::Ceq),
@@ -2677,6 +3531,36 @@ ascent_par! {
         ireg_hold_type(dst_str.to_string(), typ),
         type_to_memchunk(typ, mc);
 
+    // Scaled-index absolute addressing load
+    mach_inst(addr, MachInst::Mload(*mc, Addressing::Abasedscaled(*scale, *ident, *offset), Arc::new(vec![idx_mreg]), dst)) <--
+        pmov(addr, dst_sym, src),
+        op_register(dst_sym, dst_str),
+        let dst = Mreg::from(dst_str),
+        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let idx_mreg = Mreg::from(*idx_str),
+        ireg_hold_type(dst_str.to_string(), typ),
+        type_to_memchunk(typ, mc);
+
+    mach_inst(addr, MachInst::Mload(mc, Addressing::Abasedscaled(*scale, *ident, *offset), Arc::new(vec![idx_mreg]), dst)) <--
+        pmov(addr, dst_sym, src),
+        op_register(dst_sym, dst_str),
+        let dst = Mreg::from(dst_str),
+        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let idx_mreg = Mreg::from(*idx_str),
+        !ireg_hold_type(dst_str.to_string(), _),
+        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        let mc = chunk_from_mnem_ext(mnem);
+
     // Absolute addressing load (mnemonic-based fallback)
     mach_inst(addr, MachInst::Mload(mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), dst)) <--
         pmov(addr, dst_sym, src),
@@ -2747,6 +3631,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Omove, Arc::new(args), *res)) <--
         pmov(address, rd, rs),
+        !div_consumed(address),
         op_register(rd, res_str),
         ireg_of(preg_of_r, Ireg::from(res_str)),
         preg_of(res, preg_of_r),
@@ -2757,6 +3642,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Omove, Arc::new(vec![src]), dst)) <--
         pmov(address, rd, rs),
+        !div_consumed(address),
         op_register(rd, dst_str),
         reg_xmm(dst_str),
         op_register(rs, src_str),
@@ -2765,6 +3651,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Omove, Arc::new(vec![src]), dst)) <--
         pmov(address, rd, rs),
+        !div_consumed(address),
         op_register(rd, dst_str),
         op_register(rs, src_str),
         reg_xmm(src_str),
@@ -2773,6 +3660,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Ointconst(imm_int), Arc::new(args), *res)) <--
         pmov(address, r, n),
+        !div_consumed(address),
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, res_str),
@@ -2785,6 +3673,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Olongconst(imm_int), Arc::new(args), *res)) <--
         pmov(address, r, n),
+        !div_consumed(address),
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, res_str),
@@ -2849,6 +3738,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Ointconst(*imm_str as i64), Arc::new(args), *res)) <--
         pmov(address, r, symid),
+        !div_consumed(address),
         op_immediate(symid, imm_str, _),
         op_register(r, res_str),
         !reg_64(res_str),
@@ -2860,6 +3750,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Olongconst(*imm_str as i64), Arc::new(args), *res)) <--
         pmov(address, r, symid),
+        !div_consumed(address),
         op_immediate(symid, imm_str, _),
         op_register(r, res_str),
         reg_64(res_str),
@@ -2871,6 +3762,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Ointconst(*imm_str), Arc::new(args), *res)) <--
         pmov(address, r, symid),
+        !div_consumed(address),
         op_immediate(symid, imm_str, _),
         op_register(r, res_str),
         !reg_64(res_str),
@@ -2883,6 +3775,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Olongconst(*imm_str), Arc::new(args), *res)) <--
         pmov(address, r, symid),
+        !div_consumed(address),
         op_immediate(symid, imm_str, _),
         op_register(r, res_str),
         reg_64(res_str),
@@ -2895,6 +3788,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(cast_op, Arc::new(args.clone()), *res)) <--
         pmov(address, r, r1),
+        !div_consumed(address),
         op_register(r1, r1_str),
         op_register(r, r_str),
         reg_is_64(r1_str, r1_is_64),
@@ -3020,6 +3914,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(op, Arc::new(args), *res)) <--
         padd(address, r, r2),
+        !div_consumed(address),
         instruction(address, _, mnem, _, _, _, _, _, _, _),
         op_register(r, r_str),
         op_register(r2, r2_str),
@@ -3038,6 +3933,7 @@ ascent_par! {
     // Divergence: ADD reg,reg can also be Olea(Aindexed2(0)); CompCert has no Oadd for x86, register addition is Olea(Aindexed2 0) compiling to LEA r,[r1+r2].
     mach_inst(address, MachInst::Mop(op, Arc::new(args), *res)) <--
         padd(address, r, r2),
+        !div_consumed(address),
         instruction(address, _, mnem, _, _, _, _, _, _, _),
         op_register(r, r_str),
         op_register(r2, r2_str),
@@ -3316,6 +4212,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Omul, Arc::new(args), *res)) <--
         pimul(address, r, r2),
+        !div_consumed(address),
         op_register(r, r_str),
         ireg_hold_type(r_str.to_string(), typ),
         if *typ == Typ::Tint,
@@ -3329,6 +4226,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Omulimm(imm_int), Arc::new(args), *res)) <--
         pimul(address, r, n),
+        !div_consumed(address),
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, r_str),
@@ -3370,6 +4268,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Omul, Arc::new(args), *res)) <--
         pimul(address, r, mem),
+        !div_consumed(address),
         op_register(r, r_str),
         ireg_hold_type(r_str.to_string(), typ),
         if *typ == Typ::Tint,
@@ -3383,6 +4282,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Omull, Arc::new(args), *res)) <--
         pimul(address, r, mem),
+        !div_consumed(address),
         op_register(r, r_str),
         ireg_hold_type(r_str.to_string(), typ),
         if *typ == Typ::Tlong || *typ == Typ::Tany64,
@@ -3817,6 +4717,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(cast_op, Arc::new(args.clone()), *res)) <--
         pmov(address, r, r1),
+        !div_consumed(address),
         op_register(r1, r1_str),
         op_register(r, r_str),
         reg_is_64(r1_str, r1_is_64),
@@ -3863,6 +4764,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Omull, Arc::new(args), *res)) <--
         pimul(address, r, r2),
+        !div_consumed(address),
         op_register(r, r_str),
         ireg_hold_type(r_str.to_string(), typ),
         if *typ == Typ::Tlong || *typ == Typ::Tany64,
@@ -3875,6 +4777,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Omullimm(imm_int), Arc::new(args), *res)) <--
         pimul(address, r, n),
+        !div_consumed(address),
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, r_str),
@@ -5301,6 +6204,17 @@ impl std::fmt::Display for AddressingError {
 // Returns true for valid general-purpose registers (excludes Unknown and RIP).
 fn is_valid_gpr(r: Ireg) -> bool {
     !matches!(r, Ireg::Unknown | Ireg::RIP)
+}
+
+// Map a 64-bit GPR name to its 32-bit alias (RAX->EAX); pass through 32-bit/unknown. Used by mod-synth dividend-holder check to equate EAX with EDI after `MOVSXD rax, edi`.
+pub fn reg_low32_alias(s: &str) -> &str {
+    match s {
+        "RAX" => "EAX", "RBX" => "EBX", "RCX" => "ECX", "RDX" => "EDX",
+        "RDI" => "EDI", "RSI" => "ESI", "RBP" => "EBP", "RSP" => "ESP",
+        "R8"  => "R8D", "R9"  => "R9D", "R10" => "R10D", "R11" => "R11D",
+        "R12" => "R12D", "R13" => "R13D", "R14" => "R14D", "R15" => "R15D",
+        other => other,
+    }
 }
 
 // Check if register name is an 8-bit GPR.

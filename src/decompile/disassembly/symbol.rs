@@ -435,6 +435,11 @@ pub fn compute_labeled_addresses(db: &mut DecompileDB, obj: &object::File) {
             // Absolute addressing (clang -fno-pie): displacement is the address itself
             abs_ops.insert(*id);
             abs_op_disp.push((*id, *disp));
+        } else if (*base == "NONE" || base.is_empty()) && *index != "NONE" && !index.is_empty() && *disp > 0 {
+            // Scaled-index absolute addressing: mov dst, [reg*scale + const_addr]
+            // (clang const-table loads). The displacement is the table base address.
+            abs_ops.insert(*id);
+            abs_op_disp.push((*id, *disp));
         }
     }
 

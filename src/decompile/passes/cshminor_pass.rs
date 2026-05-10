@@ -60,6 +60,9 @@ ascent_par! {
     relation emit_var_type_candidate(RTLReg, XType);
     relation idom(Address, Node, Node);
     relation stack_var(Address, Address, i64, RTLReg);
+    // Memory-indirect call: the rtl_pass surfaces the load addressing so we can inline the
+    // function-pointer load into the Scall callee (renders as `(*(base + disp))(args)`).
+    relation call_through_memory_load(Node, RTLReg, MemoryChunk, Addressing, Args);
 
 
     relation stmt_can_fallthrough(Node);
@@ -112,9 +115,30 @@ ascent_par! {
         active_cminor_stmt(node, _),
         active_cminor_stmt(next, _);
 
+    // Synth-node successor: bit-62 nodes (e.g. SP-indexed-load synth from rtl_pass) lack `next` entries; bridge via rtl_succ so the C emitter's DFS visits them and the synth Sset survives.
+    cminor_succ(*node, *dst) <--
+        active_cminor_stmt(node, _),
+        active_cminor_stmt(dst, _),
+        rtl_succ(node, dst),
+        if (*node & (1u64 << 62)) != 0;
 
+    // The predecessor of a synth node needs an explicit cminor_succ; `next` skips synth, leaving it unreachable from its real-address predecessor.
+    cminor_succ(*node, *dst) <--
+        active_cminor_stmt(node, _),
+        active_cminor_stmt(dst, _),
+        rtl_succ(node, dst),
+        if (*dst & (1u64 << 62)) != 0;
+
+
+    // emit_function entry may point at a non-stmt node (first instr like `mov $0x2,%r8d` later trimmed); follow `next` to the first active cminor node so reachable_from_entry/dom cover the full body.
     func_entry_node(func, entry) <--
-        emit_function(func, _, entry);
+        emit_function(func, _, entry),
+        active_cminor_stmt(entry, _);
+
+    func_entry_node(func, resolved) <--
+        emit_function(func, _, entry),
+        !active_cminor_stmt(entry, _),
+        next_to_cminor(entry, resolved);
 
 
     pred(func, to_node, from_node) <--
@@ -282,12 +306,24 @@ ascent_par! {
         active_cminor_stmt(node, ?CminorStmt::Sstore(chunk, addr, args, src)),
         if addressing_to_csharp_expr(addr, args.as_slice()).is_none();
 
+    // Default Scall conversion (callee is a plain register reference).
     csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Scall(dst, sig, func, args)),
+        !call_through_memory_load(node, _, _, _, _),
         let converted_func = match func.clone() {
             Either::Left(reg) => Either::Left(CsharpminorExpr::Evar(reg)),
             Either::Right(id) => Either::Right(id),
         },
+        let call_args = args.iter().map(|r| CsharpminorExpr::Evar(*r)).collect(),
+        let stmt = CsharpminorStmt::Scall(dst.clone(), sig.clone(), converted_func, call_args);
+
+    // Memory-indirect call: render callee as the load expression `(*(base + disp))` so the
+    // function pointer slot is dereferenced explicitly in the C output.
+    csharp_stmt_candidate(node, stmt) <--
+        active_cminor_stmt(node, ?CminorStmt::Scall(dst, sig, _, args)),
+        call_through_memory_load(node, _temp, chunk, addressing, load_args),
+        if let Some(addr_expr) = addressing_to_csharp_expr_sized(addressing, load_args.as_slice(), true),
+        let converted_func = Either::Left(CsharpminorExpr::Eload(*chunk, Box::new(addr_expr))),
         let call_args = args.iter().map(|r| CsharpminorExpr::Evar(*r)).collect(),
         let stmt = CsharpminorStmt::Scall(dst.clone(), sig.clone(), converted_func, call_args);
 

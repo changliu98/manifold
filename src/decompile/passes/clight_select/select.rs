@@ -3,7 +3,7 @@
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::clight_select::query::{
     extract_functions, extract_ite_info, extract_loop_info,
-    FunctionData, IteInfo, LoopInfo,
+    CalleeSignature, FunctionData, IteInfo, LoopInfo,
 };
 use crate::decompile::passes::c_pass::convert::from_relations::{convert_stmt, ConversionContext};
 use crate::decompile::passes::c_pass::helpers::{xtype_string_to_ctype, convert_param_type_from_param, param_name_for_reg};
@@ -86,15 +86,40 @@ pub struct SelectedFunction {
 
 
 pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, String> {
-    let (mut functions, _id_to_name) = extract_functions(db)?;
+    let (mut functions, id_to_name) = extract_functions(db)?;
 
-    // Sort candidates deterministically: hash each ClightStmt, sort by hash.
-    // Ascent parallel evaluation can produce candidates in arbitrary order;
-    // this ensures the candidate index is stable across runs.
+    let mut name_to_ident: HashMap<String, Ident> = HashMap::new();
+    {
+        // Iterate in sorted (id, name) order so that, on a sanitized-name collision,
+        // the surviving Ident is deterministic across runs.
+        let mut sorted_id_name: Vec<(&usize, &String)> = id_to_name.iter().collect();
+        sorted_id_name.sort_by_key(|(id, name)| (**id, (*name).clone()));
+        for (id, name) in sorted_id_name {
+            let sanitized = crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(name);
+            name_to_ident.entry(sanitized).or_insert(*id as Ident);
+            name_to_ident.entry(name.clone()).or_insert(*id as Ident);
+        }
+    }
+    {
+        let mut sorted_funcs: Vec<&FunctionData> = functions.iter().collect();
+        sorted_funcs.sort_by_key(|f| f.address);
+        for func in sorted_funcs {
+            name_to_ident
+                .entry(func.name.clone())
+                .or_insert(func.address as Ident);
+        }
+    }
+
+    // Sort candidates deterministically: prefer Efield form over raw pointer-deref-with-cast (so search starts on the recovered-field variant when both compile); secondary key is a deterministic hash (Ascent parallel order is arbitrary).
     for func in &mut functions {
         for candidates in func.node_statements.values_mut() {
             if candidates.len() > 1 {
-                candidates.sort_by_key(|s| stmt_deterministic_hash(s));
+                candidates.sort_by_key(|s| {
+                    // Lower key sorts first. Field-form gets 0, raw-deref form gets 1.
+                    let prefers_field = stmt_uses_efield(s);
+                    let priority: u8 = if prefers_field { 0 } else { 1 };
+                    (priority, stmt_deterministic_hash(s))
+                });
             }
         }
     }
@@ -154,6 +179,7 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
 
     let best_state = function_based_parallel_search(
         &functions, &global_struct_fields, &global_canonical_to_reg_key,
+        &name_to_ident,
     );
 
     // Split result into per-function SelectedFunction
@@ -268,10 +294,28 @@ fn build_selected_function_from_program_state(
 #[derive(Debug)]
 struct ClangError {
     line: usize,
-    #[allow(dead_code)]
     column: usize,
-    #[allow(dead_code)]
     message: String,
+}
+
+/// Extract the register ID from a `var_<digits>` token at or before `column` on the given source line.
+fn extract_reg_at_column(source: &str, line: usize, column: usize) -> Option<RTLReg> {
+    let line_text = source.lines().nth(line.saturating_sub(1))?;
+    let col_idx = column.saturating_sub(1).min(line_text.len());
+    let bytes = line_text.as_bytes();
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut start = col_idx;
+    while start > 0 && is_ident_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = col_idx;
+    while end < bytes.len() && is_ident_byte(bytes[end]) {
+        end += 1;
+    }
+    if start >= end { return None; }
+    let token = &line_text[start..end];
+    let rest = token.strip_prefix("var_")?;
+    rest.parse::<RTLReg>().ok()
 }
 
 fn materialize_statements(
@@ -296,19 +340,39 @@ fn materialize_statements(
 
 /// Determine from a clang error whether a variable should be pointer (Some(true)), integer (Some(false)), or unrelated (None).
 fn error_wants_ptr(msg: &str) -> Option<bool> {
-    // The declaration should match the expression type: "ptr to int" -> want ptr, "int to ptr" -> want int.
+    // Strong signals: declaration should match the expression type.
     if msg.contains("pointer to integer conversion") {
-        // Expression produces ptr, declaration is int -> switch decl to ptr
-        Some(true)
-    } else if msg.contains("integer to pointer conversion") {
-        // Expression produces int, declaration is ptr -> switch decl to int
-        Some(false)
-    } else if msg.contains("indirection requires pointer") {
-        // Dereferencing a non-pointer -> switch to ptr
-        Some(true)
-    } else {
-        None
+        return Some(true);
     }
+    if msg.contains("integer to pointer conversion") {
+        return Some(false);
+    }
+    if msg.contains("indirection requires pointer") {
+        return Some(true);
+    }
+    if msg.contains("subscripted value is not an array, pointer, or vector") {
+        return Some(true);
+    }
+    if msg.contains("makes pointer from integer without a cast") {
+        return Some(true);
+    }
+    if msg.contains("makes integer from pointer without a cast") {
+        return Some(false);
+    }
+    if msg.contains("comparison between pointer and integer") {
+        // Ambiguous direction; prefer pointer (the more specific commitment usually came from clang).
+        return Some(true);
+    }
+    if msg.contains("incompatible pointer types") {
+        return Some(true);
+    }
+    if msg.contains("member reference base type") && msg.contains("is not a structure or union") {
+        return Some(true);
+    }
+    if msg.contains("arithmetic on a pointer to void") {
+        return Some(false);
+    }
+    None
 }
 
 /// Find the type candidate index matching the desired ptr/int direction for a decl/param node.
@@ -448,6 +512,80 @@ fn scan_deref_regs_expr(expr: &ClightExpr) -> Vec<(RTLReg, bool)> {
     out
 }
 
+/// Walk an expression and collect register IDs directly used by mul/div/mod/and/or/xor/shl/shr (ill-typed on C pointers); drives the "force int" half of constraint propagation.
+fn scan_pure_int_regs_expr(expr: &ClightExpr, out: &mut BTreeSet<RTLReg>) {
+    match expr {
+        ClightExpr::Ebinop(op, l, r, _) => {
+            let pure_int = matches!(
+                op,
+                ClightBinaryOp::Omul
+                    | ClightBinaryOp::Odiv
+                    | ClightBinaryOp::Omod
+                    | ClightBinaryOp::Oand
+                    | ClightBinaryOp::Oor
+                    | ClightBinaryOp::Oxor
+                    | ClightBinaryOp::Oshl
+                    | ClightBinaryOp::Oshr
+            );
+            if pure_int {
+                let mut peel = |e: &ClightExpr| {
+                    let mut cur = e;
+                    loop {
+                        match cur {
+                            ClightExpr::Etempvar(id, _) => {
+                                out.insert(*id as RTLReg);
+                                break;
+                            }
+                            ClightExpr::Ecast(inner, _) => cur = inner,
+                            _ => break,
+                        }
+                    }
+                };
+                peel(l);
+                peel(r);
+            }
+            scan_pure_int_regs_expr(l, out);
+            scan_pure_int_regs_expr(r, out);
+        }
+        ClightExpr::Ederef(inner, _)
+        | ClightExpr::Eaddrof(inner, _)
+        | ClightExpr::Eunop(_, inner, _)
+        | ClightExpr::Ecast(inner, _)
+        | ClightExpr::Efield(inner, _, _) => scan_pure_int_regs_expr(inner, out),
+        ClightExpr::Econdition(c, t, f, _) => {
+            scan_pure_int_regs_expr(c, out);
+            scan_pure_int_regs_expr(t, out);
+            scan_pure_int_regs_expr(f, out);
+        }
+        _ => {}
+    }
+}
+
+fn scan_pure_int_regs_stmt(stmt: &ClightStmt, out: &mut BTreeSet<RTLReg>) {
+    match stmt {
+        ClightStmt::Sassign(l, r) => { scan_pure_int_regs_expr(l, out); scan_pure_int_regs_expr(r, out); }
+        ClightStmt::Sset(_, e) => scan_pure_int_regs_expr(e, out),
+        ClightStmt::Scall(_, f, args) => {
+            scan_pure_int_regs_expr(f, out);
+            for a in args { scan_pure_int_regs_expr(a, out); }
+        }
+        ClightStmt::Sreturn(Some(e)) => scan_pure_int_regs_expr(e, out),
+        ClightStmt::Sifthenelse(c, t, e) => {
+            scan_pure_int_regs_expr(c, out);
+            scan_pure_int_regs_stmt(t, out);
+            scan_pure_int_regs_stmt(e, out);
+        }
+        ClightStmt::Ssequence(ss) => { for s in ss { scan_pure_int_regs_stmt(s, out); } }
+        ClightStmt::Sloop(a, b) => { scan_pure_int_regs_stmt(a, out); scan_pure_int_regs_stmt(b, out); }
+        ClightStmt::Slabel(_, inner) => scan_pure_int_regs_stmt(inner, out),
+        ClightStmt::Sswitch(e, cases) => {
+            scan_pure_int_regs_expr(e, out);
+            for (_, s) in cases { scan_pure_int_regs_stmt(s, out); }
+        }
+        _ => {}
+    }
+}
+
 fn scan_deref_regs_stmt(stmt: &ClightStmt) -> Vec<(RTLReg, bool)> {
     let mut out = Vec::new();
     match stmt {
@@ -568,6 +706,35 @@ fn propagate_type_constraints(
             }
         }
     }
+
+    // Inverse: a reg used by mul/div/mod/and/or/xor/shl/shr (in any candidate) that is never deref'd and has no struct must be int (those ops are ill-typed on pointers).
+    let mut pure_int_regs: BTreeSet<RTLReg> = BTreeSet::new();
+    for node in &sorted_nodes {
+        for stmt in &func.node_statements[node] {
+            scan_pure_int_regs_stmt(stmt, &mut pure_int_regs);
+        }
+    }
+    let any_deref_regs: BTreeSet<RTLReg> = reg_deref_info.keys().copied().collect();
+    for reg in &pure_int_regs {
+        if any_deref_regs.contains(reg) { continue; }
+        if func.reg_struct_ids.contains_key(reg) { continue; }
+        if let Some(candidates) = func.var_type_candidates.get(reg) {
+            let current_idx = state.var_decl_idx.get(reg).copied().unwrap_or(0);
+            let current_is_ptr = candidates.get(current_idx)
+                .map(|s| s.starts_with("ptr_"))
+                .unwrap_or(false);
+            if !current_is_ptr { continue; }
+            // Prefer int_I64 then int_I32 then any non-ptr non-float candidate.
+            let preferred = ["int_I64", "int_I32", "int_I64_unsigned", "int_I32_unsigned"];
+            let chosen = preferred.iter()
+                .find_map(|p| candidates.iter().position(|s| s == *p))
+                .or_else(|| candidates.iter().position(|s|
+                    !s.starts_with("ptr_") && !s.starts_with("float_")));
+            if let Some(idx) = chosen {
+                state.var_decl_idx.insert(*reg, idx);
+            }
+        }
+    }
 }
 
 /// Deterministic hash of a single ClightStmt for candidate sorting.
@@ -576,6 +743,35 @@ fn stmt_deterministic_hash(stmt: &ClightStmt) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     stmt.hash(&mut hasher);
     hasher.finish()
+}
+
+/// True if the stmt (or any sub-stmt/sub-expr) contains an Efield access; used to prefer recovered struct-field forms over raw pointer derefs in candidate selection.
+fn stmt_uses_efield(stmt: &ClightStmt) -> bool {
+    fn expr_has_efield(e: &ClightExpr) -> bool {
+        match e {
+            ClightExpr::Efield(..) => true,
+            ClightExpr::Ederef(inner, _)
+            | ClightExpr::Eaddrof(inner, _)
+            | ClightExpr::Eunop(_, inner, _)
+            | ClightExpr::Ecast(inner, _) => expr_has_efield(inner),
+            ClightExpr::Ebinop(_, l, r, _) => expr_has_efield(l) || expr_has_efield(r),
+            ClightExpr::Econdition(c, t, f, _) => expr_has_efield(c) || expr_has_efield(t) || expr_has_efield(f),
+            _ => false,
+        }
+    }
+    match stmt {
+        ClightStmt::Sassign(l, r) => expr_has_efield(l) || expr_has_efield(r),
+        ClightStmt::Sset(_, e) => expr_has_efield(e),
+        ClightStmt::Scall(_, f, args) => expr_has_efield(f) || args.iter().any(expr_has_efield),
+        ClightStmt::Sbuiltin(_, _, _, args) => args.iter().any(expr_has_efield),
+        ClightStmt::Sreturn(Some(e)) => expr_has_efield(e),
+        ClightStmt::Sifthenelse(c, t, e) => expr_has_efield(c) || stmt_uses_efield(t) || stmt_uses_efield(e),
+        ClightStmt::Ssequence(ss) => ss.iter().any(stmt_uses_efield),
+        ClightStmt::Sloop(a, b) => stmt_uses_efield(a) || stmt_uses_efield(b),
+        ClightStmt::Slabel(_, inner) => stmt_uses_efield(inner),
+        ClightStmt::Sswitch(e, cases) => expr_has_efield(e) || cases.iter().any(|(_, s)| stmt_uses_efield(s)),
+        _ => false,
+    }
 }
 
 /// Deterministic hash of a HybridFunctionState for beam tie-breaking.
@@ -589,6 +785,10 @@ fn state_deterministic_hash(state: &HybridFunctionState) -> u64 {
     }
     for (reg, idx) in &state.var_decl_idx {
         reg.hash(&mut hasher);
+        idx.hash(&mut hasher);
+    }
+    for (key, idx) in &state.struct_field_type_idx {
+        key.hash(&mut hasher);
         idx.hash(&mut hasher);
     }
     hasher.finish()
@@ -657,6 +857,7 @@ fn function_based_parallel_search(
     functions: &[FunctionData],
     global_struct_fields: &HashMap<i64, Vec<(i64, Ident, MemoryChunk)>>,
     global_canonical_to_reg_key: &HashMap<i64, Vec<i64>>,
+    name_to_ident: &HashMap<String, Ident>,
 ) -> ProgramSelectionState {
     let step_budget: usize = std::env::var("CLIGHT_SELECT_STEPS")
         .ok()
@@ -691,6 +892,7 @@ fn function_based_parallel_search(
             let result = function_standalone_search(
                 func, &meta,
                 global_struct_fields, global_canonical_to_reg_key,
+                name_to_ident,
                 step_budget, max_per_node,
             );
 
@@ -715,8 +917,9 @@ fn function_standalone_search(
     meta: &RefinableMetadata,
     global_struct_fields: &HashMap<i64, Vec<(i64, Ident, MemoryChunk)>>,
     global_canonical_to_reg_key: &HashMap<i64, Vec<i64>>,
+    name_to_ident: &HashMap<String, Ident>,
     step_budget: usize,
-    _max_per_node: usize,
+    max_per_node: usize,
 ) -> HybridFunctionState {
     let mut state = build_hybrid_initial_state(func);
     let mut func_view = func.clone();
@@ -747,7 +950,7 @@ fn function_standalone_search(
                 }
             }
         }
-        let (c_code, line_map) = emit_function_c(func_view, &stmts, global_struct_fields, global_canonical_to_reg_key);
+        let (c_code, line_map) = emit_function_c(func_view, &stmts, global_struct_fields, global_canonical_to_reg_key, name_to_ident);
         let errors = run_clang_check(&c_code);
         if errors.is_empty() {
             return (0, Vec::new(), HashMap::new());
@@ -763,21 +966,28 @@ fn function_standalone_search(
                 if is_refinable && seen.insert(node) {
                     error_nodes.push(node);
                 } else if !is_refinable {
-                    if let Some(stmt) = stmts.get(&node) {
-                        let regs = crate::decompile::passes::clight_select::query::collect_stmt_regs(stmt);
-                        for reg in &regs {
-                            if let Some(pos) = func.param_regs.iter().position(|r| r == reg) {
-                                let pn = PARAM_NODE_BASE.wrapping_add(pos as u64);
-                                if meta.param_node_to_pos.contains_key(&pn) && seen.insert(pn) {
-                                    node_errors.entry(pn).or_default().push(error.message.clone());
-                                    error_nodes.push(pn);
-                                }
+                    // Prefer the register identified by the error column.
+                    let preferred = extract_reg_at_column(&c_code, error.line, error.column);
+                    let stmt_regs: Vec<RTLReg> = stmts.get(&node)
+                        .map(|s| crate::decompile::passes::clight_select::query::collect_stmt_regs(s))
+                        .unwrap_or_default();
+                    let target_regs: Vec<RTLReg> = match preferred {
+                        Some(r) if stmt_regs.contains(&r) => vec![r],
+                        Some(r) => vec![r],
+                        None => stmt_regs,
+                    };
+                    for reg in &target_regs {
+                        if let Some(pos) = func.param_regs.iter().position(|r| r == reg) {
+                            let pn = PARAM_NODE_BASE.wrapping_add(pos as u64);
+                            if meta.param_node_to_pos.contains_key(&pn) && seen.insert(pn) {
+                                node_errors.entry(pn).or_default().push(error.message.clone());
+                                error_nodes.push(pn);
                             }
-                            let dn = DECL_NODE_BASE.wrapping_add(*reg);
-                            if meta.decl_node_to_reg.contains_key(&dn) && seen.insert(dn) {
-                                node_errors.entry(dn).or_default().push(error.message.clone());
-                                error_nodes.push(dn);
-                            }
+                        }
+                        let dn = DECL_NODE_BASE.wrapping_add(*reg);
+                        if meta.decl_node_to_reg.contains_key(&dn) && seen.insert(dn) {
+                            node_errors.entry(dn).or_default().push(error.message.clone());
+                            error_nodes.push(dn);
                         }
                     }
                 }
@@ -792,12 +1002,19 @@ fn function_standalone_search(
     if current_errors == 0 { return state; }
 
     let mut steps = 0usize;
+    let wave12_budget = step_budget * 3 / 4;
 
-    // Wave 1: Batch error-directed fixes.
-    // Apply all directed type fixes in one batch, then evaluate once.
-    {
-        let mut batch = state.clone();
-        let mut any_fix = false;
+    // Outer iteration: re-run Wave 1 + Wave 2 while errors strictly decrease.
+    let max_outer_iters: usize = 4;
+    let mut iter = 0usize;
+    while iter < max_outer_iters && current_errors > 0 && steps < wave12_budget {
+        iter += 1;
+        let pre_iter_errors = current_errors;
+
+        // Wave 1: collect directed fixes (deterministically by sorted error_nodes), then
+        // try the full batch. If errors regress, bisect to extract the helpful subset.
+        let mut fix_pairs: Vec<(RTLReg, usize)> = Vec::new();
+        let mut seen_regs: HashSet<RTLReg> = HashSet::new();
         for &node in &error_nodes {
             let directed = node_errors.get(&node).and_then(|msgs| {
                 for msg in msgs {
@@ -808,7 +1025,7 @@ fn function_standalone_search(
                         Some(r)
                     } else { None };
                     if let Some(reg) = reg {
-                        let current = batch.var_decl_idx.get(&reg).copied().unwrap_or(0);
+                        let current = state.var_decl_idx.get(&reg).copied().unwrap_or(0);
                         if let Some(new_idx) = find_directed_type_idx(reg, want_ptr, current, func) {
                             return Some((reg, new_idx));
                         }
@@ -817,39 +1034,76 @@ fn function_standalone_search(
                 None
             });
             if let Some((reg, new_idx)) = directed {
-                batch.var_decl_idx.insert(reg, new_idx);
-                any_fix = true;
+                if seen_regs.insert(reg) {
+                    fix_pairs.push((reg, new_idx));
+                }
             }
         }
-        if any_fix {
-            steps += 1;
-            let (batch_errors, batch_en, batch_ne) = evaluate(&batch, &mut func_view);
-            if batch_errors <= current_errors {
-                state = batch;
-                current_errors = batch_errors;
-                error_nodes = batch_en;
-                node_errors = batch_ne;
-                if current_errors == 0 { return state; }
-            }
-        }
-    }
 
-    let wave2_budget = step_budget * 3 / 4;
-    {
+        // Bisection: try a slice; if it does not improve, recursively split.
+        // Each evaluate() call costs 1 step. Returns the best (errors, state, en, ne) found.
+        fn bisect_apply(
+            base: &HybridFunctionState,
+            base_errors: usize,
+            base_en: &[Node],
+            base_ne: &HashMap<Node, Vec<String>>,
+            fixes: &[(RTLReg, usize)],
+            steps: &mut usize,
+            budget: usize,
+            evaluate: &mut dyn FnMut(&HybridFunctionState) -> (usize, Vec<Node>, HashMap<Node, Vec<String>>),
+        ) -> (HybridFunctionState, usize, Vec<Node>, HashMap<Node, Vec<String>>) {
+            if fixes.is_empty() || *steps >= budget {
+                return (base.clone(), base_errors, base_en.to_vec(), base_ne.clone());
+            }
+            let mut trial = base.clone();
+            for (reg, idx) in fixes {
+                trial.var_decl_idx.insert(*reg, *idx);
+            }
+            *steps += 1;
+            let (e, en, ne) = evaluate(&trial);
+            // Strict decrease only (matches Wave 2 / outer-loop progress check); committing ties would let the outer loop mistake a tie for progress and never converge.
+            if e < base_errors {
+                return (trial, e, en, ne);
+            }
+            if fixes.len() == 1 {
+                return (base.clone(), base_errors, base_en.to_vec(), base_ne.clone());
+            }
+            let mid = fixes.len() / 2;
+            let (s1, e1, en1, ne1) = bisect_apply(base, base_errors, base_en, base_ne, &fixes[..mid], steps, budget, evaluate);
+            bisect_apply(&s1, e1, &en1, &ne1, &fixes[mid..], steps, budget, evaluate)
+        }
+
+        if !fix_pairs.is_empty() && steps < wave12_budget {
+            // bisect_apply needs an FnMut over a closure that captures func_view.
+            let mut eval_fn = |s: &HybridFunctionState| evaluate(s, &mut func_view);
+            let (new_state, new_err, new_en, new_ne) = bisect_apply(
+                &state, current_errors, &error_nodes, &node_errors,
+                &fix_pairs, &mut steps, wave12_budget, &mut eval_fn,
+            );
+            state = new_state;
+            current_errors = new_err;
+            error_nodes = new_en;
+            node_errors = new_ne;
+            if current_errors == 0 { return state; }
+        }
+
+        // Wave 2: per error-node, try alternatives in parallel; keep strict best.
         let sorted_errors: Vec<Node> = error_nodes.clone();
         for node in &sorted_errors {
-            if steps >= wave2_budget { break; }
+            if steps >= wave12_budget { break; }
 
             let alts = build_hybrid_alternatives(*node, &state, func, meta);
             if alts.is_empty() { continue; }
 
-            let budget_here = (wave2_budget - steps).min(alts.len());
+            let cap_per_node = if max_per_node == 0 { alts.len() } else { max_per_node };
+            let budget_here = (wave12_budget - steps).min(alts.len()).min(cap_per_node);
             if budget_here == 0 { break; }
             steps += budget_here;
 
             type TrialResult = (usize, HybridFunctionState, usize, Vec<Node>, HashMap<Node, Vec<String>>);
             let results: Vec<TrialResult> = alts[..budget_here].par_iter().enumerate()
                 .map(|(i, &alt)| {
+                    let _ = clang_sys::load();
                     let mut trial = state.clone();
                     apply_hybrid_choice(&mut trial, *node, alt, func, meta);
                     let mut fv = func.clone();
@@ -870,9 +1124,17 @@ fn function_standalone_search(
                 }
             }
         }
+
+        if current_errors >= pre_iter_errors {
+            break;
+        }
     }
 
-    let beam_width: usize = 3;
+    let beam_width_cap: usize = std::env::var("CLIGHT_SELECT_BEAM_WIDTH")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    // Scale beam width with the remaining error count: more errors -> wider beam,
+    // bounded by cap. Floor of 3 preserves prior behavior.
+    let beam_width: usize = (current_errors / 2).max(3).min(beam_width_cap);
     if steps < step_budget && current_errors > 0 {
         let remaining_errors: Vec<Node> = error_nodes.iter()
             .filter(|n| !build_hybrid_alternatives(**n, &state, func, meta).is_empty())
@@ -905,6 +1167,7 @@ fn function_standalone_search(
 
                 let trials: Vec<(HybridFunctionState, usize, Vec<Node>, HashMap<Node, Vec<String>>)> =
                     trial_specs.par_iter().map(|&(b, alt)| {
+                        let _ = clang_sys::load();
                         let (beam_state, _, _, _) = &beam[b];
                         let mut trial = beam_state.clone();
                         apply_hybrid_choice(&mut trial, node, alt, func, meta);
@@ -956,7 +1219,14 @@ fn assemble_loops(
 
     for (&header, info) in &headers {
         let header_label = ident_from_node(header);
-        let body_node_set: HashSet<Node> = info.body_nodes.iter().copied().collect();
+        // Body iteration order is sorted by node id (i.e. address order).
+        // Include the header itself (its own statement is part of the loop body).
+        let mut body_iter_nodes: Vec<Node> = info.body_nodes.iter().copied().collect();
+        if !body_iter_nodes.contains(&header) {
+            body_iter_nodes.push(header);
+        }
+        body_iter_nodes.sort();
+        let body_node_set: HashSet<Node> = body_iter_nodes.iter().copied().collect();
 
         // Determine exit target: the node just after the loop.
         let exit_target_label: Option<Ident> = info.primary_exit.as_ref().map(|pe| {
@@ -966,7 +1236,7 @@ fn assemble_loops(
 
         let mut body_stmts: Vec<ClightStmt> = Vec::new();
 
-        for &node in &info.body_nodes {
+        for &node in &body_iter_nodes {
             // Use pre-built break statement if this is a non-primary loop exit
             if let Some(break_stmt) = info.break_stmts.get(&node) {
                 body_stmts.push(break_stmt.clone());
@@ -1025,9 +1295,7 @@ fn assemble_loops(
     }
 }
 
-// Assemble compound if-then-else from structural metadata, analogous to
-// assemble_loops.  Operates on already-typed ClightStmt so no type decisions
-// are made here -- only structural grouping.
+// Assemble compound if-then-else from structural metadata (analogous to assemble_loops); operates on already-typed ClightStmt so no type decisions are made.
 fn assemble_ite(
     statements: &mut HashMap<Node, ClightStmt>,
     ite_info: &HashMap<Node, IteInfo>,
@@ -1167,10 +1435,84 @@ fn xtype_str_to_clight_type(s: &str) -> ClightType {
     }
 }
 
+fn xtype_to_clight_type(xt: &XType) -> ClightType {
+    let attr = ClightAttr::default();
+    match xt {
+        XType::Xvoid => ClightType::Tvoid,
+        XType::Xbool => ClightType::Tint(ClightIntSize::IBool, ClightSignedness::Signed, attr),
+        XType::Xint8signed => ClightType::Tint(ClightIntSize::I8, ClightSignedness::Signed, attr),
+        XType::Xint8unsigned => ClightType::Tint(ClightIntSize::I8, ClightSignedness::Unsigned, attr),
+        XType::Xint16signed => ClightType::Tint(ClightIntSize::I16, ClightSignedness::Signed, attr),
+        XType::Xint16unsigned => ClightType::Tint(ClightIntSize::I16, ClightSignedness::Unsigned, attr),
+        XType::Xint | XType::Xany32 => ClightType::Tint(ClightIntSize::I32, ClightSignedness::Signed, attr),
+        XType::Xintunsigned => ClightType::Tint(ClightIntSize::I32, ClightSignedness::Unsigned, attr),
+        XType::Xlong | XType::Xany64 => ClightType::Tlong(ClightSignedness::Signed, attr),
+        XType::Xlongunsigned => ClightType::Tlong(ClightSignedness::Unsigned, attr),
+        XType::Xfloat => ClightType::Tfloat(ClightFloatSize::F64, attr),
+        XType::Xsingle => ClightType::Tfloat(ClightFloatSize::F32, attr),
+        XType::Xptr => ClightType::Tpointer(
+            std::sync::Arc::new(ClightType::Tlong(ClightSignedness::Signed, attr.clone())),
+            attr,
+        ),
+        XType::Xcharptr => ClightType::Tpointer(
+            std::sync::Arc::new(ClightType::Tint(ClightIntSize::I8, ClightSignedness::Signed, attr.clone())),
+            attr,
+        ),
+        XType::Xcharptrptr => ClightType::Tpointer(
+            std::sync::Arc::new(ClightType::Tpointer(
+                std::sync::Arc::new(ClightType::Tint(ClightIntSize::I8, ClightSignedness::Signed, attr.clone())),
+                attr.clone(),
+            )),
+            attr,
+        ),
+        XType::Xintptr => ClightType::Tpointer(
+            std::sync::Arc::new(ClightType::Tint(ClightIntSize::I32, ClightSignedness::Signed, attr.clone())),
+            attr,
+        ),
+        XType::Xfloatptr => ClightType::Tpointer(
+            std::sync::Arc::new(ClightType::Tfloat(ClightFloatSize::F64, attr.clone())),
+            attr,
+        ),
+        XType::Xsingleptr => ClightType::Tpointer(
+            std::sync::Arc::new(ClightType::Tfloat(ClightFloatSize::F32, attr.clone())),
+            attr,
+        ),
+        XType::Xfuncptr => ClightType::Tpointer(
+            std::sync::Arc::new(ClightType::Tlong(ClightSignedness::Signed, attr.clone())),
+            attr,
+        ),
+        XType::XstructPtr(sid) => ClightType::Tpointer(
+            std::sync::Arc::new(ClightType::Tstruct(*sid, attr.clone())),
+            attr,
+        ),
+    }
+}
+
+fn callee_ident_from_expr(
+    func_expr: &ClightExpr,
+    name_to_ident: &HashMap<String, Ident>,
+) -> Option<Ident> {
+    match func_expr {
+        ClightExpr::Evar(id, _) => Some(*id as Ident),
+        ClightExpr::EvarSymbol(name, _) => {
+            let key = name.to_string();
+            if let Some(&id) = name_to_ident.get(&key) {
+                return Some(id);
+            }
+            let sanitized = crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(name);
+            name_to_ident.get(&sanitized).copied()
+        }
+        ClightExpr::Eaddrof(inner, _) => callee_ident_from_expr(inner, name_to_ident),
+        ClightExpr::Ecast(inner, _) => callee_ident_from_expr(inner, name_to_ident),
+        _ => None,
+    }
+}
+
 /// Add explicit casts to fix ptr/int type mismatches in a ClightStmt (values are correct on x86-64, only C types differ).
 fn fixup_ptr_int_casts(
     stmt: &ClightStmt,
     var_decl_type: &dyn Fn(Ident) -> Option<ClightType>,
+    callee_param_types: &dyn Fn(&ClightExpr) -> Option<Vec<ClightType>>,
 ) -> ClightStmt {
     fn fixup_expr(expr: &ClightExpr) -> ClightExpr {
         match expr {
@@ -1232,28 +1574,44 @@ fn fixup_ptr_int_casts(
             ClightStmt::Sset(*id, rhs)
         }
         ClightStmt::Scall(ret, func, args) => {
-            ClightStmt::Scall(*ret, fixup_expr(func), args.iter().map(|a| fixup_expr(a)).collect())
+            let fixed_func = fixup_expr(func);
+            let param_types = callee_param_types(&fixed_func);
+            let fixed_args: Vec<ClightExpr> = args.iter().enumerate().map(|(i, a)| {
+                let fixed_a = fixup_expr(a);
+                if let Some(ref pts) = param_types {
+                    if let Some(target_ty) = pts.get(i) {
+                        let arg_ty = clight_expr_type(&fixed_a);
+                        let arg_is_ptr = matches!(arg_ty, ClightType::Tpointer(..));
+                        let target_is_ptr = matches!(target_ty, ClightType::Tpointer(..));
+                        if arg_is_ptr != target_is_ptr {
+                            return ClightExpr::Ecast(Box::new(fixed_a), target_ty.clone());
+                        }
+                    }
+                }
+                fixed_a
+            }).collect();
+            ClightStmt::Scall(*ret, fixed_func, fixed_args)
         }
         ClightStmt::Sbuiltin(ret, ef, tys, args) => {
             ClightStmt::Sbuiltin(*ret, ef.clone(), tys.clone(), args.iter().map(|a| fixup_expr(a)).collect())
         }
         ClightStmt::Sifthenelse(cond, t, f) => {
-            ClightStmt::Sifthenelse(fixup_expr(cond), Box::new(fixup_ptr_int_casts(t, var_decl_type)), Box::new(fixup_ptr_int_casts(f, var_decl_type)))
+            ClightStmt::Sifthenelse(fixup_expr(cond), Box::new(fixup_ptr_int_casts(t, var_decl_type, callee_param_types)), Box::new(fixup_ptr_int_casts(f, var_decl_type, callee_param_types)))
         }
         ClightStmt::Ssequence(stmts) => {
-            ClightStmt::Ssequence(stmts.iter().map(|s| fixup_ptr_int_casts(s, var_decl_type)).collect())
+            ClightStmt::Ssequence(stmts.iter().map(|s| fixup_ptr_int_casts(s, var_decl_type, callee_param_types)).collect())
         }
         ClightStmt::Sloop(a, b) => {
-            ClightStmt::Sloop(Box::new(fixup_ptr_int_casts(a, var_decl_type)), Box::new(fixup_ptr_int_casts(b, var_decl_type)))
+            ClightStmt::Sloop(Box::new(fixup_ptr_int_casts(a, var_decl_type, callee_param_types)), Box::new(fixup_ptr_int_casts(b, var_decl_type, callee_param_types)))
         }
         ClightStmt::Sswitch(expr, cases) => {
-            ClightStmt::Sswitch(fixup_expr(expr), cases.iter().map(|(v, s)| (*v, fixup_ptr_int_casts(s, var_decl_type))).collect())
+            ClightStmt::Sswitch(fixup_expr(expr), cases.iter().map(|(v, s)| (*v, fixup_ptr_int_casts(s, var_decl_type, callee_param_types))).collect())
         }
         ClightStmt::Sreturn(Some(expr)) => {
             ClightStmt::Sreturn(Some(fixup_expr(expr)))
         }
         ClightStmt::Slabel(id, inner) => {
-            ClightStmt::Slabel(*id, Box::new(fixup_ptr_int_casts(inner, var_decl_type)))
+            ClightStmt::Slabel(*id, Box::new(fixup_ptr_int_casts(inner, var_decl_type, callee_param_types)))
         }
         _ => stmt.clone(),
     }
@@ -1266,6 +1624,7 @@ fn emit_function_c(
     statements: &HashMap<Node, ClightStmt>,
     global_struct_fields: &HashMap<i64, Vec<(i64, Ident, MemoryChunk)>>,
     global_canonical_to_reg_key: &HashMap<i64, Vec<i64>>,
+    name_to_ident: &HashMap<String, Ident>,
 ) -> (String, HashMap<usize, Node>) {
     use crate::decompile::passes::c_pass::types::{CExpr, CStmt, CType, TypeQualifiers};
 
@@ -1299,11 +1658,17 @@ fn emit_function_c(
             }
         };
 
+        let callee_param_types = |f: &ClightExpr| -> Option<Vec<ClightType>> {
+            let id = callee_ident_from_expr(f, name_to_ident)?;
+            let sig = func.callee_signatures.get(&id)?;
+            Some(sig.param_types.iter().map(xtype_to_clight_type).collect())
+        };
+
         let mut sorted_nodes: Vec<Node> = statements.keys().copied().collect();
         sorted_nodes.sort();
         for node in &sorted_nodes {
             let clight_stmt = &statements[node];
-            let fixed = fixup_ptr_int_casts(clight_stmt, &var_decl_type);
+            let fixed = fixup_ptr_int_casts(clight_stmt, &var_decl_type, &callee_param_types);
             let cstmt = convert_stmt(&fixed, &mut ctx);
             all_cstmts.push((*node, cstmt));
         }
@@ -1398,9 +1763,8 @@ fn emit_function_c(
 
                 // Map this field line to a synthetic node for clang_refine
                 let current_line = out.lines().count() + 1;
-                let struct_hash: u64 = name.strip_prefix("struct_").unwrap_or("0")
-                    .chars().take(8).collect::<String>()
-                    .parse::<u64>().unwrap_or(0);
+                let struct_hex = name.strip_prefix("struct_").unwrap_or("0");
+                let struct_hash: u64 = u64::from_str_radix(struct_hex, 16).unwrap_or(0) & 0x0000_FFFF_FFFF_FFFF;
                 let field_node = STRUCT_FIELD_NODE_BASE
                     .wrapping_add(struct_hash << 16)
                     .wrapping_add(*_offset as u64);
@@ -1419,7 +1783,8 @@ fn emit_function_c(
     let mut sorted_funcs: Vec<&String> = all_func_calls.iter().collect();
     sorted_funcs.sort();
     for name in sorted_funcs {
-        out.push_str(&format!("long {}();\n", name));
+        let sig = lookup_callee_signature(name, &func.callee_signatures, name_to_ident);
+        out.push_str(&forward_decl_for(name, sig));
     }
 
     out.push('\n');
@@ -2056,6 +2421,60 @@ fn run_clang_check(c_code: &str) -> Vec<ClangError> {
     }
 }
 
+
+fn xtype_to_c_decl_str(xt: &XType) -> String {
+    match xt {
+        XType::Xvoid => "void".to_string(),
+        XType::Xbool => "int".to_string(),
+        XType::Xint8signed => "signed char".to_string(),
+        XType::Xint8unsigned => "unsigned char".to_string(),
+        XType::Xint16signed => "short".to_string(),
+        XType::Xint16unsigned => "unsigned short".to_string(),
+        XType::Xint | XType::Xany32 => "int".to_string(),
+        XType::Xintunsigned => "unsigned int".to_string(),
+        XType::Xlong | XType::Xany64 => "long".to_string(),
+        XType::Xlongunsigned => "unsigned long".to_string(),
+        XType::Xfloat => "double".to_string(),
+        XType::Xsingle => "float".to_string(),
+        XType::Xptr => "void *".to_string(),
+        XType::Xcharptr => "char *".to_string(),
+        XType::Xcharptrptr => "char **".to_string(),
+        XType::Xintptr => "int *".to_string(),
+        XType::Xfloatptr => "double *".to_string(),
+        XType::Xsingleptr => "float *".to_string(),
+        XType::Xfuncptr => "void (*)()".to_string(),
+        XType::XstructPtr(sid) => format!("struct struct_{:x} *", sid),
+    }
+}
+
+fn lookup_callee_signature<'a>(
+    name: &str,
+    sigs: &'a HashMap<Ident, CalleeSignature>,
+    name_to_ident: &HashMap<String, Ident>,
+) -> Option<&'a CalleeSignature> {
+    if let Some(rest) = name.strip_prefix("var_") {
+        if let Ok(id) = rest.parse::<Ident>() {
+            if let Some(sig) = sigs.get(&id) {
+                return Some(sig);
+            }
+        }
+    }
+    name_to_ident.get(name).and_then(|id| sigs.get(id))
+}
+
+fn forward_decl_for(
+    name: &str,
+    sig: Option<&CalleeSignature>,
+) -> String {
+    // K&R-style `<ret> name();` decl: variadic-friendly (printf/fprintf don't error on extras), still gives clang the right return type so `r = call()` yields real ptr/int diagnostics for Wave 1, and per-arg casts via callee_signatures (D11) already run at C-emission.
+    match sig {
+        Some(sig) => {
+            let ret = xtype_to_c_decl_str(&sig.return_type);
+            format!("{} {}();\n", ret, name)
+        }
+        None => format!("long {}();\n", name),
+    }
+}
 
 fn convert_clight_return_type(ty: &ClightType) -> String {
     match ty {

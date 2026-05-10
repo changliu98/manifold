@@ -524,18 +524,12 @@ impl IRPass for ClightEmitPass {
             id_to_name.entry(g.id).or_insert_with(|| g.name.clone());
         }
 
-        // Resolve auto-generated L_XXXX labels by merging fragmented func_stacksz ranges back into their containing function.
+        // Resolve auto-gen L_XXXX labels from linker-fragmented funcs (multiple func_stacksz entries); rename only those fragments to their containing function. Disassembler-created internal jump targets stay so internal gotos don't collide.
         {
             let is_generated_label = |n: &str| -> bool {
                 n.strip_prefix("L_")
                     .map_or(false, |h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
             };
-
-            // Collect jump table target addresses to prevent label-to-function-name resolution
-            let jump_table_target_addrs: HashSet<u64> = db
-                .rel_iter::<(Node, usize, Node)>("jump_table_target")
-                .map(|(_, _, target)| *target)
-                .collect();
 
             let mut raw: Vec<(u64, u64, String)> = db
                 .rel_iter::<(Address, Address, Symbol, u64)>("func_stacksz")
@@ -543,14 +537,15 @@ impl IRPass for ClightEmitPass {
                 .collect();
             raw.sort_by_key(|(s, _, _)| *s);
 
-            // Merge: absorb consecutive L_XXXX entries into the preceding real function
+            // Map of absorbed-fragment address -> absorbing function name; only these are renamed below.
+            let mut absorbed_fragment: HashMap<u64, String> = HashMap::new();
             let mut func_ranges: Vec<(u64, u64, String)> = Vec::new();
             for (start, end, name) in raw {
                 if is_generated_label(&name) {
-                    // Extend the previous real function's end to cover this fragment
                     if let Some(last) = func_ranges.last_mut() {
                         if start == last.1 {
                             last.1 = end;
+                            absorbed_fragment.insert(start, last.2.clone());
                             continue;
                         }
                     }
@@ -566,19 +561,8 @@ impl IRPass for ClightEmitPass {
                     Ok(a) => a,
                     Err(_) => continue,
                 };
-                // Don't rename labels that are jump table targets (internal labels needed by switch/case gotos)
-                if jump_table_target_addrs.contains(&addr) {
-                    continue;
-                }
-                let idx = match func_ranges.binary_search_by_key(&addr, |(s, _, _)| *s) {
-                    Ok(i) => i,
-                    Err(i) => i,
-                };
-                if idx > 0 {
-                    let (start, end, func_name) = &func_ranges[idx - 1];
-                    if addr >= *start && addr < *end {
-                        *name = func_name.clone();
-                    }
+                if let Some(func_name) = absorbed_fragment.get(&addr) {
+                    *name = func_name.clone();
                 }
             }
         }

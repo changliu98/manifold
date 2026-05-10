@@ -489,6 +489,14 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
         }
     }
 
+    // Populate reg_struct_ids BEFORE building candidates so ptr_struct_X candidates exist for struct-pointer regs; otherwise the selector falls back to ptr_int/ptr_char/ptr_void and emits `*(int *)p1` instead of `p1->ofs_0`.
+    for (addr, reg, id) in db.rel_iter::<(Address, RTLReg, usize)>("reg_to_struct_id") {
+        if let Some(func) = func_map.get_mut(addr) {
+            let canonical_id = struct_canonical.get(id).copied().unwrap_or(*id);
+            func.reg_struct_ids.insert(*reg, canonical_id);
+        }
+    }
+
     // Store all type candidates per register (sorted by priority, best first) and pad with same-size-class alternatives so clang_refine can search across ptr/int within the same width.
     for func in func_map.values_mut() {
         let all_regs: Vec<RTLReg> = func.used_regs.iter().copied()
@@ -527,7 +535,7 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
                     }
                     // Add pointer declaration alternatives only when the register has pointer evidence from the pipeline.
                     if has_ptr {
-                        for alt in ["ptr_int", "ptr_char"] {
+                        for alt in ["ptr_int", "ptr_char", "ptr_void"] {
                             let s = alt.to_string();
                             if !candidates.contains(&s) {
                                 candidates.push(s);
@@ -550,13 +558,6 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
                 );
                 func.var_type_candidates.insert(reg, candidates);
             }
-        }
-    }
-
-    for (addr, reg, id) in db.rel_iter::<(Address, RTLReg, usize)>("reg_to_struct_id") {
-        if let Some(func) = func_map.get_mut(addr) {
-            let canonical_id = struct_canonical.get(id).copied().unwrap_or(*id);
-            func.reg_struct_ids.insert(*reg, canonical_id);
         }
     }
 
@@ -950,6 +951,7 @@ pub struct LoopInfo {
 pub fn extract_loop_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, LoopInfo>> {
     let mut result: HashMap<Address, HashMap<Node, LoopInfo>> = HashMap::new();
 
+
     for (func_addr, loop_head, body_node) in db.rel_iter::<(Address, Node, Node)>("emit_loop_body") {
         if body_node != loop_head {
             result
@@ -1018,6 +1020,13 @@ pub fn extract_loop_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, Loo
             .entry(*loop_header)
             .or_insert_with(LoopInfo::default);
         info.break_stmts.insert(*exit_node, break_stmt.clone());
+    }
+
+    // Sort loop body nodes by id (address-encoded) for program order; Ascent set order is nondeterministic and may push calls past control-flow exits causing them to be eliminated as unreachable.
+    for func_map in result.values_mut() {
+        for info in func_map.values_mut() {
+            info.body_nodes.sort();
+        }
     }
 
     result

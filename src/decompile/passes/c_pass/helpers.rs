@@ -523,6 +523,7 @@ pub fn xtype_string_to_ctype(type_str: &str) -> CType {
         "float_F32" => CType::Float(FloatSize::Float),
         "float_F64" => CType::Float(FloatSize::Double),
         "ptr_I64" => CType::Pointer(Box::new(CType::long()), crate::decompile::passes::c_pass::types::TypeQualifiers::none()),
+        "ptr_void" => CType::Pointer(Box::new(CType::Void), crate::decompile::passes::c_pass::types::TypeQualifiers::none()),
         "ptr_char" => CType::Pointer(Box::new(CType::char_signed()), crate::decompile::passes::c_pass::types::TypeQualifiers::none()),
         "ptr_int" => CType::Pointer(Box::new(CType::int()), crate::decompile::passes::c_pass::types::TypeQualifiers::none()),
         "ptr_double" => CType::Pointer(Box::new(CType::double()), crate::decompile::passes::c_pass::types::TypeQualifiers::none()),

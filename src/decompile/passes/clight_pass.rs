@@ -141,9 +141,25 @@ ascent_par! {
         clight_stmt_without_field(node, s),
         if let Some(stmt) = check_clight_stmt(s);
 
+    // Statement-level cmov: lift `Sset(dst, Econdition(cond,t,f))` to `Sifthenelse(cond, Sset(dst,t), Sset(dst,f))` so tests matching `if (...)...else...` succeed instead of seeing a ternary.
+    clight_stmt_without_field(node, stmt) <--
+        csharp_stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
+        if let CsharpminorExpr::Econdition(cond, true_val, false_val) = expr,
+        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        let vars_used = extract_vars_from_csharp_exprs(&[(**cond).clone(), (**true_val).clone(), (**false_val).clone()]),
+        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        let cond_clight = clight_expr_from_csharp_with_multi_types(cond, &var_types),
+        let true_clight = clight_expr_from_csharp_with_multi_types(true_val, &var_types),
+        let false_clight = clight_expr_from_csharp_with_multi_types(false_val, &var_types),
+        let dst_ident = ident_from_reg(*dst),
+        let then_stmt = ClightStmt::Sset(dst_ident, true_clight),
+        let else_stmt = ClightStmt::Sset(dst_ident, false_clight),
+        let stmt = ClightStmt::Sifthenelse(cond_clight, Box::new(then_stmt), Box::new(else_stmt));
+
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
         is_ptr(dst),
+        if !matches!(expr, CsharpminorExpr::Econdition(_, _, _)),
         agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
         let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]),
         let var_type_variants = build_var_type_map_variants(&all_var_types, &vars_used),
@@ -157,6 +173,7 @@ ascent_par! {
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
         emit_var_type_candidate(*dst, dst_xtype),
+        if !matches!(expr, CsharpminorExpr::Econdition(_, _, _)),
         agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
         let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]),
         let var_type_variants = build_var_type_map_variants(&all_var_types, &vars_used),
@@ -171,6 +188,7 @@ ascent_par! {
         csharp_stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
         !is_ptr(dst),
         !emit_var_type_candidate(*dst, _),
+        if !matches!(expr, CsharpminorExpr::Econdition(_, _, _)),
         agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
         let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]),
         let var_type_variants = build_var_type_map_variants(&all_var_types, &vars_used),
@@ -186,6 +204,7 @@ ascent_par! {
         csharp_stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
         !is_ptr(dst),
         !emit_var_type_candidate(*dst, _),
+        if !matches!(expr, CsharpminorExpr::Econdition(_, _, _)),
         agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
         let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]),
         let var_type_variants = build_var_type_map_variants(&all_var_types, &vars_used),
@@ -1766,6 +1785,26 @@ pub fn extract_struct_field_info(expr: &CsharpminorExpr) -> Option<(i64, i64)> {
                             return Some((base_key, field));
                         }
                     }
+                    // `base + idx*scale + ofs` (clang-style non-hoisted indexed load): attribute field offset to `base` so per-element ofs_N is still recovered.
+                    CsharpminorExpr::Ebinop(op, lhs, rhs)
+                        if matches!(op, CminorBinop::Oadd | CminorBinop::Oaddl) =>
+                    {
+                        let base_reg = match (lhs.as_ref(), rhs.as_ref()) {
+                            (CsharpminorExpr::Evar(r), other) | (other, CsharpminorExpr::Evar(r))
+                                if !matches!(other, CsharpminorExpr::Econst(_)) =>
+                            {
+                                Some(*r)
+                            }
+                            _ => None,
+                        };
+                        if let Some(reg) = base_reg {
+                            let base_key = reg as i64;
+                            let field = abs_i64(accumulated_offset);
+                            if is_valid_field_offset(field, chunk) {
+                                return Some((base_key, field));
+                            }
+                        }
+                    }
                     _ => {}
                 },
                 CsharpminorExpr::Econst(Constant::Oaddrstack(ofs)) => {
@@ -1774,6 +1813,51 @@ pub fn extract_struct_field_info(expr: &CsharpminorExpr) -> Option<(i64, i64)> {
                     let field = abs_ofs - base_bucket;
                     if is_valid_field_offset(field, chunk) {
                         return Some((base_bucket, field));
+                    }
+                }
+                // Bare `Evar(reg)` (no Ebinop) is an offset-0 load; treat as field 0 keyed by the reg so `*out=x` emits `out->ofs_0=x` and `cur->value; cur->next` recovers both offset 0 and 8.
+                CsharpminorExpr::Evar(reg) => {
+                    let base_key = (*reg) as i64;
+                    if is_valid_field_offset(0, chunk) {
+                        return Some((base_key, 0));
+                    }
+                }
+                // `base + idx*scale` with no constant offset (the offset-0 pair of the
+                // accumulated-offset case above). Attribute field 0 to `base`.
+                CsharpminorExpr::Ebinop(op, lhs, rhs)
+                    if matches!(op, CminorBinop::Oadd | CminorBinop::Oaddl) =>
+                {
+                    let base_reg = match (lhs.as_ref(), rhs.as_ref()) {
+                        (CsharpminorExpr::Evar(r), other) | (other, CsharpminorExpr::Evar(r))
+                            if !matches!(other, CsharpminorExpr::Econst(_)) =>
+                        {
+                            Some(*r)
+                        }
+                        _ => None,
+                    };
+                    if let Some(reg) = base_reg {
+                        let base_key = reg as i64;
+                        if is_valid_field_offset(0, chunk) {
+                            return Some((base_key, 0));
+                        }
+                    }
+    // `Oaddrstack(ofs) + idx*scale` (clang -O1 SP-indexed load): treat stack offset as a field in a bucket-0 stack-base struct so the load emits field-access instead of `*(int *)(-N + idx*S)`.
+                    let stack_base = match (lhs.as_ref(), rhs.as_ref()) {
+                        (CsharpminorExpr::Econst(Constant::Oaddrstack(ofs)), other)
+                        | (other, CsharpminorExpr::Econst(Constant::Oaddrstack(ofs)))
+                            if !matches!(other, CsharpminorExpr::Econst(_)) =>
+                        {
+                            Some(*ofs as i64)
+                        }
+                        _ => None,
+                    };
+                    if let Some(ofs) = stack_base {
+                        let abs_base = abs_i64(ofs);
+                        let base_bucket = (abs_base / 64) * 64;
+                        let field = abs_i64(abs_base - base_bucket);
+                        if is_valid_field_offset(field, chunk) {
+                            return Some((base_bucket, field));
+                        }
                     }
                 }
                 _ => {}
@@ -2880,6 +2964,15 @@ fn extract_const_offset_clight(expr: &ClightExpr) -> Option<i64> {
     }
 }
 
+/// Returns true for ClightExpr non-constant index terms (mul or arbitrary runtime expr) so the struct-base matcher can ignore them when recovering clang `base + idx*scale + ofs` field accesses.
+fn is_index_term_clight(expr: &ClightExpr) -> bool {
+    match expr {
+        ClightExpr::EconstInt(..) | ClightExpr::EconstLong(..) => false,
+        ClightExpr::Ecast(inner, _) => is_index_term_clight(inner),
+        _ => true,
+    }
+}
+
 fn extract_deref_field_pattern(inner: &ClightExpr) -> Option<(Ident, i64)> {
     let stripped = match inner {
         ClightExpr::Ecast(e, _) => e.as_ref(),
@@ -2887,9 +2980,64 @@ fn extract_deref_field_pattern(inner: &ClightExpr) -> Option<(Ident, i64)> {
     };
     match stripped {
         ClightExpr::Ebinop(ClightBinaryOp::Oadd, lhs, rhs, _) => {
-            let base_ident = extract_base_ident_clight(lhs)?;
-            let offset = extract_const_offset_clight(rhs)?;
-            Some((base_ident, offset.abs()))
+            // 1. `base + const_offset` (the original case).
+            if let (Some(base_ident), Some(offset)) = (
+                extract_base_ident_clight(lhs),
+                extract_const_offset_clight(rhs),
+            ) {
+                return Some((base_ident, offset.abs()));
+            }
+            // 2. `(base + idx*scale) + const_offset` -- clang-style indexed loads.
+            if let Some(offset) = extract_const_offset_clight(rhs) {
+                if let ClightExpr::Ebinop(ClightBinaryOp::Oadd, inner_l, inner_r, _) =
+                    match lhs.as_ref() {
+                        ClightExpr::Ecast(e, _) => e.as_ref(),
+                        other => other,
+                    }
+                {
+                    let base = match (extract_base_ident_clight(inner_l), is_index_term_clight(inner_r)) {
+                        (Some(b), true) => Some(b),
+                        _ => match (is_index_term_clight(inner_l), extract_base_ident_clight(inner_r)) {
+                            (true, Some(b)) => Some(b),
+                            _ => None,
+                        },
+                    };
+                    if let Some(base_ident) = base {
+                        return Some((base_ident, offset.abs()));
+                    }
+                }
+            }
+            // 3. `base + idx*scale` (no const offset; field is implicitly 0).
+            if is_index_term_clight(rhs) {
+                if let Some(base_ident) = extract_base_ident_clight(lhs) {
+                    return Some((base_ident, 0));
+                }
+            }
+            if is_index_term_clight(lhs) {
+                if let Some(base_ident) = extract_base_ident_clight(rhs) {
+                    return Some((base_ident, 0));
+                }
+            }
+            // 4. `EconstInt(stack_ofs) + idx*scale` (clang -O1 SP-indexed load; stack ofs becomes a literal post-select). Treat abs(stack_ofs) as field offset in bucket-0 stack-base struct (mirrors the Oaddrstack branch in extract_struct_field_info).
+            let stack_const = match (
+                extract_const_offset_clight(lhs),
+                extract_const_offset_clight(rhs),
+                is_index_term_clight(lhs),
+                is_index_term_clight(rhs),
+            ) {
+                (Some(c), None, _, true) => Some(c),
+                (None, Some(c), true, _) => Some(c),
+                _ => None,
+            };
+            if let Some(c) = stack_const {
+                let abs_c = c.abs();
+                if abs_c < 2048 {
+                    let base_bucket = (abs_c / 64) * 64;
+                    let field = abs_c - base_bucket;
+                    return Some((base_bucket as usize, field));
+                }
+            }
+            None
         }
         ClightExpr::Etempvar(ident, _) => Some((*ident, 0)),
         _ => None,
