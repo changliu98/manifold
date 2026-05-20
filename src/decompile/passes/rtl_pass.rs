@@ -1472,8 +1472,7 @@ ascent_par! {
         sp_indexed_store(addr),
         let synth = *addr | (1u64 << 62);
 
-    // Place the synthetic Istore's instr_in_function directly off addr's
-    // function membership (parallel to the SP-load case above).
+    // Place the synthetic Istore's instr_in_function directly off addr's function membership (parallel to the SP-load case above).
     instr_in_function(synth, func_start) <--
         sp_indexed_store(addr),
         instr_in_function(addr, func_start),
@@ -1485,8 +1484,7 @@ ascent_par! {
         ltl_succ(addr, next),
         let synth = *addr | (1u64 << 62);
 
-    // Synth -> next via the function-bounded skip walk when the store's
-    // raw next address has no ltl_inst (parallel to the SP-load case).
+    // Synth -> next via the function-bounded skip walk when the store's raw next address has no ltl_inst (parallel to the SP-load case).
     rtl_succ_candidate(synth, dst) <--
         sp_indexed_store(addr),
         instr_in_function(addr, func_start),
@@ -4177,8 +4175,7 @@ ascent_par! {
         if *arg == Mreg::SP && *ofs >= 8,
         !func_uses_bp_base(func_start);
 
-    // Memory-operand arithmetic like `add 0x8(%rsp), %eax` is lifted via
-    // arith_load_op
+    // Memory-operand arithmetic like `add 0x8(%rsp), %eax` is lifted via arith_load_op
     stack_passed_param(func_start, *ofs) <--
         instr_in_function(addr, func_start),
         function_entry_count(func_start, addr, count),
@@ -5741,6 +5738,8 @@ fn collect_sorted_rtl_next(db: &DecompileDB) -> Vec<(Node, Node)> {
 
 
 // Declarative RTL optimizer; _v2 outputs are diffed against the imperative results.
+// Debug-only: in release builds nothing reads its outputs, so the whole program is excluded.
+#[cfg(debug_assertions)]
 ascent_par! {
     #![measure_rule_times]
 
@@ -6016,6 +6015,7 @@ pub(crate) fn flatten_ba_uses(arg: &BuiltinArg<RTLReg>) -> Vec<RTLReg> {
 }
 
 // Build and run RTLOptimizerProgram over a PassContext; returns the program for inspection.
+#[cfg(debug_assertions)]
 fn run_rtl_optimizer_program(ctx: &PassContext) -> RTLOptimizerProgram {
     let mut prog = RTLOptimizerProgram::default();
 
@@ -6071,6 +6071,16 @@ impl RtlOptStats {
     }
 }
 
+#[cfg(debug_assertions)]
+struct AscentV2Snapshot {
+    self_zero: HashSet<Node>,
+    dead_store: HashSet<Node>,
+    dead_call: HashSet<Node>,
+    copy_subst: HashMap<RTLReg, RTLReg>,
+    inline_temp: HashSet<RTLReg>,
+    dead_or_copy_eliminated: HashSet<Node>,
+}
+
 fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
     let mut ctx = PassContext::load(db);
     if ctx.functions.is_empty() {
@@ -6100,18 +6110,22 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
         .collect();
     let per_func_var_types = std::sync::Mutex::new(per_func_var_types);
 
-    // Ascent _v2 outputs (self_zero/dead_store/copy_subst/inline_temp) are diffed below.
-    let ascent_opt = run_rtl_optimizer_program(&ctx);
-    let ascent_self_zero: HashSet<Node> = ascent_opt.self_zero_v2.iter().map(|&(n,)| n).collect();
-    let ascent_dead_store: HashSet<Node> = ascent_opt.dead_store_v2.iter().map(|&(n,)| n).collect();
-    let ascent_copy_eliminated: HashSet<Node> = ascent_opt.copy_eliminated_v2.iter().map(|&(n,)| n).collect();
-    let ascent_dead_call: HashSet<Node> = ascent_opt.dead_call_dst_v2.iter().map(|&(n,)| n).collect();
-    let ascent_copy_subst: HashMap<RTLReg, RTLReg> = ascent_opt.copy_subst_resolved_v2
-        .iter().map(|&(d, s)| (d, s)).collect();
-    let ascent_inline_temp: HashSet<RTLReg> = ascent_opt.inline_temp_v2.iter().map(|&(r,)| r).collect();
-    let ascent_dead_or_copy_eliminated: HashSet<Node> = ascent_dead_store.union(&ascent_copy_eliminated).copied().collect();
-    // resolved_v2 is already transitive; no further resolution needed.
-    let ascent_copy_subst = ascent_copy_subst; // already transitive via resolved_v2
+    // RTLOptimizerProgram is the Ascent v2 of the imperative optimizer. Its outputs are only consumed by the debug-only RTL_V2_DIFF block below, so in release builds we skip it entirely (dominates the RTL pass -- ~57s on a 700KB binary).
+    #[cfg(debug_assertions)]
+    let ascent_v2: Option<AscentV2Snapshot> = if std::env::var("RTL_V2_DIFF").is_ok() {
+        let ascent_opt = run_rtl_optimizer_program(&ctx);
+        let self_zero: HashSet<Node> = ascent_opt.self_zero_v2.iter().map(|&(n,)| n).collect();
+        let dead_store: HashSet<Node> = ascent_opt.dead_store_v2.iter().map(|&(n,)| n).collect();
+        let copy_eliminated: HashSet<Node> = ascent_opt.copy_eliminated_v2.iter().map(|&(n,)| n).collect();
+        let dead_call: HashSet<Node> = ascent_opt.dead_call_dst_v2.iter().map(|&(n,)| n).collect();
+        let copy_subst: HashMap<RTLReg, RTLReg> = ascent_opt.copy_subst_resolved_v2
+            .iter().map(|&(d, s)| (d, s)).collect();
+        let inline_temp: HashSet<RTLReg> = ascent_opt.inline_temp_v2.iter().map(|&(r,)| r).collect();
+        let dead_or_copy_eliminated: HashSet<Node> = dead_store.union(&copy_eliminated).copied().collect();
+        Some(AscentV2Snapshot { self_zero, dead_store, dead_call, copy_subst, inline_temp, dead_or_copy_eliminated })
+    } else {
+        None
+    };
 
     let results: Vec<_> = ctx.functions.par_iter_mut()
         .map(|(&func_addr, func)| {
@@ -6236,72 +6250,68 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
     // Diff logging: compare Ascent v2 vs imperative iteration-1 outputs.
     // Uses eprintln so that diffs surface during test runs (no env_logger is configured).
     #[cfg(debug_assertions)]
-    if std::env::var("RTL_V2_DIFF").is_ok() {
-        let self_zero_missing: Vec<_> = imp_self_zero_all.difference(&ascent_self_zero).copied().collect();
-        let self_zero_extra: Vec<_> = ascent_self_zero.difference(&imp_self_zero_all).copied().collect();
+    if let Some(v2) = &ascent_v2 {
+        let self_zero_missing: Vec<_> = imp_self_zero_all.difference(&v2.self_zero).copied().collect();
+        let self_zero_extra: Vec<_> = v2.self_zero.difference(&imp_self_zero_all).copied().collect();
         if !self_zero_missing.is_empty() || !self_zero_extra.is_empty() {
             eprintln!(
                 "rtl_v2 diff self_zero: imperative={} ascent={} missing_from_ascent={} extra_in_ascent={}",
-                imp_self_zero_all.len(), ascent_self_zero.len(),
+                imp_self_zero_all.len(), v2.self_zero.len(),
                 self_zero_missing.len(), self_zero_extra.len()
             );
         }
         // imp_dead_store_all = union of copy-eliminated and dead-store nodes (both Inop in iter 1); compare against the same Ascent union.
-        let ds_missing: Vec<_> = imp_dead_store_all.difference(&ascent_dead_or_copy_eliminated).copied().collect();
-        let ds_extra: Vec<_> = ascent_dead_or_copy_eliminated.difference(&imp_dead_store_all).copied().collect();
+        let ds_missing: Vec<_> = imp_dead_store_all.difference(&v2.dead_or_copy_eliminated).copied().collect();
+        let ds_extra: Vec<_> = v2.dead_or_copy_eliminated.difference(&imp_dead_store_all).copied().collect();
         if !ds_missing.is_empty() || !ds_extra.is_empty() {
             eprintln!(
                 "rtl_v2 diff dead_or_copy_elim (iter1): imperative={} ascent_union={} missing_from_ascent={} extra_in_ascent={}",
-                imp_dead_store_all.len(), ascent_dead_or_copy_eliminated.len(),
+                imp_dead_store_all.len(), v2.dead_or_copy_eliminated.len(),
                 ds_missing.len(), ds_extra.len()
             );
         }
-        let dc_missing: Vec<_> = imp_dead_call_all.difference(&ascent_dead_call).copied().collect();
-        let dc_extra: Vec<_> = ascent_dead_call.difference(&imp_dead_call_all).copied().collect();
+        let dc_missing: Vec<_> = imp_dead_call_all.difference(&v2.dead_call).copied().collect();
+        let dc_extra: Vec<_> = v2.dead_call.difference(&imp_dead_call_all).copied().collect();
         if !dc_missing.is_empty() || !dc_extra.is_empty() {
             eprintln!(
                 "rtl_v2 diff dead_call_dst (iter1): imperative={} ascent={} missing={} extra={}",
-                imp_dead_call_all.len(), ascent_dead_call.len(),
+                imp_dead_call_all.len(), v2.dead_call.len(),
                 dc_missing.len(), dc_extra.len()
             );
         }
-        // ascent_copy_subst is path-conservative; expected subset of imperative.
+        // ascent copy_subst is path-conservative; expected subset of imperative.
         let cp_missing: Vec<_> = imp_copy_subst_all.iter()
-            .filter(|&(d, _)| !ascent_copy_subst.contains_key(d))
+            .filter(|&(d, _)| !v2.copy_subst.contains_key(d))
             .map(|(&d, &s)| (d, s))
             .collect();
-        let cp_mismatch: Vec<_> = ascent_copy_subst.iter()
+        let cp_mismatch: Vec<_> = v2.copy_subst.iter()
             .filter_map(|(&d, &s_asc)| {
                 imp_copy_subst_all.get(&d).and_then(|&s_imp| {
                     if s_asc != s_imp { Some((d, s_imp, s_asc)) } else { None }
                 })
             })
             .collect();
-        let cp_extra: Vec<_> = ascent_copy_subst.iter()
+        let cp_extra: Vec<_> = v2.copy_subst.iter()
             .filter(|&(d, _)| !imp_copy_subst_all.contains_key(d))
             .map(|(&d, &s)| (d, s))
             .collect();
         if !cp_missing.is_empty() || !cp_extra.is_empty() || !cp_mismatch.is_empty() {
             eprintln!(
                 "rtl_v2 diff copy_subst (iter1): imperative={} ascent={} ascent_missing={} ascent_extra={} value_mismatch={}",
-                imp_copy_subst_all.len(), ascent_copy_subst.len(),
+                imp_copy_subst_all.len(), v2.copy_subst.len(),
                 cp_missing.len(), cp_extra.len(), cp_mismatch.len()
             );
         }
-        let it_missing: Vec<_> = ctx.inline_temps.difference(&ascent_inline_temp).copied().collect();
-        let it_extra: Vec<_> = ascent_inline_temp.difference(&ctx.inline_temps).copied().collect();
+        let it_missing: Vec<_> = ctx.inline_temps.difference(&v2.inline_temp).copied().collect();
+        let it_extra: Vec<_> = v2.inline_temp.difference(&ctx.inline_temps).copied().collect();
         if !it_missing.is_empty() || !it_extra.is_empty() {
             eprintln!(
                 "rtl_v2 diff inline_temp: imperative={} ascent={} missing={} extra={}",
-                ctx.inline_temps.len(), ascent_inline_temp.len(),
+                ctx.inline_temps.len(), v2.inline_temp.len(),
                 it_missing.len(), it_extra.len()
             );
         }
     }
-    // Suppress unused-var warnings in release builds where the diff block is compiled out.
-    let _ = (&ascent_self_zero, &ascent_dead_store, &ascent_dead_call,
-             &ascent_copy_subst, &ascent_inline_temp, &ascent_copy_eliminated,
-             &ascent_dead_or_copy_eliminated);
 
     ctx.var_types = merged_var_types;
     ctx.write_back(db);

@@ -327,7 +327,7 @@ impl IRPass for SignatureReconciliationPass {
 }
 
 // ABI parameter order: integer regs first (DI..R9), then float regs (X0..X7)
-fn param_mreg_sort_key(mreg: Mreg) -> usize {
+pub(crate) fn param_mreg_sort_key(mreg: Mreg) -> usize {
     match mreg {
         Mreg::DI => 0,
         Mreg::SI => 1,
@@ -432,12 +432,16 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         def_params.entry(addr).or_default().push(reg);
     }
     for (addr, params) in def_params.iter_mut() {
-        params.sort_by_key(|reg| {
-            if let Some(mreg) = rtl_to_mreg.get(&(*addr, *reg)) {
-                param_mreg_sort_key(*mreg)
-            } else {
-                usize::MAX
-            }
+        params.sort_by(|a, b| {
+            let ka = rtl_to_mreg
+                .get(&(*addr, *a))
+                .map(|m| param_mreg_sort_key(*m))
+                .unwrap_or(usize::MAX);
+            let kb = rtl_to_mreg
+                .get(&(*addr, *b))
+                .map(|m| param_mreg_sort_key(*m))
+                .unwrap_or(usize::MAX);
+            ka.cmp(&kb).then_with(|| a.cmp(b))
         });
         params.dedup();
     }
@@ -448,9 +452,22 @@ fn reconcile_signatures(db: &mut DecompileDB) {
     let def_void: std::collections::HashSet<Address> = db.rel_iter::<(Address,)>("emit_function_void_candidate")
         .map(|&(addr,)| addr)
         .collect();
-    let def_return_types: HashMap<Address, XType> = db.rel_iter::<(Address, XType)>("emit_function_return_type_xtype_candidate")
-        .map(|&(addr, ref xtype)| (addr, xtype.clone()))
-        .collect();
+    // Multiple xtype candidates per return; pick by priority to stay deterministic across runs.
+    let def_return_types: HashMap<Address, XType> = {
+        let mut groups: HashMap<Address, Vec<XType>> = HashMap::new();
+        for &(addr, ref xtype) in db.rel_iter::<(Address, XType)>("emit_function_return_type_xtype_candidate") {
+            groups.entry(addr).or_default().push(xtype.clone());
+        }
+        groups
+            .into_iter()
+            .map(|(addr, mut tys)| {
+                tys.sort_by_key(|ty| {
+                    (crate::decompile::passes::clight_pass::xtype_refine_priority(ty), *ty)
+                });
+                (addr, *tys.last().unwrap())
+            })
+            .collect()
+    };
 
     // call_targets is consumed by patch_db and the call-site arg-type lookup below.
     let call_targets: HashMap<Node, Address> = db.rel_iter::<(Node, Address)>("call_target_func")
@@ -873,10 +890,16 @@ fn patch_db(
             }
         }
         for (addr, params) in existing_params.iter_mut() {
-            params.sort_by_key(|reg| {
-                rtl_to_mreg.get(&(*addr, *reg))
+            params.sort_by(|a, b| {
+                let ka = rtl_to_mreg
+                    .get(&(*addr, *a))
                     .map(|m| param_mreg_sort_key(*m))
-                    .unwrap_or(usize::MAX)
+                    .unwrap_or(usize::MAX);
+                let kb = rtl_to_mreg
+                    .get(&(*addr, *b))
+                    .map(|m| param_mreg_sort_key(*m))
+                    .unwrap_or(usize::MAX);
+                ka.cmp(&kb).then_with(|| a.cmp(b))
             });
         }
 
@@ -928,10 +951,16 @@ fn patch_db(
             }
         }
         for (addr, params) in existing_params.iter_mut() {
-            params.sort_by_key(|reg| {
-                rtl_to_mreg.get(&(*addr, *reg))
+            params.sort_by(|a, b| {
+                let ka = rtl_to_mreg
+                    .get(&(*addr, *a))
                     .map(|m| param_mreg_sort_key(*m))
-                    .unwrap_or(usize::MAX)
+                    .unwrap_or(usize::MAX);
+                let kb = rtl_to_mreg
+                    .get(&(*addr, *b))
+                    .map(|m| param_mreg_sort_key(*m))
+                    .unwrap_or(usize::MAX);
+                ka.cmp(&kb).then_with(|| a.cmp(b))
             });
         }
 

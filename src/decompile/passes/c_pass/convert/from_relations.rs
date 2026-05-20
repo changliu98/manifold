@@ -12,7 +12,7 @@ use crate::decompile::passes::clight_select::query::GlobalData;
 use crate::decompile::passes::clight_select::select::SelectedFunction;
 use crate::x86::types as clight;
 use crate::x86::types::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use log::debug;
 use std::sync::Arc;
 
@@ -256,9 +256,13 @@ pub fn build_cast_from_relations(
 
     let mut stmt_map: HashMap<crate::x86::types::Node, CStmt> = HashMap::new();
     for func in selected_functions {
-        for (node, clight_stmt) in &func.statements {
+        // func.statements is a HashMap; iterating it directly leaks non-deterministic order into convert_stmt -> record_var_type (which is first-wins), so a variable's recorded C type flips between runs. Walk nodes in sorted order.
+        let mut nodes: Vec<crate::x86::types::Node> = func.statements.keys().copied().collect();
+        nodes.sort();
+        for node in nodes {
+            let clight_stmt = &func.statements[&node];
             let converted = convert_stmt(clight_stmt, &mut ctx);
-            stmt_map.insert(*node, converted);
+            stmt_map.insert(node, converted);
         }
     }
 
@@ -425,10 +429,18 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         });
     }
 
+    // instr_in_function is multi-valued (shared PLT/thunk nodes); keep the smallest owning address so the node->function mapping is identical across runs.
     let mut node_to_func: HashMap<crate::x86::types::Node, crate::x86::types::Address> =
         HashMap::new();
     for (node, func) in db.rel_iter::<(Node, Address)>("instr_in_function") {
-        node_to_func.insert(*node, *func);
+        node_to_func
+            .entry(*node)
+            .and_modify(|e| {
+                if *func < *e {
+                    *e = *func;
+                }
+            })
+            .or_insert(*func);
     }
 
     let recovered_func_names = recover_func_names_from_assert(db);
@@ -496,8 +508,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                         }
                     }
                 }
-                // synth-source edge to an external (non-bundle) consumer: keep as-is
-                // (synth nodes aren't bundle members, so no remap needed for src).
+                // synth-source edge to an external (non-bundle) consumer: keep as-is (synth nodes aren't bundle members, so no remap needed for src).
                 let _ = src_is_synth;
                 out
             })
@@ -741,6 +752,17 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             loc: SourceLoc::unknown(),
         };
 
+        if std::env::var("DET_FP").is_ok() {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let body_str = crate::decompile::passes::c_pass::print::print_stmt(&func_def.body);
+            let mut lv: Vec<String> = func_def.local_vars.iter().map(|v| format!("{:?}", v)).collect();
+            lv.sort();
+            let mut h = DefaultHasher::new();
+            body_str.hash(&mut h);
+            lv.join(",").hash(&mut h);
+            eprintln!("[FP-E] {:016x} {} {:016x}", func_addr, func_def.name, h.finish());
+        }
         tu.add_function(func_def);
     }
 
@@ -774,12 +796,23 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         "fcntl",
     ].iter().copied().collect();
 
-    for (name, _param_count, ret_type, param_types) in db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature") {
-        let sanitized_name = sanitize_c_symbol_name(name);
+    // resolved_extern_signature comes from Ascent (set-semantics, non-deterministic order) and may carry multiple rows for the same function name (one per call-site signature). Group by sanitized name, pick a single signature deterministically, then emit in sorted name order so the C file is byte-stable across runs.
+    let mut extern_by_name: BTreeMap<String, Vec<(usize, XType, Arc<Vec<XType>>)>> = BTreeMap::new();
+    for (name, param_count, ret_type, param_types) in db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature") {
+        let sanitized = sanitize_c_symbol_name(name);
+        extern_by_name
+            .entry(sanitized)
+            .or_default()
+            .push((*param_count, *ret_type, param_types.clone()));
+    }
+    for (sanitized_name, mut sigs) in extern_by_name {
         if emitted_func_names.contains(&sanitized_name) || header_declared.contains(sanitized_name.as_str()) {
             continue;
         }
-        let ret_ctype = convert_xtype(ret_type);
+        // Deterministic pick: prefer the row whose XType vector compares smallest.
+        sigs.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)).then_with(|| a.0.cmp(&b.0)));
+        let (_param_count, ret_type, param_types) = sigs.into_iter().next().unwrap();
+        let ret_ctype = convert_xtype(&ret_type);
         let params: Vec<FuncParam> = param_types
             .iter()
             .enumerate()
@@ -790,15 +823,21 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         tu.add_func_decl(decl);
     }
 
-    for (name,) in db.rel_iter::<(Symbol,)>("unknown_extern") {
-        let sanitized_name = sanitize_c_symbol_name(name);
+    let resolved_extern_names: HashSet<String> = db
+        .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature")
+        .map(|(n, _, _, _)| sanitize_c_symbol_name(n))
+        .collect();
+    let mut unknown_extern_names: Vec<String> = db
+        .rel_iter::<(Symbol,)>("unknown_extern")
+        .map(|(n,)| sanitize_c_symbol_name(n))
+        .collect();
+    unknown_extern_names.sort();
+    unknown_extern_names.dedup();
+    for sanitized_name in unknown_extern_names {
         if emitted_func_names.contains(&sanitized_name) || header_declared.contains(sanitized_name.as_str()) {
             continue;
         }
-        if db
-            .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature")
-            .any(|(n, _, _, _)| sanitize_c_symbol_name(n) == sanitized_name)
-        {
+        if resolved_extern_names.contains(&sanitized_name) {
             continue;
         }
 
@@ -3442,8 +3481,7 @@ fn remove_gotos_to_missing_labels(stmt: &CStmt, missing: &HashSet<String>) -> CS
     }
 }
 
-// Return-value forwarding: when `if (...) { var = val; } else { var = val2; } return var;`
-// transform to `if (...) { return val; } else { return val2; }`
+// Return-value forwarding: when `if (...) { var = val; } else { var = val2; } return var;` transform to `if (...) { return val; } else { return val2; }`
 fn forward_return_value(stmt: &CStmt) -> CStmt {
     match stmt {
         CStmt::Block(items) => {

@@ -1,5 +1,5 @@
 // IRPass trait, swap-run-swap macros, and dependency-based pass scheduler.
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use crate::decompile::elevator::DecompileDB;
 
 // A single stage of the decompilation pipeline with declared input/output relations.
@@ -11,6 +11,9 @@ pub trait IRPass: Send + Sync {
     fn inputs(&self) -> &'static [&'static str] { &[] }
 
     fn outputs(&self) -> &'static [&'static str] { &[] }
+
+    /// Relations this pass reads through imperative `db.rel_iter(...)` calls outside its Ascent program (and helper modules invoked from `run`). Must be declared so the scheduler can clone them for parallel sub-DBs and keep them alive under --memsave.
+    fn extra_reads(&self) -> &'static [&'static str] { &[] }
 
     /// Per-rule dependency edges within this pass's Ascent program: (body_rel, head_rel) pairs.
     fn rule_deps(&self) -> &'static [(&'static str, &'static str)] { &[] }
@@ -230,6 +233,45 @@ impl Schedule {
     }
 }
 
+impl Schedule {
+    /// For each stage, list the relations that can be dropped after the stage completes: a relation R is dropped after stage S iff S is the maximum stage that has any pass referencing R in the union of inputs(), outputs(), and extra_reads().
+    ///
+    /// Returns `Vec<Vec<&'static str>>` indexed by stage index.
+    pub fn compute_drops(&self, passes: &[Box<dyn IRPass>]) -> Vec<Vec<&'static str>> {
+        let pass_to_stage: Vec<usize> = {
+            let mut map = vec![0usize; passes.len()];
+            for (stage_idx, stage) in self.stages.iter().enumerate() {
+                for &p in &stage.passes {
+                    map[p] = stage_idx;
+                }
+            }
+            map
+        };
+
+        let mut last_use: HashMap<&'static str, usize> = HashMap::new();
+        for (p_idx, pass) in passes.iter().enumerate() {
+            let stage = pass_to_stage[p_idx];
+            let groups = [pass.inputs(), pass.outputs(), pass.extra_reads()];
+            for group in groups.iter() {
+                for &rel in group.iter() {
+                    last_use.entry(rel)
+                        .and_modify(|s| if stage > *s { *s = stage; })
+                        .or_insert(stage);
+                }
+            }
+        }
+
+        let mut drops_per_stage: Vec<Vec<&'static str>> = vec![Vec::new(); self.stages.len()];
+        for (&rel, &stage) in &last_use {
+            drops_per_stage[stage].push(rel);
+        }
+        for v in &mut drops_per_stage {
+            v.sort();
+        }
+        drops_per_stage
+    }
+}
+
 // Builds a dependency graph from pass input/output declarations and produces a parallel schedule.
 pub struct PassScheduler;
 
@@ -239,9 +281,10 @@ impl PassScheduler {
         let n = passes.len();
         let names: Vec<&'static str> = passes.iter().map(|p| p.name()).collect();
 
+        // Include extra_reads in the input set so the schedule's RAW edges cover imperative reads outside the Ascent program (e.g., clight_emit_pass reading via clight_select).
         let inputs: Vec<HashSet<&'static str>> = passes
             .iter()
-            .map(|p| p.inputs().iter().copied().collect())
+            .map(|p| p.inputs().iter().chain(p.extra_reads().iter()).copied().collect())
             .collect();
         let outputs: Vec<HashSet<&'static str>> = passes
             .iter()

@@ -29,7 +29,8 @@ fn print_usage_and_exit() -> ! {
         	--dump-ir        dump each IR stage to separate files (.asm, .mach, .linear, etc.)\n\
         	--dump-clight-json   export selected Clight IR as JSON (.clight.json)\n\
         	--measure-rule-times  dump per-pass Ascent rule timing to debug/rule_times/\n\
-        	--dump-deps          dump pipeline dependency graph as Graphviz DOT to pipeline.dot"
+        	--dump-deps          dump pipeline dependency graph as Graphviz DOT to pipeline.dot\n\
+        	--memsave            drop each IR relation after its last declared consumer pass (saves memory)"
     );
     std::process::exit(1);
 }
@@ -56,6 +57,7 @@ fn main() {
     let mut dump_ir = false;
     let mut dump_clight_json = false;
     let mut dump_deps = false;
+    let mut memsave = false;
 
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -65,11 +67,20 @@ fn main() {
             "--dump-ir" => dump_ir = true,
             "--dump-clight-json" => dump_clight_json = true,
             "--dump-deps" => dump_deps = true,
+            "--memsave" => memsave = true,
             s if s.starts_with('-') => {
                 eprintln!("Unknown option: {}", s);
             }
             _ => positional.push(arg),
         }
+    }
+
+    // --memsave drops relations early, which destroys data the trace/IR-dump paths need at end-of-pipeline. Force memsave off if any debug dump is requested.
+    if memsave && (trace_enabled || dump_ir || dump_clight_json) {
+        eprintln!(
+            "--memsave is incompatible with --trace/--dump-ir/--dump-clight-json; disabling --memsave."
+        );
+        memsave = false;
     }
 
     // --dump-deps can run without a binary input
@@ -125,7 +136,7 @@ fn main() {
 
     let pipeline_start = Instant::now();
     println!("Started");
-    prog.run_pipeline(&input_path, trace_enabled, measure_rule_times);
+    prog.run_pipeline(&input_path, trace_enabled, measure_rule_times, memsave);
     let pipeline_elapsed = pipeline_start.elapsed();
     println!("  Pipeline: {}", fmt_elapsed(pipeline_elapsed));
 

@@ -468,6 +468,7 @@ impl IRPass for ClightEmitPass {
             .clone()
             .expect("binary_path must be set before ClightEmitPass");
 
+        let t = std::time::Instant::now();
         let selected_functions = match crate::decompile::passes::clight_select::select::select_clight_stmts(db) {
             Ok(funcs) => funcs,
             Err(e) => {
@@ -475,14 +476,18 @@ impl IRPass for ClightEmitPass {
                 return;
             }
         };
+        eprintln!("[clight-emit] select_clight_stmts: {:?} ({} funcs)", t.elapsed(), selected_functions.len());
 
         let mut id_to_name: HashMap<usize, String> = HashMap::new();
+        // ident_to_symbol iteration order is non-deterministic; when several symbols share an id, prefer the shortest name with a lex tiebreak so the choice is stable.
         for (id, name) in db.rel_iter::<(Ident, Symbol)>("ident_to_symbol") {
             let name_str = name.to_string();
             id_to_name
                 .entry(*id)
                 .and_modify(|existing| {
-                    if name.len() < existing.len() {
+                    let take = name_str.len() < existing.len()
+                        || (name_str.len() == existing.len() && name_str.as_str() < existing.as_str());
+                    if take {
                         *existing = name_str.clone();
                     }
                 })
@@ -609,6 +614,7 @@ impl IRPass for ClightEmitPass {
             .rel_iter::<(Node, Node)>("clight_succ")
             .map(|(src, dst)| (*src, *dst))
             .collect();
+        let t = std::time::Instant::now();
         let raw_translation_unit = crate::decompile::passes::c_pass::convert::build_cast_from_relations(
             db,
             &selected_functions,
@@ -616,6 +622,7 @@ impl IRPass for ClightEmitPass {
             &id_to_name,
             &edges,
         );
+        eprintln!("[clight-emit] build_cast_from_relations (raw TU): {:?}", t.elapsed());
 
         let mut string_map = build_string_literal_map(db);
         for g in &globals {
@@ -768,9 +775,14 @@ impl IRPass for ClightEmitPass {
                 }
             }
 
-            for (node, succs) in &func.successors {
-                for succ in succs {
-                    func_edges.push((*node, *succ));
+            // func.successors is a HashMap; iterating directly leaks non-deterministic ordering into func_edges -> all_edges -> remapped_edges. order_nodes_dfs sorts adjacency lists, but it relies on the *set* of (src, dst) pairs being the same, which it is -- so the impact is mainly on diagnostic stability. Sort by source for a stable iteration order anyway.
+            let mut succ_nodes: Vec<Node> = func.successors.keys().copied().collect();
+            succ_nodes.sort();
+            for node in succ_nodes {
+                if let Some(succs) = func.successors.get(&node) {
+                    for succ in succs {
+                        func_edges.push((node, *succ));
+                    }
                 }
             }
             {
@@ -835,7 +847,9 @@ impl IRPass for ClightEmitPass {
         db.cast_var_types_for_emission = var_types_for_emission.clone();
         db.cast_raw_translation_unit = Some(raw_translation_unit);
 
+        let t = std::time::Instant::now();
         let struct_defs = crate::decompile::passes::clight_select::query::extract_struct_definitions(db);
+        eprintln!("[clight-emit] extract_struct_definitions: {:?} ({} structs)", t.elapsed(), struct_defs.len());
         let stmt_map: HashMap<Node, CStmt> = all_statements.into_iter().collect();
 
         log::info!(
@@ -843,6 +857,7 @@ impl IRPass for ClightEmitPass {
             stmt_map.len()
         );
 
+        let t = std::time::Instant::now();
         let mut tu = crate::decompile::passes::c_pass::convert::build_translation_unit_from_stmt_map_with_types(
             db,
             &db.cast_selected_functions,
@@ -853,9 +868,12 @@ impl IRPass for ClightEmitPass {
             &db.cast_var_types_for_emission,
             &node_to_func_addr,
         );
+        eprintln!("[clight-emit] build_translation_unit (optimized TU): {:?}", t.elapsed());
 
         // Identify opaque libc structs (FILE, DIR) via C AST scan and RTL-level analysis.
+        let t = std::time::Instant::now();
         let mut opaque_map = identify_opaque_libc_structs_from_tu(&tu);
+        eprintln!("[clight-emit] identify_opaque_libc_structs: {:?} ({} found)", t.elapsed(), opaque_map.len());
 
         // Supplement with RTL-level analysis: struct IDs flowing through opaque-pointer call args.
         {
@@ -967,6 +985,41 @@ impl IRPass for ClightEmitPass {
             "cast_var_types_for_emission",
             "cast_raw_translation_unit",
             "cast_optimized_translation_unit",
+        ]
+    }
+
+    fn extra_reads(&self) -> &'static [&'static str] {
+        &[
+            "direct_call",
+            "dwarf_func_param_name",
+            "emit_break_stmt",
+            "emit_function_param_count",
+            "emit_function_param_is_pointer",
+            "emit_function_param_type",
+            "emit_function_return",
+            "emit_function_return_type_xtype",
+            "emit_function_void",
+            "emit_global_is_char_ptr",
+            "emit_global_is_ptr",
+            "emit_global_struct_fields",
+            "emit_goto_target",
+            "emit_ifbody_false",
+            "emit_ifbody_true",
+            "emit_join_point",
+            "emit_loop_exit",
+            "emit_scond_no_join",
+            "emit_sseq",
+            "emit_struct_def",
+            "emit_struct_field",
+            "emit_var_is_struct",
+            "func_param_struct_type",
+            "known_global_type",
+            "plt_entry",
+            "reg_rtl",
+            "resolved_extern_signature",
+            "rtl_reg_used_in_func",
+            "struct_id_to_canonical",
+            "unknown_extern",
         ]
     }
 }

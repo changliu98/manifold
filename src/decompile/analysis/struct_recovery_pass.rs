@@ -469,17 +469,19 @@ fn try_build_layout(accesses: &[(i64, MemoryChunk)]) -> Option<Vec<InferredField
     }
 
     let mut field_map: BTreeMap<i64, MemoryChunk> = BTreeMap::new();
-    for (ofs, chunks) in per_offset {
+    for (ofs, mut chunks) in per_offset {
+        // Order-stable: chunks comes from a Vec built in Ascent tuple-insertion order (non-deterministic). Sort to canonicalize before picking.
+        chunks.sort();
         let first = chunks[0];
         let all_same = chunks.iter().all(|c| *c == first);
         let chosen = if all_same {
             first
         } else {
-            // Widest chunk: preserves width; drops signed/unsigned/int/float claim when not agreed.
+            // Widest chunk; tie-break by chunk Ord so the choice is the same every run.
             chunks
                 .iter()
                 .copied()
-                .max_by_key(|c| chunk_byte_size(c))
+                .max_by(|a, b| chunk_byte_size(a).cmp(&chunk_byte_size(b)).then_with(|| a.cmp(b)))
                 .unwrap_or(first)
         };
         field_map.insert(ofs, chosen);
@@ -532,10 +534,22 @@ fn post_process_structs(db: &mut DecompileDB) {
         .cloned()
         .collect();
 
-    let existing_types: HashMap<RTLReg, XType> = db
-        .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
-        .map(|&(r, t)| (r, t))
-        .collect();
+    // emit_var_type_candidate may carry multiple xtypes per register. .collect() into a HashMap is "last-iterated wins", and Ascent emits tuples in non-deterministic order, so the chosen xtype would flip between runs (struct field types/padding observed flipping long<->int<->double). Pick by xtype_refine_priority with a deterministic XType tiebreak so the same SET of candidates yields the same chosen xtype every run.
+    let existing_types: HashMap<RTLReg, XType> = {
+        let mut groups: HashMap<RTLReg, Vec<XType>> = HashMap::new();
+        for &(r, t) in db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate") {
+            groups.entry(r).or_default().push(t);
+        }
+        groups
+            .into_iter()
+            .map(|(reg, mut tys)| {
+                tys.sort_by_key(|ty| {
+                    (crate::decompile::passes::clight_pass::xtype_refine_priority(ty), *ty)
+                });
+                (reg, *tys.last().unwrap())
+            })
+            .collect()
+    };
 
     let stack_candidates: Vec<(Address, i64)> = db
         .rel_iter::<(Address, i64)>("stack_is_struct_candidate")
@@ -577,8 +591,14 @@ fn post_process_structs(db: &mut DecompileDB) {
             ptr_deref_map.entry(base).or_default().push((ofs, chunk, val, func));
         }
     }
+    // Canonicalize per-reg access lists so accesses.first() and downstream HashMap insertion orders are stable across runs (Ascent tuple-insertion order is not).
+    for v in ptr_deref_map.values_mut() {
+        v.sort();
+    }
+    let mut struct_candidates_sorted = struct_candidates.clone();
+    struct_candidates_sorted.sort();
 
-    for &ptr_reg in &struct_candidates {
+    for &ptr_reg in &struct_candidates_sorted {
         let accesses = match ptr_deref_map.get(&ptr_reg) {
             Some(a) => a,
             None => continue,
@@ -599,13 +619,18 @@ fn post_process_structs(db: &mut DecompileDB) {
     for &(func, base_ofs, field_ofs, chunk, rtl_reg) in &stack_fields {
         stack_field_map.entry((func, base_ofs)).or_default().push((field_ofs, chunk, rtl_reg));
     }
+    for v in stack_field_map.values_mut() { v.sort(); }
 
     let mut stack_lea_map: HashMap<(Address, i64), Vec<RTLReg>> = HashMap::new();
     for &(func, base_ofs, reg) in &stack_lea_regs {
         stack_lea_map.entry((func, base_ofs)).or_default().push(reg);
     }
+    for v in stack_lea_map.values_mut() { v.sort(); }
 
-    for &(func, base_ofs) in &stack_candidates {
+    let mut stack_candidates_sorted = stack_candidates.clone();
+    stack_candidates_sorted.sort();
+
+    for &(func, base_ofs) in &stack_candidates_sorted {
         let fields_data = match stack_field_map.get(&(func, base_ofs)) {
             Some(f) => f,
             None => continue,
@@ -644,8 +669,12 @@ fn post_process_structs(db: &mut DecompileDB) {
             global_deref_map.entry(ident).or_default().push((ofs, chunk, val_reg));
         }
     }
+    for v in global_deref_map.values_mut() { v.sort(); }
 
-    for &(ident,) in &global_candidates {
+    let mut global_candidates_sorted = global_candidates.clone();
+    global_candidates_sorted.sort();
+
+    for &(ident,) in &global_candidates_sorted {
         let accesses = match global_deref_map.get(&ident) {
             Some(a) => a,
             None => continue,
@@ -670,7 +699,9 @@ fn post_process_structs(db: &mut DecompileDB) {
     let mut candidates: Vec<CandidateStruct> = layout_access_count
         .into_iter()
         .map(|(fields, access_count)| {
-            let ptr_regs = layout_ptr_regs.remove(&fields).unwrap_or_default();
+            let mut ptr_regs = layout_ptr_regs.remove(&fields).unwrap_or_default();
+            // ptr_regs is built by pushing during non-deterministic iteration; sort so var_struct_map / canonical_id assignment is stable across runs.
+            ptr_regs.sort();
             CandidateStruct { ptr_regs, fields, access_count }
         })
         .collect();

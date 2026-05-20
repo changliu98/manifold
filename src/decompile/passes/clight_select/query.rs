@@ -211,9 +211,17 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
             .or_insert(*xtype);
     }
 
+    // instr_in_function is multi-valued (shared PLT/thunk nodes belong to several functions); Ascent set order is non-deterministic, so keep the smallest owning address to make the node->function mapping identical across runs.
     let mut node_to_func: HashMap<Node, Address> = HashMap::new();
     for (node, func) in db.rel_iter::<(Node, Address)>("instr_in_function") {
-        node_to_func.insert(*node, *func);
+        node_to_func
+            .entry(*node)
+            .and_modify(|e| {
+                if *func < *e {
+                    *e = *func;
+                }
+            })
+            .or_insert(*func);
     }
 
     let mut id_to_name: HashMap<usize, String> = HashMap::new();
@@ -234,12 +242,40 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
         id_to_name.insert(id, name.to_string());
     }
 
+    // emit_function_param iteration order is non-deterministic (Ascent set, parallel tuple-insertion order varies across runs). Sort each function's parameter list by the underlying Mreg's calling-convention slot, with the RTLReg as a final tiebreak, so p0/p1/... assignments and call-site argument ordering are stable.
+    let mut rtl_to_mreg_at_entry: HashMap<(Address, RTLReg), Mreg> = HashMap::new();
+    {
+        let entry_nodes: HashMap<Address, Node> = db
+            .rel_iter::<(Address, Symbol, Node)>("emit_function")
+            .map(|(a, _, n)| (*a, *n))
+            .collect();
+        for (node, mreg, rtl_reg) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl") {
+            for (&addr, &entry) in entry_nodes.iter() {
+                if entry == *node {
+                    rtl_to_mreg_at_entry.entry((addr, *rtl_reg)).or_insert(*mreg);
+                }
+            }
+        }
+    }
     let mut func_params: HashMap<Address, Vec<RTLReg>> = HashMap::new();
     for (addr, reg) in db.rel_iter::<(Address, RTLReg)>("emit_function_param") {
         let params = func_params.entry(*addr).or_default();
         if !params.contains(reg) {
             params.push(*reg);
         }
+    }
+    for (addr, params) in func_params.iter_mut() {
+        params.sort_by(|a, b| {
+            let ka = rtl_to_mreg_at_entry
+                .get(&(*addr, *a))
+                .map(|m| crate::decompile::analysis::signature_pass::param_mreg_sort_key(*m))
+                .unwrap_or(usize::MAX);
+            let kb = rtl_to_mreg_at_entry
+                .get(&(*addr, *b))
+                .map(|m| crate::decompile::analysis::signature_pass::param_mreg_sort_key(*m))
+                .unwrap_or(usize::MAX);
+            ka.cmp(&kb).then_with(|| a.cmp(b))
+        });
     }
 
     let mut var_is_struct: HashMap<(Address, RTLReg), usize> = HashMap::new();
@@ -389,8 +425,7 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
             }
         }
     }
-    // Sort successor lists for determinism (emit_next iteration order from
-    // parallel Ascent evaluation is not guaranteed).
+    // Sort successor lists for determinism (emit_next iteration order from parallel Ascent evaluation is not guaranteed).
     for func in func_map.values_mut() {
         for succs in func.successors.values_mut() {
             succs.sort();
@@ -444,26 +479,37 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
 
 
     // Collect ALL type candidates per register and pick the priority-based best.
-    let mut reg_all_type_strs: HashMap<RTLReg, Vec<String>> = HashMap::new();
-    let mut reg_best_xtype: HashMap<RTLReg, u8> = HashMap::new();
-    let mut reg_best_xtype_val: HashMap<RTLReg, XType> = HashMap::new();
+    // emit_var_type_candidate iteration order is non-deterministic (Ascent set, boxcar insertion order varies across runs). Group first, then pick the best by priority with a deterministic XType tiebreak so the chosen type is the same every run.
+    let mut reg_xtypes: HashMap<RTLReg, Vec<XType>> = HashMap::new();
     for (reg, xtype) in db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate") {
-        let type_str = xtype_to_string(xtype);
-        let strs = reg_all_type_strs.entry(*reg).or_default();
-        if !strs.contains(&type_str) {
-            strs.push(type_str.clone());
-        }
-        let prio = xtype_priority(xtype);
-        let prev_prio = reg_best_xtype.get(reg).copied().unwrap_or(0);
-        if prio >= prev_prio {
-            for func in func_map.values_mut() {
-                if func.used_regs.contains(reg) || func.param_regs.contains(reg) {
-                    func.var_types.insert(*reg, type_str.clone());
-                }
+        reg_xtypes.entry(*reg).or_default().push(xtype.clone());
+    }
+    let mut reg_all_type_strs: HashMap<RTLReg, Vec<String>> = HashMap::new();
+    let mut reg_best_xtype_val: HashMap<RTLReg, XType> = HashMap::new();
+    for (reg, mut tys) in reg_xtypes {
+        tys.sort();
+        tys.dedup();
+        let mut strs: Vec<String> = tys.iter().map(xtype_to_string).collect();
+        strs.sort();
+        strs.dedup();
+        reg_all_type_strs.insert(reg, strs);
+
+        let best = tys
+            .iter()
+            .max_by(|a, b| {
+                xtype_priority(a)
+                    .cmp(&xtype_priority(b))
+                    .then_with(|| a.cmp(b))
+            })
+            .cloned()
+            .expect("non-empty after grouping");
+        let best_str = xtype_to_string(&best);
+        for func in func_map.values_mut() {
+            if func.used_regs.contains(&reg) || func.param_regs.contains(&reg) {
+                func.var_types.insert(reg, best_str.clone());
             }
-            reg_best_xtype.insert(*reg, prio);
-            reg_best_xtype_val.insert(*reg, xtype.clone());
         }
+        reg_best_xtype_val.insert(reg, best);
     }
 
     // Upgrade param types using emit_var_type_candidate (includes XstructPtr from ClightFieldPass), which provides struct pointer info unavailable at signature resolution time.
@@ -579,34 +625,71 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
             symbol_to_idents.entry(*sym).or_default().push(*id);
         }
 
-        for (name, param_count, ret_type, param_types) in
-            db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature")
+        // resolved_extern_signature is multi-valued per symbol (one row per call-site signature); group and pick the lexicographically smallest tuple so the chosen signature is identical across runs regardless of Ascent set order.
         {
-            if let Some(idents) = symbol_to_idents.get(name) {
-                for &id in idents {
-                    callee_sigs.insert(id, CalleeSignature {
-                        param_count: *param_count,
-                        return_type: *ret_type,
-                        param_types: (**param_types).clone(),
-                    });
+            let mut by_symbol: BTreeMap<Symbol, Vec<(usize, XType, Arc<Vec<XType>>)>> =
+                BTreeMap::new();
+            for (name, param_count, ret_type, param_types) in
+                db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature")
+            {
+                by_symbol
+                    .entry(*name)
+                    .or_default()
+                    .push((*param_count, *ret_type, param_types.clone()));
+            }
+            for (name, mut sigs) in by_symbol {
+                sigs.sort();
+                let (param_count, ret_type, param_types) = sigs.into_iter().next().unwrap();
+                if let Some(idents) = symbol_to_idents.get(&name) {
+                    for &id in idents {
+                        callee_sigs.insert(id, CalleeSignature {
+                            param_count,
+                            return_type: ret_type,
+                            param_types: (*param_types).clone(),
+                        });
+                    }
                 }
             }
         }
 
+        // emit_function_param_count may be multi-valued; keep the smallest count per address and iterate in sorted address order for a deterministic result.
+        let mut param_count_by_addr: BTreeMap<Address, usize> = BTreeMap::new();
         for &(addr, count) in db.rel_iter::<(Address, usize)>("emit_function_param_count") {
+            param_count_by_addr
+                .entry(addr)
+                .and_modify(|c| *c = (*c).min(count))
+                .or_insert(count);
+        }
+        for (addr, count) in param_count_by_addr {
             let ident = addr as Ident;
             if callee_sigs.contains_key(&ident) {
                 continue;
             }
-            let mut param_types = Vec::new();
-            for &(a, _reg, ref xtype) in db.rel_iter::<(Address, RTLReg, XType)>("emit_function_param_type") {
-                if a == addr {
-                    param_types.push(*xtype);
-                }
-            }
-            let ret_type = db.rel_iter::<(Address, XType)>("emit_function_return_type_xtype")
-                .find(|(a, _)| *a == addr)
+            // emit_function_param_type iteration order is non-deterministic and the relation is multi-valued per (addr, reg); take the deduped per-reg type from param_xtypes and order by calling-convention slot so param_types is positional and identical across runs.
+            let mut typed: Vec<(RTLReg, XType)> = param_xtypes
+                .iter()
+                .filter(|((a, _), _)| *a == addr)
+                .map(|((_, reg), xt)| (*reg, *xt))
+                .collect();
+            typed.sort_by(|x, y| {
+                let kx = rtl_to_mreg_at_entry
+                    .get(&(addr, x.0))
+                    .map(|m| crate::decompile::analysis::signature_pass::param_mreg_sort_key(*m))
+                    .unwrap_or(usize::MAX);
+                let ky = rtl_to_mreg_at_entry
+                    .get(&(addr, y.0))
+                    .map(|m| crate::decompile::analysis::signature_pass::param_mreg_sort_key(*m))
+                    .unwrap_or(usize::MAX);
+                kx.cmp(&ky).then(x.0.cmp(&y.0))
+            });
+            let param_types: Vec<XType> = typed.into_iter().map(|(_, t)| t).collect();
+
+            // emit_function_return_type_xtype may be multi-valued; pick the smallest deterministically instead of relying on iteration order.
+            let ret_type = db
+                .rel_iter::<(Address, XType)>("emit_function_return_type_xtype")
+                .filter(|(a, _)| *a == addr)
                 .map(|(_, t)| *t)
+                .min()
                 .unwrap_or(XType::Xvoid);
 
             callee_sigs.insert(ident, CalleeSignature {
@@ -749,14 +832,24 @@ fn resolve_rodata_scalar(
 pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<GlobalData>, String> {
     let mut globals = Vec::new();
 
-    let mut id_to_name: HashMap<usize, String> = HashMap::new();
+    // Globals can have multiple symbols at one address (e.g. glibc weak aliases like __progname_full / program_invocation_name). HashMap::insert with non-deterministic iteration would pick a different alias each run, which then flips the type because known_global_type matches by name. Collect candidates, then pick the lex-smallest name per id so it's stable.
+    let mut ident_name_candidates: HashMap<usize, Vec<String>> = HashMap::new();
     for (id, name) in db.rel_iter::<(Ident, Symbol)>("ident_to_symbol") {
-        id_to_name.insert(*id, name.to_string());
+        ident_name_candidates.entry(*id).or_default().push(name.to_string());
+    }
+    let mut symbol_name_candidates: HashMap<usize, Vec<String>> = HashMap::new();
+    for (addr, name, _) in db.rel_iter::<(Address, Symbol, Symbol)>("symbols") {
+        symbol_name_candidates.entry(*addr as usize).or_default().push(name.to_string());
+    }
+    let mut id_to_name: HashMap<usize, String> = HashMap::new();
+    for (id, mut names) in ident_name_candidates {
+        names.sort();
+        id_to_name.insert(id, names.into_iter().next().unwrap());
     }
     // ELF symbols are authoritative: override ident_to_symbol entries.
-    for (addr, name, _) in db.rel_iter::<(Address, Symbol, Symbol)>("symbols") {
-        let id = *addr as usize;
-        id_to_name.insert(id, name.to_string());
+    for (id, mut names) in symbol_name_candidates {
+        names.sort();
+        id_to_name.insert(id, names.into_iter().next().unwrap());
     }
 
     let global_ptr_ids: std::collections::HashSet<usize> = db.rel_iter::<(Ident,)>("emit_global_is_ptr")
@@ -797,11 +890,21 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
         addrs
     };
 
-    // Build map of global load chunk types for rodata constant resolution
-    let global_chunks: HashMap<usize, MemoryChunk> = db
-        .rel_iter::<(Ident, MemoryChunk)>("global_load_chunk")
-        .map(|(id, chunk)| (*id, *chunk))
-        .collect();
+    // Build map of global load chunk types for rodata constant resolution.
+    // A literal in .rodata can be loaded with multiple chunks (e.g. as Float32 and Float64), so the relation carries several rows per id. Pick the smallest chunk by Ord so the resolved scalar value is stable across runs.
+    let global_chunks: HashMap<usize, MemoryChunk> = {
+        let mut groups: HashMap<usize, Vec<MemoryChunk>> = HashMap::new();
+        for (id, chunk) in db.rel_iter::<(Ident, MemoryChunk)>("global_load_chunk") {
+            groups.entry(*id).or_default().push(*chunk);
+        }
+        groups
+            .into_iter()
+            .map(|(id, mut chunks)| {
+                chunks.sort();
+                (id, chunks[0])
+            })
+            .collect()
+    };
 
     // Build set of read-only section address ranges
     let rodata_ranges: Vec<(u64, u64, Vec<u8>)> = obj_file
@@ -965,12 +1068,16 @@ pub fn extract_loop_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, Loo
     }
 
     for (func_addr, loop_head, exit_node, _, _, _, _) in db.rel_iter::<(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node)>("emit_loop_exit") {
-        result
+        // emit_loop_exit is multi-valued for loops with several exit branches; Ascent set order is non-deterministic, so keep the smallest exit node.
+        let info = result
             .entry(*func_addr)
             .or_default()
             .entry(*loop_head)
-            .or_insert_with(LoopInfo::default)
-            .exit_node = Some(*exit_node);
+            .or_insert_with(LoopInfo::default);
+        info.exit_node = Some(match info.exit_node {
+            Some(existing) => existing.min(*exit_node),
+            None => *exit_node,
+        });
     }
 
     for (func_addr, loop_header, step_node) in db.rel_iter::<(Address, Node, Node)>("trim_step") {
@@ -986,12 +1093,19 @@ pub fn extract_loop_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, Loo
         }
     }
 
-    // Pre-index loop_exit_branch for O(1) lookup
+    // Pre-index loop_exit_branch for O(1) lookup. The relation may carry several rows per (f, h, en); keep the lexicographically smallest debug form so the index is identical across runs regardless of Ascent set order.
     let mut exit_branch_index: HashMap<(Address, Node, Node), (Condition, Arc<Vec<CsharpminorExpr>>, bool)> = HashMap::new();
     for (f, h, en, cond, args, _exit_target, _cont_target, inverted) in
         db.rel_iter::<(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node, bool)>("loop_exit_branch")
     {
-        exit_branch_index.insert((*f, *h, *en), (cond.clone(), args.clone(), *inverted));
+        let cand = (cond.clone(), args.clone(), *inverted);
+        let take = match exit_branch_index.get(&(*f, *h, *en)) {
+            Some(existing) => format!("{:?}", cand) < format!("{:?}", existing),
+            None => true,
+        };
+        if take {
+            exit_branch_index.insert((*f, *h, *en), cand);
+        }
     }
 
     for (func_addr, loop_header, exit_node) in db.rel_iter::<(Address, Node, Node)>("primary_exit_node") {
@@ -1001,12 +1115,19 @@ pub fn extract_loop_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, Loo
                 .or_default()
                 .entry(*loop_header)
                 .or_insert_with(LoopInfo::default);
-            info.primary_exit = Some(PrimaryExitData {
-                exit_node: *exit_node,
-                condition: cond.clone(),
-                args: args.clone(),
-                inverted: *inverted,
-            });
+            // primary_exit_node may yield several candidates per loop; keep the one with the smallest exit node so the choice is deterministic across runs.
+            let take = match &info.primary_exit {
+                Some(existing) => *exit_node < existing.exit_node,
+                None => true,
+            };
+            if take {
+                info.primary_exit = Some(PrimaryExitData {
+                    exit_node: *exit_node,
+                    condition: cond.clone(),
+                    args: args.clone(),
+                    inverted: *inverted,
+                });
+            }
         }
     }
 
@@ -1019,7 +1140,14 @@ pub fn extract_loop_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, Loo
             .or_default()
             .entry(*loop_header)
             .or_insert_with(LoopInfo::default);
-        info.break_stmts.insert(*exit_node, break_stmt.clone());
+        // emit_break_stmt may carry several statements for one exit node; keep the lexicographically smallest debug form so the choice is deterministic.
+        let take = match info.break_stmts.get(exit_node) {
+            Some(existing) => format!("{:?}", break_stmt) < format!("{:?}", existing),
+            None => true,
+        };
+        if take {
+            info.break_stmts.insert(*exit_node, break_stmt.clone());
+        }
     }
 
     // Sort loop body nodes by id (address-encoded) for program order; Ascent set order is nondeterministic and may push calls past control-flow exits causing them to be eliminated as unreachable.
@@ -1065,12 +1193,16 @@ pub fn extract_ite_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, IteI
     }
 
     for (func_addr, branch, join) in db.rel_iter::<(Address, Node, Node)>("emit_join_point") {
-        result
+        let info = result
             .entry(*func_addr)
             .or_default()
             .entry(*branch)
-            .or_insert_with(IteInfo::default)
-            .join_node = Some(*join);
+            .or_insert_with(IteInfo::default);
+        // emit_join_point may yield several joins per branch; Ascent set order is non-deterministic, so keep the smallest join node.
+        info.join_node = Some(match info.join_node {
+            Some(existing) => existing.min(*join),
+            None => *join,
+        });
     }
 
     for (func_addr, branch) in db.rel_iter::<(Address, Node)>("emit_scond_no_join") {
@@ -1196,12 +1328,23 @@ pub fn extract_struct_definitions(db: &DecompileDB) -> Vec<ExtractedStruct> {
     let mut seen_struct_ids = HashSet::new();
 
     // Pre-collect efield-detected fields per struct ID (merging across functions); these come from ClightFieldPass and may contain fields not in struct_recovery.
-    let reg_to_canonical_ids: HashMap<u64, usize> = db
-        .rel_iter::<(u64, u64, usize)>("reg_to_struct_id")
-        .map(|&(_, reg, sid)| (reg, sid))
-        .collect();
+    // reg_to_struct_id may emit multiple sids per reg; pick the smallest so the same reg resolves to the same canonical id every run.
+    let reg_to_canonical_ids: HashMap<u64, usize> = {
+        let mut groups: HashMap<u64, Vec<usize>> = HashMap::new();
+        for &(_, reg, sid) in db.rel_iter::<(u64, u64, usize)>("reg_to_struct_id") {
+            groups.entry(reg).or_default().push(sid);
+        }
+        groups
+            .into_iter()
+            .map(|(reg, mut sids)| {
+                sids.sort();
+                (reg, sids[0])
+            })
+            .collect()
+    };
 
-    let mut efield_extra_fields: HashMap<usize, BTreeMap<i64, (Ident, MemoryChunk)>> = HashMap::new();
+    // Collect (struct_id, field_offset, field_name, chunk) across all emit_struct_fields tuples. Iteration over the Ascent relation and over `Arc<Vec<...>>` entries is in a non-deterministic order when multiple func_addrs contribute the same field; sort before dedup-by-(struct_id, offset) so the (name, chunk) winner is stable.
+    let mut efield_collected: Vec<(usize, i64, Ident, MemoryChunk)> = Vec::new();
     for (_func_addr, base_offset, fields) in
         db.rel_iter::<(u64, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_struct_fields")
     {
@@ -1209,11 +1352,18 @@ pub fn extract_struct_definitions(db: &DecompileDB) -> Vec<ExtractedStruct> {
         let struct_id = reg_to_canonical_ids.get(&reg)
             .copied()
             .unwrap_or_else(|| base_offset.unsigned_abs() as usize);
-
-        let entry = efield_extra_fields.entry(struct_id).or_default();
         for (field_offset, field_name, chunk) in fields.iter() {
-            entry.entry(*field_offset).or_insert((*field_name, chunk.clone()));
+            efield_collected.push((struct_id, *field_offset, *field_name, chunk.clone()));
         }
+    }
+    efield_collected.sort();
+    let mut efield_extra_fields: HashMap<usize, BTreeMap<i64, (Ident, MemoryChunk)>> = HashMap::new();
+    for (struct_id, field_offset, field_name, chunk) in efield_collected {
+        efield_extra_fields
+            .entry(struct_id)
+            .or_default()
+            .entry(field_offset)
+            .or_insert((field_name, chunk));
     }
 
     for (layout_hash, canonical_id, _field_count, _total_size) in db.rel_iter::<(u64, usize, usize, usize)>("global_struct_catalog") {

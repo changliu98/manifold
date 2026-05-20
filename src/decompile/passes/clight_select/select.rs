@@ -90,8 +90,7 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
 
     let mut name_to_ident: HashMap<String, Ident> = HashMap::new();
     {
-        // Iterate in sorted (id, name) order so that, on a sanitized-name collision,
-        // the surviving Ident is deterministic across runs.
+        // Iterate in sorted (id, name) order so that, on a sanitized-name collision, the surviving Ident is deterministic across runs.
         let mut sorted_id_name: Vec<(&usize, &String)> = id_to_name.iter().collect();
         sorted_id_name.sort_by_key(|(id, name)| (**id, (*name).clone()));
         for (id, name) in sorted_id_name {
@@ -192,7 +191,47 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
         })
         .collect();
 
+    if std::env::var("DET_FP").is_ok() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let fh = |s: &str| -> u64 {
+            let mut h = DefaultHasher::new();
+            s.hash(&mut h);
+            h.finish()
+        };
+        for f in &selected {
+            let mut st: Vec<String> = f.statements.iter().map(|(n, s)| format!("{}:{:?}", n, s)).collect();
+            st.sort();
+            let mut su: Vec<String> = f.successors.iter().map(|(n, v)| format!("{}:{:?}", n, v)).collect();
+            su.sort();
+            let mut sg: Vec<String> = f.sseq_groups.iter().map(|(k, v)| format!("{}:{:?}", k, v)).collect();
+            sg.sort();
+            let mut li: Vec<String> = f.loop_info.iter().map(|(n, v)| format!("{}:{:?}", n, v)).collect();
+            li.sort();
+            let mut rsi: Vec<String> = f.reg_struct_ids.iter().map(|(k, v)| format!("{}:{}", k, v)).collect();
+            rsi.sort();
+            eprintln!(
+                "[FP-A] {:016x} stmts={:016x} succ={:016x} sseq={:016x} linfo={:016x} rsi={:016x}",
+                f.address, fh(&st.join(",")), fh(&su.join(",")), fh(&sg.join(",")),
+                fh(&li.join(",")), fh(&rsi.join(",")),
+            );
+        }
+    }
+
     Ok(selected)
+}
+
+fn det_fp_stage(addr: Address, stage: &str, statements: &HashMap<Node, ClightStmt>) {
+    if std::env::var("DET_FP").is_err() {
+        return;
+    }
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut items: Vec<String> = statements.iter().map(|(n, s)| format!("{}:{:?}", n, s)).collect();
+    items.sort();
+    let mut h = DefaultHasher::new();
+    items.join(",").hash(&mut h);
+    eprintln!("[FP-{}] {:016x} {:016x}", stage, addr, h.finish());
 }
 
 /// Build a SelectedFunction from the program-level search result for one function.
@@ -228,13 +267,16 @@ fn build_selected_function_from_program_state(
 
     // Materialize and post-process
     let mut statements = materialize_statements(&per_func_state, func);
+    det_fp_stage(func.address, "S1mat", &statements);
 
     let func_loop_info = loop_info_all.get(&func.address).cloned().unwrap_or_default();
 
     assemble_loops(&mut statements, &func_loop_info);
+    det_fp_stage(func.address, "S2loop", &statements);
 
     let func_ite_info = ite_info_all.get(&func.address).cloned().unwrap_or_default();
     assemble_ite(&mut statements, &func_ite_info);
+    det_fp_stage(func.address, "S3ite", &statements);
 
     // Sort sseq groups by head so overlapping groups resolve deterministically.
     let mut sorted_sseq: Vec<(Node, Vec<Node>)> = func.sseq_groups.iter()
@@ -262,10 +304,15 @@ fn build_selected_function_from_program_state(
         }
     }
 
+    det_fp_stage(func.address, "S4sseq", &statements);
     inline_control_flow_bodies(&mut statements, &func.successors);
+    det_fp_stage(func.address, "S5inline", &statements);
     flatten_cascading_ifthenelse_all(&mut statements);
+    det_fp_stage(func.address, "S6flat", &statements);
     deduplicate_identical_blocks(&mut statements);
+    det_fp_stage(func.address, "S7dedup", &statements);
     ensure_goto_labels(&mut statements);
+    det_fp_stage(func.address, "S8labels", &statements);
 
     SelectedFunction {
         address: func.address,
@@ -859,10 +906,11 @@ fn function_based_parallel_search(
     global_canonical_to_reg_key: &HashMap<i64, Vec<i64>>,
     name_to_ident: &HashMap<String, Ident>,
 ) -> ProgramSelectionState {
+    // Profiling on ls (step_budget=64): 1534 clang calls / 3331 cache hits across 285 functions; 63% remain unresolved when search ends, and the top 10% of functions consume 16-64 calls each (the long tail dominating wall time). Lowered default to 16: p90 of "calls per function" was already 16, so the median and 90th percentile are untouched; the change cuts the long tail that wasn't converging anyway.
     let step_budget: usize = std::env::var("CLIGHT_SELECT_STEPS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(64);
+        .unwrap_or(16);
 
     let max_per_node: usize = std::env::var("CLIGHT_SELECT_PER_NODE")
         .ok()
@@ -878,7 +926,7 @@ fn function_based_parallel_search(
         .collect();
     funcs_to_search.sort_by_key(|&i| functions[i].address);
 
-    let raw: Vec<Option<(Address, HybridFunctionState)>> = funcs_to_search
+    let raw: Vec<Option<(Address, HybridFunctionState, CegarSearchStats)>> = funcs_to_search
         .par_iter()
         .map(|&func_idx| {
             let _ = clang_sys::load();
@@ -889,19 +937,65 @@ fn function_based_parallel_search(
                 return None;
             }
 
-            let result = function_standalone_search(
+            let (state, stats) = function_standalone_search(
                 func, &meta,
                 global_struct_fields, global_canonical_to_reg_key,
                 name_to_ident,
                 step_budget, max_per_node,
             );
 
-            Some((func.address, result))
+            Some((func.address, state, stats))
         })
         .collect();
 
-    let mut results: Vec<(Address, HybridFunctionState)> = raw.into_iter().flatten().collect();
+    let mut results: Vec<(Address, HybridFunctionState)> = Vec::with_capacity(raw.len());
+    let mut all_stats: Vec<(Address, CegarSearchStats)> = Vec::with_capacity(raw.len());
+    for entry in raw.into_iter().flatten() {
+        let (addr, state, stats) = entry;
+        results.push((addr, state));
+        all_stats.push((addr, stats));
+    }
     results.sort_by_key(|(addr, _)| *addr);
+    all_stats.sort_by_key(|(addr, _)| *addr);
+
+    if std::env::var("CLIGHT_SELECT_STATS").is_ok() {
+        let mut calls: Vec<usize> = all_stats.iter().map(|(_, s)| s.clang_calls).collect();
+        let mut hits: Vec<usize> = all_stats.iter().map(|(_, s)| s.cache_hits).collect();
+        let mut steps: Vec<usize> = all_stats.iter().map(|(_, s)| s.steps_used).collect();
+        let funcs_n = calls.len();
+        let total_calls: usize = calls.iter().sum();
+        let total_hits: usize = hits.iter().sum();
+        let total_steps: usize = steps.iter().sum();
+        let unresolved: usize = all_stats.iter().filter(|(_, s)| s.final_errors > 0).count();
+        let maxed_out: usize = all_stats.iter().filter(|(_, s)| s.max_outer_iters_reached).count();
+        calls.sort();
+        hits.sort();
+        steps.sort();
+        let pct = |v: &[usize], p: f64| -> usize {
+            if v.is_empty() { 0 } else {
+                let idx = ((v.len() as f64 - 1.0) * p).round() as usize;
+                v[idx.min(v.len() - 1)]
+            }
+        };
+        eprintln!(
+            "[cegar-stats] funcs={} total_clang_calls={} total_cache_hits={} total_steps={} unresolved={} max_iters_reached={}",
+            funcs_n, total_calls, total_hits, total_steps, unresolved, maxed_out
+        );
+        eprintln!(
+            "[cegar-stats] calls/func: min={} p50={} p75={} p90={} p95={} p99={} max={}",
+            pct(&calls, 0.0), pct(&calls, 0.5), pct(&calls, 0.75),
+            pct(&calls, 0.90), pct(&calls, 0.95), pct(&calls, 0.99),
+            pct(&calls, 1.0)
+        );
+        eprintln!(
+            "[cegar-stats] cache_hits/func: min={} p50={} p90={} max={}",
+            pct(&hits, 0.0), pct(&hits, 0.5), pct(&hits, 0.90), pct(&hits, 1.0)
+        );
+        eprintln!(
+            "[cegar-stats] steps/func: min={} p50={} p90={} max={}",
+            pct(&steps, 0.0), pct(&steps, 0.5), pct(&steps, 0.90), pct(&steps, 1.0)
+        );
+    }
 
     let mut program_state = build_program_initial_state(functions);
     for (addr, hybrid) in &results {
@@ -912,6 +1006,15 @@ fn function_based_parallel_search(
 }
 
 /// Standalone per-function search: emits this function in isolation and validates with clang.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct CegarSearchStats {
+    pub clang_calls: usize,
+    pub cache_hits: usize,
+    pub final_errors: usize,
+    pub max_outer_iters_reached: bool,
+    pub steps_used: usize,
+}
+
 fn function_standalone_search(
     func: &FunctionData,
     meta: &RefinableMetadata,
@@ -920,12 +1023,20 @@ fn function_standalone_search(
     name_to_ident: &HashMap<String, Ident>,
     step_budget: usize,
     max_per_node: usize,
-) -> HybridFunctionState {
+) -> (HybridFunctionState, CegarSearchStats) {
     let mut state = build_hybrid_initial_state(func);
     let mut func_view = func.clone();
 
     // Constraint propagation: force logically required types before any clang call
     propagate_type_constraints(&mut state, func, meta);
+
+    let clang_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cache_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Cache evaluation results keyed by the hash of the emitted C code. The CEGAR search re-evaluates many near-identical states (bisection over fix subsets, beam search ties), and changes to state fields that do not affect this function's emitted code produce identical c_code and identical clang outputs -- so the cache avoids the ~30ms libclang invocation for any state that emits a C string we have already checked. Per-function cache; freed when the search returns. Wrapped in Arc<Mutex> because Wave 2 and beam search call `evaluate` from `par_iter`, so the cache must be shared safely across rayon workers.
+    let clang_cache: std::sync::Arc<
+        std::sync::Mutex<HashMap<u64, (usize, Vec<Node>, HashMap<Node, Vec<String>>)>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     // Evaluate: emit single function -> clang, return (error_count, sorted_error_nodes, node_errors)
     let evaluate = |state: &HybridFunctionState, func_view: &mut FunctionData|
@@ -951,9 +1062,25 @@ fn function_standalone_search(
             }
         }
         let (c_code, line_map) = emit_function_c(func_view, &stmts, global_struct_fields, global_canonical_to_reg_key, name_to_ident);
+
+        let cache_key = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            c_code.hash(&mut h);
+            h.finish()
+        };
+        if let Some(cached) = clang_cache.lock().unwrap().get(&cache_key) {
+            cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return cached.clone();
+        }
+
+        clang_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let errors = run_clang_check(&c_code);
         if errors.is_empty() {
-            return (0, Vec::new(), HashMap::new());
+            let result = (0usize, Vec::new(), HashMap::new());
+            clang_cache.lock().unwrap().insert(cache_key, result.clone());
+            return result;
         }
         // Map errors to nodes
         let mut error_nodes = Vec::new();
@@ -995,24 +1122,33 @@ fn function_standalone_search(
         }
         // Sort for deterministic processing order
         error_nodes.sort();
-        (errors.len(), error_nodes, node_errors)
+        let result = (errors.len(), error_nodes, node_errors);
+        clang_cache.lock().unwrap().insert(cache_key, result.clone());
+        result
     };
 
     let (mut current_errors, mut error_nodes, mut node_errors) = evaluate(&state, &mut func_view);
-    if current_errors == 0 { return state; }
-
     let mut steps = 0usize;
     let wave12_budget = step_budget * 3 / 4;
-
-    // Outer iteration: re-run Wave 1 + Wave 2 while errors strictly decrease.
     let max_outer_iters: usize = 4;
     let mut iter = 0usize;
+
+    let make_stats = |steps: usize, errors: usize, iter: usize| CegarSearchStats {
+        clang_calls: clang_calls.load(std::sync::atomic::Ordering::Relaxed),
+        cache_hits: cache_hits.load(std::sync::atomic::Ordering::Relaxed),
+        final_errors: errors,
+        max_outer_iters_reached: iter >= max_outer_iters,
+        steps_used: steps,
+    };
+
+    if current_errors == 0 { return (state, make_stats(steps, current_errors, iter)); }
+
+    // Outer iteration: re-run Wave 1 + Wave 2 while errors strictly decrease.
     while iter < max_outer_iters && current_errors > 0 && steps < wave12_budget {
         iter += 1;
         let pre_iter_errors = current_errors;
 
-        // Wave 1: collect directed fixes (deterministically by sorted error_nodes), then
-        // try the full batch. If errors regress, bisect to extract the helpful subset.
+        // Wave 1: collect directed fixes (deterministically by sorted error_nodes), then try the full batch. If errors regress, bisect to extract the helpful subset.
         let mut fix_pairs: Vec<(RTLReg, usize)> = Vec::new();
         let mut seen_regs: HashSet<RTLReg> = HashSet::new();
         for &node in &error_nodes {
@@ -1084,7 +1220,7 @@ fn function_standalone_search(
             current_errors = new_err;
             error_nodes = new_en;
             node_errors = new_ne;
-            if current_errors == 0 { return state; }
+            if current_errors == 0 { return (state, make_stats(steps, current_errors, iter)); }
         }
 
         // Wave 2: per error-node, try alternatives in parallel; keep strict best.
@@ -1120,7 +1256,7 @@ fn function_standalone_search(
                     current_errors = new_err;
                     error_nodes = new_en;
                     node_errors = new_ne;
-                    if current_errors == 0 { return state; }
+                    if current_errors == 0 { return (state, make_stats(steps, current_errors, iter)); }
                 }
             }
         }
@@ -1132,8 +1268,7 @@ fn function_standalone_search(
 
     let beam_width_cap: usize = std::env::var("CLIGHT_SELECT_BEAM_WIDTH")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(8);
-    // Scale beam width with the remaining error count: more errors -> wider beam,
-    // bounded by cap. Floor of 3 preserves prior behavior.
+    // Scale beam width with the remaining error count: more errors -> wider beam, bounded by cap. Floor of 3 preserves prior behavior.
     let beam_width: usize = (current_errors / 2).max(3).min(beam_width_cap);
     if steps < step_budget && current_errors > 0 {
         let remaining_errors: Vec<Node> = error_nodes.iter()
@@ -1206,7 +1341,8 @@ fn function_standalone_search(
         );
     }
 
-    state
+    let stats = make_stats(steps, current_errors, iter);
+    (state, stats)
 }
 
 fn assemble_loops(
@@ -1304,8 +1440,7 @@ fn assemble_ite(
         return;
     }
 
-    // Process smallest bodies first (inner before outer) so nested compounds
-    // are ready when an outer branch collects them.
+    // Process smallest bodies first (inner before outer) so nested compounds are ready when an outer branch collects them.
     let mut branches: Vec<(&Node, &IteInfo)> = ite_info.iter().collect();
     branches.sort_by(|a, b| {
         let a_size = a.1.true_body_nodes.len() + a.1.false_body_nodes.len();

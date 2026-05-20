@@ -60,8 +60,7 @@ ascent_par! {
     relation emit_var_type_candidate(RTLReg, XType);
     relation idom(Address, Node, Node);
     relation stack_var(Address, Address, i64, RTLReg);
-    // Memory-indirect call: the rtl_pass surfaces the load addressing so we can inline the
-    // function-pointer load into the Scall callee (renders as `(*(base + disp))(args)`).
+    // Memory-indirect call: the rtl_pass surfaces the load addressing so we can inline the function-pointer load into the Scall callee (renders as `(*(base + disp))(args)`).
     relation call_through_memory_load(Node, RTLReg, MemoryChunk, Addressing, Args);
 
 
@@ -234,8 +233,7 @@ ascent_par! {
         let var_ident = ident_from_reg(*stack_rtl),
         let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Eaddrof(var_ident));
 
-    // Resolve Econst(Oaddrstack(ofs)) -> Eaddrof(var_ident) when stack_var maps the offset.
-    // This handles the case where cminor_pass already converted Olea(Ainstack) to Oaddrstack.
+    // Resolve Econst(Oaddrstack(ofs)) -> Eaddrof(var_ident) when stack_var maps the offset. This handles the case where cminor_pass already converted Olea(Ainstack) to Oaddrstack.
     csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Econst(Constant::Oaddrstack(ofs)))),
         instr_in_function(node, func_start),
@@ -317,8 +315,7 @@ ascent_par! {
         let call_args = args.iter().map(|r| CsharpminorExpr::Evar(*r)).collect(),
         let stmt = CsharpminorStmt::Scall(dst.clone(), sig.clone(), converted_func, call_args);
 
-    // Memory-indirect call: render callee as the load expression `(*(base + disp))` so the
-    // function pointer slot is dereferenced explicitly in the C output.
+    // Memory-indirect call: render callee as the load expression `(*(base + disp))` so the function pointer slot is dereferenced explicitly in the C output.
     csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Scall(dst, sig, _, args)),
         call_through_memory_load(node, _temp, chunk, addressing, load_args),
@@ -931,6 +928,14 @@ impl IRPass for CshminorPass {
         Self::prepare_jump_tables(db);
 
         run_pass!(db, CshminorPassProgram);
+    }
+
+    fn extra_reads(&self) -> &'static [&'static str] {
+        &[
+            "jump_table_target", "jump_table_impl",
+            "jump_table_cmp", "jump_table_index_reg",
+            "reg_rtl",
+        ]
     }
 
     declare_io_from!(CshminorPassProgram);

@@ -43,6 +43,7 @@ ascent_par! {
     relation emit_reg_type(RTLReg, ClightType);
     relation emit_sseq(Node, Node);
     relation emit_var_type_candidate(RTLReg, XType);
+    relation all_var_types_global(Arc<Vec<(RTLReg, XType)>>);
     relation func_param_struct_type(Address, usize, usize);
     relation func_return_struct_type(Address, usize);
     relation func_span(Symbol, Address, Address);
@@ -137,6 +138,10 @@ ascent_par! {
         if matches!(chunk, MemoryChunk::MInt32 | MemoryChunk::MAny32);
 
 
+    // collect_all_var_types aggregates the whole emit_var_type_candidate relation and does not depend on any node, so materialize it once here instead of recomputing it inside every per-statement rule below.
+    all_var_types_global(Arc::new(pairs)) <--
+        agg pairs = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty);
+
     clight_stmt_raw(node, stmt) <--
         clight_stmt_without_field(node, s),
         if let Some(stmt) = check_clight_stmt(s);
@@ -145,9 +150,9 @@ ascent_par! {
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
         if let CsharpminorExpr::Econdition(cond, true_val, false_val) = expr,
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(&[(**cond).clone(), (**true_val).clone(), (**false_val).clone()]),
-        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         let cond_clight = clight_expr_from_csharp_with_multi_types(cond, &var_types),
         let true_clight = clight_expr_from_csharp_with_multi_types(true_val, &var_types),
         let false_clight = clight_expr_from_csharp_with_multi_types(false_val, &var_types),
@@ -160,9 +165,9 @@ ascent_par! {
         csharp_stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
         is_ptr(dst),
         if !matches!(expr, CsharpminorExpr::Econdition(_, _, _)),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]),
-        let var_type_variants = build_var_type_map_variants(&all_var_types, &vars_used),
+        let var_type_variants = build_var_type_map_variants(all_var_types, &vars_used),
         for var_types in var_type_variants.iter(),
         let out_expr = clight_expr_from_csharp_with_multi_types(&expr, var_types),
         let dst_ident = ident_from_reg(*dst),
@@ -174,9 +179,9 @@ ascent_par! {
         csharp_stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
         emit_var_type_candidate(*dst, dst_xtype),
         if !matches!(expr, CsharpminorExpr::Econdition(_, _, _)),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]),
-        let var_type_variants = build_var_type_map_variants(&all_var_types, &vars_used),
+        let var_type_variants = build_var_type_map_variants(all_var_types, &vars_used),
         for var_types in var_type_variants.iter(),
         let out_expr = clight_expr_from_csharp_with_multi_types(&expr, var_types),
         let dst_ident = ident_from_reg(*dst),
@@ -189,9 +194,9 @@ ascent_par! {
         !is_ptr(dst),
         !emit_var_type_candidate(*dst, _),
         if !matches!(expr, CsharpminorExpr::Econdition(_, _, _)),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]),
-        let var_type_variants = build_var_type_map_variants(&all_var_types, &vars_used),
+        let var_type_variants = build_var_type_map_variants(all_var_types, &vars_used),
         for var_types in var_type_variants.iter(),
         let out_expr = clight_expr_from_csharp_with_multi_types(&expr, var_types),
         let dst_ident = ident_from_reg(*dst),
@@ -205,9 +210,9 @@ ascent_par! {
         !is_ptr(dst),
         !emit_var_type_candidate(*dst, _),
         if !matches!(expr, CsharpminorExpr::Econdition(_, _, _)),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]),
-        let var_type_variants = build_var_type_map_variants(&all_var_types, &vars_used),
+        let var_type_variants = build_var_type_map_variants(all_var_types, &vars_used),
         for var_types in var_type_variants.iter(),
         let out_expr = clight_expr_from_csharp_with_multi_types(&expr, var_types),
         let dst_ident = ident_from_reg(*dst),
@@ -217,11 +222,11 @@ ascent_par! {
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sstore(chunk, addr, value)),
         sstore_clight_type(node, ty),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let mut all_exprs = vec![addr.clone()],
         let _ = all_exprs.push(value.clone()),
         let vars_used = extract_vars_from_csharp_exprs(&all_exprs),
-        let var_type_variants = build_var_type_map_variants(&all_var_types, &vars_used),
+        let var_type_variants = build_var_type_map_variants(all_var_types, &vars_used),
         for var_types in var_type_variants.iter(),
         let addr_expr = clight_expr_from_csharp_with_multi_types(&addr, var_types),
         if !matches!(addr_expr, ClightExpr::EconstInt(0, _) | ClightExpr::EconstLong(0, _)),
@@ -238,16 +243,16 @@ ascent_par! {
         instr_in_function(node, func_addr),
         emit_function(func_addr, _, _),
         emit_function_return(func_addr, ret_reg),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let mut all_exprs = vec![expr.clone()],
         let _ = all_exprs.extend_from_slice(args.as_slice()),
         let vars_used = extract_vars_from_csharp_exprs(&all_exprs),
-        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         let dst_ident = Some(ident_from_reg(*ret_reg)),
         let ret_ident = ident_from_reg(*ret_reg),
         let raw_func_expr = clight_expr_from_csharp_with_multi_types(&expr, &var_types),
         let crude_sig = resolve_signature(&sig),
-        let resolved_sig = refine_indirect_call_signature(&crude_sig, args.as_slice(), &all_var_types, &None),
+        let resolved_sig = refine_indirect_call_signature(&crude_sig, args.as_slice(), all_var_types, &None),
         let func_ty = clight_function_pointer_type(&resolved_sig),
         let func_expr = ClightExpr::Ecast(Box::new(raw_func_expr.clone()), func_ty.clone()),
         let raw_args = clight_exprs_from_csharp_with_multi_types(args.as_slice(), &var_types),
@@ -262,9 +267,9 @@ ascent_par! {
         instr_in_function(node, func_addr),
         emit_function(func_addr, _, _),
         emit_function_return(func_addr, ret_reg),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(args.as_slice()),
-        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         let dst_ident = Some(ident_from_reg(*ret_reg)),
         let ret_ident = ident_from_reg(*ret_reg),
         addr_to_func_ident(addr, func_ident),
@@ -302,10 +307,10 @@ ascent_par! {
         instr_in_function(node, func_addr),
         emit_function(func_addr, _, _),
         emit_function_void(func_addr),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let raw_func_expr = clight_expr_from_csharp(&expr),
         let crude_sig = resolve_signature(&sig),
-        let resolved_sig = refine_indirect_call_signature(&crude_sig, args.as_slice(), &all_var_types, &None),
+        let resolved_sig = refine_indirect_call_signature(&crude_sig, args.as_slice(), all_var_types, &None),
         let func_ty = clight_function_pointer_type(&resolved_sig),
         let func_expr = ClightExpr::Ecast(Box::new(raw_func_expr.clone()), func_ty.clone()),
         let raw_args = clight_exprs_from_csharp(args.as_slice()),
@@ -350,9 +355,9 @@ ascent_par! {
         instr_in_function(node, func_addr),
         emit_function(func_addr, _, _),
         emit_function_return(func_addr, ret_reg),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(args.as_slice()),
-        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         let dst_ident = Some(ident_from_reg(*ret_reg)),
         let ret_ident = ident_from_reg(*ret_reg),
         let resolved_sig = resolve_signature(&sig),
@@ -384,10 +389,10 @@ ascent_par! {
         emit_function(func_addr, _, _),
         !emit_function_return(func_addr, _),
         !emit_function_void(func_addr),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let raw_func_expr = clight_expr_from_csharp(&expr),
         let crude_sig = resolve_signature(&sig),
-        let resolved_sig = refine_indirect_call_signature(&crude_sig, args.as_slice(), &all_var_types, &None),
+        let resolved_sig = refine_indirect_call_signature(&crude_sig, args.as_slice(), all_var_types, &None),
         let func_ty = clight_function_pointer_type(&resolved_sig),
         let func_expr = ClightExpr::Ecast(Box::new(raw_func_expr), func_ty),
         let raw_args = clight_exprs_from_csharp(args.as_slice()),
@@ -446,13 +451,13 @@ ascent_par! {
 
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Scall(dst, sig, Either::Left(expr), args)),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let mut all_exprs = vec![expr.clone()],
         let _ = all_exprs.extend_from_slice(args.as_slice()),
         let vars_used = extract_vars_from_csharp_exprs(&all_exprs),
-        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         let crude_sig = resolve_signature(&sig),
-        let resolved_sig = refine_indirect_call_signature(&crude_sig, args.as_slice(), &all_var_types, dst),
+        let resolved_sig = refine_indirect_call_signature(&crude_sig, args.as_slice(), all_var_types, dst),
         let dst_ident = if resolved_sig.sig_res == XType::Xvoid { None } else { dst.clone().map(ident_from_reg) },
         let raw_func_expr = clight_expr_from_csharp_with_multi_types(&expr, &var_types),
         let func_ty = clight_function_pointer_type(&resolved_sig),
@@ -463,9 +468,9 @@ ascent_par! {
 
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Scall(dst, sig, Either::Right(Either::Left(addr)), args)),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(args.as_slice()),
-        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         addr_to_func_ident(addr, func_ident),
         let resolved_sig = resolve_signature(&sig),
         let dst_ident = if resolved_sig.sig_res == XType::Xvoid { None } else { dst.clone().map(ident_from_reg) },
@@ -478,9 +483,9 @@ ascent_par! {
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Scall(dst, sig, Either::Right(Either::Left(addr)), args)),
         !addr_to_func_ident(addr, _),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(args.as_slice()),
-        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         let func_ident = *addr as Ident,
         let resolved_sig = resolve_signature(&sig),
         let dst_ident = if resolved_sig.sig_res == XType::Xvoid { None } else { dst.clone().map(ident_from_reg) },
@@ -492,9 +497,9 @@ ascent_par! {
 
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Scall(dst, sig, Either::Right(Either::Right(sym)), args)),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(args.as_slice()),
-        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         let resolved_sig = resolve_signature(&sig),
         let dst_ident = if resolved_sig.sig_res == XType::Xvoid { None } else { dst.clone().map(ident_from_reg) },
         let func_ty = clight_function_pointer_type(&resolved_sig),
@@ -505,9 +510,9 @@ ascent_par! {
 
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sbuiltin(dst, name, args, res)),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_builtin_args(&args),
-        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         let (effective_dst_init, effective_name_init) = match name.as_str() {
             "__builtin_hlt" => {
                 (None, "__builtin_unreachable".to_string())
@@ -543,9 +548,9 @@ ascent_par! {
         csharp_stmt(node, ?CsharpminorStmt::Scond(cond, exprs, ifso, ifnot)),
         !valid_switch_chain(_, node, _),
         !valid_ternary(_, node, _, _, _, _),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(exprs.as_slice()),
-        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         let condition_opt = crate::decompile::passes::clight_pass::clight_condition_expr_with_types(&cond, exprs.as_slice(), &var_types),
         if let Some(condition) = condition_opt,
         let then_stmt = ClightStmt::Sgoto(ident_from_node(*ifso)),
@@ -555,20 +560,20 @@ ascent_par! {
     // Compound Sifthenelse (lifted by structuring_pass): recursively convert bodies
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sifthenelse(cond, args, then_body, else_body)),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         agg func_syms = collect_func_symbols(ident, sym) in ident_to_symbol(ident, sym),
         let vars_used = extract_vars_from_csharp_exprs(args.as_slice()),
-        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         if let Some(condition) = crate::decompile::passes::clight_pass::clight_condition_expr_with_types(&cond, args.as_slice(), &var_types),
-        let then_clight = crate::decompile::passes::clight_pass::convert_csharp_stmt_to_clight(then_body, &all_var_types, &func_syms),
-        let else_clight = crate::decompile::passes::clight_pass::convert_csharp_stmt_to_clight(else_body, &all_var_types, &func_syms),
+        let then_clight = crate::decompile::passes::clight_pass::convert_csharp_stmt_to_clight(then_body, all_var_types, &func_syms),
+        let else_clight = crate::decompile::passes::clight_pass::convert_csharp_stmt_to_clight(else_body, all_var_types, &func_syms),
         let stmt = ClightStmt::Sifthenelse(condition, Box::new(then_clight), Box::new(else_clight));
 
     clight_stmt_without_field(head, stmt) <--
         valid_switch_chain(func, head, reg),
         agg cases = collect_switch_cases(val, target) in switch_chain_member(func, head, _, reg, val, target),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
-        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &[ *reg ]),
+        all_var_types_global(all_var_types),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &[ *reg ]),
         let discr = ClightExpr::Etempvar(ident_from_reg(*reg), var_types.get(reg).map(|types| select_type_from_candidates(types, None)).unwrap_or_else(default_int_type)),
         let table = {
              let mut entries = Vec::new();
@@ -583,9 +588,9 @@ ascent_par! {
     clight_stmt_without_field(branch, stmt) <--
         valid_ternary(func, branch, var, true_expr, false_expr, _merge),
         csharp_stmt(branch, ?CsharpminorStmt::Scond(cond, args, _, _)),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(&[true_expr.clone(), false_expr.clone()]),
-        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         let condition_opt = crate::decompile::passes::clight_pass::clight_condition_expr_with_types(&cond, args.as_slice(), &var_types),
         if let Some(condition) = condition_opt,
         let true_clight = clight_expr_from_csharp_with_multi_types(&true_expr, &var_types),
@@ -604,9 +609,9 @@ ascent_par! {
         
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sjumptable(expr, targets)),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]),
-        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         let discr = clight_expr_from_csharp_with_multi_types(&expr, &var_types),
         let table = {
             let mut entries = Vec::new();
@@ -630,9 +635,9 @@ ascent_par! {
 
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sreturn(result)),
-        agg all_var_types = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(&[result.clone()]),
-        let var_types = filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         let converted = clight_expr_from_csharp_with_multi_types(&result, &var_types),
         let stmt = ClightStmt::Sreturn(Some(converted.clone()));
 
@@ -1822,8 +1827,7 @@ pub fn extract_struct_field_info(expr: &CsharpminorExpr) -> Option<(i64, i64)> {
                         return Some((base_key, 0));
                     }
                 }
-                // `base + idx*scale` with no constant offset (the offset-0 pair of the
-                // accumulated-offset case above). Attribute field 0 to `base`.
+                // `base + idx*scale` with no constant offset (the offset-0 pair of the accumulated-offset case above). Attribute field 0 to `base`.
                 CsharpminorExpr::Ebinop(op, lhs, rhs)
                     if matches!(op, CminorBinop::Oadd | CminorBinop::Oaddl) =>
                 {

@@ -850,20 +850,20 @@ pub(crate) fn strip_version_suffix(sym: &str) -> Symbol {
 pub(crate) fn collect_unique_struct_fields<'a>(
     input: impl Iterator<Item = (&'a i64, &'a Ident, &'a MemoryChunk)>,
 ) -> impl Iterator<Item = Arc<Vec<(i64, Ident, MemoryChunk)>>> {
+    // Ascent aggregator input order is non-deterministic. Collect everything, then sort by (offset, name, chunk) before dedup-by-(offset, name) so the chunk we keep for a given field is the same across runs.
+    let mut all: Vec<(i64, Ident, MemoryChunk)> = input
+        .map(|(offset, name, chunk)| (*offset, *name, chunk.clone()))
+        .collect();
+    all.sort();
+
+    let mut fields = Vec::with_capacity(all.len());
     let mut seen = std::collections::HashSet::new();
-
-    let mut fields = Vec::new();
-
-    for (offset, name, chunk) in input {
-        let key = (*offset, *name);
-
-        if !seen.contains(&key) {
-            seen.insert(key);
-
-            fields.push((*offset, *name, chunk.clone()));
+    for tuple in all {
+        let key = (tuple.0, tuple.1);
+        if seen.insert(key) {
+            fields.push(tuple);
         }
     }
-    fields.sort_by_key(|(off, _, _)| *off);
 
     std::iter::once(Arc::new(fields))
 }

@@ -466,10 +466,24 @@ impl DecompileDB {
     }
 
     // Execute the full decompilation pipeline: schedule passes, run them (with optional parallelism), handle tracing.
-    pub fn run_pipeline(&mut self, binary_path: &std::path::Path, trace_enabled: bool, measure_rule_times: bool) {
+    pub fn run_pipeline(
+        &mut self,
+        binary_path: &std::path::Path,
+        trace_enabled: bool,
+        measure_rule_times: bool,
+        memsave: bool,
+    ) {
         log::info!("Starting decompilation pipeline...");
 
         let measure_mem = std::env::var("MEASURE_MEM").is_ok();
+
+        // TRACE_NODE / TRACE_FUNC read many relations after the pipeline; honoring --memsave here would empty those reads. Disable memsave when either env var is set.
+        let memsave = if memsave && (std::env::var("TRACE_NODE").is_ok() || std::env::var("TRACE_FUNC").is_ok()) {
+            eprintln!("[memsave] disabled because TRACE_NODE/TRACE_FUNC is set");
+            false
+        } else {
+            memsave
+        };
 
         self.binary_path = Some(binary_path.to_path_buf());
         self.trace_enabled = trace_enabled;
@@ -506,7 +520,21 @@ impl DecompileDB {
         let schedule = PassScheduler::build_schedule(&passes);
         schedule.print();
 
-        for stage in &schedule.stages {
+        let drops_per_stage: Vec<Vec<&'static str>> = if memsave {
+            schedule.compute_drops(&passes)
+        } else {
+            vec![Vec::new(); schedule.stages.len()]
+        };
+
+        if memsave {
+            let total_dropped: usize = drops_per_stage.iter().map(|v| v.len()).sum();
+            eprintln!(
+                "[memsave] enabled: scheduled {} relation drops across {} stages",
+                total_dropped, drops_per_stage.len()
+            );
+        }
+
+        for (stage_idx, stage) in schedule.stages.iter().enumerate() {
             if stage.passes.len() == 1 {
                 let idx = stage.passes[0];
                 let pass = &passes[idx];
@@ -529,15 +557,16 @@ impl DecompileDB {
                     .map(|&idx| passes[idx].name())
                     .collect();
 
-                let pass_ios: Vec<(&[&'static str], &[&'static str])> = stage.passes.iter()
-                    .map(|&idx| (passes[idx].inputs(), passes[idx].outputs()))
+                let pass_ios: Vec<(&[&'static str], &[&'static str], &[&'static str])> = stage.passes.iter()
+                    .map(|&idx| (passes[idx].inputs(), passes[idx].outputs(), passes[idx].extra_reads()))
                     .collect();
 
                 let sub_dbs: Option<Vec<DecompileDB>> = pass_ios.iter()
-                    .map(|(inputs, outputs)| {
-                        // Clone both inputs and outputs since output relations may have pre-existing data that pass rules read.
+                    .map(|(inputs, outputs, extras)| {
+                        // Clone inputs, outputs, and imperative reads. Outputs may have pre-existing data that pass rules read; extras are imperative `rel_iter` reads outside the Ascent program.
                         let mut all_needed: Vec<&'static str> = inputs.to_vec();
                         all_needed.extend_from_slice(outputs);
+                        all_needed.extend_from_slice(extras);
                         all_needed.sort();
                         all_needed.dedup();
                         let cloned = self.try_clone_relations(&all_needed)?;
@@ -570,7 +599,7 @@ impl DecompileDB {
                     });
 
                     for (i, mut sub_db) in sub_dbs.into_iter().enumerate() {
-                        let (_inputs, outputs) = &pass_ios[i];
+                        let (_inputs, outputs, _extras) = &pass_ios[i];
                         for &out_name in *outputs {
                             if let Some(val) = sub_db.relations.remove(out_name) {
                                 self.relations.insert(out_name, val);
@@ -603,6 +632,29 @@ impl DecompileDB {
                         } else {
                             log::info!("Pass {} completed in {:?}", pass.name(), elapsed);
                         }
+                    }
+                }
+            }
+
+            if memsave {
+                let to_drop = &drops_per_stage[stage_idx];
+                if !to_drop.is_empty() {
+                    let mut dropped_bytes: usize = 0;
+                    let mut dropped_count: usize = 0;
+                    for &name in to_drop {
+                        if let Some(entry) = self.relations.remove(name) {
+                            if let Some((_, bytes)) = entry.size_info() {
+                                dropped_bytes += bytes;
+                            }
+                            dropped_count += 1;
+                        }
+                    }
+                    if dropped_count > 0 {
+                        let mb = dropped_bytes as f64 / 1024.0 / 1024.0;
+                        eprintln!(
+                            "[memsave] stage {}: dropped {} relations (~{:.1} MB)",
+                            stage_idx, dropped_count, mb
+                        );
                     }
                 }
             }
