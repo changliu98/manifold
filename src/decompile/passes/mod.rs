@@ -4,6 +4,7 @@ pub mod asm_pass;
 pub mod mach_pass;
 pub mod linear_pass;
 pub mod rtl_pass;
+pub mod rtl_optimize_pass;
 pub mod cminor_pass;
 pub mod csh_pass;
 pub mod cshminor_pass;
