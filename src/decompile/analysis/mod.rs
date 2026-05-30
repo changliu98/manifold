@@ -6,3 +6,4 @@ pub mod ptr_to_pass;
 pub mod struct_recovery_pass;
 pub mod canary_vla_pass;
 pub mod structuring_pass;
+pub mod closed_form_switch_pass;

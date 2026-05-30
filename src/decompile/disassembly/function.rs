@@ -21,6 +21,7 @@ pub fn infer_functions(db: &mut DecompileDB, insns: &[DecodedInsn]) {
         entries.insert(*callee);
     }
 
+    // main_function is seeded earlier by detect_main_via_libc_start_main so main becomes a block leader and named entry.
     for (addr,) in db.rel_iter::<(Address,)>("main_function") {
         entries.insert(*addr);
     }
@@ -346,4 +347,61 @@ pub fn detect_prologue_entries(insns: &[DecodedInsn]) -> BTreeSet<u64> {
     }
 
     entries
+}
+
+// Parse `lea rdi, [rip +/- 0xN]` and return the absolute target address, else None. Used to recover main from _start.
+fn parse_lea_rdi_rip_relative(insn: &DecodedInsn) -> Option<u64> {
+    if insn.mnemonic != "LEA" {
+        return None;
+    }
+    let op = insn.op_str;
+    if !op.starts_with("RDI") {
+        return None;
+    }
+    let bracket_start = op.find('[')?;
+    let bracket_end = op.find(']')?;
+    let inner = op[bracket_start + 1..bracket_end].trim();
+    let rest = inner.strip_prefix("RIP")?.trim();
+    let (sign, hex) = if let Some(s) = rest.strip_prefix('-') {
+        (-1i64, s.trim())
+    } else if let Some(s) = rest.strip_prefix('+') {
+        (1i64, s.trim())
+    } else if rest.is_empty() {
+        return Some(insn.address + insn.size as u64);
+    } else {
+        return None;
+    };
+    let hex = hex.strip_prefix("0X").unwrap_or(hex);
+    let disp = i64::from_str_radix(hex, 16).ok()? * sign;
+    Some((insn.address as i64 + insn.size as i64 + disp) as u64)
+}
+
+// Recover main from _start's `lea main(%rip), %rdi; ...; call __libc_start_main` by scanning first 32 insns from ELF entry; None if "main" symbol exists or no match.
+pub fn detect_main_via_libc_start_main(
+    db: &DecompileDB,
+    insns: &[DecodedInsn],
+) -> Option<u64> {
+    let has_main_sym = db
+        .rel_iter::<(Address, usize, Symbol, Symbol, Symbol, usize, Symbol, usize, Symbol)>("symbol_table")
+        .any(|(_, _, _, _, _, _, _, _, name)| *name == "main");
+    if has_main_sym {
+        return None;
+    }
+
+    let entry_addr = db.rel_iter::<(Address,)>("main_function")
+        .next()
+        .map(|(a,)| *a)?;
+
+    let start_idx = insns.binary_search_by_key(&entry_addr, |i| i.address).ok()?;
+    let insn_addrs: HashSet<u64> = insns.iter().map(|i| i.address).collect();
+    let end_idx = (start_idx + 32).min(insns.len());
+
+    for i in start_idx..end_idx {
+        if let Some(target) = parse_lea_rdi_rip_relative(&insns[i]) {
+            if target != entry_addr && insn_addrs.contains(&target) {
+                return Some(target);
+            }
+        }
+    }
+    None
 }

@@ -1,9 +1,5 @@
 #[test]
-fn dump_output() {
-    if std::env::var("DUMP_OUTPUT").is_ok() {
-        println!("=== DATAFLOW OUTPUT ===\n{}", OUTPUT.text);
-    }
-}
+fn dump_output() { dump_output_if_env("DATAFLOW", &OUTPUT.text); }
 
 #[test]
 fn all_functions_present() {

@@ -51,13 +51,6 @@ ascent_par! {
 
     provenance_edge(func, src, dst, EdgeType::Embed, offset) <--
         instr_in_function(node, func),
-        rtl_inst(node, ?RTLInst::Iop(Operation::Oleal(Addressing::Aindexed(offset)), args, dst)),
-        if args.len() >= 1,
-        if offset.abs() < 65536,
-        let src = args[0];
-
-    provenance_edge(func, src, dst, EdgeType::Embed, offset) <--
-        instr_in_function(node, func),
         rtl_inst(node, ?RTLInst::Iop(Operation::Oaddlimm(offset), args, dst)),
         if args.len() >= 1,
         if offset.abs() < 65536,
@@ -71,24 +64,10 @@ ascent_par! {
         if offset.abs() < 65536,
         let src = args[0];
 
-    provenance_edge(func, src, dst, EdgeType::Embed, offset) <--
-        instr_in_function(node, func),
-        rtl_inst(node, ?RTLInst::Iop(Operation::Oleal(Addressing::Aindexed2(offset)), args, dst)),
-        if args.len() >= 1,
-        if offset.abs() < 65536,
-        let src = args[0];
-
     // Embed edges from LEA with scaled indexed addressing (base + index*scale + offset)
     provenance_edge(func, src, dst, EdgeType::Embed, offset) <--
         instr_in_function(node, func),
         rtl_inst(node, ?RTLInst::Iop(Operation::Olea(Addressing::Aindexed2scaled(_, offset)), args, dst)),
-        if args.len() >= 1,
-        if offset.abs() < 65536,
-        let src = args[0];
-
-    provenance_edge(func, src, dst, EdgeType::Embed, offset) <--
-        instr_in_function(node, func),
-        rtl_inst(node, ?RTLInst::Iop(Operation::Oleal(Addressing::Aindexed2scaled(_, offset)), args, dst)),
         if args.len() >= 1,
         if offset.abs() < 65536,
         let src = args[0];
@@ -143,9 +122,7 @@ ascent_par! {
         if *depth < 6,
         let child_prov_id = compute_provenance_id(*func, *dst);
 
-    // A chain has pointer evidence when any member has an outgoing Embed or Deref edge.
-    // Chains with only Assign edges (simple register copies of integer values) do not
-    // constitute pointer evidence.
+    // A chain has pointer evidence when any member has an outgoing Embed or Deref edge; chains with only Assign edges (simple register copies of integer values) do not.
     #[local] relation chain_has_ptr_evidence(Address, RTLReg, u64);
     chain_has_ptr_evidence(func, root, prov_id) <--
         provenance_chain(func, src, root, prov_id, _, _),

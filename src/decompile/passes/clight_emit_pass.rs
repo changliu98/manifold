@@ -2,7 +2,7 @@ use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
 use crate::decompile::passes::c_pass::helpers::{
     build_string_literal_map, collect_goto_label_targets, convert_param_type_from_param,
-    extract_named_label, inline_rodata_constants, inline_string_literals, is_terminal_cstmt,
+    extract_named_label, inline_string_literals, is_terminal_cstmt,
     param_name_for_reg, xtype_string_to_ctype,
 };
 use crate::decompile::passes::c_pass::types::{
@@ -13,8 +13,7 @@ use crate::x86::types::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// Known libc functions that take opaque struct pointer parameters.
-/// Maps function_name -> Vec<(param_position, typedef_name)>.
+/// Known libc functions that take opaque struct pointer parameters; maps function_name -> Vec<(param_position, typedef_name)>.
 fn known_opaque_struct_params() -> HashMap<&'static str, Vec<(usize, &'static str)>> {
     let mut m: HashMap<&str, Vec<(usize, &str)>> = HashMap::new();
     // FILE* at position 0
@@ -767,8 +766,8 @@ impl IRPass for ClightEmitPass {
                     let cstmt = crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&cstmt, &|e| {
                         inline_string_literals(e, &string_map)
                     });
-                    let cstmt = crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&cstmt, &|e| {
-                        inline_rodata_constants(e, &rodata_const_map)
+                    let cstmt = crate::decompile::passes::c_pass::helpers::map_stmt_exprs_total(&cstmt, &|e| {
+                        crate::decompile::passes::c_pass::helpers::inline_rodata_constants_preserving_addrof(e, &rodata_const_map)
                     });
                     let cstmt = crate::decompile::passes::c_pass::convert::from_relations::narrow_varargs_in_stmt(&cstmt);
                     statements.push((node, cstmt));

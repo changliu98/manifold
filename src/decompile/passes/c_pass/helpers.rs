@@ -120,6 +120,73 @@ pub fn map_stmt_exprs(s: &CStmt, f: &impl Fn(&CExpr) -> Option<CExpr>) -> CStmt 
     }
 }
 
+// Stmt-level version of `inline_rodata_constants_preserving_addrof`. Identical structure to `map_stmt_exprs` but applies the AddrOf-aware top-down rewrite to every contained CExpr in one pass.
+pub fn map_stmt_exprs_total(s: &CStmt, f: &impl Fn(&CExpr) -> CExpr) -> CStmt {
+    match s {
+        CStmt::Expr(e) => CStmt::Expr(f(e)),
+        CStmt::If(cond, then_s, else_s) => CStmt::If(
+            f(cond),
+            Box::new(map_stmt_exprs_total(then_s, f)),
+            else_s.as_ref().map(|s| Box::new(map_stmt_exprs_total(s, f))),
+        ),
+        CStmt::Switch(expr, body) => CStmt::Switch(f(expr), Box::new(map_stmt_exprs_total(body, f))),
+        CStmt::While(cond, body) => CStmt::While(f(cond), Box::new(map_stmt_exprs_total(body, f))),
+        CStmt::DoWhile(body, cond) => {
+            CStmt::DoWhile(Box::new(map_stmt_exprs_total(body, f)), f(cond))
+        }
+        CStmt::For(init, cond, update, body) => {
+            let new_init = match init {
+                Some(ForInit::Expr(e)) => Some(ForInit::Expr(f(e))),
+                _ => init.clone(),
+            };
+            let new_cond = cond.as_ref().map(|e| f(e));
+            let new_update = update.as_ref().map(|e| f(e));
+            CStmt::For(new_init, new_cond, new_update, Box::new(map_stmt_exprs_total(body, f)))
+        }
+        CStmt::Return(Some(e)) => CStmt::Return(Some(f(e))),
+        CStmt::Block(items) => CStmt::Block(
+            items
+                .iter()
+                .map(|item| match item {
+                    CBlockItem::Stmt(stmt) => CBlockItem::Stmt(map_stmt_exprs_total(stmt, f)),
+                    CBlockItem::Decl(decls) => CBlockItem::Decl(
+                        decls
+                            .iter()
+                            .map(|d| VarDecl {
+                                init: d.init.as_ref().map(|init| map_initializer_total(init, f)),
+                                ..d.clone()
+                            })
+                            .collect(),
+                    ),
+                })
+                .collect(),
+        ),
+        CStmt::Sequence(stmts) => {
+            CStmt::Sequence(stmts.iter().map(|s| map_stmt_exprs_total(s, f)).collect())
+        }
+        CStmt::Labeled(label, inner) => {
+            CStmt::Labeled(label.clone(), Box::new(map_stmt_exprs_total(inner, f)))
+        }
+        _ => s.clone(),
+    }
+}
+
+fn map_initializer_total(init: &Initializer, f: &impl Fn(&CExpr) -> CExpr) -> Initializer {
+    match init {
+        Initializer::Expr(e) => Initializer::Expr(f(e)),
+        Initializer::List(items) => Initializer::List(
+            items
+                .iter()
+                .map(|item| InitItem {
+                    designator: item.designator.clone(),
+                    init: map_initializer_total(&item.init, f),
+                })
+                .collect(),
+        ),
+        Initializer::String(lit) => Initializer::String(lit.clone()),
+    }
+}
+
 
 pub fn collect_goto_targets(stmt: &CStmt) -> Vec<String> {
     let mut targets = Vec::new();
@@ -652,13 +719,77 @@ pub fn inline_string_literals(expr: &CExpr, string_map: &HashMap<String, String>
     None
 }
 
-pub fn inline_rodata_constants(expr: &CExpr, const_map: &HashMap<String, CExpr>) -> Option<CExpr> {
-    if let CExpr::Var(name) = expr {
-        if let Some(replacement) = const_map.get(name) {
-            return Some(replacement.clone());
+// Top-down walk that inlines `Var(name)` to a rodata scalar from `const_map`, but skips any Var sitting directly inside an `&` (address-of). Taking the address of an inlined scalar literal (`&1530735616`) is meaningless C: the AddrOf wanted the symbol's storage location, not its value.
+pub fn inline_rodata_constants_preserving_addrof(
+    expr: &CExpr,
+    const_map: &HashMap<String, CExpr>,
+) -> CExpr {
+    use crate::decompile::passes::c_pass::types::UnaryOp;
+    match expr {
+        CExpr::Unary(UnaryOp::AddrOf, inner) => {
+            // Do NOT inline a Var that's the direct operand of `&`; keep the symbol. Recurse otherwise to handle `&(struct.field)` and similar nested cases.
+            let new_inner: CExpr = match inner.as_ref() {
+                CExpr::Var(name) if const_map.contains_key(name) => (**inner).clone(),
+                _ => inline_rodata_constants_preserving_addrof(inner, const_map),
+            };
+            CExpr::Unary(UnaryOp::AddrOf, Box::new(new_inner))
         }
+        CExpr::Var(name) => {
+            if let Some(replacement) = const_map.get(name) {
+                replacement.clone()
+            } else {
+                expr.clone()
+            }
+        }
+        CExpr::Unary(op, inner) => CExpr::Unary(
+            *op,
+            Box::new(inline_rodata_constants_preserving_addrof(inner, const_map)),
+        ),
+        CExpr::Binary(op, lhs, rhs) => CExpr::Binary(
+            *op,
+            Box::new(inline_rodata_constants_preserving_addrof(lhs, const_map)),
+            Box::new(inline_rodata_constants_preserving_addrof(rhs, const_map)),
+        ),
+        CExpr::Assign(op, lhs, rhs) => CExpr::Assign(
+            *op,
+            Box::new(inline_rodata_constants_preserving_addrof(lhs, const_map)),
+            Box::new(inline_rodata_constants_preserving_addrof(rhs, const_map)),
+        ),
+        CExpr::Ternary(c, t, e) => CExpr::Ternary(
+            Box::new(inline_rodata_constants_preserving_addrof(c, const_map)),
+            Box::new(inline_rodata_constants_preserving_addrof(t, const_map)),
+            Box::new(inline_rodata_constants_preserving_addrof(e, const_map)),
+        ),
+        CExpr::Call(func, args) => CExpr::Call(
+            Box::new(inline_rodata_constants_preserving_addrof(func, const_map)),
+            args.iter()
+                .map(|a| inline_rodata_constants_preserving_addrof(a, const_map))
+                .collect(),
+        ),
+        CExpr::Index(arr, idx) => CExpr::Index(
+            Box::new(inline_rodata_constants_preserving_addrof(arr, const_map)),
+            Box::new(inline_rodata_constants_preserving_addrof(idx, const_map)),
+        ),
+        CExpr::Member(e, field) => CExpr::Member(
+            Box::new(inline_rodata_constants_preserving_addrof(e, const_map)),
+            field.clone(),
+        ),
+        CExpr::MemberPtr(e, field) => CExpr::MemberPtr(
+            Box::new(inline_rodata_constants_preserving_addrof(e, const_map)),
+            field.clone(),
+        ),
+        CExpr::Cast(ty, e) => CExpr::Cast(
+            ty.clone(),
+            Box::new(inline_rodata_constants_preserving_addrof(e, const_map)),
+        ),
+        CExpr::SizeofExpr(e) => CExpr::SizeofExpr(Box::new(
+            inline_rodata_constants_preserving_addrof(e, const_map),
+        )),
+        CExpr::Paren(e) => CExpr::Paren(Box::new(inline_rodata_constants_preserving_addrof(
+            e, const_map,
+        ))),
+        _ => expr.clone(),
     }
-    None
 }
 
 pub fn is_char_pointer_type(ty: &CType) -> bool {

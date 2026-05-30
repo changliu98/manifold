@@ -666,8 +666,7 @@ fn propagate_type_constraints(
     func: &FunctionData,
     _meta: &RefinableMetadata,
 ) {
-    // For each register, track: does every candidate that mentions it deref it?
-    // reg -> (all_deref, any_non_deref, needs_struct_ptr)
+    // Per register, track whether every candidate that mentions it derefs it: reg -> (all_deref, any_non_deref, needs_struct_ptr).
     let mut reg_deref_info: BTreeMap<RTLReg, (bool, bool, Option<usize>)> = BTreeMap::new();
 
     // Sorted iteration: deterministic entry.2 update when a reg spans nodes with different sids.
@@ -1176,8 +1175,7 @@ fn function_standalone_search(
             }
         }
 
-        // Bisection: try a slice; if it does not improve, recursively split.
-        // Each evaluate() call costs 1 step. Returns the best (errors, state, en, ne) found.
+        // Bisection: try a slice, and if it does not improve, recursively split; each evaluate() call costs 1 step. Returns the best (errors, state, en, ne) found.
         fn bisect_apply(
             base: &HybridFunctionState,
             base_errors: usize,
@@ -1355,13 +1353,12 @@ fn assemble_loops(
 
     for (&header, info) in &headers {
         let header_label = ident_from_node(header);
-        // Body iteration order is sorted by node id (i.e. address order).
-        // Include the header itself (its own statement is part of the loop body).
+        // Body iteration follows execution order: synthetic addresses (bit 62 set, e.g. arith_load fused Add) execute immediately after their base address, so naive numeric sort places them after every real-address node in the body and the synth Sset would emit at the bottom of the loop body, breaking the read-modify-write order of memory ops.
         let mut body_iter_nodes: Vec<Node> = info.body_nodes.iter().copied().collect();
         if !body_iter_nodes.contains(&header) {
             body_iter_nodes.push(header);
         }
-        body_iter_nodes.sort();
+        body_iter_nodes.sort_by_key(|&n| crate::util::exec_order_key(n));
         let body_node_set: HashSet<Node> = body_iter_nodes.iter().copied().collect();
 
         // Determine exit target: the node just after the loop.
@@ -1369,6 +1366,16 @@ fn assemble_loops(
             // Use the primary exit node; exact target resolved by goto matching below.
             ident_from_node(pe.exit_node)
         });
+
+        // Collect goto targets within the body so we don't drop label-only Sskip nodes that another body stmt jumps to (e.g. cond's else branch targeting the body's first instruction). Dropping them re-creates the label outside the loop via ensure_goto_labels and leaks the body out via the goto.
+        let mut body_goto_targets: HashSet<Ident> = HashSet::new();
+        for &node in &body_iter_nodes {
+            if let Some(stmt) = statements.get(&node) {
+                for t in collect_goto_targets(stmt) {
+                    body_goto_targets.insert(t as Ident);
+                }
+            }
+        }
 
         let mut body_stmts: Vec<ClightStmt> = Vec::new();
 
@@ -1386,16 +1393,31 @@ fn assemble_loops(
 
             // Convert gotos: header_label->Scontinue, outside loop->Sbreak, recurse into branches.
             let converted = convert_loop_gotos(&stmt, header_label, &body_node_set, &exit_target_label);
-            // Check nonempty: peel through Slabel wrappers to see if innermost is Sskip
+            // Check nonempty: peel through Slabel wrappers to see if innermost is Sskip.
             let mut s = &converted;
-            while let ClightStmt::Slabel(_, inner) = s { s = inner; }
-            if !matches!(s, ClightStmt::Sskip) {
-                // Strip one outer label
-                let stripped = match converted {
-                    ClightStmt::Slabel(_, inner) => *inner,
-                    other => other,
-                };
-                body_stmts.push(stripped);
+            let mut outer_label: Option<Ident> = None;
+            while let ClightStmt::Slabel(lbl, inner) = s {
+                if outer_label.is_none() {
+                    outer_label = Some(*lbl);
+                }
+                s = inner;
+            }
+            let is_skip = matches!(s, ClightStmt::Sskip);
+            // Preserve label-only Sskip when another body stmt gotos this label; otherwise the label is needed for control flow inside the loop, but the body would emit it outside via ensure_goto_labels.
+            let target_within_body = outer_label
+                .map(|lbl| body_goto_targets.contains(&lbl))
+                .unwrap_or(false);
+            if !is_skip || target_within_body {
+                if is_skip {
+                    body_stmts.push(converted);
+                } else {
+                    // Strip one outer label so the body's natural fallthrough threads via the parent Ssequence; downstream label-restoration adds it back when a goto actually targets it.
+                    let stripped = match converted {
+                        ClightStmt::Slabel(_, inner) => *inner,
+                        other => other,
+                    };
+                    body_stmts.push(stripped);
+                }
             }
         }
 
@@ -2472,9 +2494,13 @@ fn chunk_to_c_type_str(chunk: &MemoryChunk) -> &'static str {
     }
 }
 
-// Fresh CXIndex per call sidesteps the per-instance LLVM bug #25896 race.
+// Fresh CXIndex per call sidesteps the per-instance LLVM bug #25896 race. libclang is not safe to initialize/invoke concurrently (CEGAR selector calls this from rayon workers and the test suite decompiles concurrently), so all libclang access is serialized through a global lock; the per-function clang_cache keeps locked calls low, and it is poison-tolerant so one panicking check does not wedge later ones.
+static CLANG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn run_clang_check(c_code: &str) -> Vec<ClangError> {
     use clang_sys::*;
+
+    let _clang_guard = CLANG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let c_code_bytes = c_code.as_bytes();
     let filename = CString::new("check.c").unwrap();

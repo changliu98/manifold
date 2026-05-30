@@ -79,6 +79,9 @@ fn has_indirect_call(func: &str) -> bool {
 }
 
 #[test]
+fn dump_output() { dump_output_if_env("ABI_EDGES", &OUTPUT.text); }
+
+#[test]
 fn all_functions_present() {
     for name in [
         "ret_i8",

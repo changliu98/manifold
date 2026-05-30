@@ -25,35 +25,6 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
     eprintln!("  emit_clight_stmt_without_field: {}", emit_wf_count);
     eprintln!("  emit_clight_stmt:               {}", emit_count);
     eprintln!("  emit_var_type:                  {}", var_type_count);
-
-    // Check specific nodes for square function
-    for (node, stmt) in db.rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt") {
-        if *node == 0x1137 || *node == 0x113b || *node == 0x1129 || *node == 0x1134 {
-            eprintln!("  csharp_stmt(0x{:x}): {:?}", node, stmt);
-        }
-    }
-    let reg_dst: u64 = 9223372036855057664;
-    let reg_src: u64 = 9223372036855056965;
-    for (reg, xty) in db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate") {
-        if *reg == reg_dst || *reg == reg_src {
-            eprintln!("  emit_var_type(reg={}): {:?}", reg, xty);
-        }
-    }
-    for (reg,) in db.rel_iter::<(RTLReg,)>("is_ptr") {
-        if *reg == reg_dst || *reg == reg_src {
-            eprintln!("  is_ptr(reg={})", reg);
-        }
-    }
-    for (node, stmt) in db.rel_iter::<(Node, ClightStmt)>("clight_stmt_without_field") {
-        if *node >= 0x1129 && *node <= 0x113b {
-            eprintln!("  clight_stmt_without_field(0x{:x}): {:?}", node, stmt);
-        }
-    }
-    for (addr, node, stmt) in db.rel_iter::<(Address, Node, ClightStmt)>("emit_clight_stmt") {
-        if *addr == 0x1129 {
-            eprintln!("  emit_clight_stmt(func=0x{:x}, node=0x{:x}): {:?}", addr, node, stmt);
-        }
-    }
     eprintln!("=== End Diagnostics ===\n");
 
     let selected_functions = select_clight_stmts(db)?;

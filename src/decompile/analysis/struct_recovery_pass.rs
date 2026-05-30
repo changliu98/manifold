@@ -13,7 +13,7 @@ use crate::x86::types::*;
 use ascent::ascent_par;
 
 
-fn chunk_byte_size(chunk: &MemoryChunk) -> usize {
+pub fn chunk_byte_size(chunk: &MemoryChunk) -> usize {
     match chunk {
         MemoryChunk::MBool | MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned => 1,
         MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => 2,
@@ -95,15 +95,12 @@ ascent_par! {
     #[local] relation ptr_has_offset(RTLReg, i64);
     ptr_has_offset(reg, ofs) <-- ptr_deref(reg, ofs, _, _, _);
 
-    // Promote as struct on: 3+ distinct offsets, OR 2 offsets with differing chunks (can't be array).
+    // Promote as struct on: 2+ distinct offsets (try_build_layout + ptr_has_variable_index reject uniform-stride 3+ as arrays), OR 2 offsets with differing chunks (can't be array); replacing the former 3-way self-join, this also recovers two-field structs and is O(n^2) not O(n^3).
     #[local] relation ptr_has_multiple_offsets(RTLReg);
     ptr_has_multiple_offsets(reg) <--
         ptr_has_offset(reg, a),
         ptr_has_offset(reg, b),
-        ptr_has_offset(reg, c),
-        if a != b,
-        if b != c,
-        if a != c;
+        if a != b;
     ptr_has_multiple_offsets(reg) <--
         ptr_deref(reg, a, chunk_a, _, _),
         ptr_deref(reg, b, chunk_b, _, _),
@@ -261,13 +258,17 @@ ascent_par! {
     // Same promotion policy as ptr_has_multiple_offsets.
     relation stack_is_struct_candidate(Address, i64);
 
+    // 3+ distinct field offsets, counted via aggregation; the former 3-way self-join was O(fields^3) (minutes on date/touch). Distinct-project first since stack_struct_field repeats an offset across chunks/regs.
+    #[local] relation stack_distinct_field_ofs(Address, i64, i64);
+    stack_distinct_field_ofs(*func, *base_ofs, *fofs) <--
+        stack_struct_field(func, base_ofs, fofs, _, _);
+    #[local] relation stack_field_ofs_count(Address, i64, usize);
+    stack_field_ofs_count(func, base_ofs, count) <--
+        stack_distinct_field_ofs(func, base_ofs, _),
+        agg count = ascent::aggregators::count() in stack_distinct_field_ofs(func, base_ofs, _);
     stack_is_struct_candidate(func, base_ofs) <--
-        stack_struct_field(func, base_ofs, a, _, _),
-        stack_struct_field(func, base_ofs, b, _, _),
-        stack_struct_field(func, base_ofs, c, _, _),
-        if a != b,
-        if b != c,
-        if a != c;
+        stack_field_ofs_count(func, base_ofs, count),
+        if *count >= 3;
     stack_is_struct_candidate(func, base_ofs) <--
         stack_struct_field(func, base_ofs, a, chunk_a, _),
         stack_struct_field(func, base_ofs, b, chunk_b, _),
@@ -289,13 +290,14 @@ ascent_par! {
 
     // Global struct: 3+ offsets OR 2 offsets with differing chunks (pair-like).
     #[local] relation global_has_multiple_offsets(Ident);
+    // 3+ distinct offsets via aggregation (global_has_offset is already distinct per (ident,ofs)); replaces the O(offsets^3) 3-way self-join.
+    #[local] relation global_offset_count(Ident, usize);
+    global_offset_count(ident, count) <--
+        global_has_offset(ident, _),
+        agg count = ascent::aggregators::count() in global_has_offset(ident, _);
     global_has_multiple_offsets(ident) <--
-        global_has_offset(ident, a),
-        global_has_offset(ident, b),
-        global_has_offset(ident, c),
-        if a != b,
-        if b != c,
-        if a != c;
+        global_offset_count(ident, count),
+        if *count >= 3;
     global_has_multiple_offsets(ident) <--
         global_deref(ident, a, chunk_a, _),
         global_deref(ident, b, chunk_b, _),

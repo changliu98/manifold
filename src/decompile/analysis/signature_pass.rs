@@ -62,6 +62,8 @@ ascent_par! {
     relation emit_function_float_param_count(Address, usize);
     relation emit_function_stack_param_count(Address, usize);
     relation known_varargs_function(Symbol, usize);
+    // Functions inferred variadic by their XMM register save area prologue (test %al,%al; je; movaps xmm0..7 to stack).
+    relation func_has_variadic_xmm_prologue(Address);
     relation emit_function_has_return_candidate(Address);
     relation emit_function_void_candidate(Address);
     relation emit_function_return_type_xtype_candidate(Address, XType);
@@ -202,11 +204,13 @@ ascent_par! {
         call_target_func(n, f),
         call_returns_value(n, _);
 
-    // Varargs: emit_function whose name is listed in known_varargs_function.
+    // Varargs: emit_function listed in known_varargs_function, OR functions whose prologue spills all 8 XMM arg regs (SysV variadic register save area; see func_has_variadic_xmm_prologue in rtl_pass.rs).
     relation is_varargs_fn(Address);
     is_varargs_fn(addr) <--
         emit_function(addr, name, _),
         known_varargs_function(name, _);
+    is_varargs_fn(addr) <--
+        func_has_variadic_xmm_prologue(addr);
 
     // main() detection by name only.
     relation is_main_fn(Address);
@@ -308,6 +312,7 @@ impl IRPass for SignatureReconciliationPass {
             "emit_var_type_candidate", "call_arg",
             "func_has_param_evidence", "call_has_arg_evidence",
             "emit_function_float_param_count", "emit_function_stack_param_count",
+            "func_has_variadic_xmm_prologue",
             "rtl_inst",
         ]
     }
@@ -621,6 +626,9 @@ fn reconcile_signatures(db: &mut DecompileDB) {
 
         // Use position-level result, but allow call-site override with strong consensus
         let reconciled_count = if !has_call_sites {
+            position_based_count
+        } else if is_va {
+            // Variadic: call sites carry extra variadic args that must not inflate the fixed-param count.
             position_based_count
         } else if call_site_mode > position_based_count
             && consensus_ratio >= 0.6 && total_sites >= 2
@@ -943,14 +951,15 @@ fn patch_db(
     }
 
     {
-        let mut existing_params: HashMap<Address, Vec<RTLReg>> = HashMap::new();
-        for &(addr, reg) in db.rel_iter::<(Address, RTLReg)>("emit_function_param_candidate") {
-            let params = existing_params.entry(addr).or_default();
+        // Read from emit_function_param (just written by block 1) so synthetic regs added when growing param_count beyond existing evidence get types pushed too; the former emit_function_param_candidate only had the original (pre-widening) reg set, dropping types for widened slots and leaving e.g. main's argv as Xany64/Xint.
+        let mut effective_params: HashMap<Address, Vec<RTLReg>> = HashMap::new();
+        for &(addr, reg) in db.rel_iter::<(Address, RTLReg)>("emit_function_param") {
+            let params = effective_params.entry(addr).or_default();
             if !params.contains(&reg) {
                 params.push(reg);
             }
         }
-        for (addr, params) in existing_params.iter_mut() {
+        for (addr, params) in effective_params.iter_mut() {
             params.sort_by(|a, b| {
                 let ka = rtl_to_mreg
                     .get(&(*addr, *a))
@@ -971,7 +980,7 @@ fn patch_db(
             .collect();
 
         for proto in prototypes {
-            if let Some(params) = existing_params.get(&proto.address) {
+            if let Some(params) = effective_params.get(&proto.address) {
                 for (i, &reg) in params.iter().enumerate().take(proto.param_count) {
                     let xtype = proto.param_types.get(i).cloned().unwrap_or(XType::Xany64);
                     new_param_types.push((proto.address, reg, xtype));
@@ -987,7 +996,8 @@ fn patch_db(
             let mut set = HashSet::new();
             let existing_params: HashMap<Address, Vec<RTLReg>> = {
                 let mut m: HashMap<Address, Vec<RTLReg>> = HashMap::new();
-                for &(addr, reg) in db.rel_iter::<(Address, RTLReg)>("emit_function_param_candidate") {
+                // Read from emit_function_param (just written) to include synthetic regs added when widening param_count beyond original evidence.
+                for &(addr, reg) in db.rel_iter::<(Address, RTLReg)>("emit_function_param") {
                     m.entry(addr).or_default().push(reg);
                 }
                 for (addr, params) in m.iter_mut() {
@@ -1001,7 +1011,11 @@ fn patch_db(
                 m
             };
             for proto in prototypes {
-                if proto.confidence == SignatureConfidence::KnownExtern {
+                // Suppress struct/pointer overrides for prototypes whose param types come from a known signature (KnownExtern, e.g. printf; HighConfidence, e.g. main(int, char**)); otherwise downstream type-priority logic in clight_select treats var_is_struct as winning.
+                if matches!(
+                    proto.confidence,
+                    SignatureConfidence::KnownExtern | SignatureConfidence::HighConfidence
+                ) {
                     if let Some(params) = existing_params.get(&proto.address) {
                         for &reg in params.iter().take(proto.param_count) {
                             set.insert((proto.address, reg));

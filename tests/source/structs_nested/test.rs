@@ -1,4 +1,7 @@
 #[test]
+fn dump_output() { dump_output_if_env("STRUCTS_NESTED", &OUTPUT.text); }
+
+#[test]
 fn all_functions_present() {
     for name in ["read_nested", "write_nested", "array_of_structs_sum",
                   "linked_list_sum", "linked_list_length", "struct_chain_access",

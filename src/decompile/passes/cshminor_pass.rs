@@ -12,6 +12,15 @@ use crate::x86::mach::Mreg;
 use crate::x86::op::{Addressing, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
+use ascent::Dual;
+use ascent::lattice::set::Set;
+
+// Helper: add node n to a Set<Node>, returning new Set
+fn dom_set_with_self(strict: &Set<Node>, n: Node) -> Set<Node> {
+    let mut s = strict.0.clone();
+    s.insert(n);
+    Set(s)
+}
 
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Copy)]
@@ -146,40 +155,37 @@ ascent_par! {
         instr_in_function(to_node, func);
 
 
-    relation pred_count(Address, Node, usize);
-    relation reachable_from_entry(Address, Node);
-    relation path_avoiding(Address, Node, Node);
-    relation dom(Address, Node, Node);
-    relation not_idom(Address, Node, Node);
-    relation dom_depth(Address, Node, usize);
-    relation dom_children(Address, Node, Node);
-    relation dom_tree_root(Address, Node);
+    // dom/not_idom are #[local] intermediates; only idom is exported.
+    #[local] relation dom(Address, Node, Node);
+    #[local] relation not_idom(Address, Node, Node);
 
-    pred_count(func, node, count) <--
-        instr_in_function(node, func),
-        agg count = ascent::aggregators::count() in pred(func, node, _);
+    // Lattice-based dom: intersection of pred dom-sets via Dual<Set<Node>>; replaces the path_avoiding O(V^2) computation (~115 MB on /bin/ls).
+    #[local] lattice strict_dom_set(Address, Node, Dual<Set<Node>>);
+    lattice dom_set(Address, Node, Dual<Set<Node>>);
 
-    reachable_from_entry(func, n) <-- func_entry_node(func, n);
-    reachable_from_entry(func, y) <-- reachable_from_entry(func, x), cminor_succ(x, y), instr_in_function(y, func);
+    // Cooper-Harvey-Kennedy dom: dom_set(n) = strict_dom_set(n) U {n}; strict_dom_set(n) = intersect dom_set(p) over preds; entry seed = {entry}.
 
-    // path_avoiding(func, n, d): n reachable from entry without passing through d
-    path_avoiding(func, entry, d) <--
-        func_entry_node(func, entry),
-        reachable_from_entry(func, d),
-        if entry != d;
-    path_avoiding(func, n, d) <--
-        path_avoiding(func, m, d),
-        cminor_succ(m, n),
+    // Entry case: dom_set = {entry}.
+    dom_set(func, entry, Dual(Set::singleton(*entry))) <--
+        func_entry_node(func, entry);
+
+    // Non-entry case: strict_dom_set accumulates intersection of preds' dom_sets
+    strict_dom_set(func, n, Dual(p_doms_dual.0.clone())) <--
+        cminor_succ(p, n),
         instr_in_function(n, func),
-        if n != d;
+        instr_in_function(p, func),
+        dom_set(func, p, p_doms_dual),
+        !func_entry_node(func, n);
 
-    // d dominates n iff no path from entry to n avoids d
-    dom(func, n, n) <--
-        reachable_from_entry(func, n);
-    dom(func, n, d) <--
-        reachable_from_entry(func, n),
-        reachable_from_entry(func, d),
-        !path_avoiding(func, n, d);
+    // dom_set = strict union {n}.
+    dom_set(func, n, Dual(dom_set_with_self(&strict_dual.0, *n))) <--
+        strict_dom_set(func, n, strict_dual),
+        !func_entry_node(func, n);
+
+    // Materialize dom relation by iterating each node's dom_set
+    dom(func, n, *d) <--
+        dom_set(func, n, doms_dual),
+        for d in doms_dual.0.iter();
 
     // Immediate dominator: closest strict dominator
     not_idom(func, n, d) <--
@@ -192,19 +198,6 @@ ascent_par! {
         dom(func, n, d),
         !not_idom(func, n, d),
         if n != d;
-
-    dom_depth(func, entry, 0) <--
-        func_entry_node(func, entry);
-
-    dom_depth(func, node, depth + 1) <--
-        idom(func, node, idom_node),
-        dom_depth(func, idom_node, depth);
-
-    dom_children(func, parent, child) <--
-        idom(func, child, parent);
-
-    dom_tree_root(func, entry) <--
-        func_entry_node(func, entry);
 
 
     relation csharp_stmt_candidate(Node, CsharpminorStmt);

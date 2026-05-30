@@ -513,6 +513,7 @@ impl DecompileDB {
             Box::new(csh_pass::CshPass),
             Box::new(cshminor_pass::CshminorPass),
             Box::new(structuring_pass::StructuringPass),
+            Box::new(closed_form_switch_pass::ClosedFormSwitchPass),
             Box::new(clight_pass::ClightPass),
             Box::new(clight_pass::ClightFieldPass),
             Box::new(clight_emit_pass::ClightEmitPass),

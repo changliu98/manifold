@@ -6,13 +6,17 @@ use crate::x86::types::*;
 
 // Strip GCC/Clang optimizer suffixes (.constprop, .isra, .cold, etc.) into valid C identifiers.
 fn sanitize_symbol_name(name: &str) -> String {
-    if let Some(pos) = name.find(".constprop.")
-        .or_else(|| name.find(".isra."))
-        .or_else(|| name.find(".cold"))
-        .or_else(|| name.find(".part."))
-        .or_else(|| name.find(".lto_priv."))
-        .or_else(|| name.find(".localalias"))
-    {
+    // Find earliest position of ANY recognized optimizer suffix (handles chained suffixes like compare.part.0.isra.0 -> compare_part_0_isra_0).
+    let positions = [
+        name.find(".constprop."),
+        name.find(".isra."),
+        name.find(".cold"),
+        name.find(".part."),
+        name.find(".lto_priv."),
+        name.find(".localalias"),
+    ];
+    if let Some(min_pos) = positions.iter().flatten().min() {
+        let pos = *min_pos;
         return name[..pos].to_string() + &name[pos..].replace('.', "_");
     }
     name.to_string()
@@ -121,8 +125,7 @@ fn load_plt(db: &mut DecompileDB, obj: &object::File) {
                 }
             }
         }
-        // .rela.plt entries (JUMP_SLOT for PLT stubs -- not included in dynamic_relocations())
-        // Also builds rela_plt_names for CET .plt entries in a single pass.
+        // .rela.plt entries (JUMP_SLOT for PLT stubs, not in dynamic_relocations()); also builds rela_plt_names for CET .plt entries in one pass.
         for section in obj.sections() {
             if section.name().unwrap_or("") == ".rela.plt" {
                 if let Ok(data) = section.data() {
@@ -223,6 +226,8 @@ fn load_plt(db: &mut DecompileDB, obj: &object::File) {
                                 let jmp_addr = insn.address();
                                 db.rel_push("plt_entry", (jmp_addr, name));
                                 db.rel_push("plt_entry", (jmp_addr + 1, name));
+                                // Register the PLT stub as a named symbol so symbol_resolved_addr maps the extern name to this stub's address (direct CALL imm uses named-call form).
+                                db.rel_push("symbols", (entry_addr, name, "Beg"));
                                 found = true;
                             }
                         }
@@ -248,6 +253,8 @@ fn load_plt(db: &mut DecompileDB, obj: &object::File) {
                                     let name = rela_plt_names[idx];
                                     db.rel_push("plt_block", (entry_addr, name));
                                     db.rel_push("plt_entry", (entry_addr, name));
+                                    // Register the stub as a named symbol so CALL imm operands resolve to named-call form.
+                                    db.rel_push("symbols", (entry_addr, name, "Beg"));
                                 }
                             }
                         }
@@ -382,6 +389,13 @@ pub fn compute_labeled_addresses(db: &mut DecompileDB, obj: &object::File) {
 
     let existing: HashSet<u64> = db.rel_iter::<(Address, Symbol, Symbol)>("symbols").map(|(a, _, _)| *a).collect();
 
+    // PLT stub addresses must never receive L_xxxx labels: their name comes from the linker via plt_entry/plt_block.
+    let plt_addrs: HashSet<u64> = db
+        .rel_iter::<(Address, Symbol)>("plt_entry")
+        .map(|(a, _)| *a)
+        .chain(db.rel_iter::<(Address, Symbol)>("plt_block").map(|(a, _)| *a))
+        .collect();
+
     // Build sorted symbol ranges from symbol_size so addresses inside a known symbol's range don't get separate L_ entries.
     let mut symbol_ranges: Vec<(u64, u64)> = db
         .rel_iter::<(Address, usize, Symbol)>("symbol_size")
@@ -436,8 +450,7 @@ pub fn compute_labeled_addresses(db: &mut DecompileDB, obj: &object::File) {
             abs_ops.insert(*id);
             abs_op_disp.push((*id, *disp));
         } else if (*base == "NONE" || base.is_empty()) && *index != "NONE" && !index.is_empty() && *disp > 0 {
-            // Scaled-index absolute addressing: mov dst, [reg*scale + const_addr]
-            // (clang const-table loads). The displacement is the table base address.
+            // Scaled-index absolute addressing: mov dst, [reg*scale + const_addr] (clang const-table loads); the displacement is the table base address.
             abs_ops.insert(*id);
             abs_op_disp.push((*id, *disp));
         }
@@ -522,6 +535,7 @@ pub fn compute_labeled_addresses(db: &mut DecompileDB, obj: &object::File) {
 
     for addr in &labeled {
         if !existing.contains(addr)
+            && !plt_addrs.contains(addr)
             && !inside_existing_symbol(*addr)
             && !new_symbols.iter().any(|(a, _, _)| a == addr)
         {

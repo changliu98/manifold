@@ -189,11 +189,26 @@ ascent_par! {
     ltl_inst(addr, inst) <--
         linear_inst(addr, ?LinearInst::Lcall(Either::Right(Either::Left(sym)))),
         symbol_resolved_addr(*sym, target_addr),
+        !plt_block(*target_addr, _),
+        !plt_entry(*target_addr, _),
         let inst = LTLInst::Lcall(Either::Right(Either::Left(*target_addr)));
 
     ltl_inst(addr, inst) <--
         linear_inst(addr, ?LinearInst::Lcall(Either::Right(Either::Left(sym)))),
         !symbol_resolved_addr(*sym, _),
+        let inst = LTLInst::Lcall(Either::Right(Either::Right(sym.clone())));
+
+    // PLT/external symbol: keep the symbol form so RTL picks up the known extern signature.
+    ltl_inst(addr, inst) <--
+        linear_inst(addr, ?LinearInst::Lcall(Either::Right(Either::Left(sym)))),
+        symbol_resolved_addr(*sym, target_addr),
+        plt_block(*target_addr, _),
+        let inst = LTLInst::Lcall(Either::Right(Either::Right(sym.clone())));
+
+    ltl_inst(addr, inst) <--
+        linear_inst(addr, ?LinearInst::Lcall(Either::Right(Either::Left(sym)))),
+        symbol_resolved_addr(*sym, target_addr),
+        plt_entry(*target_addr, _),
         let inst = LTLInst::Lcall(Either::Right(Either::Right(sym.clone())));
 
     ltl_inst(addr, inst) <--
@@ -204,14 +219,29 @@ ascent_par! {
         linear_inst(addr, ?LinearInst::Ltailcall(Either::Right(Either::Right(addr_val)))),
         let inst = LTLInst::Ltailcall(Either::Right(Either::Left(*addr_val)));
 
+    // Same PLT-aware split as Lcall above: internal symbols resolve to addresses; PLT/external symbols stay as symbols so the known extern signature applies.
     ltl_inst(addr, inst) <--
         linear_inst(addr, ?LinearInst::Ltailcall(Either::Right(Either::Left(sym)))),
         symbol_resolved_addr(*sym, target_addr),
+        !plt_block(*target_addr, _),
+        !plt_entry(*target_addr, _),
         let inst = LTLInst::Ltailcall(Either::Right(Either::Left(*target_addr)));
 
     ltl_inst(addr, inst) <--
         linear_inst(addr, ?LinearInst::Ltailcall(Either::Right(Either::Left(sym)))),
         !symbol_resolved_addr(*sym, _),
+        let inst = LTLInst::Ltailcall(Either::Right(Either::Right(sym.clone())));
+
+    ltl_inst(addr, inst) <--
+        linear_inst(addr, ?LinearInst::Ltailcall(Either::Right(Either::Left(sym)))),
+        symbol_resolved_addr(*sym, target_addr),
+        plt_block(*target_addr, _),
+        let inst = LTLInst::Ltailcall(Either::Right(Either::Right(sym.clone())));
+
+    ltl_inst(addr, inst) <--
+        linear_inst(addr, ?LinearInst::Ltailcall(Either::Right(Either::Left(sym)))),
+        symbol_resolved_addr(*sym, target_addr),
+        plt_entry(*target_addr, _),
         let inst = LTLInst::Ltailcall(Either::Right(Either::Right(sym.clone())));
 
     ltl_inst(addr, inst) <--

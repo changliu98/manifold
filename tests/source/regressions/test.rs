@@ -1,4 +1,7 @@
 #[test]
+fn dump_output() { dump_output_if_env("REGRESSIONS", &OUTPUT.text); }
+
+#[test]
 fn all_functions_present() {
     for name in ["add_op", "xor_op", "guard", "test_early_return_ladder",
                   "test_nested_if_chain", "dispatch", "test_indirect_dispatch",

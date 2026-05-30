@@ -73,6 +73,8 @@ ascent_par! {
     relation restore_callee_save_rec(Address, Arc<Vec<Mreg>>, i64);
     relation tail_call_candidate(Address, Symbol, Arc<Vec<Mreg>>);
     relation lgoto_converted_to_tailcall(Address, Symbol, Arc<Vec<Mreg>>, i64);
+    // Computed in asm_pass: a direct JMP whose immediate target is inside its own function.
+    relation jmp_target_in_own_func(Address);
     relation lbuiltin(Address, String, Arc<Vec<BuiltinArg<Mreg>>>, BuiltinArg<Mreg>);
     relation llabel(Address, String);
     relation lgoto(Address, Symbol);
@@ -175,6 +177,8 @@ ascent_par! {
         next(restore_addr, goto_addr_ref),
         lgoto(goto_addr_ref, _),
         let goto_addr = *goto_addr_ref,
+        // An intra-function goto (target inside the same function) is a back-edge/epilogue jump, not a tail call; converting it fabricates a call to a nonexistent L_<addr>() function (S5).
+        !jmp_target_in_own_func(goto_addr),
         restore_callee_save_rec(restore_addr, _, offset);
 
     linear_inst(addr, linst) <--

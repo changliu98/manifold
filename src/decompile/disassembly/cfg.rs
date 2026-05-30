@@ -362,9 +362,7 @@ pub fn analyze_jump_tables(
             continue;
         }
 
-        // Only consider indirect JMPs (register or memory operand, not RIP-relative).
-        // Check both op1 and op2: the operand swap in instruction.rs puts single-operand
-        // JMP targets into op2 (op1 becomes "0").
+        // Only indirect JMPs (register/memory operand, not RIP-relative); check both op1 and op2 since instruction.rs's operand swap puts single-operand JMP targets into op2 (op1 becomes "0").
         let check_op = |op: &str| -> bool {
             if op == "0" { return false; }
             if op_reg_map.contains_key(op) { return true; }
@@ -415,10 +413,10 @@ fn find_jump_table_info(
         None => return None,
     };
 
-    let mut table_base: Option<u64> = None;
+    // Collect ALL rip-relative LEA / absolute-table candidates (nearest-first) rather than committing to the first; entry validation below picks the base that actually reads as a table, recovering getopt-style tables whose base LEA is hoisted before the dispatch loop (behind intervening arg-setup LEAs and a `call getopt_long`).
+    let mut lea_candidates: Vec<(u64, usize)> = Vec::new();
     let mut table_bound: Option<usize> = None;
     let mut default_target: Option<u64> = None;
-    let mut first_lea_idx: Option<usize> = None;
     let mut cmp_addr: Option<u64> = None;
     let mut index_reg: Option<String> = None;
     let mut bounds_check_fallthrough_idx: Option<usize> = None;
@@ -438,32 +436,24 @@ fn find_jump_table_info(
             "LEA" => {
                 if let Some(&disp) = rip_indirect_map.get(op1) {
                     let base_addr = (prev_insn.address as i64 + size as i64 + disp) as u64;
-                    if table_base.is_none() {
-                        table_base = Some(base_addr);
-                        first_lea_idx = Some(idx);
-                    }
+                    lea_candidates.push((base_addr, idx));
                 }
             }
-            // Clang -O0 non-PIE pattern: mov table(,%index,scale), %reg; jmp *%reg
-            // The absolute table address is the displacement in the memory operand.
+            // Clang -O0 non-PIE pattern: mov table(,%index,scale), %reg; jmp *%reg -- the absolute table address is the displacement in the memory operand.
             "MOV" => {
-                if table_base.is_none() {
-                    for op in [op1, op2] {
-                        if let Some(&(_seg, base, index, scale, disp)) = op_indirect_map.get(op) {
-                            if base == "NONE" && index != "NONE" && (scale == 4 || scale == 8) && disp > 0 {
-                                table_base = Some(disp as u64);
-                                first_lea_idx = Some(idx);
-                                if index_reg.is_none() {
-                                    index_reg = Some(index.to_string());
-                                }
-                                break;
+                for op in [op1, op2] {
+                    if let Some(&(_seg, base, index, scale, disp)) = op_indirect_map.get(op) {
+                        if base == "NONE" && index != "NONE" && (scale == 4 || scale == 8) && disp > 0 {
+                            lea_candidates.push((disp as u64, idx));
+                            if index_reg.is_none() {
+                                index_reg = Some(index.to_string());
                             }
+                            break;
                         }
                     }
                 }
             }
-            // SUB+JA is equivalent to CMP+JA for bounds checking (clang -O0 pattern:
-            // sub $N,%reg; ja default). Both set CF/ZF the same way for unsigned compare.
+            // SUB+JA equals CMP+JA for bounds checking (clang -O0 pattern: sub $N,%reg; ja default); both set CF/ZF the same way for unsigned compare.
             "CMP" | "SUB" => {
                 if let Some(&imm) = op_imm_map.get(op1) {
                     if table_bound.is_none() && imm > 0 && imm < 1000 {
@@ -483,9 +473,7 @@ fn find_jump_table_info(
                     }
                 }
             }
-            // Clang uses AND with a bitmask to constrain the switch index instead
-            // of CMP+JA. E.g., `and $3, %edi` limits the index to 0..3 (4 entries).
-            // The mask must be 2^n - 1 (all low bits set) to be a valid bounds constraint.
+            // Clang uses AND with a bitmask instead of CMP+JA to constrain the switch index (e.g. `and $3, %edi` limits to 0..3); mask must be 2^n - 1 (all low bits set) to be a valid bounds constraint.
             "AND" => {
                 if table_bound.is_none() {
                     let (imm_op, reg_op) = if op_imm_map.contains_key(op1) {
@@ -515,96 +503,85 @@ fn find_jump_table_info(
                     }
                 }
             }
-            "JMP" | "CALL" | "RET" => {
+            // Do NOT break on CALL: a callee-saved register can hold a table base set up by a LEA before the call (e.g. getopt loops); entry validation below rejects bogus bases.
+            "JMP" | "RET" => {
                 break;
             }
             _ => {}
         }
-
-        if table_base.is_some() && table_bound.is_some() {
-            break;
-        }
     }
 
-    // Fallback: extract table base from the JMP operand itself.
-    // Handles non-PIE pattern: jmp *table_addr(,index,scale) where the absolute
-    // table address is embedded as the displacement in the memory operand.
-    if table_base.is_none() {
-        if let Some((_, _, op1, _)) = unrefined_by_addr.get(&jmp_addr) {
-            if let Some(&(_seg, base, index, scale, disp)) = op_indirect_map.get(op1) {
-                if base == "NONE" && index != "NONE" && (scale == 4 || scale == 8) && disp > 0 {
-                    table_base = Some(disp as u64);
-                    if index_reg.is_none() {
-                        index_reg = Some(index.to_string());
-                    }
+    // JMP-operand fallback (non-PIE: jmp *table(,idx,scale)) as the lowest-priority candidate.
+    if let Some((_, _, op1, _)) = unrefined_by_addr.get(&jmp_addr) {
+        if let Some(&(_seg, base, index, scale, disp)) = op_indirect_map.get(op1) {
+            if base == "NONE" && index != "NONE" && (scale == 4 || scale == 8) && disp > 0 {
+                lea_candidates.push((disp as u64, jmp_idx));
+                if index_reg.is_none() {
+                    index_reg = Some(index.to_string());
                 }
             }
         }
     }
 
-    let table_base = match table_base {
-        Some(base) => base,
-        None => return None,
-    };
+    if lea_candidates.is_empty() {
+        return None;
+    }
 
     let table_bound = table_bound.unwrap_or(256);
-
     let max_entries = table_bound.min(512);
 
-    // Try 4-byte relative offsets first (most common format)
-    let mut ordered_targets: Vec<u64> = Vec::new();
-
-    for i in 0..max_entries {
-        let entry_addr = table_base + (i as u64 * 4);
-        if let Some(offset) = read_i32_at(section_data, entry_addr) {
-            let target = (table_base as i64 + offset as i64) as u64;
-            if addr_set.contains(&target) {
-                ordered_targets.push(target);
+    // Try each candidate base (nearest LEA first, JMP-operand fallback last); the first base whose rodata reads as >=2 valid in-function targets wins, filtering intervening arg-setup LEAs.
+    for &(cand_base, cand_idx) in &lea_candidates {
+        // 4-byte relative offsets (most common format)
+        let mut ordered_targets: Vec<u64> = Vec::new();
+        for i in 0..max_entries {
+            let entry_addr = cand_base + (i as u64 * 4);
+            if let Some(offset) = read_i32_at(section_data, entry_addr) {
+                let target = (cand_base as i64 + offset as i64) as u64;
+                if addr_set.contains(&target) {
+                    ordered_targets.push(target);
+                } else {
+                    break;
+                }
             } else {
                 break;
             }
-        } else {
-            break;
         }
-    }
+        if ordered_targets.len() >= 2 {
+            let impl_start = bounds_check_fallthrough_idx.or(Some(cand_idx));
+            let impl_addrs = collect_impl_addrs(insns, impl_start, jmp_idx);
+            return Some(JumpTableInfo {
+                ordered_targets,
+                impl_addrs,
+                cmp_addr,
+                index_reg: index_reg.clone(),
+            });
+        }
 
-    if ordered_targets.len() >= 2 {
-        let impl_start = bounds_check_fallthrough_idx.or(first_lea_idx);
-        let impl_addrs = collect_impl_addrs(insns, impl_start, jmp_idx);
-
-        return Some(JumpTableInfo {
-            ordered_targets,
-            impl_addrs,
-            cmp_addr,
-            index_reg: index_reg.clone(),
-        });
-    }
-
-    // Fall back to 8-byte absolute addresses
-    ordered_targets.clear();
-    for i in 0..max_entries {
-        let entry_addr = table_base + (i as u64 * 8);
-        if let Some(target) = read_u64_at(section_data, entry_addr) {
-            if addr_set.contains(&target) {
-                ordered_targets.push(target);
-            } else if target > 0 && target < 0x10000 {
+        // Fall back to 8-byte absolute addresses
+        let mut ordered_targets: Vec<u64> = Vec::new();
+        for i in 0..max_entries {
+            let entry_addr = cand_base + (i as u64 * 8);
+            if let Some(target) = read_u64_at(section_data, entry_addr) {
+                if addr_set.contains(&target) {
+                    ordered_targets.push(target);
+                } else if target > 0 && target < 0x10000 {
+                    break;
+                }
+            } else {
                 break;
             }
-        } else {
-            break;
         }
-    }
-
-    if ordered_targets.len() >= 2 {
-        let impl_start = bounds_check_fallthrough_idx.or(first_lea_idx);
-        let impl_addrs = collect_impl_addrs(insns, impl_start, jmp_idx);
-
-        return Some(JumpTableInfo {
-            ordered_targets,
-            impl_addrs,
-            cmp_addr,
-            index_reg,
-        });
+        if ordered_targets.len() >= 2 {
+            let impl_start = bounds_check_fallthrough_idx.or(Some(cand_idx));
+            let impl_addrs = collect_impl_addrs(insns, impl_start, jmp_idx);
+            return Some(JumpTableInfo {
+                ordered_targets,
+                impl_addrs,
+                cmp_addr,
+                index_reg: index_reg.clone(),
+            });
+        }
     }
 
     None
@@ -678,21 +655,23 @@ pub fn analyze_data_lookup_tables(
             continue;
         }
 
-        // Check if op2 (source for load) is an indirect operand with no base and scaled index
-        // Pattern: disp(,%reg,scale) where disp points into rodata
-        let (table_base, scale, _index_str) = if let Some(&(_seg, base, index, sc, disp)) = op_indirect_map.get(op2) {
+        // The operand swap in instruction.rs puts the source in op1 and destination in op2 (AT&T-style ordering). Check both op1 and op2 to find the indirect-source operand. Pattern: disp(,%reg,scale) where disp points into rodata.
+        let find_table_op = |op: &str| -> Option<(u64, i64, &'static str)> {
+            let &(_seg, base, index, sc, disp) = op_indirect_map.get(op)?;
             if base != "NONE" || index == "NONE" || (sc != 4 && sc != 8) || disp <= 0 {
-                continue;
+                return None;
             }
-            // Check if disp points into a rodata section
             let disp_u64 = disp as u64;
             let in_rodata = rodata_ranges.iter().any(|(start, end, _)| disp_u64 >= *start && disp_u64 < *end);
             if !in_rodata {
-                continue;
+                return None;
             }
-            (disp_u64, sc, index)
-        } else {
-            continue;
+            Some((disp_u64, sc, index))
+        };
+
+        let (table_base, scale, _index_str) = match find_table_op(op1).or_else(|| find_table_op(op2)) {
+            Some(t) => t,
+            None => continue,
         };
 
         // Look backwards for bounds check (CMP+JA or AND)

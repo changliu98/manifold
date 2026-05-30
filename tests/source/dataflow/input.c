@@ -1,19 +1,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+// optnone (clang) / optimize("O0") (gcc) blocks IPSCCP & inlining so call sites in test_chained_calls / test_tail_call / test_call_arg_passing survive at -O1 (otherwise the optimizer substitutes the callee's return value at the call site and removes the call).
+#if defined(__clang__)
+#define KEEP_CALLABLE __attribute__((noinline,optnone))
+#else
+#define KEEP_CALLABLE __attribute__((noinline,optimize("O0")))
+#endif
+
 volatile int sink;
 
-__attribute__((noinline))
+KEEP_CALLABLE
 int test_identity(int x) {
     return x;
 }
 
-__attribute__((noinline))
+KEEP_CALLABLE
 int test_two_params(int a, int b) {
     return a + b;
 }
 
-__attribute__((noinline))
+KEEP_CALLABLE
 int test_three_params(int a, int b, int c) {
     return a * b + c;
 }
@@ -107,8 +114,10 @@ int test_complex_phi(int x, int y, int z) {
             r = x - y;
         }
     } else {
+        // sink write inside the body prevents -O1 from collapsing the accumulator loop into the closed-form `z*(z-1)/2` (LLVM/GCC loop-idiom recognition only fires when the body has no other observable side effects).
         for (int i = 0; i < z; i++) {
             r += i;
+            sink = r;
         }
     }
     return r;
@@ -251,8 +260,10 @@ __attribute__((noinline))
 int test_nested_loops_phi(int n) {
     int sum = 0;
     for (int i = 0; i < n; i++) {
+        // sink write in the inner loop body prevents -O1 loop-idiom from replacing `for (j=0; j<i; j++) sum += j` with the closed-form `i*(i-1)/2`, which would erase the inner loop entirely.
         for (int j = 0; j < i; j++) {
             sum += j;
+            sink = sum;
         }
         sum -= i;
     }

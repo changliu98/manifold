@@ -137,7 +137,8 @@ impl AbiConfig {
 static ABI_CONFIG: OnceLock<AbiConfig> = OnceLock::new();
 
 pub fn init_abi_config(config: AbiConfig) {
-    ABI_CONFIG.set(config).expect("ABI config already initialized");
+    // Idempotent: concurrent decompiles can race the caller's check-then-act; first write wins and a later Err is a harmless no-op (all decompiles in one process share the same target ABI).
+    let _ = ABI_CONFIG.set(config);
 }
 
 pub fn abi_config() -> &'static AbiConfig {

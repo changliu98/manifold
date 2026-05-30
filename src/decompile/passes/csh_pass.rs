@@ -11,6 +11,12 @@ use crate::x86::types::*;
 use ascent::ascent_par;
 use log::warn;
 
+// True when `name` is an auto-generated L_<hex> label (disassembler-emitted, used by absorbed-fragment detection).
+pub(crate) fn is_generated_label_name(name: &str) -> bool {
+    name.strip_prefix("L_")
+        .map_or(false, |h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 
 ascent_par! {
     #![measure_rule_times]
@@ -67,10 +73,41 @@ ascent_par! {
         plt_block(addr, sym),
         let clean_name = strip_version_suffix(sym);
 
+    // Absorb contiguous L_XXXX fragments into the preceding non-L_XXXX function; func_extended_end is a monotonic lattice of the function's effective end.
+    lattice func_extended_end(Address, Address);
+
+    func_extended_end(start, *end) <--
+        func_stacksz(start, end, name, _),
+        if !crate::decompile::passes::csh_pass::is_generated_label_name(name);
+
+    func_extended_end(absorber_start, *frag_end) <--
+        func_extended_end(absorber_start, current_end),
+        func_stacksz(frag_start, frag_end, frag_name, _),
+        if crate::decompile::passes::csh_pass::is_generated_label_name(frag_name),
+        if *frag_start == *current_end;
+
+    // Maps the start address of every absorbed L_XXXX fragment to the absorber's name.
+    relation absorbed_fragment_to_func(Address, Symbol);
+
+    absorbed_fragment_to_func(frag_start, *absorber_name) <--
+        func_extended_end(absorber_start, current_end),
+        func_stacksz(absorber_start, _, absorber_name, _),
+        if !crate::decompile::passes::csh_pass::is_generated_label_name(absorber_name),
+        func_stacksz(frag_start, _, frag_name, _),
+        if crate::decompile::passes::csh_pass::is_generated_label_name(frag_name),
+        if *frag_start >= *absorber_start && *frag_start < *current_end;
+
+    // Default mapping: the address falls within the function's own (non-absorbed) range.
     ident_to_symbol(ident, name) <--
         addr_to_func_ident(addr, ident),
         func_stacksz(start, end, name, _),
-        if addr >= start && addr < end;
+        if addr >= start && addr < end,
+        !absorbed_fragment_to_func(addr, _);
+
+    // Absorbed fragment: rewrite L_XXXX -> absorbing function name at the fragment entry.
+    ident_to_symbol(ident, absorber_name) <--
+        addr_to_func_ident(addr, ident),
+        absorbed_fragment_to_func(addr, absorber_name);
 
     base_addr_usage(node, *reg, 0) <--
         cminorsel_stmt(node, ?CminorStmt::Sassign(_, expr)),
@@ -98,11 +135,17 @@ impl IRPass for CshPass {
 
 
 pub fn make_field_ident(offset: i64, _chunk: MemoryChunk) -> Ident {
-    offset.max(0) as Ident
+    // Preserve the sign (two's complement) instead of clamping to 0: clamping collapsed every negative-offset field onto `ofs_0`, colliding with the real offset-0 field and producing duplicate struct members. Non-negative offsets are unaffected.
+    offset as Ident
 }
 
 pub fn field_ident_to_name(ident: Ident) -> String {
-    format!("ofs_{}", ident)
+    let off = ident as i64;
+    if off < 0 {
+        format!("ofs_neg{}", off.unsigned_abs())
+    } else {
+        format!("ofs_{}", off)
+    }
 }
 
 pub fn is_function_type(ty: &ClightType) -> bool {

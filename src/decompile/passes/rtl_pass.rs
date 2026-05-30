@@ -881,11 +881,40 @@ ascent_par! {
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *src_mreg, arg_id);
 
-    // arith_load_op: memory-source arithmetic (e.g. add [mem], reg); only fires without a real ltl op.
+    // arith_load_op: memory-source arithmetic (e.g. add [mem], reg); only fires without a real ltl op. BP-relative loads (local-variable arithmetic like `add -12(%rbp), %eax`) bind the load result to the same stack_rtl that Lsetstack/mach_imm_stack_init write to; otherwise the loaded value is a fresh RTEMP that copy-prop/dead-store eliminates while the matching store flows independently, blanking the loop body.
     rtl_inst_candidate(addr, load_inst) <--
         arith_load_op(addr, _op, chunk, base_mreg, disp, _dst_mreg),
         !has_ltl_op(addr),
         reg_xtl(addr, *base_mreg, base_rtl),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, stack_rtl),
+        if *base_mreg == Mreg::BP,
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        arith_load_op(addr, op, _chunk, base_mreg, disp, dst_mreg),
+        !has_ltl_op(addr),
+        reg_xtl(addr, *dst_mreg, dst_rtl),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, stack_rtl),
+        if *base_mreg == Mreg::BP,
+        let synthetic_addr = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, *stack_rtl]), *dst_rtl);
+
+    // Fallback (non-BP base or BP without matching stack_var): use a fresh RTEMP, same as before.
+    #[local] relation arith_load_uses_stack_var(Node);
+    arith_load_uses_stack_var(addr) <--
+        arith_load_op(addr, _, _, base_mreg, disp, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, _),
+        if *base_mreg == Mreg::BP;
+
+    rtl_inst_candidate(addr, load_inst) <--
+        arith_load_op(addr, _op, chunk, base_mreg, disp, _dst_mreg),
+        !has_ltl_op(addr),
+        reg_xtl(addr, *base_mreg, base_rtl),
+        !arith_load_uses_stack_var(addr),
         let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp);
 
@@ -893,6 +922,7 @@ ascent_par! {
         arith_load_op(addr, op, _chunk, _base_mreg, _disp, dst_mreg),
         !has_ltl_op(addr),
         reg_xtl(addr, *dst_mreg, dst_rtl),
+        !arith_load_uses_stack_var(addr),
         let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
         let synthetic_addr = *addr | (1u64 << 62),
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, temp]), *dst_rtl);
@@ -2722,6 +2752,7 @@ ascent_par! {
         let target_addr = (*addr as i64 + *size as i64 + *disp) as Address,
         !symbol_table(target_addr, _, _, _, _, _, _, _, _),
         !plt_entry(target_addr, _),
+        !func_span(_, target_addr, _),
         let name_string = format!("SUB_{:x}", target_addr),
         let name_sym = Box::leak(name_string.into_boxed_str()) as &'static str;
 
@@ -2871,6 +2902,19 @@ ascent_par! {
         lop_overwrite_use_id(useaddr, mreg, use_id),
         if def_id != use_id,
         !has_intervening_def(defaddr, useaddr, mreg);
+
+    // CMP/TEST+SETCC fusion: asm pass emits one Mop(Ocmp(...), [...], dst_mreg) at the CMP/TEST address, but Capstone still tags the SETCC address as the reg_def for dst_mreg; without aliasing, that SETCC def creates a phantom fresh xtl id shadowing the Ocmp's def in block_last_def/reg_def_used chains, making the Ocmp dead and leaving its consumer (e.g. ADD eax,1) reading an uninitialized register. Alias the two def ids so the canonical xtl threads the Ocmp result to its user.
+    alias_edge(lop_def_id, setcc_def_id) <--
+        ltl_inst(lop_addr, ?LTLInst::Lop(Operation::Ocmp(_), _, dst_mreg)),
+        next(lop_addr, setcc_addr),
+        reg_def(setcc_addr, *dst_mreg),
+        !ltl_inst(setcc_addr, _),
+        !trim_instruction(setcc_addr),
+        is_def(lop_addr, lop_def_id),
+        reg_xtl(lop_addr, *dst_mreg, lop_def_id),
+        is_def(setcc_addr, setcc_def_id),
+        reg_xtl(setcc_addr, *dst_mreg, setcc_def_id),
+        if lop_def_id != setcc_def_id;
 
     alias_edge(def_id, use_id) <--
         reg_def_used(defaddr, mreg, useaddr),
@@ -3587,6 +3631,17 @@ ascent_par! {
         instr_min_order(func_start, call_addr, call_order),
         if *call_order > *def_order && (*call_order - *def_order) < 128;
 
+    // Fix 1: live-in / pass-through parameter forwarded to a resolved call. An ABI arg register that is a validated parameter and isn't redefined before the call still holds the incoming value, so forward it as a call arg. Gated to resolved callees (known direct target or known-signature extern) so indirect calls -- whose target reg may itself be a fn-pointer param -- aren't corrupted. Fixes args dropped to literal 0 (e.g. last_component(name)).
+    relation call_has_resolved_callee(Node);
+    call_has_resolved_callee(call_addr) <-- call_target_func(call_addr, _);
+    call_has_resolved_callee(call_addr) <-- call_has_known_signature(call_addr, _, _, _);
+
+    arg_setup_candidate(func_start, mreg, call_addr) <--
+        func_param_validated(func_start, mreg),
+        is_call_instruction(call_addr),
+        instr_in_function(call_addr, func_start),
+        call_has_resolved_callee(call_addr);
+
     call_clobbers_arg_reg(defaddr, mreg, call_addr) <--
         arg_setup_candidate(defaddr, mreg, call_addr),
         call_to_call_backward(call_addr, between_call),
@@ -3784,13 +3839,44 @@ ascent_par! {
     call_has_float_arg_at_position(call_addr, 7) <--
         call_float_arg_max_position(call_addr, max_pos), if *max_pos >= 7;
 
+    // Fix 3: gate XMM/float-arg positions by the callee signature, mirroring call_arg_position_allowed for the integer path. Without it the float-arg collection appends ANY lea/load->XMM within backward reach (including dead branches and other functions' constant setup) as a spurious float argument, e.g. dcgettext (3 pointer/int params, 0 float params) collecting five leaked string arguments. A float position is only valid when the callee actually accepts a float there.
+    relation call_float_arg_position_allowed(Node, usize);
+
+    // No known signature, direct internal target whose inferred param count covers this ordinal.
+    call_float_arg_position_allowed(call_addr, pos) <--
+        call_has_float_arg_at_position(call_addr, pos),
+        !call_has_known_signature(call_addr, _, _, _),
+        call_target_func(call_addr, target),
+        func_has_param_at_position(target, pos);
+
+    // No known signature and the direct target has no recovered param info: stay permissive (mirror of the integer rule) rather than dropping real float args.
+    call_float_arg_position_allowed(call_addr, pos) <--
+        call_has_float_arg_at_position(call_addr, pos),
+        !call_has_known_signature(call_addr, _, _, _),
+        call_target_func(call_addr, target),
+        !func_has_param_at_position(target, _);
+
+    // Known varargs function (printf-family with %f, etc.): allow any float position.
+    call_float_arg_position_allowed(call_addr, pos) <--
+        call_has_float_arg_at_position(call_addr, pos),
+        call_has_known_signature(call_addr, name, _, _),
+        known_varargs_function(name, _);
+
+    // Known non-varargs signature: allow float position k only if the signature declares more than k float-valued (Xfloat/Xsingle) parameters. Pointer args (e.g. char*) travel in integer regs and do not count toward XMM positions.
+    call_float_arg_position_allowed(call_addr, pos) <--
+        call_has_float_arg_at_position(call_addr, pos),
+        call_has_known_signature(call_addr, name, _, _),
+        !known_varargs_function(name, _),
+        known_extern_signature(name, _, _, arg_types),
+        if arg_types.iter().filter(|t| matches!(t, XType::Xfloat | XType::Xsingle)).count() > *pos;
+
     relation call_float_arg_mapping(Node, usize, RTLReg);
 
     call_float_arg_mapping(*call_addr, pos, rtl_reg) <--
         call_float_arg_setup_detected(defaddr, dst_reg, call_addr),
         reg_rtl(defaddr, dst_reg, rtl_reg),
         if let Some(pos) = xmm_arg_reg_position(dst_reg),
-        call_has_float_arg_at_position(call_addr, pos);
+        call_float_arg_position_allowed(call_addr, pos);
 
     relation call_float_args_collected(Node, Args);
 
@@ -4093,6 +4179,82 @@ ascent_par! {
     is_float_arg_reg(Mreg::X6);
     is_float_arg_reg(Mreg::X7);
 
+    // SysV x86-64 variadic prologue: caller signals XMM-arg count via %al; callee runs `test %al,%al; je skip; movaps %xmm0..7, [stack]; skip:`. The 8 movaps stores spill the XMM register save area, NOT real float parameters. Detect: an XMM arg reg stack-stored within function entry distance, with the XMM reg either having no def chain or a def chain from outside this function. The two-mode check mirrors arg_reg_spilled_to_stack.
+    relation xmm_arg_spilled_in_prologue(Address, Mreg);
+
+    // Lstore form: movaps %xmm, ofs(%rsp|%rbp) -- def outside this function.
+    xmm_arg_spilled_in_prologue(func_start, *src) <--
+        instr_in_function(addr, func_start),
+        function_entry_count(func_start, addr, count),
+        if *count < FUNC_ARG_DIST,
+        ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Aindexed(_), args, src)),
+        is_xmm_arg_reg(src),
+        for arg in args.iter(),
+        if *arg == Mreg::BP || *arg == Mreg::SP,
+        reg_def_used(defaddr, src, addr),
+        !instr_in_function(defaddr, func_start);
+
+    // Lstore form: no def reaching at all.
+    xmm_arg_spilled_in_prologue(func_start, *src) <--
+        instr_in_function(addr, func_start),
+        function_entry_count(func_start, addr, count),
+        if *count < FUNC_ARG_DIST,
+        ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Aindexed(_), args, src)),
+        is_xmm_arg_reg(src),
+        for arg in args.iter(),
+        if *arg == Mreg::BP || *arg == Mreg::SP,
+        !reg_def_used(_, src, addr);
+
+    // setstack form: def outside this function.
+    xmm_arg_spilled_in_prologue(func_start, *src) <--
+        instr_in_function(addr, func_start),
+        function_entry_count(func_start, addr, count),
+        if *count < FUNC_ARG_DIST,
+        ltl_inst(addr, ?LTLInst::Lsetstack(src, _slot, _ofs, _typ)),
+        is_xmm_arg_reg(src),
+        reg_def_used(defaddr, src, addr),
+        !instr_in_function(defaddr, func_start);
+
+    // setstack form: no def at all.
+    xmm_arg_spilled_in_prologue(func_start, *src) <--
+        instr_in_function(addr, func_start),
+        function_entry_count(func_start, addr, count),
+        if *count < FUNC_ARG_DIST,
+        ltl_inst(addr, ?LTLInst::Lsetstack(src, _slot, _ofs, _typ)),
+        is_xmm_arg_reg(src),
+        !reg_def_used(_, src, addr);
+
+    // Lstore (Ainstack) form: def outside this function.
+    xmm_arg_spilled_in_prologue(func_start, *src) <--
+        instr_in_function(addr, func_start),
+        function_entry_count(func_start, addr, count),
+        if *count < FUNC_ARG_DIST,
+        ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Ainstack(_), _, src)),
+        is_xmm_arg_reg(src),
+        reg_def_used(defaddr, src, addr),
+        !instr_in_function(defaddr, func_start);
+
+    // Lstore (Ainstack) form: no def at all.
+    xmm_arg_spilled_in_prologue(func_start, *src) <--
+        instr_in_function(addr, func_start),
+        function_entry_count(func_start, addr, count),
+        if *count < FUNC_ARG_DIST,
+        ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Ainstack(_), _, src)),
+        is_xmm_arg_reg(src),
+        !reg_def_used(_, src, addr);
+
+    // Function has the canonical variadic-prologue XMM register save (all 8 XMMs spilled); real functions never spill all 8 XMM arg regs at entry.
+    relation func_has_variadic_xmm_prologue(Address);
+    func_has_variadic_xmm_prologue(func_start) <--
+        xmm_arg_spilled_in_prologue(func_start, Mreg::X0),
+        xmm_arg_spilled_in_prologue(func_start, Mreg::X1),
+        xmm_arg_spilled_in_prologue(func_start, Mreg::X2),
+        xmm_arg_spilled_in_prologue(func_start, Mreg::X3),
+        xmm_arg_spilled_in_prologue(func_start, Mreg::X4),
+        xmm_arg_spilled_in_prologue(func_start, Mreg::X5),
+        xmm_arg_spilled_in_prologue(func_start, Mreg::X6),
+        xmm_arg_spilled_in_prologue(func_start, Mreg::X7);
+
     relation func_float_param_used(Address, Mreg);
 
     func_float_param_used(func_start, *mreg) <--
@@ -4101,7 +4263,8 @@ ascent_par! {
         function_entry_count(func_start, addr, count),
         if *count < FUNC_ARG_DIST,
         ltl_inst_uses_mreg(addr, mreg),
-        !reg_def_used(_, mreg, addr);
+        !reg_def_used(_, mreg, addr),
+        !func_has_variadic_xmm_prologue(func_start);
 
     func_float_param_used(func_start, *mreg) <--
         is_float_arg_reg(mreg),
@@ -4109,7 +4272,8 @@ ascent_par! {
         function_entry_count(func_start, use_addr, count),
         if *count < FUNC_ARG_DIST,
         reg_def_used(def_addr, mreg, use_addr),
-        !instr_in_function(def_addr, func_start);
+        !instr_in_function(def_addr, func_start),
+        !func_has_variadic_xmm_prologue(func_start);
 
     relation func_float_param_validated(Address, Mreg, usize);
 

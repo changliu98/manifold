@@ -111,6 +111,19 @@ ascent_par! {
     relation sseq_head(Node);
     relation valid_next(Node);
 
+    // Data lookup tables: each (mov_addr, table_base, entry_count, entry_scale, index_reg_str) recovered by the disassembly pass, with values stored in data_lookup_table_value. Used to lift a clang-style table-load `mov disp(,%idx,scale), %dst` into a Sswitch.
+    relation data_lookup_table(Node, u64, usize, i64, &'static str);
+    relation data_lookup_table_value(Node, usize, i64);
+
+    // Closed-form switches: clang -O1 collapses dense switches into arithmetic + cmov. ClosedFormSwitchPass (analysis layer) emits closed_form_switch / closed_form_switch_case at the csharp_stmt level; the rule below lowers them to Sswitch.
+    relation closed_form_switch(Node, RTLReg, RTLReg, bool, i64);
+    relation closed_form_switch_case(Node, i64, i64);
+
+    // Gate: nodes whose Sset we will replace with a Sswitch (data lookup or closed-form).
+    relation data_lookup_node(Node);
+    data_lookup_node(node) <-- data_lookup_table(node, _, _, _, _);
+    data_lookup_node(node) <-- closed_form_switch(node, _, _, _, _);
+
     // Sstore type divergence: primary type + sign-flipped variants for ambiguous chunks
     relation sstore_clight_type(Node, ClightType);
 
@@ -150,6 +163,7 @@ ascent_par! {
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
         if let CsharpminorExpr::Econdition(cond, true_val, false_val) = expr,
+        !data_lookup_node(node),
         all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(&[(**cond).clone(), (**true_val).clone(), (**false_val).clone()]),
         let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
@@ -161,10 +175,45 @@ ascent_par! {
         let else_stmt = ClightStmt::Sset(dst_ident, false_clight),
         let stmt = ClightStmt::Sifthenelse(cond_clight, Box::new(then_stmt), Box::new(else_stmt));
 
+    // Data lookup table: rewrite `Sset(dst, Eload(_, &table + idx*scale))` as a Sswitch where each case (idx == k) assigns the known constant table[k] to dst. The clang -O1 pattern `mov disp(,%idx,scale), %dst` collapses a dense switch into a constant table load; recover the original switch from the table values captured by analyze_data_lookup_tables.
+    clight_stmt_without_field(node, stmt) <--
+        csharp_stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
+        data_lookup_table(node, _table_base, _entry_count, _entry_scale, _idx_reg),
+        if let CsharpminorExpr::Eload(_chunk, addr_expr) = expr,
+        if let Some(idx_reg) = data_lookup_extract_index(addr_expr),
+        all_var_types_global(all_var_types),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &[idx_reg]),
+        let discr_expr = ClightExpr::Etempvar(
+            ident_from_reg(idx_reg),
+            var_types.get(&idx_reg).map(|types| select_type_from_candidates(types, None)).unwrap_or_else(default_int_type),
+        ),
+        let dst_ident = ident_from_reg(*dst),
+        agg cases_sorted = collect_data_lookup_values(idx, val) in data_lookup_table_value(node, idx, val),
+        if !cases_sorted.is_empty(),
+        let table = build_data_lookup_switch_cases(&cases_sorted, dst_ident),
+        let stmt = ClightStmt::Sswitch(discr_expr.clone(), table);
+
+    // Closed-form switch: at `node` the Sset writes the cmov/closed-form value to dst_reg. Replace with Sswitch on disc_reg using cases from ClosedFormSwitchPass.
+    clight_stmt_without_field(node, stmt) <--
+        csharp_stmt(node, ?CsharpminorStmt::Sset(_, _)),
+        closed_form_switch(node, disc_reg, dst_reg, has_default, default_val),
+        all_var_types_global(all_var_types),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &[*disc_reg, *dst_reg]),
+        let discr_expr = ClightExpr::Etempvar(
+            ident_from_reg(*disc_reg),
+            var_types.get(disc_reg).map(|types| select_type_from_candidates(types, None)).unwrap_or_else(default_int_type),
+        ),
+        let dst_ident = ident_from_reg(*dst_reg),
+        agg cases_sorted = collect_data_lookup_values_i64(case_idx, case_val) in closed_form_switch_case(node, case_idx, case_val),
+        if !cases_sorted.is_empty(),
+        let table = build_closed_form_switch_cases(&cases_sorted, dst_ident, *has_default, *default_val),
+        let stmt = ClightStmt::Sswitch(discr_expr.clone(), table);
+
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
         is_ptr(dst),
         if !matches!(expr, CsharpminorExpr::Econdition(_, _, _)),
+        !data_lookup_node(node),
         all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]),
         let var_type_variants = build_var_type_map_variants(all_var_types, &vars_used),
@@ -179,6 +228,7 @@ ascent_par! {
         csharp_stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
         emit_var_type_candidate(*dst, dst_xtype),
         if !matches!(expr, CsharpminorExpr::Econdition(_, _, _)),
+        !data_lookup_node(node),
         all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]),
         let var_type_variants = build_var_type_map_variants(all_var_types, &vars_used),
@@ -194,6 +244,7 @@ ascent_par! {
         !is_ptr(dst),
         !emit_var_type_candidate(*dst, _),
         if !matches!(expr, CsharpminorExpr::Econdition(_, _, _)),
+        !data_lookup_node(node),
         all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]),
         let var_type_variants = build_var_type_map_variants(all_var_types, &vars_used),
@@ -210,6 +261,7 @@ ascent_par! {
         !is_ptr(dst),
         !emit_var_type_candidate(*dst, _),
         if !matches!(expr, CsharpminorExpr::Econdition(_, _, _)),
+        !data_lookup_node(node),
         all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]),
         let var_type_variants = build_var_type_map_variants(all_var_types, &vars_used),
@@ -878,11 +930,11 @@ impl IRPass for ClightFieldPass {
     }
 
     fn inputs(&self) -> &'static [&'static str] {
-        &["emit_struct_fields", "instr_in_function", "clight_stmt_without_field", "emit_clight_stmt_without_field", "clight_stmt_dead_without_field", "mach_imm_stack_init"]
+        &["emit_struct_fields", "instr_in_function", "clight_stmt_without_field", "emit_clight_stmt_without_field", "clight_stmt_dead_without_field", "mach_imm_stack_init", "global_struct_catalog", "emit_function", "reg_rtl", "call_arg_mapping", "call_target_func", "reg_to_struct_id"]
     }
 
     fn outputs(&self) -> &'static [&'static str] {
-        &["clight_stmt", "emit_clight_stmt", "clight_stmt_dead"]
+        &["clight_stmt", "emit_clight_stmt", "clight_stmt_dead", "reg_to_struct_id"]
     }
 }
 
@@ -990,6 +1042,106 @@ pub(crate) fn xtype_refine_priority(xtype: &XType) -> u8 {
         XType::Xcharptr | XType::Xcharptrptr => 14,
         _ => 0,
     }
+}
+
+
+/// Extract the discriminant register from the address expression of an Eload used as a data lookup table. The address is `Ebinop(Oaddl, table_base_const, Ebinop(scale_op, Evar(idx), scale_const))` or related shapes. Returns the idx RTLReg.
+pub(crate) fn data_lookup_extract_index(addr_expr: &CsharpminorExpr) -> Option<RTLReg> {
+    fn find_evar(e: &CsharpminorExpr) -> Option<RTLReg> {
+        match e {
+            CsharpminorExpr::Evar(r) => Some(*r),
+            CsharpminorExpr::Ebinop(_, lhs, rhs) => find_evar(lhs).or_else(|| find_evar(rhs)),
+            CsharpminorExpr::Eunop(_, inner) => find_evar(inner),
+            _ => None,
+        }
+    }
+
+    if let CsharpminorExpr::Ebinop(_, lhs, rhs) = addr_expr {
+        let lhs_is_addr = matches!(
+            lhs.as_ref(),
+            CsharpminorExpr::Econst(Constant::Oaddrsymbol(_, _))
+        );
+        let rhs_is_addr = matches!(
+            rhs.as_ref(),
+            CsharpminorExpr::Econst(Constant::Oaddrsymbol(_, _))
+        );
+        if lhs_is_addr {
+            return find_evar(rhs);
+        }
+        if rhs_is_addr {
+            return find_evar(lhs);
+        }
+    }
+    find_evar(addr_expr)
+}
+
+/// Ascent aggregator: collect data lookup table values sorted by index.
+pub fn collect_data_lookup_values<'a>(
+    inp: impl Iterator<Item = (&'a usize, &'a i64)>,
+) -> impl Iterator<Item = Vec<(usize, i64)>> {
+    let mut pairs: Vec<(usize, i64)> = inp.map(|(i, v)| (*i, *v)).collect();
+    pairs.sort_by_key(|(i, _)| *i);
+    pairs.dedup_by_key(|(i, _)| *i);
+    std::iter::once(pairs)
+}
+
+/// Build the ClightLabeledStatements list for a data lookup table switch: `case k: dst = table[k]; break;` for each index k.
+pub(crate) fn build_data_lookup_switch_cases(
+    cases_sorted: &[(usize, i64)],
+    dst_ident: Ident,
+) -> ClightLabeledStatements {
+    let mut entries = Vec::with_capacity(cases_sorted.len());
+    for (idx, val) in cases_sorted {
+        let val_i32 = i32::try_from(*val).unwrap_or((*val as u32) as i32);
+        let set_stmt = ClightStmt::Sset(
+            dst_ident,
+            ClightExpr::EconstInt(val_i32, default_int_type()),
+        );
+        // case k: { dst = val_k; break; }
+        let case_body = ClightStmt::Ssequence(vec![set_stmt, ClightStmt::Sbreak]);
+        entries.push((Some(*idx as Z), case_body));
+    }
+    entries
+}
+
+/// Aggregator for closed-form switch cases (the index/key is already an i64 here).
+pub fn collect_data_lookup_values_i64<'a>(
+    inp: impl Iterator<Item = (&'a i64, &'a i64)>,
+) -> impl Iterator<Item = Vec<(i64, i64)>> {
+    let mut pairs: Vec<(i64, i64)> = inp.map(|(i, v)| (*i, *v)).collect();
+    pairs.sort_by_key(|(i, _)| *i);
+    pairs.dedup_by_key(|(i, _)| *i);
+    std::iter::once(pairs)
+}
+
+/// Build the ClightLabeledStatements list for a closed-form switch: one case per disc value, plus an optional default (None case key).
+pub(crate) fn build_closed_form_switch_cases(
+    cases_sorted: &[(i64, i64)],
+    dst_ident: Ident,
+    has_default: bool,
+    default_val: i64,
+) -> ClightLabeledStatements {
+    let mut entries: ClightLabeledStatements = Vec::with_capacity(cases_sorted.len() + 1);
+    for (case_idx, case_val) in cases_sorted {
+        let val_i32 = i32::try_from(*case_val).unwrap_or((*case_val as u32) as i32);
+        let set_stmt = ClightStmt::Sset(
+            dst_ident,
+            ClightExpr::EconstInt(val_i32, default_int_type()),
+        );
+        let case_body = ClightStmt::Ssequence(vec![set_stmt, ClightStmt::Sbreak]);
+        entries.push((Some(*case_idx as Z), case_body));
+    }
+    if has_default {
+        let val_i32 = i32::try_from(default_val).unwrap_or((default_val as u32) as i32);
+        let set_stmt = ClightStmt::Sset(
+            dst_ident,
+            ClightExpr::EconstInt(val_i32, default_int_type()),
+        );
+        let default_body = ClightStmt::Ssequence(vec![set_stmt, ClightStmt::Sbreak]);
+        // CompCert ClightLabeledStatements uses None as the default case.
+        entries.push((None, default_body));
+    }
+    entries
 }
 
 
@@ -3301,68 +3453,99 @@ fn infer_struct_fields_from_stack_inits(db: &mut DecompileDB) {
         groups
     };
 
-    let mut func_inits: HashMap<u64, Vec<(i64, Typ)>> = HashMap::new();
+    use crate::decompile::analysis::struct_recovery_pass::chunk_byte_size;
+
+    // Collect (offset, chunk) per function; multiple inits at one offset reduce to the widest chunk seen.
+    let mut func_inits: HashMap<u64, std::collections::BTreeMap<i64, MemoryChunk>> = HashMap::new();
     for (addr, ofs, _val, typ) in db.rel_iter::<(Address, i64, i64, Typ)>("mach_imm_stack_init") {
         if let Some(&func) = node_to_func.get(addr) {
-            func_inits.entry(func).or_default().push((*ofs, typ.clone()));
+            let chunk = typ_to_chunk(typ);
+            let entry = func_inits.entry(func).or_default();
+            let pick = match entry.get(ofs) {
+                None => chunk,
+                Some(prev) => {
+                    if chunk_byte_size(&chunk) > chunk_byte_size(prev) {
+                        chunk
+                    } else {
+                        prev.clone()
+                    }
+                }
+            };
+            entry.insert(*ofs, pick);
         }
     }
 
     let mut new_fields: Vec<(u64, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)> = Vec::new();
 
-    for (func_addr, inits) in &func_inits {
-        let mut offsets: Vec<i64> = inits.iter().map(|(ofs, _)| *ofs).collect();
-        offsets.sort();
-        offsets.dedup();
+    for (func_addr, offset_chunks) in &func_inits {
+        // BTreeMap is already sorted by offset.
+        let entries: Vec<(i64, MemoryChunk)> =
+            offset_chunks.iter().map(|(o, c)| (*o, c.clone())).collect();
 
-        if offsets.len() < 4 {
+        if entries.len() < 2 {
+            // Without at least two inits there is no stride to infer.
             continue;
         }
 
+        // Assumes homogeneous array-of-structs layout (uniform field size = stride); mixed-field-size structs would need separate handling.
+        let field_size = chunk_byte_size(&entries[0].1) as i64;
+        if !matches!(field_size, 1 | 2 | 4 | 8) {
+            continue;
+        }
+        if !entries.iter().all(|(_, c)| chunk_byte_size(c) as i64 == field_size) {
+            continue;
+        }
+        let chunk = entries[0].1.clone();
+
+        let offsets: Vec<i64> = entries.iter().map(|(o, _)| *o).collect();
         let deltas: Vec<i64> = offsets.windows(2).map(|w| w[1] - w[0]).collect();
+        // Adjacent offsets must be exactly field_size apart (packed array of uniform structs has no padding).
+        if !deltas.iter().all(|d| *d == field_size) {
+            continue;
+        }
 
-        if deltas.iter().all(|d| *d == 4) {
-            for fields_per_struct in 2..=4 {
-                let struct_size = 4 * fields_per_struct as i64;
-                if offsets.len() % fields_per_struct != 0 {
-                    continue;
-                }
-                let num_structs = offsets.len() / fields_per_struct;
-                if num_structs < 2 {
-                    continue;
-                }
+        // Require N >= 2 copies of a K-field struct so we don't confuse scattered uniform-width locals with an array of structs.
+        let max_fields = offsets.len();
+        for fields_per_struct in 1..=max_fields {
+            let struct_size = field_size * fields_per_struct as i64;
+            if offsets.len() % fields_per_struct != 0 {
+                continue;
+            }
+            let num_structs = offsets.len() / fields_per_struct;
+            if num_structs < 2 {
+                continue;
+            }
 
-                let base_ofs = offsets[0];
-                let mut valid = true;
-                for s in 0..num_structs {
-                    for f in 0..fields_per_struct {
-                        let expected = base_ofs + (s as i64) * struct_size + (f as i64) * 4;
-                        if offsets[s * fields_per_struct + f] != expected {
-                            valid = false;
-                            break;
-                        }
-                    }
-                    if !valid {
+            let base_ofs = offsets[0];
+            let mut valid = true;
+            for s in 0..num_structs {
+                for f in 0..fields_per_struct {
+                    let expected = base_ofs + (s as i64) * struct_size + (f as i64) * field_size;
+                    if offsets[s * fields_per_struct + f] != expected {
+                        valid = false;
                         break;
                     }
                 }
-
-                if valid {
-                    let fields: Vec<(i64, Ident, MemoryChunk)> = (0..fields_per_struct)
-                        .map(|f| {
-                            let field_offset = (f as i64) * 4;
-                            let field_name = generate_field_name(field_offset);
-                            (field_offset, field_name, MemoryChunk::MInt32)
-                        })
-                        .collect();
-
-                    let fields_arc = Arc::new(fields);
-                    for s in 0..num_structs {
-                        let instance_base = base_ofs + (s as i64) * struct_size;
-                        new_fields.push((*func_addr, instance_base, fields_arc.clone()));
-                    }
+                if !valid {
                     break;
                 }
+            }
+
+            if valid {
+                let fields: Vec<(i64, Ident, MemoryChunk)> = (0..fields_per_struct)
+                    .map(|f| {
+                        let field_offset = (f as i64) * field_size;
+                        let field_name = generate_field_name(field_offset);
+                        (field_offset, field_name, chunk.clone())
+                    })
+                    .collect();
+
+                let fields_arc = Arc::new(fields);
+                for s in 0..num_structs {
+                    let instance_base = base_ofs + (s as i64) * struct_size;
+                    new_fields.push((*func_addr, instance_base, fields_arc.clone()));
+                }
+                break;
             }
         }
     }
@@ -3385,9 +3568,8 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
         }
     }
 
-    // Build reg-to-canonical struct ID mapping so Tstruct IDs in expressions match XstructPtr IDs in declarations.
-    // Use min-aggregation on sid to make selection deterministic when a reg has multiple canonical IDs across addresses.
-    let reg_to_canonical: HashMap<Ident, Ident> = {
+    // Build reg-to-canonical struct ID mapping so Tstruct IDs in expressions match XstructPtr IDs in declarations; min-aggregate on sid for deterministic selection when a reg has multiple canonical IDs across addresses.
+    let mut reg_to_canonical: HashMap<Ident, Ident> = {
         let mut groups: HashMap<Ident, Ident> = HashMap::new();
         for &(_, reg, sid) in db.rel_iter::<(Address, RTLReg, usize)>("reg_to_struct_id") {
             groups.entry(reg as Ident)
@@ -3396,6 +3578,171 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
         }
         groups
     };
+
+    // Canonicalize efield-detected struct identity by bucketing unmapped (func, reg) by exact (offset, chunk) shape hash and linking callsite-passing peers via union-find; kept imperative because fresh-ID allocation needs a counter Datalog cannot express directly.
+    {
+        use crate::decompile::analysis::struct_recovery_pass::{compute_layout_hash_from_tuples, chunk_byte_size};
+        let mut shape_to_id: HashMap<u64, Ident> = HashMap::new();
+        let mut next_id: usize = 1;
+        for (h, id, _, _) in db.rel_iter::<(u64, usize, usize, usize)>("global_struct_catalog") {
+            shape_to_id.insert(*h, *id as Ident);
+            if *id >= next_id { next_id = *id + 1; }
+        }
+
+        // Group all (func, base_reg) -> set of (offset, chunk) for efield-discovered structs.
+        let mut reg_fields: HashMap<(u64, i64), std::collections::BTreeSet<(i64, MemoryChunk)>> = HashMap::new();
+        for (func_addr, base_off, fields) in
+            db.rel_iter::<(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_struct_fields")
+        {
+            let entry = reg_fields.entry((*func_addr, *base_off)).or_default();
+            for (field_off, _, chunk) in fields.iter() {
+                entry.insert((*field_off, chunk.clone()));
+            }
+        }
+
+        // Callsite linkage via ABI: a register passed as the N-th argument is the same abstract pointer as the callee's N-th parameter register. Union them so disjoint per-function field-sets merge into one canonical struct.
+        let abi_regs = &crate::x86::abi::abi_config().int_arg_regs;
+        // Invert emit_function to lookup the function owning a given entry node.
+        let entry_node_to_func: HashMap<Node, Address> = db
+            .rel_iter::<(Address, Symbol, Node)>("emit_function")
+            .map(|(a, _, n)| (*n, *a))
+            .collect();
+        let mut entry_mreg_to_rtl: HashMap<(Address, Mreg), RTLReg> = HashMap::new();
+        for &(node, mreg, rtl) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl") {
+            if let Some(&func) = entry_node_to_func.get(&node) {
+                entry_mreg_to_rtl.insert((func, mreg), rtl);
+            }
+        }
+
+        // Callee at pos -> RTLReg (per function). One entry per (func, pos) using the first ABI-matching reg.
+        let mut callee_param_at: HashMap<(Address, usize), RTLReg> = HashMap::new();
+        for &func in entry_node_to_func.values() {
+            for (pos, abi_mreg) in abi_regs.iter().enumerate() {
+                if let Some(&rtl) = entry_mreg_to_rtl.get(&(func, *abi_mreg)) {
+                    callee_param_at.entry((func, pos)).or_insert(rtl);
+                }
+            }
+        }
+
+        // Caller side: which (call_node, pos) carries which RTLReg.
+        let mut call_args: Vec<(Node, usize, RTLReg)> = db
+            .rel_iter::<(Node, usize, RTLReg)>("call_arg_mapping")
+            .map(|t| (t.0, t.1, t.2))
+            .collect();
+        call_args.sort();
+
+        let call_targets: HashMap<Node, Address> = db
+            .rel_iter::<(Node, Address)>("call_target_func")
+            .map(|(n, a)| (*n, *a))
+            .collect();
+
+        // Union-Find over RTLReg, lazily created as we walk the linkages.
+        let mut parent: HashMap<RTLReg, RTLReg> = HashMap::new();
+        fn ufind(parent: &mut HashMap<RTLReg, RTLReg>, r: RTLReg) -> RTLReg {
+            let p = *parent.entry(r).or_insert(r);
+            if p == r { return r; }
+            let root = ufind(parent, p);
+            parent.insert(r, root);
+            root
+        }
+        fn uunion(parent: &mut HashMap<RTLReg, RTLReg>, a: RTLReg, b: RTLReg) {
+            let ra = ufind(parent, a);
+            let rb = ufind(parent, b);
+            if ra != rb {
+                // Keep the smaller as root for determinism.
+                let (r, c) = if ra < rb { (ra, rb) } else { (rb, ra) };
+                parent.insert(c, r);
+            }
+        }
+
+        for (call_node, pos, arg_reg) in &call_args {
+            if let Some(callee) = call_targets.get(call_node) {
+                if let Some(&callee_reg) = callee_param_at.get(&(*callee, *pos)) {
+                    uunion(&mut parent, *arg_reg, callee_reg);
+                }
+            }
+        }
+
+        // For each (func, reg) that needs canonicalization, follow the union-find to its root, then aggregate fields per root.
+        let mut sorted_keys: Vec<(u64, i64)> = reg_fields.keys().copied().collect();
+        sorted_keys.sort();
+
+        // Group keys by union-find root. Regs that aren't in `parent` are their own root.
+        let mut root_members: HashMap<RTLReg, Vec<(u64, i64)>> = HashMap::new();
+        let mut root_fields: HashMap<RTLReg, std::collections::BTreeMap<i64, MemoryChunk>> = HashMap::new();
+        for key in &sorted_keys {
+            let (_func_addr, base_off) = *key;
+            // emit_struct_fields.base_off is i64 and can encode RTLRegs (high bit set per fresh_xtl_reg), constants, or stack-offset buckets. Only RTLReg-encoded keys belong in the union-find; gating on the high bit avoids polluting equivalence classes with unrelated integer values.
+            if (base_off as u64) & (1u64 << 63) == 0 { continue; }
+            let reg = base_off as RTLReg;
+            let root = ufind(&mut parent, reg);
+            root_members.entry(root).or_default().push(*key);
+            let entry = root_fields.entry(root).or_default();
+            for (off, chunk) in &reg_fields[key] {
+                // Widen chunks at the same offset: keep the widest one observed across all members of the equivalence class.
+                let cur = entry.get(off).cloned();
+                let pick = match cur {
+                    None => chunk.clone(),
+                    Some(prev) => if chunk_byte_size(chunk) > chunk_byte_size(&prev) { chunk.clone() } else { prev },
+                };
+                entry.insert(*off, pick);
+            }
+        }
+
+        // Assign canonical IDs per root. Try to match an existing canonical struct by exact-shape hash; otherwise allocate a new ID.
+        let mut root_to_id: HashMap<RTLReg, Ident> = HashMap::new();
+        // For each root, check if any member is already in reg_to_canonical and pick the smallest such id as the root's id (so the union with struct_recovery's canonical IDs is preserved).
+        for (root, members) in &root_members {
+            let mut existing_ids: Vec<Ident> = members.iter()
+                .filter_map(|(_, base_off)| reg_to_canonical.get(&(*base_off as Ident)).copied())
+                .collect();
+            existing_ids.sort();
+            if let Some(&id) = existing_ids.first() {
+                root_to_id.insert(*root, id);
+            }
+        }
+
+        let mut sorted_roots: Vec<RTLReg> = root_members.keys().copied().collect();
+        sorted_roots.sort();
+
+        for root in &sorted_roots {
+            if root_to_id.contains_key(root) { continue; }
+            let fields = match root_fields.get(root) {
+                Some(f) if !f.is_empty() => f,
+                _ => continue,
+            };
+            let tuples: Vec<(i64, usize, MemoryChunk)> = fields.iter()
+                .map(|(o, c)| (*o, chunk_byte_size(c), c.clone()))
+                .collect();
+            let h = compute_layout_hash_from_tuples(&tuples);
+            if let Some(&existing) = shape_to_id.get(&h) {
+                root_to_id.insert(*root, existing);
+                continue;
+            }
+            // No exact match -- allocate a new ID and register its hash so subsequent identical shapes reuse it.
+            let id = next_id as Ident;
+            next_id += 1;
+            shape_to_id.insert(h, id);
+            root_to_id.insert(*root, id);
+        }
+
+        // Push new reg_to_struct_id entries; extract_struct_definitions takes min sid so smaller shape-derived IDs win. No subset-redirect: merging shapes that share offsets but are semantically unrelated needs inter-procedural points-to.
+        let mut new_rtsi: Vec<(Address, RTLReg, usize)> = Vec::new();
+        for (root, members) in &root_members {
+            if let Some(&id) = root_to_id.get(root) {
+                for &(func_addr, base_off) in members {
+                    let reg = base_off as Ident;
+                    reg_to_canonical.insert(reg, id);
+                    new_rtsi.push((func_addr, base_off as RTLReg, id as usize));
+                }
+            }
+        }
+        new_rtsi.sort();
+        new_rtsi.dedup();
+        for tuple in new_rtsi {
+            db.rel_push("reg_to_struct_id", tuple);
+        }
+    }
 
     if func_field_info.is_empty() {
         // No struct fields -- copy clight_stmt_without_field directly to clight_stmt

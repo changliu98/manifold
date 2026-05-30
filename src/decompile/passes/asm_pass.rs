@@ -1273,6 +1273,7 @@ ascent_par! {
         !symbol_table(target_addr, _, _, _, _, _, _, _, _),
         !function_symbol(target_addr, _),
         !plt_entry(target_addr, _),
+        !func_entry(_, target_addr),
         let name_string = format!("SUB_{:x}", target_addr),
         let name_sym = Box::leak(name_string.into_boxed_str()) as &'static str;
 
@@ -1283,6 +1284,7 @@ ascent_par! {
         !symbol_table(target_addr, _, _, _, _, _, _, _, _),
         !function_symbol(target_addr, _),
         !plt_entry(target_addr, _),
+        !func_entry(_, target_addr),
         let name_string = format!("TABLE_{:x}", target_addr),
         let name_sym = Box::leak(name_string.into_boxed_str()) as &'static str;
 
@@ -1373,6 +1375,14 @@ ascent_par! {
     is_tail_call_jmp(addr) <--
         instruction(addr, _, _, "JMP", _, _, _, _, _, _),
         plt_entry(addr, _);
+
+    // A direct JMP whose immediate target lands back inside its own function is an intra-function jump (loop back-edge, shared epilogue/teardown), never a tail call; exposed so the mach-level restore-then-goto tail-call heuristic does not misclassify it as a call to a fabricated `L_<addr>()` function (root of the S5 unresolved-pseudo-call defect).
+    relation jmp_target_in_own_func(Address);
+    jmp_target_in_own_func(addr) <--
+        instruction(addr, _, _, "JMP", dst, _, _, _, _, _),
+        op_immediate(dst, target_addr, _),
+        instr_in_function(addr, func),
+        instr_in_function(*target_addr as u64, func);
 
     mach_inst(addr, MachInst::Mtailcall(Either::Right(Either::Left(sym)))) <--
         instruction(addr, _, _, "JMP", _, _, _, _, _, _),
@@ -1511,7 +1521,7 @@ ascent_par! {
         preg_of(arg, preg_of_r2),
         let regs = Arc::new(vec![*arg]),
         !transl_store_inferred(addr, _, addrmode, _, _),
-        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mc = chunk_from_mnem(mnem);
 
     // Indexed store (mnemonic-based, non-SP/non-BP base with index register)
@@ -1533,7 +1543,7 @@ ascent_par! {
         preg_of(idx_arg, preg_of_idx),
         let regs = Arc::new(vec![*arg, *idx_arg]),
         !transl_store_inferred(addr, _, addrmode, _, _),
-        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mc = chunk_from_mnem(mnem);
 
     // Scaled-index store with no base register (mnemonic-based): mov src, disp(,%idx,scale)
@@ -1553,7 +1563,7 @@ ascent_par! {
         preg_of(idx_arg, preg_of_idx),
         let regs = Arc::new(vec![*idx_arg]),
         !transl_store_inferred(addr, _, addrmode, _, _),
-        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mc = chunk_from_mnem(mnem);
 
     addrmode_needs_resolution(am, target_addr) <--
@@ -1717,7 +1727,7 @@ ascent_par! {
         instr_in_function(addr, func),
         !func_has_frame_pointer(func),
         !ireg_hold_type(dststr.to_string(), _),
-        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mc = chunk_from_mnem_ext(mnem);
 
     // BP-relative store when BP is NOT the frame pointer
@@ -1742,7 +1752,7 @@ ascent_par! {
         instr_in_function(addr, func),
         !func_has_frame_pointer(func),
         !ireg_hold_type(srcstr.to_string(), _),
-        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mc = chunk_from_mnem(mnem);
 
     // BP-relative immediate store when BP is NOT the frame pointer
@@ -2634,8 +2644,7 @@ ascent_par! {
         if Ireg::from(add2_dst_str) == Ireg::from(result_str),
         if Ireg::from(add2_src_str) == Ireg::from(sign_reg_str);
 
-    // Emit divide at the MOVSXD address: capstone reports reg_use=[input] and
-    // reg_def=[result] there, which exactly matches our Lop's I/O.
+    // Emit divide at the MOVSXD address: capstone reports reg_use=[input] and reg_def=[result] there, which exactly matches our Lop's I/O.
     mach_inst(movsxd_addr, MachInst::Mop(op.clone(), Arc::new(args.clone()), *result_mreg)) <--
         div_magic_32_compensating(movsxd_addr, _imul_addr, magic, total_shift, input_ireg, result_ireg),
         let divisor_opt = recover_signed_divisor_compensating(*magic, *total_shift),
@@ -2958,8 +2967,7 @@ ascent_par! {
         let args = vec![*input_mreg],
         let op = Operation::Odivimm(divisor);
 
-    // Mark the input-copy MOV and the SAR after it as div_consumed too, so the
-    // raw mov/sar emissions are suppressed.
+    // Mark the input-copy MOV and the SAR after it as div_consumed too, so the raw mov/sar emissions are suppressed.
     div_consumed(mov_addr) <--
         div_magic_32(_, shift_addr, _, _, in_ireg, _),
         next(shift_addr, mov_addr),
@@ -3242,16 +3250,14 @@ ascent_par! {
         op_register(mov_dst, dst_str),
         if Ireg::from(*dst_str) != *ireg;
 
-    // Memory-store MOV (`mov %reg, [mem]`) writes to memory, not to any
-    // register, so q_factor for every register is preserved.
+    // Memory-store MOV (`mov %reg, [mem]`) writes to memory, not to any register, so q_factor for every register is preserved.
     q_factor(mov_addr, *ireg, factor, *input, *divisor, *is_long) <--
         q_factor(prev_addr, ireg, factor, input, divisor, is_long),
         next(prev_addr, mov_addr),
         pmov(mov_addr, mov_dst, _),
         !op_register(mov_dst, _);
 
-    // Modulo synthesis: SUB n, qK_reg where qK_reg holds factor=K * q.
-    // Tuple: (sub_addr, dst_mreg, input_mreg, divisor, is_long).
+    // Modulo synthesis: SUB n, qK_reg where qK_reg holds factor=K * q. Tuple: (sub_addr, dst_mreg, input_mreg, divisor, is_long).
     #[local] relation mod_synth(Address, Mreg, Mreg, i64, bool);
 
     // Dividend value tracking: which regs hold input_ireg at sub_addr. Simple sub_dst==input_ireg misses MOVSXD-then-SUB cases (e.g. `movsxd rax,edi; sub eax,ecx` where EAX is a different Ireg from EDI).
@@ -3368,7 +3374,7 @@ ascent_par! {
         let regs = Arc::new(vec![*arg]),
         ireg_hold_type(dst_str.to_string(), typ),
         type_to_memchunk(typ, chunk),
-        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mnem_upper = mnem.to_ascii_uppercase(),
         if !mnem_upper.contains("MOVZ") && !mnem_upper.contains("MOVS");
 
@@ -3392,7 +3398,7 @@ ascent_par! {
         let regs = Arc::new(vec![*arg, *idx_arg]),
         ireg_hold_type(dst_str.to_string(), typ),
         type_to_memchunk(typ, chunk),
-        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mnem_upper = mnem.to_ascii_uppercase(),
         if !mnem_upper.contains("MOVZ") && !mnem_upper.contains("MOVS");
 
@@ -3414,7 +3420,7 @@ ascent_par! {
         let regs = Arc::new(vec![*idx_arg]),
         ireg_hold_type(dst_str.to_string(), typ),
         type_to_memchunk(typ, chunk),
-        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mnem_upper = mnem.to_ascii_uppercase(),
         if !mnem_upper.contains("MOVZ") && !mnem_upper.contains("MOVS");
 
@@ -3437,7 +3443,7 @@ ascent_par! {
         preg_of(arg, preg_of_r2),
         let regs = Arc::new(vec![*arg]),
         !transl_load_inferred(addr, _, addrmode, _, _),
-        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mc = chunk_from_mnem_ext(mnem);
 
     // Indexed load (mnemonic-based, non-SP/non-BP base with index register)
@@ -3459,7 +3465,7 @@ ascent_par! {
         preg_of(idx_arg, preg_of_idx),
         let regs = Arc::new(vec![*arg, *idx_arg]),
         !transl_load_inferred(addr, _, addrmode, _, _),
-        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mc = chunk_from_mnem_ext(mnem);
 
     // Scaled-index load with no base register (mnemonic-based): mov disp(,%idx,scale), dst
@@ -3479,7 +3485,7 @@ ascent_par! {
         preg_of(idx_arg, preg_of_idx),
         let regs = Arc::new(vec![*idx_arg]),
         !transl_load_inferred(addr, _, addrmode, _, _),
-        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mc = chunk_from_mnem_ext(mnem);
 
     mach_inst(addr, MachInst::Mload(*memory_chunk, addressing, Arc::new(args), *dst)) <--
@@ -3558,7 +3564,7 @@ ascent_par! {
         resolved_addr_to_symbol(target_addr, ident, offset),
         let idx_mreg = Mreg::from(*idx_str),
         !ireg_hold_type(dst_str.to_string(), _),
-        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mc = chunk_from_mnem_ext(mnem);
 
     // Absolute addressing load (mnemonic-based fallback)
@@ -3573,7 +3579,7 @@ ascent_par! {
         abs_target_addr(addr, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
         !ireg_hold_type(dst_str.to_string(), _),
-        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mc = chunk_from_mnem_ext(mnem);
 
     // Absolute addressing store: mov %eax, 0x40402c (base="NONE", disp is the address)
@@ -3602,7 +3608,7 @@ ascent_par! {
         abs_target_addr(addr, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
         !ireg_hold_type(src_str.to_string(), _),
-        instruction(addr, _, mnem, _, _, _, _, _, _, _),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mc = chunk_from_mnem(mnem);
 
     // Absolute addressing immediate store: movl $0x1, 0x40402c (base="NONE", disp is the address)

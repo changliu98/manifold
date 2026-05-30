@@ -36,22 +36,27 @@ fn compile(name: &str, compiler: &str, src: &str, opt: &str) -> PathBuf {
 }
 
 fn decompile(binary: &Path) -> TestOutput {
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(4).stack_size(64 * 1024 * 1024).build_global();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .stack_size(64 * 1024 * 1024)
+        .build()
+        .expect("failed to build per-decompile rayon pool");
 
     let binary = binary.to_path_buf();
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
-            let mut db = manifold::decompile::elevator::DecompileDB::default();
-            manifold::decompile::disassembly::load_from_binary(&mut db, &binary);
-            manifold::decompile::disassembly::load_preset(&mut db);
-            let memsave = std::env::var("MEMSAVE").is_ok();
-            db.run_pipeline(&binary, false, false, memsave);
-            let tu = db.cast_optimized_translation_unit
-                .expect("pipeline must produce translation unit");
-            let text = manifold::decompile::passes::c_pass::print_translation_unit(&tu);
-            TestOutput { text, tu }
+            pool.install(|| {
+                let mut db = manifold::decompile::elevator::DecompileDB::default();
+                manifold::decompile::disassembly::load_from_binary(&mut db, &binary);
+                manifold::decompile::disassembly::load_preset(&mut db);
+                let memsave = std::env::var("MEMSAVE").is_ok();
+                db.run_pipeline(&binary, false, false, memsave);
+                let tu = db.cast_optimized_translation_unit
+                    .expect("pipeline must produce translation unit");
+                let text = manifold::decompile::passes::c_pass::print_translation_unit(&tu);
+                TestOutput { text, tu }
+            })
         })
         .unwrap().join().expect("pipeline panicked")
 }
@@ -324,6 +329,13 @@ fn has_assign(out: &TestOutput, func: &str) -> bool {
 }
 
 
+#[allow(dead_code)]
+fn dump_output_if_env(tag: &str, text: &str) {
+    if std::env::var("DUMP_OUTPUT").is_ok() {
+        println!("=== {tag} OUTPUT ===\n{text}");
+    }
+}
+
 macro_rules! dual_compiler_test {
     ($name:ident, $opt:expr) => {
         mod $name {
@@ -357,6 +369,7 @@ dual_compiler_test!(multiarg, "-O1");
 dual_compiler_test!(nested_control, "-O0");
 dual_compiler_test!(control_recovery, "-O0");
 dual_compiler_test!(dataflow, "-O1");
+dual_compiler_test!(closed_form_switch, "-O1");
 
 // Additional edge-case coverage
 

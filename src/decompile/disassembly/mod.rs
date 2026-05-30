@@ -49,6 +49,15 @@ pub fn load_from_binary(db: &mut DecompileDB, binary_path: &Path) {
 
     let prologue_entries = function::detect_prologue_entries(&insns);
     extra_leaders.extend(prologue_entries.iter());
+
+    // Recover main from __libc_start_main pattern for stripped binaries; must precede build_blocks so main becomes a block leader.
+    if let Some(main_addr) = function::detect_main_via_libc_start_main(db, &insns) {
+        extra_leaders.push(main_addr);
+        db.rel_push("main_function", (main_addr,));
+        db.rel_push("symbols", (main_addr, "main", "Beg"));
+        log::debug!("Recovered main from __libc_start_main pattern: {:x}", main_addr);
+    }
+
     log::debug!("Extra block leaders: {} jump table targets + {} prologue entries",
               extra_leaders.len() - prologue_entries.len(), prologue_entries.len());
 

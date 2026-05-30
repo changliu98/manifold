@@ -211,13 +211,21 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
             .or_insert(*xtype);
     }
 
-    // instr_in_function is multi-valued (shared PLT/thunk nodes belong to several functions); Ascent set order is non-deterministic, so keep the smallest owning address to make the node->function mapping identical across runs.
+    // instr_in_function is multi-valued (shared PLT/thunk nodes and GCC hot/cold clones sharing a tail belong to several functions); resolve to the function that actually CONTAINS the node by address: the nearest preceding entry (largest owning address <= node). The old min-address rule handed a hot function's shared tail to its lower-addressed `.cold` clone, leaving the hot body return-less so it was dropped by dead-code elimination (emitted as a bare `int f(void)`). Nearest-preceding is deterministic like min, so node->function stays stable across runs.
     let mut node_to_func: HashMap<Node, Address> = HashMap::new();
     for (node, func) in db.rel_iter::<(Node, Address)>("instr_in_function") {
         node_to_func
             .entry(*node)
             .and_modify(|e| {
-                if *func < *e {
+                let cand_contains = *func <= *node;
+                let cur_contains = *e <= *node;
+                let better = match (cand_contains, cur_contains) {
+                    (true, true) => *func > *e,   // both contain the node: nearest preceding = larger entry
+                    (true, false) => true,        // only candidate contains it
+                    (false, true) => false,       // only current contains it
+                    (false, false) => *func < *e, // neither contains (shouldn't happen): smaller for stability
+                };
+                if better {
                     *e = *func;
                 }
             })
@@ -478,8 +486,7 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
     }
 
 
-    // Collect ALL type candidates per register and pick the priority-based best.
-    // emit_var_type_candidate iteration order is non-deterministic (Ascent set, boxcar insertion order varies across runs). Group first, then pick the best by priority with a deterministic XType tiebreak so the chosen type is the same every run.
+    // Collect ALL type candidates per register and pick the priority-based best. emit_var_type_candidate iteration order is non-deterministic (Ascent set, boxcar insertion order varies across runs). Group first, then pick the best by priority with a deterministic XType tiebreak so the chosen type is the same every run.
     let mut reg_xtypes: HashMap<RTLReg, Vec<XType>> = HashMap::new();
     for (reg, xtype) in db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate") {
         reg_xtypes.entry(*reg).or_default().push(xtype.clone());
@@ -512,18 +519,22 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
         reg_best_xtype_val.insert(reg, best);
     }
 
-    // Upgrade param types using emit_var_type_candidate (includes XstructPtr from ClightFieldPass), which provides struct pointer info unavailable at signature resolution time.
+    // Upgrade param types using emit_var_type_candidate (includes XstructPtr from ClightFieldPass) which provides struct pointer info unavailable at signature resolution time. Only upgrade FROM 64-bit generic placeholder types or generic pointer; preserve explicit semantic types: both narrow scalar (Xint for argc, Xint8signed, etc.) AND specific pointer types (Xcharptr, Xcharptrptr, Xfuncptr) from known signatures. Otherwise an XstructPtr candidate from generic load analysis would clobber the right type (e.g. main's int argc -> struct *).
     for func in func_map.values_mut() {
         for (i, reg) in func.param_regs.clone().iter().enumerate() {
             if let Some(best_xtype) = reg_best_xtype_val.get(reg) {
                 let current = func.param_types.get(i);
                 let should_upgrade = match (current, best_xtype) {
-                    // Upgrade non-struct to struct pointer
-                    (Some(ParamType::Typed(_)), XType::XstructPtr(sid)) => Some(ParamType::StructPointer(*sid)),
+                    // Upgrade from 64-bit register-width placeholders (long/any64/ptr) to struct pointer.
+                    (Some(ParamType::Typed(
+                        XType::Xlong | XType::Xlongunsigned |
+                        XType::Xany64 |
+                        XType::Xptr
+                    )), XType::XstructPtr(sid)) => Some(ParamType::StructPointer(*sid)),
                     (Some(ParamType::Pointer), XType::XstructPtr(sid)) => Some(ParamType::StructPointer(*sid)),
                     (Some(ParamType::Integer), XType::XstructPtr(sid)) => Some(ParamType::StructPointer(*sid)),
-                    // Upgrade int to pointer
-                    (Some(ParamType::Typed(XType::Xlong | XType::Xint)), XType::Xptr | XType::Xcharptr | XType::Xintptr) => Some(ParamType::Pointer),
+                    // Upgrade Xlong (64-bit generic) to pointer when load analysis says it's a ptr. Xint stays Xint: int->ptr upgrade would clobber explicit `int argc` etc.
+                    (Some(ParamType::Typed(XType::Xlong)), XType::Xptr | XType::Xcharptr | XType::Xintptr) => Some(ParamType::Pointer),
                     _ => None,
                 };
                 if let Some(new_type) = should_upgrade {
@@ -890,8 +901,7 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
         addrs
     };
 
-    // Build map of global load chunk types for rodata constant resolution.
-    // A literal in .rodata can be loaded with multiple chunks (e.g. as Float32 and Float64), so the relation carries several rows per id. Pick the smallest chunk by Ord so the resolved scalar value is stable across runs.
+    // Build map of global load chunk types for rodata constant resolution. A literal in .rodata can be loaded with multiple chunks (e.g. as Float32 and Float64), so the relation carries several rows per id. Pick the smallest chunk by Ord so the resolved scalar value is stable across runs.
     let global_chunks: HashMap<usize, MemoryChunk> = {
         let mut groups: HashMap<usize, Vec<MemoryChunk>> = HashMap::new();
         for (id, chunk) in db.rel_iter::<(Ident, MemoryChunk)>("global_load_chunk") {
@@ -1327,8 +1337,7 @@ pub fn extract_struct_definitions(db: &DecompileDB) -> Vec<ExtractedStruct> {
     let mut structs = Vec::new();
     let mut seen_struct_ids = HashSet::new();
 
-    // Pre-collect efield-detected fields per struct ID (merging across functions); these come from ClightFieldPass and may contain fields not in struct_recovery.
-    // reg_to_struct_id may emit multiple sids per reg; pick the smallest so the same reg resolves to the same canonical id every run.
+    // Pre-collect efield-detected fields per struct ID (merging across functions); these come from ClightFieldPass and may contain fields not in struct_recovery. reg_to_struct_id may emit multiple sids per reg, so pick the smallest so the same reg resolves to the same canonical id every run.
     let reg_to_canonical_ids: HashMap<u64, usize> = {
         let mut groups: HashMap<u64, Vec<usize>> = HashMap::new();
         for &(_, reg, sid) in db.rel_iter::<(u64, u64, usize)>("reg_to_struct_id") {
