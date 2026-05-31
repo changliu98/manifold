@@ -187,6 +187,9 @@ fn load_plt(db: &mut DecompileDB, obj: &object::File) {
         };
         let base = section.address();
 
+        // Record the full PLT-section span so function inference keeps PLT-internal addresses out of tail-call entry seeding.
+        db.rel_push("plt_section_range", (base, base + data.len() as u64));
+
         let entry_size: usize = 16;
 
         let start_offset: usize = if sec_name == ".plt" { entry_size } else { 0 };

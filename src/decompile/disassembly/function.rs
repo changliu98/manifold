@@ -78,6 +78,18 @@ pub fn infer_functions(db: &mut DecompileDB, insns: &[DecodedInsn]) {
         }
     }
 
+    // Seed entries from cross-function tail-call jmps (-O1+ `call;ret` becomes `jmp`); see seed_tailcall_entries.
+    {
+        let new_seeds = seed_tailcall_entries(db, insns, &entries, &jump_table_targets, &func_ranges);
+        let n = new_seeds.len();
+        for t in new_seeds {
+            entries.insert(t);
+        }
+        if n > 0 {
+            log::debug!("Function inference: seeded {} entries from cross-function tail-call jmps", n);
+        }
+    }
+
     // Build func_entry and ddisasm_function_entry relations
     let mut func_entry: Vec<(&'static str, u64)> = Vec::new();
     let mut func_entry_set: Vec<(u64,)> = Vec::new();
@@ -325,6 +337,16 @@ pub fn infer_functions(db: &mut DecompileDB, insns: &[DecodedInsn]) {
     db.rel_set("block_in_function", block_in_function.into_iter().collect::<ascent::boxcar::Vec<_>>());
 }
 
+// A C++ EH landing pad (`endbr64; mov <reg>,%rax/%rdx`) is an unwinder resume target, not a function entry; insns[i] is the candidate ENDBR64.
+fn is_eh_landing_pad_at(insns: &[DecodedInsn], i: usize) -> bool {
+    if insns[i].mnemonic != "ENDBR64" { return false; }
+    let Some(next) = insns.get(i + 1) else { return false; };
+    if next.mnemonic != "MOV" { return false; }
+    // capstone Intel op_str is "DST, SRC"; an EH pad moves FROM %rax/%rdx (the source, 2nd operand).
+    let op = next.op_str.to_uppercase();
+    matches!(op.rsplit(',').next().map(str::trim), Some("RAX") | Some("RDX"))
+}
+
 // Detect function entries via prologue patterns (ENDBR64, push rbp, sub rsp) after terminals.
 pub fn detect_prologue_entries(insns: &[DecodedInsn]) -> BTreeSet<u64> {
     let mut entries = BTreeSet::new();
@@ -338,21 +360,17 @@ pub fn detect_prologue_entries(insns: &[DecodedInsn]) -> BTreeSet<u64> {
         matches!(m, "NOP" | "INT3")
     };
 
-    let is_prologue_start = |insn: &DecodedInsn| -> bool {
-        if insn.mnemonic == "ENDBR64" {
-            return true;
-        }
-        if insn.mnemonic == "PUSH" && insn.op_str.to_uppercase().contains("RBP") {
-            return true;
-        }
-        if insn.mnemonic == "SUB" && insn.op_str.to_uppercase().contains("RSP") {
-            return true;
-        }
-        false
+    // ENDBR64 is a CET landing pad placed only at indirect-branch/call targets (function entries), never mid-function.
+    let is_endbr = |insn: &DecodedInsn| -> bool { insn.mnemonic == "ENDBR64" };
+
+    let is_other_prologue = |insn: &DecodedInsn| -> bool {
+        (insn.mnemonic == "PUSH" && insn.op_str.to_uppercase().contains("RBP"))
+            || (insn.mnemonic == "SUB" && insn.op_str.to_uppercase().contains("RSP"))
     };
 
     for i in 1..insns.len() {
-        if !is_prologue_start(&insns[i]) {
+        let endbr = is_endbr(&insns[i]);
+        if !endbr && !is_other_prologue(&insns[i]) {
             continue;
         }
 
@@ -361,12 +379,189 @@ pub fn detect_prologue_entries(insns: &[DecodedInsn]) -> BTreeSet<u64> {
             j -= 1;
         }
 
-        if is_terminal(insns[j].mnemonic) {
+        let prev = insns[j].mnemonic;
+        // A terminal predecessor bounds any prologue; for ENDBR64 a CALL predecessor (no-return call) also bounds a fresh function, excluding EH pads.
+        if (is_terminal(prev) || (endbr && prev == "CALL")) && !is_eh_landing_pad_at(insns, i) {
             entries.insert(insns[i].address);
         }
     }
 
     entries
+}
+
+// Minimal union-find over u64 keys grouping instructions into intra-function fall-through components, used by seed_tailcall_entries.
+struct UnionFind {
+    parent: HashMap<u64, u64>,
+    size: HashMap<u64, u64>,
+}
+
+impl UnionFind {
+    fn new() -> Self {
+        UnionFind { parent: HashMap::new(), size: HashMap::new() }
+    }
+    fn find(&mut self, x: u64) -> u64 {
+        self.parent.entry(x).or_insert(x);
+        self.size.entry(x).or_insert(1);
+        // Iterative root walk + path compression (avoids deep recursion on long instruction chains).
+        let mut root = x;
+        while self.parent[&root] != root {
+            root = self.parent[&root];
+        }
+        let mut cur = x;
+        while cur != root {
+            let next = self.parent[&cur];
+            self.parent.insert(cur, root);
+            cur = next;
+        }
+        root
+    }
+    fn union(&mut self, a: u64, b: u64) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb { return; }
+        let (sa, sb) = (self.size[&ra], self.size[&rb]);
+        let (big, small) = if sa >= sb { (ra, rb) } else { (rb, ra) };
+        self.parent.insert(small, big);
+        self.size.insert(big, sa + sb);
+    }
+}
+
+// Seed new entries from cross-function tail-call jmps (`jmp callee` shape of `call;ret`); a tail call requires a different nearest-known-entry AND a different fall-through component (else intra-function), plus guards: clean block leader, not a jump-table/PLT/EH-pad target, not inside a known FUNC range, preceded by a terminal (yields zero seeds at -O0).
+fn seed_tailcall_entries(
+    db: &DecompileDB,
+    insns: &[DecodedInsn],
+    entries: &BTreeSet<u64>,
+    jump_table_targets: &HashSet<u64>,
+    func_ranges: &[(u64, u64)],
+) -> Vec<u64> {
+    if insns.is_empty() { return Vec::new(); }
+
+    let is_terminal = |m: &str| -> bool {
+        matches!(m, "RET" | "JMP" | "HLT" | "UD2" | "INT3")
+    };
+    let is_padding = |m: &str| -> bool {
+        matches!(m, "NOP" | "INT3")
+    };
+    let is_uncond_terminal = |m: &str| -> bool {
+        // Instructions after which control does NOT fall through to the next instruction.
+        matches!(m, "RET" | "JMP" | "HLT" | "UD2")
+    };
+    let is_cond_jump = |m: &str| -> bool {
+        matches!(m,
+            "JE" | "JNE" | "JL" | "JLE" | "JG" | "JGE"
+            | "JB" | "JBE" | "JA" | "JAE" | "JP" | "JNP"
+            | "JO" | "JNO" | "JS" | "JNS"
+            | "JCXZ" | "JECXZ" | "JRCXZ"
+            | "LOOP" | "LOOPE" | "LOOPNE")
+    };
+
+    let addr_set: HashSet<u64> = insns.iter().map(|i| i.address).collect();
+
+    // Resolved single-target direct JMP/Jcc/CALL immediates; jump-table dispatcher jmps are handled via jump_table_target below.
+    let mut direct_jmp_target: HashMap<u64, u64> = HashMap::new();
+    for (src, dst) in db.rel_iter::<(Address, Address)>("direct_jump") {
+        // Keep only single-target jmps (a jump-table dispatcher has many direct_jump rows for one src).
+        direct_jmp_target.entry(*src).or_insert(*dst);
+    }
+    // Jump-table dispatcher jmp addresses (to exclude from the tail-call scan) and their case targets.
+    let mut jt_dispatcher: HashSet<u64> = HashSet::new();
+    let mut jt_edges: Vec<(u64, u64)> = Vec::new();
+    for (jmp_addr, _idx, target) in db.rel_iter::<(Node, usize, Node)>("jump_table_target") {
+        jt_dispatcher.insert(*jmp_addr);
+        jt_edges.push((*jmp_addr, *target));
+    }
+
+    // Build fall-through-component union-find: join on every edge except unconditional `jmp <imm>`.
+    let mut uf = UnionFind::new();
+    for (k, insn) in insns.iter().enumerate() {
+        let m = insn.mnemonic;
+        // Fall-through to the next instruction unless this is an unconditional terminal.
+        if !is_uncond_terminal(m) {
+            if let Some(next) = insns.get(k + 1) {
+                uf.union(insn.address, next.address);
+            }
+        }
+        // Conditional branch: both the fall-through (above) and the taken target stay in-function.
+        if is_cond_jump(m) {
+            if let Some(&t) = direct_jmp_target.get(&insn.address) {
+                if addr_set.contains(&t) {
+                    uf.union(insn.address, t);
+                }
+            }
+        }
+    }
+    // Jump-table dispatch edges keep all switch cases in the dispatcher's function.
+    for (jmp_addr, target) in &jt_edges {
+        if addr_set.contains(target) {
+            uf.union(*jmp_addr, *target);
+        }
+    }
+
+    // Sorted known entries for the nearest-preceding-entry test.
+    let known_entries: Vec<u64> = entries.iter().copied().collect(); // BTreeSet -> already ascending
+    let nearest_entry = |addr: u64| -> Option<u64> {
+        match known_entries.binary_search(&addr) {
+            Ok(_) => Some(addr),
+            Err(0) => None,
+            Err(i) => Some(known_entries[i - 1]),
+        }
+    };
+
+    // Index for the "preceded by a terminal" leader test.
+    let addr_to_idx: HashMap<u64, usize> =
+        insns.iter().enumerate().map(|(i, d)| (d.address, i)).collect();
+    let preceded_by_terminal = |target: u64| -> bool {
+        let Some(&k) = addr_to_idx.get(&target) else { return false; };
+        if k == 0 { return false; }
+        let mut j = k - 1;
+        while j > 0 && is_padding(insns[j].mnemonic) {
+            j -= 1;
+        }
+        is_terminal(insns[j].mnemonic)
+    };
+
+    let block_leaders: HashSet<u64> = db.rel_iter::<(Address,)>("block").map(|(a,)| *a).collect();
+    let plt_addrs: HashSet<u64> = db.rel_iter::<(Address, Symbol)>("plt_block").map(|(a, _)| *a).collect();
+    // Full PLT-section spans, covering the PLT-0 resolver and stub tails (not in plt_block) so a jmp into them is not seeded as a tail call.
+    let plt_ranges: Vec<(u64, u64)> =
+        db.rel_iter::<(Address, Address)>("plt_section_range").map(|(s, e)| (*s, *e)).collect();
+    let in_plt_section = |addr: u64| -> bool {
+        plt_ranges.iter().any(|(s, e)| addr >= *s && addr < *e)
+    };
+
+    // EH landing-pad leaders: a jmp originating in such a pad is an exception resume into its owning function, not a tail call, so map each instruction to its block leader.
+    let mut insn_to_leader: HashMap<u64, u64> = HashMap::new();
+    for (insn_addr, block_addr) in db.rel_iter::<(Address, Address)>("code_in_block") {
+        insn_to_leader.insert(*insn_addr, *block_addr);
+    }
+    let eh_pad_leaders: HashSet<u64> = (0..insns.len())
+        .filter(|&i| is_eh_landing_pad_at(insns, i))
+        .map(|i| insns[i].address)
+        .collect();
+
+    let mut seeds: BTreeSet<u64> = BTreeSet::new();
+    for insn in insns {
+        if insn.mnemonic != "JMP" { continue; }
+        if jt_dispatcher.contains(&insn.address) { continue; }   // switch dispatch, not a tail call
+        // A jmp from an EH landing-pad block is an exception resume into its owning function, never a tail call.
+        if insn_to_leader.get(&insn.address).map_or(false, |l| eh_pad_leaders.contains(l)) { continue; }
+        let Some(&target) = direct_jmp_target.get(&insn.address) else { continue; };
+        if target == 0 || !addr_set.contains(&target) { continue; }
+        if entries.contains(&target) { continue; }               // already a known entry
+        // Cross-function discriminators (both required): nearest known entry differs AND source/target sit in different fall-through components.
+        if nearest_entry(insn.address) == nearest_entry(target) { continue; }
+        if uf.find(insn.address) == uf.find(target) { continue; }
+        // Spurious-entry guards (a)-(e) plus the PLT-section and EH-landing-pad exclusions.
+        if !block_leaders.contains(&target) { continue; }
+        if jump_table_targets.contains(&target) { continue; }
+        if plt_addrs.contains(&target) { continue; }
+        if in_plt_section(target) { continue; }
+        if eh_pad_leaders.contains(&target) { continue; }
+        if func_ranges.iter().any(|(s, e)| target > *s && target < *e) { continue; }
+        if !preceded_by_terminal(target) { continue; }
+        seeds.insert(target);
+    }
+    seeds.into_iter().collect()
 }
 
 // Parse `lea rdi, [rip +/- 0xN]` and return the absolute target address, else None. Used to recover main from _start.

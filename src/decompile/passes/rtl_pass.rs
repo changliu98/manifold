@@ -1649,6 +1649,17 @@ ascent_par! {
                    else if mnem.ends_with("Q") { MemoryChunk::MInt64 }
                    else { MemoryChunk::MInt32 };
 
+    // cmp imm, [global] with a RIP-relative operand has no base/index GPR, so the mreg-gated Iload never fires; resolve the RIP target to an Aglobal and define the fresh reg the Icond consumes.
+    rtl_inst_candidate(addr, RTLInst::Iload(MemoryChunk::MInt32, Addressing::Aglobal(target_addr, 0), Arc::new(vec![]), *fresh_reg)) <--
+        instruction(addr, size, _, mnem, dst, src, _, _, _, _),
+        if mnem.starts_with("CMP"),
+        op_immediate(dst, _, _),
+        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        if is_rip(base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        temp_cmp_reg(addr, fresh_reg),
+        let target_addr = (*addr as i64 + *size as i64 + *disp) as Ident;
+
     // Icond from cmp[mem],imm placed at JCC (CMP/JCC sequential); false target is JCC's fallthrough (not next_addr=JCC) to avoid self-loop on false branch. Mirrors patterns at 1766/1782/1834.
     rtl_inst_candidate(*next_addr, RTLInst::Icond(cond, args.clone(), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
         instruction(addr, _, _, mnem, dst, src, _, _, _, _),
