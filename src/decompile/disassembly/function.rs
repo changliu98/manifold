@@ -58,6 +58,26 @@ pub fn infer_functions(db: &mut DecompileDB, insns: &[DecodedInsn]) {
 
     entries.extend(&filtered_prologue);
 
+    // Seed entries from data code pointers (vtable/fn-ptr tables, PIE addends): keep clean block leaders not inside a FUNC range, not jump-table targets, not PLT stubs.
+    {
+        let block_leaders: HashSet<u64> = db.rel_iter::<(Address,)>("block").map(|(a,)| *a).collect();
+        let plt_addrs: HashSet<u64> = db.rel_iter::<(Address, Symbol)>("plt_block").map(|(a, _)| *a).collect();
+        let mut seeded = 0u32;
+        for (_slot, target) in db.rel_iter::<(Address, Address)>("code_pointer_in_data") {
+            let target = *target;
+            if entries.contains(&target) { continue; }
+            if !block_leaders.contains(&target) { continue; }
+            if jump_table_targets.contains(&target) { continue; }
+            if plt_addrs.contains(&target) { continue; }
+            if func_ranges.iter().any(|(start, end)| target > *start && target < *end) { continue; }
+            entries.insert(target);
+            seeded += 1;
+        }
+        if seeded > 0 {
+            log::debug!("Function inference: seeded {} entries from code pointers in data", seeded);
+        }
+    }
+
     // Build func_entry and ddisasm_function_entry relations
     let mut func_entry: Vec<(&'static str, u64)> = Vec::new();
     let mut func_entry_set: Vec<(u64,)> = Vec::new();

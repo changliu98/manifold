@@ -1477,7 +1477,7 @@ fn assemble_ite(
             Some(other) => other,
             None => continue,
         };
-        let (cond, _then_target, _else_target) = match unwrapped {
+        let (cond, then_target, else_target) = match unwrapped {
             ClightStmt::Sifthenelse(c, t, e) => (c.clone(), t.clone(), e.clone()),
             _ => continue,
         };
@@ -1514,8 +1514,26 @@ fn assemble_ite(
             }
         };
 
-        let then_body = collect_body(&info.true_body_nodes);
-        let else_body = collect_body(&info.false_body_nodes);
+        let mut then_body = collect_body(&info.true_body_nodes);
+        let mut else_body = collect_body(&info.false_body_nodes);
+
+        // A branch side whose body was not inlined because its target is a (merging) shared landing pad -- excluded from the if-body seeds in the structuring pass -- must keep its original `goto target` rather than collapse to an empty Sskip that silently drops the control edge and loses the condition. Only restore the goto when the target is a real jump elsewhere (not the join point, where an empty side is a legitimate fallthrough). then_target/else_target are the flat Scond's `Sgoto(ident)` statements from clight_pass.
+        let join_ident = info.join_node.map(ident_from_node);
+        let goto_is_to_join = |g: &ClightStmt| matches!(g, ClightStmt::Sgoto(t) if Some(*t) == join_ident);
+        if info.true_body_nodes.is_empty()
+            && matches!(then_body, ClightStmt::Sskip)
+            && matches!(then_target.as_ref(), ClightStmt::Sgoto(_))
+            && !goto_is_to_join(then_target.as_ref())
+        {
+            then_body = (*then_target).clone();
+        }
+        if info.false_body_nodes.is_empty()
+            && matches!(else_body, ClightStmt::Sskip)
+            && matches!(else_target.as_ref(), ClightStmt::Sgoto(_))
+            && !goto_is_to_join(else_target.as_ref())
+        {
+            else_body = (*else_target).clone();
+        }
 
         let compound = ClightStmt::Sifthenelse(cond, Box::new(then_body), Box::new(else_body));
         let wrapped = match statements.get(&branch) {

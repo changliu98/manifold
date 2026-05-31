@@ -317,11 +317,32 @@ ascent_par! {
         scond_node(branch, t, f),
         target_reaches_or_eq(t, node),
         target_reaches_or_eq(f, node),
-        dominates(node, branch);
+        dominates(node, branch),
+        postdominates(branch, node);
 
     lattice join_point(Node, ascent::Dual<Node>);
     join_point(*branch, ascent::Dual(*node)) <--
         join_candidate(branch, node);
+
+    // (target, branch): each condition branch's two CFG targets, tagged with the branch.
+    relation scond_branch_target(Node, Node);
+    scond_branch_target(*t, *branch) <-- scond_node(branch, t, _);
+    scond_branch_target(*f, *branch) <-- scond_node(branch, _, f);
+
+    // A node directly targeted by >=2 distinct condition branches.
+    relation multi_branch_target(Node);
+    multi_branch_target(*node) <--
+        scond_branch_target(node, b1),
+        scond_branch_target(node, b2),
+        if b1 != b2;
+
+    // A shared landing pad of a MULTI-WAY guard chain that merges back into common code: it is targeted by >=2 distinct branches AND it flows on to a join point that is ITSELF targeted by >=2 distinct branches (so the post-pad merge is a genuine multi-way reconvergence, e.g. `if (A||B|| !D) { error; } ok:` where both the error block and the ok/return block are jumped to by several guards). Inlining such a pad into one branch's if-body steals it from the others (collapsing the chain, dropping their conditions) or duplicates it onto the wrong path; it must stay a standalone labeled block reached by `goto`. A clean `&&`/`||` short-circuit whose shared exit merges via a plain fallthrough/jump (join not itself a branch target) is NOT flagged, so the existing inliner keeps folding it goto-free; neither is a terminal-exit guard chain (no join to reach).
+    relation shared_target(Node);
+    shared_target(*node) <--
+        multi_branch_target(node),
+        join_point(_, ?ascent::Dual(j)),
+        multi_branch_target(j),
+        target_reaches_or_eq(node, j);
 
     // If-body membership: nodes reachable from branch targets, stopping at join point
     relation ifbody_true(Node, Node);
@@ -330,6 +351,7 @@ ascent_par! {
         scond_node(branch, t, _),
         join_point(branch, ?ascent::Dual(join)),
         if t != join,
+        !shared_target(t),
         !loop_header(t);
 
     ifbody_true(*branch, *next) <--
@@ -337,6 +359,7 @@ ascent_par! {
         cfg_edge(cur, next),
         join_point(branch, ?ascent::Dual(join)),
         if next != join,
+        !shared_target(next),
         dominates(next, branch),
         !loop_header(next),
         !loop_body_node(next);
@@ -345,6 +368,7 @@ ascent_par! {
         scond_node(branch, _, f),
         join_point(branch, ?ascent::Dual(join)),
         if f != join,
+        !shared_target(f),
         !loop_header(f);
 
     ifbody_false(*branch, *next) <--
@@ -352,6 +376,7 @@ ascent_par! {
         cfg_edge(cur, next),
         join_point(branch, ?ascent::Dual(join)),
         if next != join,
+        !shared_target(next),
         dominates(next, branch),
         !loop_header(next),
         !loop_body_node(next);
@@ -365,11 +390,13 @@ ascent_par! {
     ifbody_true(*branch, *t) <--
         scond_no_join(branch),
         scond_node(branch, t, _),
+        !shared_target(t),
         !loop_header(t);
     ifbody_true(*branch, *next) <--
         scond_no_join(branch),
         ifbody_true(branch, cur),
         cfg_edge(cur, next),
+        !shared_target(next),
         dominates(next, branch),
         !loop_header(next),
         !loop_body_node(next);
@@ -377,11 +404,13 @@ ascent_par! {
     ifbody_false(*branch, *f) <--
         scond_no_join(branch),
         scond_node(branch, _, f),
+        !shared_target(f),
         !loop_header(f);
     ifbody_false(*branch, *next) <--
         scond_no_join(branch),
         ifbody_false(branch, cur),
         cfg_edge(cur, next),
+        !shared_target(next),
         dominates(next, branch),
         !loop_header(next),
         !loop_body_node(next);
@@ -409,6 +438,32 @@ ascent_par! {
     relation dominates(Node, Node);
     dominates(*n, *d) <--
         dom_set(n, doms_dual),
+        for d in doms_dual.0.iter(),
+        if *d != *n;
+
+    // Post-dominators: dominance on the reversed CFG, seeded from exit nodes (no outgoing cfg edge: returns, tailcalls, noreturn calls). An if-join must post-dominate the branch; this rejects "joins" that lie on one branch's exclusive (e.g. shared-error) path instead of at the true reconvergence point.
+    relation exit_node(Node);
+    exit_node(*n) <-- stmt(n, _), !cfg_edge(n, _);
+
+    #[local] lattice strict_pdom_set(Node, Dual<Set<Node>>);
+    lattice pdom_set(Node, Dual<Set<Node>>);
+
+    pdom_set(*ex, Dual(Set::singleton(*ex))) <--
+        exit_node(ex);
+
+    strict_pdom_set(*n, Dual(s_doms.0.clone())) <--
+        cfg_edge(n, s),
+        pdom_set(s, s_doms),
+        !exit_node(n);
+
+    pdom_set(*n, Dual(dom_set_with_self(&strict.0, *n))) <--
+        strict_pdom_set(n, strict),
+        !exit_node(n);
+
+    // Strict post-dominance: d post-dominates n and d != n.
+    relation postdominates(Node, Node);
+    postdominates(*n, *d) <--
+        pdom_set(n, doms_dual),
         for d in doms_dual.0.iter(),
         if *d != *n;
 

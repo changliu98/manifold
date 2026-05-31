@@ -50,6 +50,17 @@ pub fn load_from_binary(db: &mut DecompileDB, binary_path: &Path) {
     let prologue_entries = function::detect_prologue_entries(&insns);
     extra_leaders.extend(prologue_entries.iter());
 
+    // Make data code pointers (vtable/fn-ptr tables, PIE addends) block leaders so infer_functions can seed and carve their bodies; build_blocks keeps only real instruction starts.
+    let jump_table_dsts: std::collections::HashSet<u64> = jump_table_targets.values()
+        .flat_map(|info| info.ordered_targets.iter().copied())
+        .collect();
+    let code_pointer_targets: Vec<u64> = db
+        .rel_iter::<(Address, Address)>("code_pointer_in_data")
+        .map(|(_, target)| *target)
+        .filter(|t| !jump_table_dsts.contains(t))
+        .collect();
+    extra_leaders.extend(code_pointer_targets.iter());
+
     // Recover main from __libc_start_main pattern for stripped binaries; must precede build_blocks so main becomes a block leader.
     if let Some(main_addr) = function::detect_main_via_libc_start_main(db, &insns) {
         extra_leaders.push(main_addr);

@@ -283,8 +283,13 @@ fn detect_main(db: &mut DecompileDB, obj: &object::File) {
 
 // Scan data sections for code pointers and GOT relocations for external symbol references.
 fn load_data_pointers(db: &mut DecompileDB, obj: &object::File) {
+    // Exclude PLT stub sections from code ranges: they hold only linkage thunks, so a data slot pointing into a PLT stub is a linker artifact, not a function pointer.
     let code_ranges: Vec<(u64, u64)> = obj.sections()
         .filter(|s| s.kind() == SectionKind::Text)
+        .filter(|s| {
+            let n = s.name().unwrap_or("");
+            n != ".plt" && n != ".plt.sec" && n != ".plt.got"
+        })
         .filter_map(|s| Some((s.address(), s.address() + s.size())))
         .collect();
 
@@ -292,11 +297,15 @@ fn load_data_pointers(db: &mut DecompileDB, obj: &object::File) {
         code_ranges.iter().any(|(start, end)| addr >= *start && addr < *end)
     };
 
-    // Scan data/rodata sections for 8-byte values pointing into code
+    // Scan data/rodata for 8-byte values pointing into code; skip GOT sections (.got, .got.plt) since their dynamic-linker pointers (e.g. lazy PLT resolver fallbacks) are not function entries.
     for section in obj.sections() {
         match section.kind() {
             SectionKind::Data | SectionKind::ReadOnlyData | SectionKind::ReadOnlyDataWithRel => {}
             _ => continue,
+        }
+        let sec_name = section.name().unwrap_or("");
+        if sec_name == ".got" || sec_name == ".got.plt" {
+            continue;
         }
         let data = match section.data() {
             Ok(d) => d,
@@ -309,6 +318,25 @@ fn load_data_pointers(db: &mut DecompileDB, obj: &object::File) {
             let val = u64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
             if is_code_addr(val) {
                 db.rel_push("code_pointer_in_data", (base + offset as u64, val));
+            }
+        }
+    }
+
+    // In PIE binaries data code pointers are zero in section bytes (real target is the R_X86_64_RELATIVE addend applied at load), so recover them from the relocation addend here.
+    if let Some(dyn_relocs) = obj.dynamic_relocations() {
+        for (offset, reloc) in dyn_relocs {
+            let is_relative = matches!(
+                reloc.flags(),
+                object::RelocationFlags::Elf { r_type }
+                    if r_type == object::elf::R_X86_64_RELATIVE
+                        || r_type == object::elf::R_X86_64_RELATIVE64
+            );
+            if !is_relative {
+                continue;
+            }
+            let target = reloc.addend() as u64;
+            if is_code_addr(target) {
+                db.rel_push("code_pointer_in_data", (offset, target));
             }
         }
     }

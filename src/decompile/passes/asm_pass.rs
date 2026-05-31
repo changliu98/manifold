@@ -1316,10 +1316,34 @@ ascent_par! {
         op_immediate(dst, imm_str, _),
         !symbols(*imm_str as Address, _, _);
 
+    // Resolve `call *disp(%rip)` via rip_target_addr to the GOT slot, then to an extern symbol or named symbol, emitting a named direct call so the known extern signature applies (RIP has no GP-reg).
+    relation rip_indirect_call_resolved(Address);
+
+    mach_inst(addr, MachInst::Mcall(Either::Right(Either::Left(name)))),
+    rip_indirect_call_resolved(*addr) <--
+        instruction(addr, _, _, "CALL", dst, _, _, _, _, _),
+        op_indirect(dst, _, base_str, idx_str, _, _, _),
+        reg_ip(*base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        rip_target_addr(addr, target),
+        pointer_to_external_symbol(target, name);
+
+    mach_inst(addr, MachInst::Mcall(Either::Right(Either::Left(name)))),
+    rip_indirect_call_resolved(*addr) <--
+        instruction(addr, _, _, "CALL", dst, _, _, _, _, _),
+        op_indirect(dst, _, base_str, idx_str, _, _, _),
+        reg_ip(*base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        rip_target_addr(addr, target),
+        !pointer_to_external_symbol(target, _),
+        symbols(*target, name, _);
+
+    // Register-indirect (`call *%rax`) and unresolved RIP-relative calls fall back to Mcall(Left(base)); resolvable RIP slots are handled above and excluded here so no call is dropped.
     mach_inst(addr, MachInst::Mcall(Either::Left(Mreg::from(Ireg::from(base_str))))) <--
         instruction(addr, _, _, "CALL", dst, _, _, _, _, _),
         op_indirect(dst, _, base_str, _, _, _, _),
-        if base_str != &"NONE";
+        if base_str != &"NONE",
+        !rip_indirect_call_resolved(*addr);
 
 
     prev_instr(next_addr, curr_addr) <-- next(curr_addr, next_addr);
@@ -1338,7 +1362,9 @@ ascent_par! {
         op_register(rsp, "RSP"),
         next(addr, addr1),
         pjmp(addr1, dst),
-        op_immediate(dst, imm_str, _);
+        op_immediate(dst, imm_str, _),
+        // Require a real function-entry target: an `L_<addr>` label (e.g. shared epilogue) is not a tailcall and would fabricate a call to an undefined `L_<addr>()` (S5).
+        func_entry(_, *imm_str as u64);
 
 
     mach_inst(addr, MachInst::Mtailcall(Either::Right(Either::Left(sym)))), plabel(addr1, sym) <--
@@ -1362,7 +1388,9 @@ ascent_par! {
         next(addr, next_addr),
         !instr_in_function(next_addr, func),
         // Exclude intra-function jumps (loop back-edges at function boundaries are not tail calls).
-        !instr_in_function(*target_addr as u64, func);
+        !instr_in_function(*target_addr as u64, func),
+        // Require a real function-entry target: an `L_<addr>` label (e.g. landing-pad continuation) is not a tailcall and lets the JMP fall through to Mgoto instead of an undefined `L_<addr>()` (S5).
+        func_entry(_, *target_addr as u64);
 
     is_tail_call_jmp(addr) <--
         instruction(addr, _, _, "JMP", dst, _, _, _, _, _),
@@ -1401,10 +1429,11 @@ ascent_par! {
         instruction(addr, _, _, "RET", _, _, _, _, _, _);
 
 
+    // No-result builtin: BAInt(0) is the canonical empty-result form (matching cminor_pass) so downstream does not synthesize a dst and render `var = __builtin_unreachable()`.
     mach_inst(addr, MachInst::Mbuiltin(
         "__builtin_unreachable".to_string(),
         vec![],
-        BuiltinArg::BA(Mreg::from(Ireg::Unknown))
+        BuiltinArg::BAInt(0)
     )) <--
         phlt(addr),
         builtins("__builtin_unreachable");

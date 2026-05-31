@@ -2385,9 +2385,47 @@ ascent_par! {
         let inst = RTLInst::Ijumptable(*arg_rtl, Arc::new(targets.clone()));
 
 
-    ax_value_addr(ret_addr, def_addr) <--
+    // Direct def-use: the return value's defining instruction reaches the return.
+    relation ax_value_direct(Address, Address);
+    ax_value_direct(ret_addr, def_addr) <--
         ltl_inst(ret_addr, ?LTLInst::Lreturn),
         reg_def_used(def_addr, Mreg::AX, ret_addr);
+
+    ax_value_addr(ret_addr, def_addr) <--
+        ax_value_direct(ret_addr, def_addr);
+
+    func_ax_def(func_start, addr, rtl_reg) <--
+        instr_in_function(addr, func_start),
+        reg_def_site(addr, Mreg::AX),
+        reg_rtl(addr, Mreg::AX, rtl_reg);
+
+    // Recovery (return def-use broken): no def reaches the return but an AX def-site exists, so bind the return to the last in-function AX def by program order (mirrors arg_reg_used_no_def) instead of a fresh undefined reg.
+    relation ax_recovered_cand(Address, Address, Address);
+    ax_recovered_cand(func_start, ret_addr, def_addr) <--
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        !ax_value_direct(ret_addr, _),
+        instr_in_function(ret_addr, func_start),
+        func_ax_def(func_start, def_addr, _),
+        instr_min_order(func_start, def_addr, def_order),
+        instr_min_order(func_start, ret_addr, ret_order),
+        if *def_order <= *ret_order;
+
+    // Keep only the latest such def (closest to the return).
+    relation ax_recovered_killed(Address, Address, Address);
+    ax_recovered_killed(func_start, ret_addr, def_addr) <--
+        ax_recovered_cand(func_start, ret_addr, def_addr),
+        ax_recovered_cand(func_start, ret_addr, other_def),
+        instr_min_order(func_start, def_addr, def_order),
+        instr_min_order(func_start, other_def, other_order),
+        if *other_order > *def_order;
+
+    relation ax_recovered(Address, Address, Address);
+    ax_recovered(func_start, ret_addr, def_addr) <--
+        ax_recovered_cand(func_start, ret_addr, def_addr),
+        !ax_recovered_killed(func_start, ret_addr, def_addr);
+
+    ax_value_addr(ret_addr, def_addr) <--
+        ax_recovered(_, ret_addr, def_addr);
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lreturn),
@@ -2395,16 +2433,19 @@ ascent_par! {
         reg_rtl(addr, Mreg::AX, ret_rtl),
         let inst = RTLInst::Ireturn(*ret_rtl);
 
+    // Recovery return: the return node has no propagated AX rtl reg, so build Ireturn over the recovered def's reg_rtl directly (consistent with function_return_point_reg).
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lreturn),
+        ax_recovered(_, addr, def_addr),
+        !reg_rtl(addr, Mreg::AX, _),
+        reg_rtl(def_addr, Mreg::AX, ret_rtl),
+        let inst = RTLInst::Ireturn(*ret_rtl);
+
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lreturn),
         !ax_value_addr(addr, _),
         let void_reg = crate::decompile::passes::rtl_pass::fresh_xtl_reg(*addr, Mreg::AX),
         let inst = RTLInst::Ireturn(void_reg);
-
-    func_ax_def(func_start, addr, rtl_reg) <--
-        instr_in_function(addr, func_start),
-        reg_def_site(addr, Mreg::AX),
-        reg_rtl(addr, Mreg::AX, rtl_reg);
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lgetstack(slot, ofs, typ, dst)),
@@ -4890,6 +4931,30 @@ ascent_par! {
         instr_in_function(ret_point2, undiscov_addr2),
         ltl_inst(ret_point2, ?LTLInst::Lreturn),
         !reg_rtl(ret_point2, Mreg::AX, _);
+
+    // A function has a return value if any return point resolves an AX value (direct def-use or recovered last-def); ax_value_addr is keyed on the return node.
+    relation func_has_ax_return_value(Address);
+    func_has_ax_return_value(func_start) <--
+        instr_in_function(ret_point, func_start),
+        ltl_inst(ret_point, ?LTLInst::Lreturn),
+        ax_value_addr(ret_point, _);
+
+    // Float/double returns place the result in XMM0 (X0), which the AX-keyed machinery misses; treat an X0 def reaching a return as a return value so they are not misclassified as void.
+    func_has_ax_return_value(func_start) <--
+        instr_in_function(ret_point, func_start),
+        ltl_inst(ret_point, ?LTLInst::Lreturn),
+        instr_in_function(def_addr, func_start),
+        reg_def_site(def_addr, Mreg::X0),
+        instr_min_order(func_start, def_addr, def_order),
+        instr_min_order(func_start, ret_point, ret_order),
+        if *def_order <= *ret_order;
+
+    // Genuine void: a function whose return points have no AX/X0 value source at all; without this the void fallback fabricates an undefined AX reg typed as `long`, emitting `return <uninitialized var>`.
+    emit_function_void_candidate(func_start) <--
+        func_stacksz(func_start, _, _, _),
+        instr_in_function(ret_point, func_start),
+        ltl_inst(ret_point, ?LTLInst::Lreturn),
+        !func_has_ax_return_value(func_start);
 
 
     relation func_is_variadic(Address);
