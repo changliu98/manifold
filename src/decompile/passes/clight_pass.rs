@@ -595,18 +595,45 @@ ascent_par! {
         let converted_args = clight_builtin_args_with_multi_types(&effective_args_init, &var_types),
         let stmt = ClightStmt::Scall(effective_dst, ClightExpr::EvarSymbol(effective_name, default_void_ptr_type()), converted_args);
 
-    // Flat Scond (not lifted by structuring_pass): convert to Sifthenelse with gotos
+    // Goto-chain threading: a forwarding block is a node whose whole statement is a lone unconditional jump, excluding entry/loop/switch anchors.
+    #[local] relation fwd(Node, Node);
+    fwd(*node, *target) <--
+        csharp_stmt(node, ?CsharpminorStmt::Sjump(target)),
+        if *node != *target,
+        !func_entry_node(_, node),
+        !emit_loop_body(_, node, _),
+        !emit_switch_chain(_, node, _);
+
+    // Resolve each forwarding chain to its terminal target; a purely cyclic chain has no terminal and yields no fact, so it is left intact.
+    #[local] relation goto_chain_end(Node, Node);
+    goto_chain_end(*n, *f) <-- fwd(n, f), !fwd(f, _);
+    goto_chain_end(*n, *f) <-- fwd(n, m), goto_chain_end(m, f);
+
+    // Every node used as a branch/jump destination, so final_goto is total over the targets we thread on.
+    #[local] relation goto_dst(Node);
+    goto_dst(*a) <-- csharp_stmt(_, ?CsharpminorStmt::Scond(_, _, a, _));
+    goto_dst(*b) <-- csharp_stmt(_, ?CsharpminorStmt::Scond(_, _, _, b));
+    goto_dst(*t) <-- csharp_stmt(_, ?CsharpminorStmt::Sjump(t));
+
+    // final_goto(orig, dst): single-valued, total over goto_dst -- the chain end if orig forwards, else orig itself.
+    #[local] relation final_goto(Node, Node);
+    final_goto(*n, *f) <-- goto_chain_end(n, f);
+    final_goto(*n, *n) <-- goto_dst(n), !goto_chain_end(n, _);
+
+    // Flat Scond (not lifted by structuring_pass): convert to Sifthenelse with gotos threaded to their chain ends
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Scond(cond, exprs, ifso, ifnot)),
         !valid_switch_chain(_, node, _),
         !valid_ternary(_, node, _, _, _, _),
+        final_goto(ifso, ifso_final),
+        final_goto(ifnot, ifnot_final),
         all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(exprs.as_slice()),
         let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         let condition_opt = crate::decompile::passes::clight_pass::clight_condition_expr_with_types(&cond, exprs.as_slice(), &var_types),
         if let Some(condition) = condition_opt,
-        let then_stmt = ClightStmt::Sgoto(ident_from_node(*ifso)),
-        let else_stmt = ClightStmt::Sgoto(ident_from_node(*ifnot)),
+        let then_stmt = ClightStmt::Sgoto(ident_from_node(*ifso_final)),
+        let else_stmt = ClightStmt::Sgoto(ident_from_node(*ifnot_final)),
         let stmt = ClightStmt::Sifthenelse(condition.clone(), Box::new(then_stmt), Box::new(else_stmt));
 
     // Compound Sifthenelse (lifted by structuring_pass): recursively convert bodies
@@ -678,7 +705,8 @@ ascent_par! {
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sjump(target)),
         if *node != *target,
-        let stmt = ClightStmt::Sgoto(ident_from_node(*target));
+        final_goto(target, target_final),
+        let stmt = ClightStmt::Sgoto(ident_from_node(*target_final));
 
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sjump(target)),

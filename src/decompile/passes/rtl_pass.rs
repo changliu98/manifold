@@ -1733,7 +1733,9 @@ ascent_par! {
     rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*reg_rtl, *fresh_reg]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
         pcmp(addr, r1, r2),
         op_register(r1, reg_str),
-        op_indirect(r2, _, _, _, _, _, _),
+        op_indirect(r2, _, _, _, _, disp, _),
+        instr_in_function(addr, cmp_func),
+        !stack_var(cmp_func, addr, *disp, _),
         temp_cmp_reg(addr, fresh_reg),
         let mreg = Mreg::from(reg_str),
         reg_rtl(addr, mreg, reg_rtl),
@@ -1749,7 +1751,9 @@ ascent_par! {
     rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*reg_rtl, *fresh_reg]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
         pcmp(addr, r1, r2),
         op_register(r1, reg_str),
-        op_indirect(r2, _, _, _, _, _, _),
+        op_indirect(r2, _, _, _, _, disp, _),
+        instr_in_function(addr, cmp_func),
+        !stack_var(cmp_func, addr, *disp, _),
         temp_cmp_reg(addr, fresh_reg),
         let mreg = Mreg::from(reg_str),
         reg_rtl(addr, mreg, reg_rtl),
@@ -1800,8 +1804,10 @@ ascent_par! {
 
     rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*fresh_reg, *reg_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
         pcmp(addr, r1, r2),
-        op_indirect(r1, _, _, _, _, _, _),
+        op_indirect(r1, _, _, _, _, disp, _),
         op_register(r2, reg_str),
+        instr_in_function(addr, cmp_func),
+        !stack_var(cmp_func, addr, *disp, _),
         temp_cmp_reg(addr, fresh_reg),
         let mreg = Mreg::from(reg_str),
         reg_rtl(addr, mreg, reg_rtl),
@@ -1816,8 +1822,10 @@ ascent_par! {
 
     rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*fresh_reg, *reg_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
         pcmp(addr, r1, r2),
-        op_indirect(r1, _, _, _, _, _, _),
+        op_indirect(r1, _, _, _, _, disp, _),
         op_register(r2, reg_str),
+        instr_in_function(addr, cmp_func),
+        !stack_var(cmp_func, addr, *disp, _),
         temp_cmp_reg(addr, fresh_reg),
         let mreg = Mreg::from(reg_str),
         reg_rtl(addr, mreg, reg_rtl),

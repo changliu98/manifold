@@ -161,7 +161,7 @@ fn xtype_from_string(s: &str) -> Option<XType> {
 pub struct DecompileDB {
     pub relations: StdHashMap<&'static str, RelationEntry>,
 
-    // Typed per-function trees from ClightSelectPass, rewritten in place by GotoReducePass, then consumed by ClightEmitPass.
+    // Typed per-function trees produced by ClightSelectPass and consumed by ClightEmitPass.
     pub clight_selected_functions: Vec<SelectedFunction>,
 
     pub cast_selected_functions: Vec<SelectedFunction>,
@@ -512,7 +512,6 @@ impl DecompileDB {
             Box::new(clight_pass::ClightPass),
             Box::new(clight_pass::ClightFieldPass),
             Box::new(clight_emit_pass::ClightSelectPass),
-            Box::new(goto_reduce_pass::GotoReducePass),
             Box::new(clight_emit_pass::ClightEmitPass),
         ];
 

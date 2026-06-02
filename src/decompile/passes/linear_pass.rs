@@ -45,6 +45,7 @@ ascent_par! {
     relation known_func_returns_long(Symbol);
     relation known_func_returns_ptr(Symbol);
     relation known_func_returns_single(Symbol);
+    relation mach_imm_stack_init(Address, i64, i64, Typ);
     relation main_function(Address);
     relation reg_def_used(Address, Mreg, Address);
     relation reg_rtl(Node, Mreg, RTLReg);
@@ -480,11 +481,16 @@ ascent_par! {
         !linear_inst(*t, _),
         !next(*t, _);
 
+    // A node with an immediate-to-stack store (mach_imm_stack_init, e.g. `movl $imm,-off(rbp)`) has a real side effect but no linear_inst, so it must be its own canonical node: branch targets must not be threaded past it, which would drop the store and leave the stack slot use-before-def.
+    ltl_canonical_node(n, n) <--
+        mach_imm_stack_init(n, _, _, _);
+
     ltl_canonical_node(n, canon) <--
         ltl_inst(n, inst),
         if let LTLInst::Lbranch(Either::Right(t)) = inst,
         if *t != *n,
         !ltl_branch_cycle(n),
+        !mach_imm_stack_init(n, _, _, _),
         ltl_canonical_node(*t, canon);
 
     ltl_canonical_node(*target_addr, *target_addr) <--

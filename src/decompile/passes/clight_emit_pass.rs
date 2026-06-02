@@ -575,7 +575,7 @@ impl IRPass for ClightEmitPass {
             .clone()
             .expect("binary_path must be set before ClightEmitPass");
 
-        // Take the typed, goto-reduced trees produced by ClightSelectPass and rewritten by GotoReducePass.
+        // Take the typed per-function trees produced by ClightSelectPass.
         let selected_functions = std::mem::take(&mut db.clight_selected_functions);
         eprintln!("[clight-emit] selected functions: {}", selected_functions.len());
 
