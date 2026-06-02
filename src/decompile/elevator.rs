@@ -161,6 +161,9 @@ fn xtype_from_string(s: &str) -> Option<XType> {
 pub struct DecompileDB {
     pub relations: StdHashMap<&'static str, RelationEntry>,
 
+    // Typed per-function trees from ClightSelectPass, rewritten in place by GotoReducePass, then consumed by ClightEmitPass.
+    pub clight_selected_functions: Vec<SelectedFunction>,
+
     pub cast_selected_functions: Vec<SelectedFunction>,
     pub cast_globals: Vec<GlobalData>,
     pub cast_id_to_name: HashMap<usize, String>,
@@ -181,6 +184,7 @@ impl Default for DecompileDB {
         Self {
             relations: StdHashMap::new(),
 
+            clight_selected_functions: Default::default(),
             cast_selected_functions: Default::default(),
             cast_globals: Default::default(),
             cast_id_to_name: Default::default(),
@@ -471,19 +475,10 @@ impl DecompileDB {
         binary_path: &std::path::Path,
         trace_enabled: bool,
         measure_rule_times: bool,
-        memsave: bool,
     ) {
         log::info!("Starting decompilation pipeline...");
 
         let measure_mem = std::env::var("MEASURE_MEM").is_ok();
-
-        // TRACE_NODE / TRACE_FUNC read many relations after the pipeline; honoring --memsave here would empty those reads. Disable memsave when either env var is set.
-        let memsave = if memsave && (std::env::var("TRACE_NODE").is_ok() || std::env::var("TRACE_FUNC").is_ok()) {
-            eprintln!("[memsave] disabled because TRACE_NODE/TRACE_FUNC is set");
-            false
-        } else {
-            memsave
-        };
 
         self.binary_path = Some(binary_path.to_path_buf());
         self.trace_enabled = trace_enabled;
@@ -516,27 +511,15 @@ impl DecompileDB {
             Box::new(closed_form_switch_pass::ClosedFormSwitchPass),
             Box::new(clight_pass::ClightPass),
             Box::new(clight_pass::ClightFieldPass),
+            Box::new(clight_emit_pass::ClightSelectPass),
+            Box::new(goto_reduce_pass::GotoReducePass),
             Box::new(clight_emit_pass::ClightEmitPass),
         ];
 
         let schedule = PassScheduler::build_schedule(&passes);
         schedule.print();
 
-        let drops_per_stage: Vec<Vec<&'static str>> = if memsave {
-            schedule.compute_drops(&passes)
-        } else {
-            vec![Vec::new(); schedule.stages.len()]
-        };
-
-        if memsave {
-            let total_dropped: usize = drops_per_stage.iter().map(|v| v.len()).sum();
-            eprintln!(
-                "[memsave] enabled: scheduled {} relation drops across {} stages",
-                total_dropped, drops_per_stage.len()
-            );
-        }
-
-        for (stage_idx, stage) in schedule.stages.iter().enumerate() {
+        for stage in schedule.stages.iter() {
             if stage.passes.len() == 1 {
                 let idx = stage.passes[0];
                 let pass = &passes[idx];
@@ -634,29 +617,6 @@ impl DecompileDB {
                         } else {
                             log::info!("Pass {} completed in {:?}", pass.name(), elapsed);
                         }
-                    }
-                }
-            }
-
-            if memsave {
-                let to_drop = &drops_per_stage[stage_idx];
-                if !to_drop.is_empty() {
-                    let mut dropped_bytes: usize = 0;
-                    let mut dropped_count: usize = 0;
-                    for &name in to_drop {
-                        if let Some(entry) = self.relations.remove(name) {
-                            if let Some((_, bytes)) = entry.size_info() {
-                                dropped_bytes += bytes;
-                            }
-                            dropped_count += 1;
-                        }
-                    }
-                    if dropped_count > 0 {
-                        let mb = dropped_bytes as f64 / 1024.0 / 1024.0;
-                        eprintln!(
-                            "[memsave] stage {}: dropped {} relations (~{:.1} MB)",
-                            stage_idx, dropped_count, mb
-                        );
                     }
                 }
             }

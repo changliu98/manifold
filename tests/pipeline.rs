@@ -50,8 +50,7 @@ fn decompile(binary: &Path) -> TestOutput {
                 let mut db = manifold::decompile::elevator::DecompileDB::default();
                 manifold::decompile::disassembly::load_from_binary(&mut db, &binary);
                 manifold::decompile::disassembly::load_preset(&mut db);
-                let memsave = std::env::var("MEMSAVE").is_ok();
-                db.run_pipeline(&binary, false, false, memsave);
+                db.run_pipeline(&binary, false, false);
                 let tu = db.cast_optimized_translation_unit
                     .expect("pipeline must produce translation unit");
                 let text = manifold::decompile::passes::c_pass::print_translation_unit(&tu);

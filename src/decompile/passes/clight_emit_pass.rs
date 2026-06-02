@@ -454,6 +454,114 @@ fn collect_all_referenced_structs(
     referenced
 }
 
+// Shared read set for the select/emit split; the full set keeps both halves ordered after their producers, with clight_selected_functions the typed-tree handoff.
+const CLIGHT_EMIT_INPUTS: &[&str] = &[
+    "clight_selected_functions",
+    "emit_clight_stmt",
+    "emit_function",
+    "emit_function_param",
+    "emit_function_return_type",
+    "emit_next",
+    "emit_var_type_candidate",
+    "emit_loop_body",
+    "emit_switch_chain",
+    "emit_struct_fields",
+    "primary_exit_node",
+    "loop_exit_branch",
+    "trim_step",
+    "known_extern_signature",
+    "ident_to_symbol",
+    "is_external_function",
+    "clight_succ",
+    "string_data",
+    "instr_in_function",
+    "emit_address_as_offset",
+    "symbol_size",
+    "interior_element_size",
+    "is_global_array",
+    "global_var_ref",
+    "global_load_chunk",
+    "emit_canonical_struct_id",
+    "global_struct_catalog",
+    "func_stacksz",
+    "symbols",
+    "reg_to_struct_id",
+    "call_target_func",
+    "call_arg_mapping",
+];
+
+const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
+    "direct_call",
+    "dwarf_func_param_name",
+    "emit_break_stmt",
+    "emit_function_param_count",
+    "emit_function_param_is_pointer",
+    "emit_function_param_type",
+    "emit_function_return",
+    "emit_function_return_type_xtype",
+    "emit_function_void",
+    "emit_global_is_char_ptr",
+    "emit_global_is_ptr",
+    "emit_global_struct_fields",
+    "emit_goto_target",
+    "emit_ifbody_false",
+    "emit_ifbody_true",
+    "emit_join_point",
+    "emit_loop_exit",
+    "emit_scond_no_join",
+    "emit_sseq",
+    "emit_struct_def",
+    "emit_struct_field",
+    "emit_var_is_struct",
+    "func_param_struct_type",
+    "known_global_type",
+    "plt_entry",
+    "reg_rtl",
+    "resolved_extern_signature",
+    "rtl_reg_used_in_func",
+    "struct_id_to_canonical",
+    "unknown_extern",
+];
+
+// Front half of codegen: CEGAR selection + tree assembly, kept separate so goto-reduction can rewrite the typed trees before emission with types frozen.
+pub struct ClightSelectPass;
+
+impl IRPass for ClightSelectPass {
+    fn name(&self) -> &'static str {
+        "clight_select"
+    }
+
+    fn run(&self, db: &mut DecompileDB) {
+        let t = std::time::Instant::now();
+        match crate::decompile::passes::clight_select::select::select_clight_stmts(db) {
+            Ok(funcs) => {
+                eprintln!(
+                    "[clight-select] select_clight_stmts: {:?} ({} funcs)",
+                    t.elapsed(),
+                    funcs.len()
+                );
+                db.clight_selected_functions = funcs;
+            }
+            Err(e) => {
+                log::warn!("ClightSelectPass: failed to select statements: {}", e);
+                db.clight_selected_functions = Vec::new();
+            }
+        }
+    }
+
+    fn inputs(&self) -> &'static [&'static str] {
+        CLIGHT_EMIT_INPUTS
+    }
+
+    fn outputs(&self) -> &'static [&'static str] {
+        &["clight_selected_functions"]
+    }
+
+    fn extra_reads(&self) -> &'static [&'static str] {
+        CLIGHT_EMIT_EXTRA_READS
+    }
+}
+
 pub struct ClightEmitPass;
 
 impl IRPass for ClightEmitPass {
@@ -467,15 +575,9 @@ impl IRPass for ClightEmitPass {
             .clone()
             .expect("binary_path must be set before ClightEmitPass");
 
-        let t = std::time::Instant::now();
-        let selected_functions = match crate::decompile::passes::clight_select::select::select_clight_stmts(db) {
-            Ok(funcs) => funcs,
-            Err(e) => {
-                log::warn!("ClightEmitPass: failed to select statements: {}", e);
-                return;
-            }
-        };
-        eprintln!("[clight-emit] select_clight_stmts: {:?} ({} funcs)", t.elapsed(), selected_functions.len());
+        // Take the typed, goto-reduced trees produced by ClightSelectPass and rewritten by GotoReducePass.
+        let selected_functions = std::mem::take(&mut db.clight_selected_functions);
+        eprintln!("[clight-emit] selected functions: {}", selected_functions.len());
 
         let mut id_to_name: HashMap<usize, String> = HashMap::new();
         // ident_to_symbol iteration order is non-deterministic; when several symbols share an id, prefer the shortest name with a lex tiebreak so the choice is stable.
@@ -940,39 +1042,7 @@ impl IRPass for ClightEmitPass {
     }
 
     fn inputs(&self) -> &'static [&'static str] {
-        &[
-            "emit_clight_stmt",
-            "emit_function",
-            "emit_function_param",
-            "emit_function_return_type",
-            "emit_next",
-            "emit_var_type_candidate",
-            "emit_loop_body",
-            "emit_switch_chain",
-            "emit_struct_fields",
-            "primary_exit_node",
-            "loop_exit_branch",
-            "trim_step",
-            "known_extern_signature",
-            "ident_to_symbol",
-            "is_external_function",
-            "clight_succ",
-            "string_data",
-            "instr_in_function",
-            "emit_address_as_offset",
-            "symbol_size",
-            "interior_element_size",
-            "is_global_array",
-            "global_var_ref",
-            "global_load_chunk",
-            "emit_canonical_struct_id",
-            "global_struct_catalog",
-            "func_stacksz",
-            "symbols",
-            "reg_to_struct_id",
-            "call_target_func",
-            "call_arg_mapping",
-        ]
+        CLIGHT_EMIT_INPUTS
     }
 
     fn outputs(&self) -> &'static [&'static str] {
@@ -988,38 +1058,7 @@ impl IRPass for ClightEmitPass {
     }
 
     fn extra_reads(&self) -> &'static [&'static str] {
-        &[
-            "direct_call",
-            "dwarf_func_param_name",
-            "emit_break_stmt",
-            "emit_function_param_count",
-            "emit_function_param_is_pointer",
-            "emit_function_param_type",
-            "emit_function_return",
-            "emit_function_return_type_xtype",
-            "emit_function_void",
-            "emit_global_is_char_ptr",
-            "emit_global_is_ptr",
-            "emit_global_struct_fields",
-            "emit_goto_target",
-            "emit_ifbody_false",
-            "emit_ifbody_true",
-            "emit_join_point",
-            "emit_loop_exit",
-            "emit_scond_no_join",
-            "emit_sseq",
-            "emit_struct_def",
-            "emit_struct_field",
-            "emit_var_is_struct",
-            "func_param_struct_type",
-            "known_global_type",
-            "plt_entry",
-            "reg_rtl",
-            "resolved_extern_signature",
-            "rtl_reg_used_in_func",
-            "struct_id_to_canonical",
-            "unknown_extern",
-        ]
+        CLIGHT_EMIT_EXTRA_READS
     }
 }
 

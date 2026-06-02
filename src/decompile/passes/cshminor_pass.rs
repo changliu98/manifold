@@ -124,18 +124,21 @@ ascent_par! {
         active_cminor_stmt(next, _);
 
     // Synth-node successor: bit-62 nodes (e.g. SP-indexed-load synth from rtl_pass) lack `next` entries; bridge via rtl_succ so the C emitter's DFS visits them and the synth Sset survives.
+    // rtl_succ drives the join (one tuple per CFG edge), binding node+dst so the active_cminor_stmt
+    // lookups are indexed; scanning active_cminor_stmt twice with independent unbound vars was an
+    // O(active^2) self-join (36s on large binaries). Clause order is semantics-neutral in Datalog.
     cminor_succ(*node, *dst) <--
-        active_cminor_stmt(node, _),
-        active_cminor_stmt(dst, _),
         rtl_succ(node, dst),
-        if (*node & (1u64 << 62)) != 0;
+        if (*node & (1u64 << 62)) != 0,
+        active_cminor_stmt(node, _),
+        active_cminor_stmt(dst, _);
 
     // The predecessor of a synth node needs an explicit cminor_succ; `next` skips synth, leaving it unreachable from its real-address predecessor.
     cminor_succ(*node, *dst) <--
-        active_cminor_stmt(node, _),
-        active_cminor_stmt(dst, _),
         rtl_succ(node, dst),
-        if (*dst & (1u64 << 62)) != 0;
+        if (*dst & (1u64 << 62)) != 0,
+        active_cminor_stmt(node, _),
+        active_cminor_stmt(dst, _);
 
 
     // emit_function entry may point at a non-stmt node (first instr like `mov $0x2,%r8d` later trimmed); follow `next` to the first active cminor node so reachable_from_entry/dom cover the full body.
@@ -187,9 +190,11 @@ ascent_par! {
         dom_set(func, n, doms_dual),
         for d in doms_dual.0.iter();
 
-    // Immediate dominator: closest strict dominator
+    // Immediate dominator: closest strict dominator. d is not n's idom iff some mid sits strictly
+    // between them on the dom chain (mid dom n, d dom mid). The original also joined dom(n,d), but
+    // that is implied transitively (dom is transitively closed), so dropping it removes one arm of
+    // the dom-triple-join (20s on large CFGs) without changing the derived set.
     not_idom(func, n, d) <--
-        dom(func, n, d),
         dom(func, n, mid),
         dom(func, mid, d),
         if mid != n,

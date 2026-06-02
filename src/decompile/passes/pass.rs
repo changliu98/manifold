@@ -12,7 +12,7 @@ pub trait IRPass: Send + Sync {
 
     fn outputs(&self) -> &'static [&'static str] { &[] }
 
-    /// Relations this pass reads through imperative `db.rel_iter(...)` calls outside its Ascent program (and helper modules invoked from `run`). Must be declared so the scheduler can clone them for parallel sub-DBs and keep them alive under --memsave.
+    /// Relations this pass reads through imperative `db.rel_iter(...)` calls outside its Ascent program (and helper modules invoked from `run`). Must be declared so the scheduler can clone them for parallel sub-DBs.
     fn extra_reads(&self) -> &'static [&'static str] { &[] }
 
     /// Per-rule dependency edges within this pass's Ascent program: (body_rel, head_rel) pairs.
@@ -233,45 +233,6 @@ impl Schedule {
     }
 }
 
-impl Schedule {
-    /// For each stage, list the relations that can be dropped after the stage completes: a relation R is dropped after stage S iff S is the maximum stage that has any pass referencing R in the union of inputs(), outputs(), and extra_reads().
-    ///
-    /// Returns `Vec<Vec<&'static str>>` indexed by stage index.
-    pub fn compute_drops(&self, passes: &[Box<dyn IRPass>]) -> Vec<Vec<&'static str>> {
-        let pass_to_stage: Vec<usize> = {
-            let mut map = vec![0usize; passes.len()];
-            for (stage_idx, stage) in self.stages.iter().enumerate() {
-                for &p in &stage.passes {
-                    map[p] = stage_idx;
-                }
-            }
-            map
-        };
-
-        let mut last_use: HashMap<&'static str, usize> = HashMap::new();
-        for (p_idx, pass) in passes.iter().enumerate() {
-            let stage = pass_to_stage[p_idx];
-            let groups = [pass.inputs(), pass.outputs(), pass.extra_reads()];
-            for group in groups.iter() {
-                for &rel in group.iter() {
-                    last_use.entry(rel)
-                        .and_modify(|s| if stage > *s { *s = stage; })
-                        .or_insert(stage);
-                }
-            }
-        }
-
-        let mut drops_per_stage: Vec<Vec<&'static str>> = vec![Vec::new(); self.stages.len()];
-        for (&rel, &stage) in &last_use {
-            drops_per_stage[stage].push(rel);
-        }
-        for v in &mut drops_per_stage {
-            v.sort();
-        }
-        drops_per_stage
-    }
-}
-
 // Builds a dependency graph from pass input/output declarations and produces a parallel schedule.
 pub struct PassScheduler;
 
@@ -383,6 +344,8 @@ macro_rules! run_pass {
                 prog.scc_times_summary(),
                 prog.relation_sizes_summary(),
             );
+            // Flush per-pass so the breakdown is visible even when a later pass times out.
+            eprintln!("[RULE_TIMES] pass {}\n{}\n[/RULE_TIMES]", pass_name, summary);
             $db.rule_time_reports.push((pass_name, summary));
         }
         prog.swap_db_fields($db);

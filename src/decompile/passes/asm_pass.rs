@@ -3296,25 +3296,29 @@ ascent_par! {
         psub(sub_addr, _, _),
         divide_q(_, _, divisor, input_ireg, is_long);
 
-    // low-32 alias of any MOVSXD/MOV 
+    // low-32 alias of any MOVSXD/MOV.
+    // divide_q (few idiv sites) drives, then the mov_src==input_ireg filter prunes pmov early, and
+    // psub is crossed in LAST so it only multiplies matched tuples. The original led with psub, so
+    // every subtract instruction multiplied the divide_q x pmov cross-product -- O(psub*divide_q*pmov),
+    // 36s on large binaries. Clause order is semantics-neutral in Datalog.
     dividend_holder(*sub_addr, low32_ireg, *input_ireg, *divisor, *is_long) <--
-        psub(sub_addr, _, _),
         divide_q(_, _, divisor, input_ireg, is_long),
         pmov(_mov_addr, mov_dst_sym, mov_src_sym),
-        op_register(mov_dst_sym, mov_dst_str),
         op_register(mov_src_sym, mov_src_str),
         if Ireg::from(*mov_src_str) == *input_ireg,
-        let low32_ireg = Ireg::from(reg_low32_alias(*mov_dst_str));
+        op_register(mov_dst_sym, mov_dst_str),
+        let low32_ireg = Ireg::from(reg_low32_alias(*mov_dst_str)),
+        psub(sub_addr, _, _);
 
     // full-width MOVSXD dst (e.g., RAX itself when source is EDI).
     dividend_holder(*sub_addr, mov_dst_full_ireg, *input_ireg, *divisor, *is_long) <--
-        psub(sub_addr, _, _),
         divide_q(_, _, divisor, input_ireg, is_long),
         pmov(_mov_addr, mov_dst_sym, mov_src_sym),
-        op_register(mov_dst_sym, mov_dst_str),
         op_register(mov_src_sym, mov_src_str),
         if Ireg::from(*mov_src_str) == *input_ireg,
-        let mov_dst_full_ireg = Ireg::from(*mov_dst_str);
+        op_register(mov_dst_sym, mov_dst_str),
+        let mov_dst_full_ireg = Ireg::from(*mov_dst_str),
+        psub(sub_addr, _, _);
 
     mod_synth(sub_addr, *result_mreg, *input_mreg, *divisor, *is_long) <--
         psub(sub_addr, sub_dst_sym, sub_src_sym),

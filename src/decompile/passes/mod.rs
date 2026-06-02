@@ -9,6 +9,7 @@ pub mod cminor_pass;
 pub mod csh_pass;
 pub mod cshminor_pass;
 pub mod clight_pass;
+pub mod goto_reduce_pass;
 pub mod clight_emit_pass;
 pub mod clight_select;
 pub mod c_pass;

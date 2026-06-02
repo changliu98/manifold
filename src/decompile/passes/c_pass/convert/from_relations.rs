@@ -2609,9 +2609,13 @@ pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> C
         clight::ClightStmt::Sreturn(Some(expr)) => CStmt::Return(Some(convert_expr(expr, ctx))),
 
         clight::ClightStmt::Sswitch(expr, cases) => {
-            let switch_expr = convert_expr(expr, ctx);
-            let body = convert_switch_cases(cases, ctx);
-            CStmt::Switch(switch_expr, Box::new(body))
+            if let Some(range_if) = try_switch_to_range_if(expr, cases, ctx) {
+                range_if
+            } else {
+                let switch_expr = convert_expr(expr, ctx);
+                let body = convert_switch_cases(cases, ctx);
+                CStmt::Switch(switch_expr, Box::new(body))
+            }
         }
 
         clight::ClightStmt::Slabel(label_id, inner) => {
@@ -2743,18 +2747,203 @@ fn convert_switch_cases(
     cases: &clight::ClightLabeledStatements,
     ctx: &mut ConversionContext,
 ) -> CStmt {
-    let mut block_items = Vec::new();
+    // Convert each (label, body) pair first.
+    let converted: Vec<(Label, CStmt)> = cases
+        .iter()
+        .map(|(label, stmt)| {
+            let label = match label {
+                Some(val) => Label::Case(CExpr::int(*val)),
+                None => Label::Default,
+            };
+            (label, convert_stmt(stmt, ctx))
+        })
+        .collect();
 
-    for (label, stmt) in cases {
-        let label = match label {
-            Some(val) => Label::Case(CExpr::int(*val)),
-            None => Label::Default,
-        };
-        let inner = convert_stmt(stmt, ctx);
-        block_items.push(CBlockItem::Stmt(CStmt::Labeled(label, Box::new(inner))));
+    // Collapse maximal runs of consecutive cases that share an identical, non-fall-through body
+    // into one stacked-label arm (`case a: case b: <body>`), the way switch arms are written by
+    // hand. A chain lowered from a jump table or comparison ladder produces one `case k: goto L;`
+    // per value, so distinct values reaching the same target would otherwise emit one goto each.
+    // Only bodies ending in an unconditional control transfer are merged, so stacking them cannot
+    // change C fall-through accumulation semantics. Labels are nested (Labeled wrapping Labeled)
+    // rather than emitted as separate empty-bodied block items, so later block-level cleanup
+    // passes treat each arm as a single unit and cannot drop an intermediate label.
+    let mut block_items = Vec::new();
+    let mut i = 0;
+    while i < converted.len() {
+        let mut j = i + 1;
+        if switch_body_exits(&converted[i].1) {
+            while j < converted.len() && converted[j].1 == converted[i].1 {
+                j += 1;
+            }
+        }
+        let mut arm = converted[j - 1].1.clone();
+        for (label, _) in converted[i..j].iter().rev() {
+            arm = CStmt::Labeled(label.clone(), Box::new(arm));
+        }
+        block_items.push(CBlockItem::Stmt(arm));
+        i = j;
     }
 
     CStmt::Block(block_items)
+}
+
+/// True if `stmt` ends in an unconditional control transfer, so control never falls off its end.
+/// Stacking consecutive same-bodied switch cases under shared labels is sound only when the shared
+/// body cannot fall through into the following case.
+fn switch_body_exits(stmt: &CStmt) -> bool {
+    match stmt {
+        CStmt::Goto(_) | CStmt::Break | CStmt::Continue | CStmt::Return(_) => true,
+        CStmt::Labeled(_, inner) => switch_body_exits(inner),
+        CStmt::Sequence(stmts) => stmts.last().map_or(false, switch_body_exits),
+        CStmt::Block(items) => items
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                CBlockItem::Stmt(s) => Some(s),
+                _ => None,
+            })
+            .map_or(false, switch_body_exits),
+        _ => false,
+    }
+}
+
+/// Number of disjoint value ranges above which a single-target switch is left as a switch rather
+/// than expanded into an `||` chain of range tests (keeps a genuinely sparse set readable as a switch).
+const MAX_RANGE_IF_RUNS: usize = 8;
+
+/// A switch whose explicit cases all branch to one identical, non-fall-through body is semantically a
+/// membership test: `switch(e){case lo: ... case hi: goto L;}` == `if (e>=lo && e<=hi) goto L;`. Jump
+/// tables and equality-comparison ladders lower to exactly this shape -- one `case k: goto L;` per
+/// value -- which a human writes as a range / `ctype`-style `if`. Recover that form when it is
+/// provably equivalent and return None (leaving the switch intact) otherwise.
+///
+/// Equivalence conditions, all required:
+/// - the scrutinee is duplicable (no memory read), since it is evaluated once per range test;
+/// - every explicit case shares one body that cannot fall through (so arm order is irrelevant and
+///   unmatched values still fall past the `if`, matching switch semantics with no `default`);
+/// - an optional `default` body (also non-fall-through) becomes the trailing `else`;
+/// - all case values are non-negative, so the `>=`/`<=` range tests agree with the switch's integer
+///   match regardless of the scrutinee's signedness (equality on the exact case constants is always
+///   sound; only the relational range form is signedness-sensitive). Each emitted range covers a
+///   maximal run of contiguous case labels, so every integer it admits is a real case value.
+fn try_switch_to_range_if(
+    expr: &clight::ClightExpr,
+    cases: &clight::ClightLabeledStatements,
+    ctx: &mut ConversionContext,
+) -> Option<CStmt> {
+    if cases.is_empty() || !clight_scrutinee_dupable(expr) {
+        return None;
+    }
+
+    let mut values: Vec<i64> = Vec::new();
+    let mut arm_body: Option<&clight::ClightStmt> = None;
+    let mut default_body: Option<&clight::ClightStmt> = None;
+    for (label, body) in cases {
+        match label {
+            Some(v) => {
+                match arm_body {
+                    None => arm_body = Some(body),
+                    Some(b) if b == body => {}
+                    // A second distinct target means a real multi-way dispatch; keep the switch.
+                    Some(_) => return None,
+                }
+                values.push(*v);
+            }
+            None => {
+                if default_body.is_some() {
+                    return None;
+                }
+                default_body = Some(body);
+            }
+        }
+    }
+
+    let arm_body = arm_body?;
+    if !clight_stmt_exits(arm_body) {
+        return None;
+    }
+    if matches!(default_body, Some(d) if !clight_stmt_exits(d)) {
+        return None;
+    }
+
+    values.sort_unstable();
+    values.dedup();
+    if values.first().map_or(true, |&v| v < 0) {
+        return None;
+    }
+
+    // Collapse the sorted values into maximal runs of contiguous integers.
+    let mut runs: Vec<(i64, i64)> = Vec::new();
+    for &v in &values {
+        match runs.last_mut() {
+            Some(run) if v == run.1 + 1 => run.1 = v,
+            _ => runs.push((v, v)),
+        }
+    }
+    if runs.len() > MAX_RANGE_IF_RUNS {
+        return None;
+    }
+
+    let scrutinee = convert_expr(expr, ctx);
+    let mut condition: Option<CExpr> = None;
+    for (lo, hi) in runs {
+        let part = if lo == hi {
+            CExpr::Binary(BinaryOp::Eq, Box::new(scrutinee.clone()), Box::new(CExpr::int(lo)))
+        } else {
+            // Wrap each `e>=lo && e<=hi` group in parens so a multi-range condition reads as
+            // `(e>=lo && e<=hi) || (e>=lo2 && e<=hi2)` rather than relying on C's &&-over-|| precedence.
+            CExpr::Paren(Box::new(CExpr::Binary(
+                BinaryOp::And,
+                Box::new(CExpr::Binary(BinaryOp::Ge, Box::new(scrutinee.clone()), Box::new(CExpr::int(lo)))),
+                Box::new(CExpr::Binary(BinaryOp::Le, Box::new(scrutinee.clone()), Box::new(CExpr::int(hi)))),
+            )))
+        };
+        condition = Some(match condition {
+            None => part,
+            Some(c) => CExpr::Binary(BinaryOp::Or, Box::new(c), Box::new(part)),
+        });
+    }
+
+    let then_branch = convert_stmt(arm_body, ctx);
+    let else_branch = default_body.map(|d| Box::new(convert_stmt(d, ctx)));
+    Some(CStmt::If(condition?, Box::new(then_branch), else_branch))
+}
+
+/// True if `expr` can be evaluated more than once without changing program behavior: a constant or
+/// variable read, or arithmetic over such. Excludes memory reads (`Efield`, address-of) so a range
+/// `if` never duplicates a load that could alias or be volatile. The Clight expression language has
+/// no call or assignment forms, so these are the only impurity concerns.
+fn clight_scrutinee_dupable(expr: &clight::ClightExpr) -> bool {
+    match expr {
+        clight::ClightExpr::EconstInt(_, _)
+        | clight::ClightExpr::EconstLong(_, _)
+        | clight::ClightExpr::EconstFloat(_, _)
+        | clight::ClightExpr::EconstSingle(_, _)
+        | clight::ClightExpr::Evar(_, _)
+        | clight::ClightExpr::EvarSymbol(_, _)
+        | clight::ClightExpr::Etempvar(_, _) => true,
+        clight::ClightExpr::Ecast(inner, _) | clight::ClightExpr::Eunop(_, inner, _) => {
+            clight_scrutinee_dupable(inner)
+        }
+        clight::ClightExpr::Ebinop(_, lhs, rhs, _) => {
+            clight_scrutinee_dupable(lhs) && clight_scrutinee_dupable(rhs)
+        }
+        _ => false,
+    }
+}
+
+/// True if a Clight statement ends in an unconditional control transfer (mirrors `switch_body_exits`
+/// at the Clight level, before conversion to the C AST).
+fn clight_stmt_exits(stmt: &clight::ClightStmt) -> bool {
+    match stmt {
+        clight::ClightStmt::Sgoto(_)
+        | clight::ClightStmt::Sbreak
+        | clight::ClightStmt::Scontinue
+        | clight::ClightStmt::Sreturn(_) => true,
+        clight::ClightStmt::Slabel(_, inner) => clight_stmt_exits(inner),
+        clight::ClightStmt::Ssequence(stmts) => stmts.last().map_or(false, clight_stmt_exits),
+        _ => false,
+    }
 }
 
 fn external_func_name(ef: &ExternalFunction) -> String {

@@ -465,21 +465,24 @@ ascent_par! {
     global_addr_reg(*ident, b) <-- global_addr_reg(ident, a), alias_edge(a, b);
     global_addr_reg(*ident, a) <-- global_addr_reg(ident, b), alias_edge(a, b);
 
-    // When a global address register is used as base for a load at offset 0, track the chunk
+    // When a global address register is used as base for a load at offset 0, track the chunk.
+    // Drive off the load instruction, bind base_rtl, then match global_addr_reg BY that register
+    // (indexed lookup on col 1). The original led with global_addr_reg and scanned ltl_inst, then
+    // related them only via the trailing addr_rtl==base_rtl filter -- an O(global_addr_reg*ltl_inst)
+    // cross-product (26s). Clause order is semantics-neutral; matching base_rtl in the body
+    // position is equivalent to the equality filter.
     global_load_chunk(*ident, chunk.clone()) <--
-        global_addr_reg(ident, addr_rtl),
         ltl_inst(node, ?LTLInst::Lload(chunk, Addressing::Aindexed(0), args, _)),
         if !args.is_empty(),
         reg_rtl(node, args[0], base_rtl),
-        if *addr_rtl == *base_rtl;
+        global_addr_reg(ident, base_rtl);
 
     // When a global address register is used as base for a store at offset 0, track the chunk
     global_load_chunk(*ident, chunk.clone()) <--
-        global_addr_reg(ident, addr_rtl),
         ltl_inst(node, ?LTLInst::Lstore(chunk, Addressing::Aindexed(0), args, _)),
         if !args.is_empty(),
         reg_rtl(node, args[0], base_rtl),
-        if *addr_rtl == *base_rtl;
+        global_addr_reg(ident, base_rtl);
 
     // Note: emit_global_is_ptr/emit_global_is_char_ptr are computed in type_pass.rs (more precise).
 
@@ -2910,23 +2913,27 @@ ascent_par! {
         !is_loop_back_edge(mid, dst);
 
     relation has_intervening_def(Address, Address, Mreg);
+    // Reachability checks are moved ahead of instr_in_function(mid_addr,func) so the def->mid->use
+    // path constraint prunes candidate mids before the remaining (multi-valued) instr lookup -- the
+    // join was reg_def_used x defs-per-mreg with the strongest filters applied last (8.9s + 18.3s).
+    // Pure clause reorder: same derived set.
     has_intervening_def(def_addr, use_addr, mreg) <--
         reg_def_used(def_addr, mreg, use_addr),
         reg_def_site(mid_addr, mreg),
         if *mid_addr != *def_addr && *mid_addr != *use_addr,
         instr_in_function(def_addr, func),
-        instr_in_function(mid_addr, func),
         forward_reachable(func, def_addr, mid_addr),
-        forward_reachable(func, mid_addr, use_addr);
+        forward_reachable(func, mid_addr, use_addr),
+        instr_in_function(mid_addr, func);
 
     has_intervening_def(def_addr, use_addr, mreg) <--
         reg_def_used(def_addr, mreg, use_addr),
         is_call_clobbered(mid_addr, mreg),
         if *mid_addr != *def_addr && *mid_addr != *use_addr,
         instr_in_function(def_addr, func),
-        instr_in_function(mid_addr, func),
         forward_reachable(func, def_addr, mid_addr),
-        forward_reachable(func, mid_addr, use_addr);
+        forward_reachable(func, mid_addr, use_addr),
+        instr_in_function(mid_addr, func);
 
     relation param_live_block(Address, Address, Mreg);
 

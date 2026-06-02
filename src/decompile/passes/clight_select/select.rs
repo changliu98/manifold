@@ -1454,6 +1454,18 @@ fn assemble_loops(
 }
 
 // Assemble compound if-then-else from structural metadata (analogous to assemble_loops); operates on already-typed ClightStmt so no type decisions are made.
+// Count ClightStmt tree nodes; bounds assemble_ite against pathological overlapping if-bodies.
+fn clight_stmt_size(s: &ClightStmt) -> usize {
+    match s {
+        ClightStmt::Ssequence(v) => 1 + v.iter().map(clight_stmt_size).sum::<usize>(),
+        ClightStmt::Sifthenelse(_, a, b) => 1 + clight_stmt_size(a) + clight_stmt_size(b),
+        ClightStmt::Sloop(a, b) => 1 + clight_stmt_size(a) + clight_stmt_size(b),
+        ClightStmt::Slabel(_, inner) => 1 + clight_stmt_size(inner),
+        ClightStmt::Sswitch(_, cases) => 1 + cases.iter().map(|(_, c)| clight_stmt_size(c)).sum::<usize>(),
+        _ => 1,
+    }
+}
+
 fn assemble_ite(
     statements: &mut HashMap<Node, ClightStmt>,
     ite_info: &HashMap<Node, IteInfo>,
@@ -1469,6 +1481,11 @@ fn assemble_ite(
         let b_size = b.1.true_body_nodes.len() + b.1.false_body_nodes.len();
         a_size.cmp(&b_size).then(b.0.cmp(a.0))
     });
+
+    // Per-branch ceiling on assembled-compound size; bounds the 2^depth shared-node duplication
+    // blowup on degenerate control flow. Far above any real function's nesting, so it only trips
+    // on pathological structuring (configurable via ITE_MAX_NODES).
+    let node_cap: usize = std::env::var("ITE_MAX_NODES").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
 
     for (&branch, info) in &branches {
         // Branch holds Sifthenelse from clight_pass flat Scond rule, possibly wrapped in Slabel.
@@ -1536,6 +1553,20 @@ fn assemble_ite(
         }
 
         let compound = ClightStmt::Sifthenelse(cond, Box::new(then_body), Box::new(else_body));
+
+        // Duplicating a shared node into both arms is intentional (it avoids gotos), but on dense
+        // reconverging control flow that duplication compounds 2^depth across deeply nested
+        // branches and exhausts memory (362705: 122 branches, ~all body nodes shared by both sides
+        // -> a single compound reaching billions of nodes). Bound it: if one branch's assembled
+        // compound is absurdly large, leave that branch flat (its scond keeps its goto edges)
+        // rather than nest it. Real functions are orders of magnitude smaller, so this only trips
+        // on degenerate structuring; the skipped branch's body nodes stay top-level for the gotos.
+        let csize = clight_stmt_size(&compound);
+        if csize > node_cap {
+            eprintln!("[assemble_ite] branch {:x}: compound too large ({} nodes > cap {}); left flat with gotos to avoid 2^depth blowup", branch, csize, node_cap);
+            continue;
+        }
+
         let wrapped = match statements.get(&branch) {
             Some(ClightStmt::Slabel(lbl, _)) => ClightStmt::Slabel(*lbl, Box::new(compound)),
             _ => compound,
@@ -2890,6 +2921,14 @@ fn inline_control_flow_bodies(
             visiting.insert(node);
             let (inlined, newly_inlined) =
                 inline_stmt_recursive_track(&stmt, statements, &preds, &mut visiting, 0);
+            // Free absorbed children immediately. Each inlined node has pred_count==1 (its only
+            // predecessor is the node we just inlined it into), so it is not referenced elsewhere
+            // and its content now lives inside `inlined`. Without this, every node's fully-inlined
+            // tree coexists in `statements` until the retain below -- O(n^2) memory on long pred==1
+            // chains, which OOMs large functions (e.g. 136803, stuck here at >11G).
+            for &n in &newly_inlined {
+                statements.remove(&n);
+            }
             inlined_nodes.extend(newly_inlined);
             if inlined != stmt {
                 statements.insert(node, inlined);

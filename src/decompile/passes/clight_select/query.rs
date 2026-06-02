@@ -391,9 +391,40 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
 
     let goto_targets: HashSet<Node> = db.rel_iter::<(Address, Node)>("emit_goto_target").map(|(_, target)| *target).collect();
 
+    // emit_clight_stmt is multi-valued: instr_in_function lists a shared node (e.g. a compiler-merged
+    // abort/error trampoline reached by `jae`/`jb` bounds-check edges from many functions) under EVERY
+    // reaching function. Pushing each node's statement into all of them duplicates one function's whole
+    // body into every reacher (observed: function 0x1f460's body emitted into 27 functions, each then
+    // starting with a spurious abort()). Resolve each node to the single function that CONTAINS it --
+    // the nearest preceding entry by address among the functions that claim it (masking the synthetic
+    // bit so split nodes resolve like their real address) -- and emit the statement only under that
+    // owner. This mirrors the node_to_func resolution above and in clight_select/query node_to_func.
+    const SYNTH_BIT: u64 = 1u64 << 62;
+    let mut node_candidate_addrs: HashMap<Node, Vec<Address>> = HashMap::new();
+    for (addr, node, _stmt) in db.rel_iter::<(Address, Node, ClightStmt)>("emit_clight_stmt") {
+        node_candidate_addrs.entry(*node).or_default().push(*addr);
+    }
+    let mut node_owner: HashMap<Node, Address> = HashMap::new();
+    for (node, addrs) in &node_candidate_addrs {
+        let real = *node & !SYNTH_BIT;
+        // Nearest preceding entry: largest claiming addr <= real; if none precedes, the smallest claimant.
+        let owner = addrs
+            .iter()
+            .filter(|&&a| a <= real)
+            .max()
+            .copied()
+            .or_else(|| addrs.iter().min().copied());
+        if let Some(owner) = owner {
+            node_owner.insert(*node, owner);
+        }
+    }
+
     for (addr, node, stmt) in db.rel_iter::<(Address, Node, ClightStmt)>("emit_clight_stmt") {
         let is_goto_target = goto_targets.contains(node);
         if !is_nonempty_stmt(stmt) && !is_goto_target {
+            continue;
+        }
+        if node_owner.get(node) != Some(addr) {
             continue;
         }
         if let Some(func) = func_map.get_mut(addr) {
