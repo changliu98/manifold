@@ -42,10 +42,12 @@ pub fn infer_functions(db: &mut DecompileDB, insns: &[DecodedInsn]) {
                   prologue_entries.len() - filtered_prologue.len());
     }
 
-    let func_ranges: Vec<(u64, u64)> = db.rel_iter::<(Address, usize, Symbol, Symbol, Symbol, usize, Symbol, usize, Symbol)>("symbol_table")
+    let mut func_ranges: Vec<(u64, u64)> = db.rel_iter::<(Address, usize, Symbol, Symbol, Symbol, usize, Symbol, usize, Symbol)>("symbol_table")
         .filter(|(addr, size, sym_type, ..)| *sym_type == "FUNC" && *size > 0 && *addr > 0)
         .map(|(addr, size, ..)| (*addr, *addr + *size as u64))
         .collect();
+    // Augment FUNC-symbol ranges with .eh_frame_hdr FDE bracket ranges: authoritative extents covering bodies that lack a sized FUNC symbol (cold C++ landing pads), used by every inside-FUNC-range guard below to reject mid-body spurious entries.
+    func_ranges.extend(db.rel_iter::<(Address, Address)>("eh_frame_func_range").map(|(s, e)| (*s, *e)));
     let before_sym_filter = filtered_prologue.len();
     let filtered_prologue: BTreeSet<u64> = filtered_prologue
         .into_iter()
@@ -227,6 +229,8 @@ pub fn infer_functions(db: &mut DecompileDB, insns: &[DecodedInsn]) {
             if assigned_blocks.contains(&block_addr) { continue; }
             if has_pred.contains(&block_addr) { continue; }
             if plt_addrs.contains(&block_addr) { continue; }
+            // Do not promote a block strictly inside a known FUNC-symbol range to its own function: it is a mid-body block (C++ landing pad or post-ret tail) lacking a CFG predecessor only because we do not model exception-unwinder edges; promoting it mints a fake entry with an undefined frame pointer (every [rbp-N] becomes a phantom ((struct*)var)->ofs_N, producing use-before-def). Mirrors the inside-FUNC-range guard used by the seeders above.
+            if func_ranges.iter().any(|(start, end)| block_addr > *start && block_addr < *end) { continue; }
             let is_padding = db.rel_iter::<(Address, usize, &'static str, &'static str, Symbol, Symbol, Symbol, Symbol, usize, usize)>("unrefinedinstruction")
                 .find(|(addr, ..)| *addr == block_addr)
                 .map(|(_, _, _, mnem, ..)| matches!(*mnem, "NOP" | "INT3" | "HLT" | "UD2"))

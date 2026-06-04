@@ -735,6 +735,10 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 renamer.seed_param(name, i, dwarf_name);
             }
         }
+        // Reserve every pass-through (non-compacted) name first so counter-based compaction of synthetic regs cannot collide with a literal short var_N.
+        for v in &local_vars {
+            renamer.reserve(&v.name);
+        }
         for v in &local_vars {
             renamer.ensure_mapping(&v.name);
         }
@@ -747,6 +751,22 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             v.name = renamer.rename(&v.name);
             v
         }).collect();
+
+        // Use-before-def guard: a local read but never the plain-variable assignment target, address-taken, or inc/dec'd in the final body has no producer and "comes from nowhere" (a residual use-before-def upstream recovery could not resolve), so zero-initialize its declaration to avoid reading an undefined value. Defensive last resort; the real fixes are upstream (reaching-def / return-value recovery).
+        let mut local_origin_names: HashSet<String> = HashSet::new();
+        for p in &params {
+            if let Some(n) = &p.name { local_origin_names.insert(n.clone()); }
+        }
+        collect_var_origins_stmt(&body, &mut local_origin_names);
+        let local_vars: Vec<VarDecl> = local_vars
+            .into_iter()
+            .map(|mut v| {
+                if v.init.is_none() && !local_origin_names.contains(&v.name) {
+                    v.init = zero_initializer_for_var(&v.ty);
+                }
+                v
+            })
+            .collect();
 
         let func_name = if func.name.starts_with("FUN_") {
             recovered_func_names.get(&func.address).cloned().unwrap_or_else(|| func.name.clone())
@@ -942,6 +962,99 @@ pub(crate) fn convert_param_type_from_param(param: &ParamType) -> CType {
         ParamType::Pointer => CType::ptr(CType::Void),
         ParamType::Typed(xtype) => convert_xtype(xtype),
         ParamType::Integer | ParamType::Unknown => CType::int(),
+    }
+}
+
+// Collect locals with an origin in the body for the use-before-def guard: the plain-variable LHS of an assignment, an address-taken variable (&v -- a callee may fill it), or an inc/dec target; a referenced local with none of these "comes from nowhere". Mirrors the use-before-def metric's notion of "written" (assign / ++,-- / address-taken).
+fn collect_var_origins_expr(expr: &CExpr, out: &mut HashSet<String>) {
+    match expr {
+        CExpr::Assign(_, lhs, rhs) => {
+            if let CExpr::Var(n) = lhs.as_ref() { out.insert(n.clone()); }
+            collect_var_origins_expr(lhs, out);
+            collect_var_origins_expr(rhs, out);
+        }
+        CExpr::Unary(op, inner) => {
+            if matches!(op, UnaryOp::AddrOf | UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::PostInc | UnaryOp::PostDec) {
+                if let CExpr::Var(n) = inner.as_ref() { out.insert(n.clone()); }
+            }
+            collect_var_origins_expr(inner, out);
+        }
+        CExpr::Binary(_, l, r) | CExpr::Index(l, r) => {
+            collect_var_origins_expr(l, out);
+            collect_var_origins_expr(r, out);
+        }
+        CExpr::Ternary(c, t, e) => {
+            collect_var_origins_expr(c, out);
+            collect_var_origins_expr(t, out);
+            collect_var_origins_expr(e, out);
+        }
+        CExpr::Call(f, args) => {
+            collect_var_origins_expr(f, out);
+            for a in args { collect_var_origins_expr(a, out); }
+        }
+        CExpr::Cast(_, inner) | CExpr::Paren(inner) | CExpr::Member(inner, _)
+        | CExpr::MemberPtr(inner, _) | CExpr::SizeofExpr(inner) => {
+            collect_var_origins_expr(inner, out);
+        }
+        CExpr::StmtExpr(stmts, fin) => {
+            for s in stmts { collect_var_origins_stmt(s, out); }
+            collect_var_origins_expr(fin, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_var_origins_stmt(stmt: &CStmt, out: &mut HashSet<String>) {
+    use crate::decompile::passes::c_pass::types::ForInit;
+    match stmt {
+        CStmt::Expr(e) | CStmt::Return(Some(e)) => collect_var_origins_expr(e, out),
+        CStmt::If(c, t, e) => {
+            collect_var_origins_expr(c, out);
+            collect_var_origins_stmt(t, out);
+            if let Some(s) = e { collect_var_origins_stmt(s, out); }
+        }
+        CStmt::Switch(e, body) => {
+            collect_var_origins_expr(e, out);
+            collect_var_origins_stmt(body, out);
+        }
+        CStmt::While(c, body) | CStmt::DoWhile(body, c) => {
+            collect_var_origins_expr(c, out);
+            collect_var_origins_stmt(body, out);
+        }
+        CStmt::For(init, cond, update, body) => {
+            match init {
+                Some(ForInit::Expr(e)) => collect_var_origins_expr(e, out),
+                Some(ForInit::Decl(decls)) => { for d in decls { out.insert(d.name.clone()); } }
+                None => {}
+            }
+            if let Some(c) = cond { collect_var_origins_expr(c, out); }
+            if let Some(u) = update { collect_var_origins_expr(u, out); }
+            collect_var_origins_stmt(body, out);
+        }
+        CStmt::Block(items) => {
+            for item in items {
+                match item {
+                    CBlockItem::Stmt(s) => collect_var_origins_stmt(s, out),
+                    CBlockItem::Decl(decls) => { for d in decls { out.insert(d.name.clone()); } }
+                }
+            }
+        }
+        CStmt::Sequence(stmts) => { for s in stmts { collect_var_origins_stmt(s, out); } }
+        CStmt::Labeled(_, inner) => collect_var_origins_stmt(inner, out),
+        _ => {}
+    }
+}
+
+// Zero initializer for a "variable from nowhere": scalars/pointers get `= 0`, aggregates get `= {0}` (both valid C); function/void-typed declarations are left untouched.
+fn zero_initializer_for_var(ty: &CType) -> Option<crate::decompile::passes::c_pass::types::Initializer> {
+    use crate::decompile::passes::c_pass::types::{InitItem, Initializer};
+    match ty {
+        CType::Void | CType::Function(..) => None,
+        CType::Struct(_) | CType::Union(_) | CType::Array(..) => Some(Initializer::List(vec![InitItem {
+            designator: None,
+            init: Initializer::Expr(CExpr::int(0)),
+        }])),
+        _ => Some(Initializer::Expr(CExpr::int(0))),
     }
 }
 
@@ -1648,17 +1761,36 @@ impl VarRenamer {
         self.map.insert(name.to_string(), short);
     }
 
+    // ensure_mapping compacts a name only when it is a synthetic-reg name var_<5+ digit decimal> (fresh_xtl_reg sets bit 63, producing ~19-digit values); everything else (short var_N for real machine regs, params, globals) passes through rename() unchanged.
+    fn is_renameable(name: &str) -> bool {
+        match name.strip_prefix("var_") {
+            Some(suffix) => suffix.len() > 4 && suffix.chars().all(|c| c.is_ascii_digit()),
+            None => false,
+        }
+    }
+
+    // Reserve a pass-through name so counter-based compaction never collides with it: short var_N names (e.g. var_0 from RTLReg 0) keep their literal spelling, so a compacted synthetic reg must not also be assigned that spelling.
+    fn reserve(&mut self, name: &str) {
+        if !Self::is_renameable(name) {
+            self.used_names.insert(name.to_string());
+        }
+    }
+
     fn ensure_mapping(&mut self, name: &str) {
         if self.map.contains_key(name) {
             return;
         }
-        if let Some(suffix) = name.strip_prefix("var_") {
-            if suffix.len() > 4 && suffix.chars().all(|c| c.is_ascii_digit()) {
-                let short = format!("var_{:x}", self.counter);
-                self.used_names.insert(short.clone());
-                self.map.insert(name.to_string(), short);
+        if Self::is_renameable(name) {
+            // Skip counter values already taken by a reserved pass-through name or a previously compacted reg, so two distinct slots never share one name.
+            let short = loop {
+                let candidate = format!("var_{:x}", self.counter);
                 self.counter += 1;
-            }
+                if !self.used_names.contains(&candidate) {
+                    break candidate;
+                }
+            };
+            self.used_names.insert(short.clone());
+            self.map.insert(name.to_string(), short);
         }
     }
 
@@ -2168,7 +2300,7 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
         clight::ClightExpr::Ecast(inner, ty) => {
             CExpr::Cast(convert_clight_type(ty), Box::new(convert_expr(inner, ctx)))
         }
-        clight::ClightExpr::Efield(inner, field_id, _ty) => {
+        clight::ClightExpr::Efield(inner, field_id, field_ty) => {
             let inner_expr = convert_expr(inner, ctx);
             let field_name = crate::decompile::passes::csh_pass::field_ident_to_name(*field_id);
             let inner_ct = clight_expr_to_ctype(inner);
@@ -2184,7 +2316,28 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
                                 field_name,
                             )
                         }
-                        _ => CExpr::MemberPtr(ptr_expr.clone(), field_name),
+                        // The base derefs to a non-aggregate (no struct/union identity recovered for it), so `->ofs_N` would be a member access through a void/scalar pointer and cannot compile. The field ident encodes the byte offset N (see field_ident_to_name); lower to a typed byte-offset deref `*(FieldTy *)((char *)base + N)`, matching Ghidra's `*(int *)(param + 0x10)` form. FieldTy comes from the Efield's own type, which is always a concrete scalar/pointer here.
+                        _ => {
+                            let offset = *field_id as i64;
+                            let field_ctype = convert_clight_type(field_ty);
+                            let char_ptr = CType::Pointer(
+                                Box::new(CType::char_signed()),
+                                TypeQualifiers::none(),
+                            );
+                            let byte_addr = CExpr::Binary(
+                                BinaryOp::Add,
+                                Box::new(CExpr::Cast(char_ptr, ptr_expr.clone())),
+                                Box::new(CExpr::int(offset)),
+                            );
+                            let field_ptr = CType::Pointer(
+                                Box::new(field_ctype),
+                                TypeQualifiers::none(),
+                            );
+                            CExpr::Unary(
+                                UnaryOp::Deref,
+                                Box::new(CExpr::Cast(field_ptr, Box::new(byte_addr))),
+                            )
+                        }
                     }
                 }
                 _ => CExpr::Member(Box::new(inner_expr), field_name),

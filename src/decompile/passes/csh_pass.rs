@@ -339,7 +339,12 @@ pub fn clight_type_from_xtype(xtype: &XType) -> ClightType {
 
 pub fn clight_function_pointer_type(sig: &Signature) -> ClightType {
     let arg_types: Vec<ClightType> = sig.sig_args.iter().map(clight_type_from_xtype).collect();
-    let ret_type = clight_type_from_xtype(&sig.sig_res);
+    // A call whose result is itself used as a code pointer carries sig_res = Xfuncptr, which would nest a function-pointer return inside this function-pointer type. C has no unparenthesized spelling for that, and it would print as the un-parseable doubled cast `void (*)(void) (*)(args)`. Collapse such a return to a generic data pointer (matching Ghidra's `code *` return convention); the indirect call site does not depend on the exact pointee.
+    let ret_type = if sig.sig_res == XType::Xfuncptr {
+        pointer_to(ClightType::Tvoid)
+    } else {
+        clight_type_from_xtype(&sig.sig_res)
+    };
     pointer_to(ClightType::Tfunction(Arc::new(arg_types), Arc::new(ret_type), sig.sig_cc))
 }
 

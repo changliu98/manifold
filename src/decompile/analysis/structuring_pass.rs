@@ -1950,18 +1950,27 @@ ascent_par! {
         before_in_block(intro, u),
         !copy_killed_between(intro, dst, src, u);
 
+    // The copy at `intro` has a use of `dst` it does NOT cover (dst read where the copy is inactive: another block, or before `intro` via a back-edge -- the loop-carried read); such uses cannot be rewritten to `src`, so killing/substituting the copy would strip dst's def and collapse the loop-carried value to its pre-loop definition (a frozen counter/accumulator).
+    relation copy_use_uncovered(Node);
+    copy_use_uncovered(*intro) <--
+        copy_intro(intro, dst, src),
+        stmt_uses(u, dst),
+        !copy_active_at(u, dst, src, intro);
+
     // Non-transitive on purpose; Rust fold runs the chain while preserving the original-uses anchor.
     relation applicable_subst(Node, RTLReg, RTLReg);
     applicable_subst(*u, *dst, *src) <--
-        copy_active_at(u, dst, src, _intro),
-        stmt_uses(u, dst);
+        copy_active_at(u, dst, src, intro),
+        stmt_uses(u, dst),
+        !copy_use_uncovered(intro);
 
-    // A copy is dead if at least one substitution fires for it.
+    // A copy is dead if at least one substitution fires for it AND every use of dst is covered.
     relation dead_copy_v2(Node);
     dead_copy_v2(*intro) <--
         copy_intro(intro, dst, src),
         copy_active_at(u, dst, src, intro),
-        stmt_uses(u, dst);
+        stmt_uses(u, dst),
+        !copy_use_uncovered(intro);
 }
 
 fn eliminate_dead_returns(working: &mut HashMap<Node, CsharpminorStmt>, db: &DecompileDB) {

@@ -120,13 +120,21 @@ ascent_par! {
         def_int_pos(f, p),
         if *p < 6;
 
-    // (b) call-site ratio confirms (only when there is at least one informative call)
+    // A pure-float-param function reads float params (XMM args) but no integer arg register; at its call sites, int arg regs live across the call for unrelated reasons get back-attributed as args, so call_pos_support fabricates positions the callee never consumes (the spurious trailing `long` on float-only sigs like f(double,double,double)).
+    #[local] relation func_pure_float_params(Address);
+    func_pure_float_params(f) <--
+        emit_function_float_param_count(f, fc),
+        if *fc > 0,
+        !func_has_param_evidence(f, _);
+
+    // (b) call-site ratio confirms (only with at least one informative call); suppressed for pure-float-param functions, where the definition is authoritative that it reads no int arg reg so caller-side int-reg evidence is leftover state, not a parameter.
     int_pos_confirmed(f, p) <--
         call_pos_support(f, p, c),
         informative_call_count(f, total),
         if *p < 6,
         if *total > 0,
-        if (*c as f64) / (*total as f64) >= CALL_SITE_CONFIRM_THRESHOLD;
+        if (*c as f64) / (*total as f64) >= CALL_SITE_CONFIRM_THRESHOLD,
+        !func_pure_float_params(f);
 
     // Reconciled int count: max confirmed position + 1. Emits only when some confirmation exists.
     relation reconciled_int_count(Address, usize);

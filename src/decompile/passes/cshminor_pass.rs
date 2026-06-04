@@ -731,6 +731,14 @@ ascent_par! {
     relation trim_step(Address, Node, Node);
     relation loop_continue_cond(Address, Node, ClightExpr);
     relation emit_break_stmt(Address, Node, Node, ClightStmt);
+    // A non-primary loop exit branch whose target flows to a function return rather than post-loop code; a valueless break here drops the returned value at the post-loop join (A5 dead-return-overwrite: the function always yields the post-loop default), so select tail-duplicates value_node + the return into the exit branch. Fields: func, header, exit_node, value_node, ret_node.
+    relation loop_exit_to_return(Address, Node, Node, Node, Node);
+    relation node_multi_pred(Address, Node);
+    // node flows to a function return (ret_node) through zero or more pure jump nodes (no intervening assignment, branch, or side effect), so a value-set-then-`jmp epilogue` exit is recognized as a return even with the jump on its own node between them.
+    relation returns_after(Address, Node, Node);
+    // any loop exit branch (bound or early) that flows to a function return, with the per-loop count: a genuine early-return defect needs >=2 such exits (an early return distinct from loop termination), while a single return exit is just a normal `while(cond){} return v` that must keep its exit as the loop condition rather than collapse to `while(1)`.
+    relation loop_return_exit_any(Address, Node, Node);
+    relation loop_return_exit_count(Address, Node, usize);
     relation node_owned_by_loop(Address, Node, Node);
 
     emit_loop_body(func, header, body_node) <--
@@ -781,6 +789,60 @@ ascent_par! {
             Box::new(ClightStmt::Sbreak),
             Box::new(ClightStmt::Sskip),
         );
+
+    node_multi_pred(func, n) <--
+        pred(func, n, p1),
+        pred(func, n, p2),
+        if p1 != p2;
+
+    returns_after(func, node, node) <--
+        func_exit_node(func, node);
+
+    returns_after(func, node, ret_node) <--
+        returns_after(func, succ, ret_node),
+        cminor_succ(node, succ),
+        active_cminor_stmt(node, ?CminorStmt::Sjump(_)),
+        instr_in_function(node, func);
+
+    loop_return_exit_any(func, header, exit_node) <--
+        loop_exit_branch(func, header, exit_node, _, _, exit_target, _, _),
+        active_cminor_stmt(exit_target, ?CminorStmt::Sassign(_, _)),
+        cminor_succ(exit_target, succ),
+        returns_after(func, succ, _);
+
+    loop_return_exit_any(func, header, exit_node) <--
+        loop_exit_branch(func, header, exit_node, _, _, exit_target, _, _),
+        func_exit_node(func, exit_target);
+
+    loop_return_exit_count(func, header, c) <--
+        loop_head(func, header),
+        agg c = ascent::aggregators::count() in loop_return_exit_any(func, header, _);
+
+    // The exit target is a plain value assignment that flows (through pure jumps only) to a function return; guards: exit_target leaves the loop, is itself an assignment (not a branch, so duplicating it is sound despite any spurious CFG fallthrough edges), reaches a return with no intervening effect, and has a single predecessor (reached only via this exit, so it can be relocated from its hoisted top-level position into the exit branch).
+    loop_exit_to_return(func, header, exit_node, exit_target, ret_node) <--
+        loop_exit_branch(func, header, exit_node, _, _, exit_target, _, _),
+        !primary_exit_node(func, header, exit_node),
+        !exit_at_latch(func, header, exit_node),
+        !loop_body(func, header, exit_target),
+        active_cminor_stmt(exit_target, ?CminorStmt::Sassign(_, _)),
+        cminor_succ(exit_target, succ),
+        returns_after(func, succ, ret_node),
+        !node_multi_pred(func, exit_target),
+        pred(func, exit_target, exit_node),
+        loop_return_exit_count(func, header, c),
+        if *c >= 2;
+
+    // 0-hop: the exit target is itself the function return (value computed inline at the exit).
+    loop_exit_to_return(func, header, exit_node, exit_target, exit_target) <--
+        loop_exit_branch(func, header, exit_node, _, _, exit_target, _, _),
+        !primary_exit_node(func, header, exit_node),
+        !exit_at_latch(func, header, exit_node),
+        !loop_body(func, header, exit_target),
+        func_exit_node(func, exit_target),
+        !node_multi_pred(func, exit_target),
+        pred(func, exit_target, exit_node),
+        loop_return_exit_count(func, header, c),
+        if *c >= 2;
 
     node_owned_by_loop(func, node, header) <--
         innermost_loop(func, node, header),

@@ -22,6 +22,74 @@ fn sanitize_symbol_name(name: &str) -> String {
     name.to_string()
 }
 
+// Fixed byte width of a DWARF pointer encoding's format nibble (0 = variable/unsupported here).
+fn eh_enc_fixed_size(enc: u8) -> usize {
+    match enc & 0x0f {
+        0x02 | 0x0a => 2,
+        0x03 | 0x0b => 4,
+        0x04 | 0x0c => 8,
+        _ => 0,
+    }
+}
+
+// Recover authoritative function-start addresses from the .eh_frame_hdr sorted FDE search table (real functions have an FDE; landing pads/post-ret tails do not); degrades to empty on any unhandled pointer encoding so the downstream guard is a no-op rather than a wrong range.
+fn parse_eh_frame_hdr_starts(obj: &object::File) -> Vec<u64> {
+    let sec = match obj.section_by_name(".eh_frame_hdr") { Some(s) => s, None => return Vec::new() };
+    let vaddr = sec.address();
+    let data = match sec.data() { Ok(d) => d, Err(_) => return Vec::new() };
+    if data.len() < 12 || data[0] != 1 { return Vec::new(); }
+    let (eh_frame_ptr_enc, fde_count_enc, table_enc) = (data[1], data[2], data[3]);
+    let mut off = 4usize;
+    let p1 = eh_enc_fixed_size(eh_frame_ptr_enc);
+    if p1 == 0 || off + p1 > data.len() { return Vec::new(); }
+    off += p1;
+    let cs = eh_enc_fixed_size(fde_count_enc);
+    if cs == 0 || off + cs > data.len() { return Vec::new(); }
+    let fde_count: u64 = match cs {
+        2 => u16::from_le_bytes([data[off], data[off + 1]]) as u64,
+        4 => u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as u64,
+        8 => u64::from_le_bytes(data[off..off + 8].try_into().unwrap()),
+        _ => return Vec::new(),
+    };
+    off += cs;
+    let es = eh_enc_fixed_size(table_enc);
+    if es == 0 { return Vec::new(); }
+    let app = table_enc & 0x70;
+    let entry = es * 2;
+    let mut starts: Vec<u64> = Vec::new();
+    for i in 0..fde_count {
+        let p = off + (i as usize) * entry;
+        if p + es > data.len() { break; }
+        let rel: i64 = match es {
+            2 => i16::from_le_bytes([data[p], data[p + 1]]) as i64,
+            4 => i32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]) as i64,
+            8 => i64::from_le_bytes(data[p..p + 8].try_into().unwrap()),
+            _ => return Vec::new(),
+        };
+        let loc = match app {
+            0x00 => rel as u64,
+            0x10 => (vaddr + p as u64).wrapping_add(rel as u64),
+            0x30 => vaddr.wrapping_add(rel as u64),
+            _ => return Vec::new(),
+        };
+        starts.push(loc);
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    starts
+}
+
+// Push eh_frame_func_range(start, next_start) bracket ranges from the FDE starts so function inference treats a no-predecessor block strictly inside a range as a mid-body block (landing pad/tail), not a spurious entry; real functions sit ON a boundary so the strict-inequality guard preserves them.
+pub fn load_eh_frame_ranges(db: &mut DecompileDB, obj: &object::File) {
+    let starts = parse_eh_frame_hdr_starts(obj);
+    for w in starts.windows(2) {
+        db.rel_push("eh_frame_func_range", (w[0] as Address, w[1] as Address));
+    }
+    if starts.len() >= 2 {
+        log::debug!("eh_frame_hdr: {} FDE starts -> {} bracket ranges", starts.len(), starts.len() - 1);
+    }
+}
+
 // Populate symbol_table, symbols, symbol_size, PLT, main_function, and data pointer relations.
 pub fn load_symbols(db: &mut DecompileDB, obj: &object::File) {
     let mut symbols_vec: Vec<(u64, usize, &'static str, &'static str,
@@ -95,6 +163,37 @@ pub fn load_symbols(db: &mut DecompileDB, obj: &object::File) {
     detect_main(db, obj);
 
     load_data_pointers(db, obj);
+
+    load_data_section_ranges(db, obj);
+}
+
+// Push [start, end) ranges for allocated non-code data sections; a no-base absolute or scaled-index displacement is a genuine data/table address only when it lands in one, else a scaled-index lea displacement (e.g. `lea 0x8(,%rsi,8)`) is mistaken for a table base and synthesized into a bogus global.
+fn load_data_section_ranges(db: &mut DecompileDB, obj: &object::File) {
+    for section in obj.sections() {
+        if !section_is_allocated_elf(&section) {
+            continue;
+        }
+        match section.kind() {
+            SectionKind::Text => continue,
+            _ => {}
+        }
+        let addr = section.address();
+        let size = section.size();
+        if addr == 0 || size == 0 {
+            continue;
+        }
+        db.rel_push("data_section_range", (addr, addr + size));
+    }
+}
+
+// True when an ELF section is loaded at runtime (SHF_ALLOC); non-allocated metadata sections (.comment, .note.*, .debug_*) sit at sh_addr=0 and never hold runtime data.
+fn section_is_allocated_elf(section: &object::Section) -> bool {
+    match section.flags() {
+        object::SectionFlags::Elf { sh_flags } => {
+            sh_flags & u64::from(object::elf::SHF_ALLOC) != 0
+        }
+        _ => section.address() != 0,
+    }
 }
 
 // Parse PLT stubs (.plt, .plt.sec, .plt.got) to populate plt_entry and plt_block relations.

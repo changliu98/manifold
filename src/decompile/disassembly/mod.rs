@@ -38,6 +38,7 @@ pub fn load_from_binary(db: &mut DecompileDB, binary_path: &Path) {
     }
 
     symbol::load_symbols(db, &obj);
+    symbol::load_eh_frame_ranges(db, &obj);
 
     let insns = instruction::disassemble_sections(db, &obj);
 

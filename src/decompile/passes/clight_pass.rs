@@ -715,11 +715,19 @@ ascent_par! {
 
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sreturn(result)),
+        instr_in_function(node, func_addr),
+        !emit_function_void(func_addr),
         all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(&[result.clone()]),
         let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         let converted = clight_expr_from_csharp_with_multi_types(&result, &var_types),
         let stmt = ClightStmt::Sreturn(Some(converted.clone()));
+
+    // A return in a void function carries no value (e.g. deregister_tm_clones after the static tail is folded away): emit a bare `return;` so the result type stays void and no undefined return-value expression is materialized.
+    clight_stmt_without_field(node, ClightStmt::Sreturn(None)) <--
+        csharp_stmt(node, ?CsharpminorStmt::Sreturn(_)),
+        instr_in_function(node, func_addr),
+        emit_function_void(func_addr);
 
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Snop),
@@ -2804,7 +2812,10 @@ pub(crate) fn check_clight_stmt(stmt: &ClightStmt) -> Option<ClightStmt> {
         }
         ClightStmt::Scall(dst, func_expr, args) => {
             let func_ty = clight_expr_type(func_expr);
-            let func_ok = is_function_type(&func_ty) || is_function_pointer_type(&func_ty);
+            // A named symbol (EvarSymbol) is a direct function designator -- it is callable as `name(...)` regardless of the type stored on the node, and some symbols (e.g. the __builtin_unreachable / abort cold-call lowering carries default_void_ptr_type) reject being called through a function-pointer cast. Treat such a callee as well-formed so it is emitted bare; only genuine indirect-value callees (derefs, arithmetic, tempvars, data Evar) get the synthesized fnptr cast below.
+            let func_ok = is_function_type(&func_ty)
+                || is_function_pointer_type(&func_ty)
+                || matches!(func_expr, ClightExpr::EvarSymbol(_, _));
             let args_ok = args.iter().all(|arg| {
                 let arg_ty = clight_expr_type(arg);
                 !is_function_pointer_type(&arg_ty) && !is_function_type(&arg_ty)

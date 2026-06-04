@@ -155,17 +155,8 @@ impl Printer {
             }
 
             CExpr::Call(func, args) => {
-                // Strip redundant function pointer casts for named functions, but keep casts for register variables (var_*) whose declared type may not be a function pointer.
-                let callee = match func.as_ref() {
-                    CExpr::Cast(CType::Pointer(inner, _), expr)
-                        if matches!(inner.as_ref(), CType::Function(..)) =>
-                    {
-                        let is_register_var = matches!(expr.as_ref(), CExpr::Var(name) if name.starts_with("var_"));
-                        if is_register_var { func.as_ref() } else { expr.as_ref() }
-                    }
-                    _ => func.as_ref(),
-                };
-                self.print_expr_prec(callee, 15);
+                // A function-pointer cast on a call target only ever wraps an INDIRECT callee (a memory deref, an address computed by arithmetic, or a register/parameter holding a code pointer). Direct named-function calls carry a bare callee with no such cast, so they are never affected here. The cast supplies the call signature, hence it must be preserved for the call to type-check, e.g. (*(T (*)(args))(p))(...). Dropping it produced a call through long ("called object is not a function or function pointer") or an arity mismatch against a differently-declared parameter.
+                self.print_expr_prec(func.as_ref(), 15);
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {

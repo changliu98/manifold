@@ -113,10 +113,21 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
     for func in &mut functions {
         for candidates in func.node_statements.values_mut() {
             if candidates.len() > 1 {
+                // When a node offers a byte-addressed `(char *)base + c` alongside a bare `base + c` on a non-char pointer, both compile but the bare form silently re-scales the constant by the element size (B2 mis-scaling), so demote it and search the byte-correct char-cast candidate first.
+                let has_byte_cast = candidates.iter().any(stmt_uses_charcast_ptr_arith);
                 candidates.sort_by_key(|s| {
                     // Lower key sorts first. Field-form gets 0, raw-deref form gets 1.
                     let prefers_field = stmt_uses_efield(s);
-                    let priority: u8 = if prefers_field { 0 } else { 1 };
+                    let priority: u8 = if prefers_field {
+                        0
+                    } else if has_byte_cast
+                        && stmt_uses_bare_nonchar_ptr_const_arith(s)
+                        && !stmt_uses_charcast_ptr_arith(s)
+                    {
+                        2
+                    } else {
+                        1
+                    };
                     (priority, stmt_deterministic_hash(s))
                 });
             }
@@ -820,6 +831,98 @@ fn stmt_uses_efield(stmt: &ClightStmt) -> bool {
     }
 }
 
+/// True if the pointee is a 1-byte char type, i.e. `base + c` is already byte arithmetic.
+fn is_char_pointee(ty: &ClightType) -> bool {
+    matches!(ty, ClightType::Tpointer(inner, _) if matches!(inner.as_ref(), ClightType::Tint(ClightIntSize::I8, _, _)))
+}
+
+/// True if the stmt contains a byte-addressed pointer add/sub `(char *)base + c` (the B2-correct form: offset is bytes, not scaled by an element size).
+fn stmt_uses_charcast_ptr_arith(stmt: &ClightStmt) -> bool {
+    fn expr_has(e: &ClightExpr) -> bool {
+        if let ClightExpr::Ebinop(op, l, r, _) = e {
+            if matches!(op, ClightBinaryOp::Oadd | ClightBinaryOp::Osub) {
+                let l_char = matches!(l.as_ref(), ClightExpr::Ecast(_, t) if is_char_pointee(t));
+                let r_char = matches!(r.as_ref(), ClightExpr::Ecast(_, t) if is_char_pointee(t));
+                if l_char || r_char {
+                    return true;
+                }
+            }
+        }
+        match e {
+            ClightExpr::Ederef(inner, _)
+            | ClightExpr::Eaddrof(inner, _)
+            | ClightExpr::Eunop(_, inner, _)
+            | ClightExpr::Ecast(inner, _)
+            | ClightExpr::Efield(inner, _, _) => expr_has(inner),
+            ClightExpr::Ebinop(_, l, r, _) => expr_has(l) || expr_has(r),
+            ClightExpr::Econdition(c, t, f, _) => expr_has(c) || expr_has(t) || expr_has(f),
+            _ => false,
+        }
+    }
+    walk_stmt_exprs(stmt, &expr_has)
+}
+
+/// True if the stmt contains a bare add/sub of a non-zero integer CONSTANT to a non-char pointer (e.g. `base + 10`, `base` is `T *`, T != char); C re-scales the constant by sizeof(T), so this form mis-scales whenever the constant is a raw byte offset.
+fn stmt_uses_bare_nonchar_ptr_const_arith(stmt: &ClightStmt) -> bool {
+    fn const_val(e: &ClightExpr) -> Option<i64> {
+        match e {
+            ClightExpr::EconstInt(v, _) => Some(*v as i64),
+            ClightExpr::EconstLong(v, _) => Some(*v),
+            _ => None,
+        }
+    }
+    fn bare_nonchar_ptr(e: &ClightExpr) -> bool {
+        // A pointer operand that is not itself a char-cast (which would already be byte arithmetic).
+        if matches!(e, ClightExpr::Ecast(_, t) if is_char_pointee(t)) {
+            return false;
+        }
+        let ty = crate::decompile::passes::csh_pass::clight_expr_type(e);
+        matches!(ty, ClightType::Tpointer(ref inner, _) if !matches!(inner.as_ref(), ClightType::Tint(ClightIntSize::I8, _, _)))
+    }
+    fn expr_has(e: &ClightExpr) -> bool {
+        if let ClightExpr::Ebinop(op, l, r, _) = e {
+            if matches!(op, ClightBinaryOp::Oadd | ClightBinaryOp::Osub) {
+                let lc = const_val(l);
+                let rc = const_val(r);
+                if matches!(rc, Some(c) if c != 0) && bare_nonchar_ptr(l) {
+                    return true;
+                }
+                if matches!(lc, Some(c) if c != 0) && bare_nonchar_ptr(r) {
+                    return true;
+                }
+            }
+        }
+        match e {
+            ClightExpr::Ederef(inner, _)
+            | ClightExpr::Eaddrof(inner, _)
+            | ClightExpr::Eunop(_, inner, _)
+            | ClightExpr::Ecast(inner, _)
+            | ClightExpr::Efield(inner, _, _) => expr_has(inner),
+            ClightExpr::Ebinop(_, l, r, _) => expr_has(l) || expr_has(r),
+            ClightExpr::Econdition(c, t, f, _) => expr_has(c) || expr_has(t) || expr_has(f),
+            _ => false,
+        }
+    }
+    walk_stmt_exprs(stmt, &expr_has)
+}
+
+/// Apply an expression predicate to every top-level expression carried by a statement (recursing into nested statements); returns true if it holds for any of them.
+fn walk_stmt_exprs(stmt: &ClightStmt, pred: &dyn Fn(&ClightExpr) -> bool) -> bool {
+    match stmt {
+        ClightStmt::Sassign(l, r) => pred(l) || pred(r),
+        ClightStmt::Sset(_, e) => pred(e),
+        ClightStmt::Scall(_, f, args) => pred(f) || args.iter().any(|a| pred(a)),
+        ClightStmt::Sbuiltin(_, _, _, args) => args.iter().any(|a| pred(a)),
+        ClightStmt::Sreturn(Some(e)) => pred(e),
+        ClightStmt::Sifthenelse(c, t, e) => pred(c) || walk_stmt_exprs(t, pred) || walk_stmt_exprs(e, pred),
+        ClightStmt::Ssequence(ss) => ss.iter().any(|s| walk_stmt_exprs(s, pred)),
+        ClightStmt::Sloop(a, b) => walk_stmt_exprs(a, pred) || walk_stmt_exprs(b, pred),
+        ClightStmt::Slabel(_, inner) => walk_stmt_exprs(inner, pred),
+        ClightStmt::Sswitch(e, cases) => pred(e) || cases.iter().any(|(_, s)| walk_stmt_exprs(s, pred)),
+        _ => false,
+    }
+}
+
 /// Deterministic hash of a HybridFunctionState for beam tie-breaking.
 fn state_deterministic_hash(state: &HybridFunctionState) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -1351,6 +1454,9 @@ fn assemble_loops(
     let mut headers: Vec<(&Node, &LoopInfo)> = loop_info.iter().collect();
     headers.sort_by(|a, b| a.1.body_nodes.len().cmp(&b.1.body_nodes.len()).then(a.0.cmp(b.0)));
 
+    // Top-level value nodes tail-duplicated into a loop exit branch (A5), removed below so they are not also emitted (hoisted) outside the loop; each has a single predecessor (its exit), so removing it cannot orphan another path.
+    let mut absorbed_value_nodes: Vec<Node> = Vec::new();
+
     for (&header, info) in &headers {
         let header_label = ident_from_node(header);
         // Body iteration follows execution order: synthetic addresses (bit 62 set, e.g. arith_load fused Add) execute immediately after their base address, so naive numeric sort places them after every real-address node in the body and the synth Sset would emit at the bottom of the loop body, breaking the read-modify-write order of memory ops.
@@ -1382,6 +1488,14 @@ fn assemble_loops(
         for &node in &body_iter_nodes {
             // Use pre-built break statement if this is a non-primary loop exit
             if let Some(break_stmt) = info.break_stmts.get(&node) {
+                // A5: if this exit flows to a function return, tail-duplicate the value assignment + the return into the branch rather than emitting a valueless break, which drops the returned value at the post-loop join.
+                if let Some(&(value_node, ret_node)) = info.exit_returns.get(&node) {
+                    if let Some(tail) = build_return_tail(statements, value_node, ret_node) {
+                        body_stmts.push(replace_break_with(break_stmt, &tail));
+                        absorbed_value_nodes.push(value_node);
+                        continue;
+                    }
+                }
                 body_stmts.push(break_stmt.clone());
                 continue;
             }
@@ -1451,6 +1565,53 @@ fn assemble_loops(
             }
         }
     }
+
+    // Drop value nodes absorbed by an A5 tail-duplication so they are not also emitted outside the loop.
+    for node in absorbed_value_nodes {
+        statements.remove(&node);
+    }
+}
+
+// Build the tail-duplicated return for an A5 loop exit: the value assignment at value_node then the return at ret_node, each node's label stripped (originals stay labeled until the absorbed value node is removed; ret_node may be shared, so it is duplicated, not moved).
+fn build_return_tail(
+    statements: &HashMap<Node, ClightStmt>,
+    value_node: Node,
+    ret_node: Node,
+) -> Option<ClightStmt> {
+    let val = strip_outer_labels(statements.get(&value_node)?);
+    if value_node == ret_node {
+        Some(val)
+    } else {
+        let ret = strip_outer_labels(statements.get(&ret_node)?);
+        Some(ClightStmt::Ssequence(vec![val, ret]))
+    }
+}
+
+// Peel any leading Slabel wrappers off a statement so a duplicated copy carries no duplicate label.
+fn strip_outer_labels(s: &ClightStmt) -> ClightStmt {
+    match s {
+        ClightStmt::Slabel(_, inner) => strip_outer_labels(inner),
+        other => other.clone(),
+    }
+}
+
+// Replace every Sbreak in a (pre-built break) statement with the given tail statement, turning `if(cond) break` into `if(cond) { value; return }` for an A5 exit that flows to a function return.
+fn replace_break_with(stmt: &ClightStmt, tail: &ClightStmt) -> ClightStmt {
+    match stmt {
+        ClightStmt::Sbreak => tail.clone(),
+        ClightStmt::Sifthenelse(c, t, e) => ClightStmt::Sifthenelse(
+            c.clone(),
+            Box::new(replace_break_with(t, tail)),
+            Box::new(replace_break_with(e, tail)),
+        ),
+        ClightStmt::Ssequence(ss) => {
+            ClightStmt::Ssequence(ss.iter().map(|s| replace_break_with(s, tail)).collect())
+        }
+        ClightStmt::Slabel(l, inner) => {
+            ClightStmt::Slabel(*l, Box::new(replace_break_with(inner, tail)))
+        }
+        other => other.clone(),
+    }
 }
 
 // Assemble compound if-then-else from structural metadata (analogous to assemble_loops); operates on already-typed ClightStmt so no type decisions are made.
@@ -1499,6 +1660,22 @@ fn assemble_ite(
             _ => continue,
         };
 
+        // A trailing `goto <join>` in an if-body is a redundant fallthrough ONLY when the join is the next top-level statement after the whole compound; since final emit is address-sorted, tail-merged code can place an if-body's value store at a HIGHER address than the merged join with an unconditional store interposed, so popping the goto makes the body fall through it and overwrite the value (A5 dead return-overwrite -> lookups return 0/NULL). Pop only when the join is the immediate top-level successor of the body span, else keep the goto early-exit (keeping a goto is always safe, at worst a redundant jump; dropping a needed one is the bug).
+        let should_pop_join_goto = match info.join_node {
+            Some(join) => {
+                let body_span_max = info
+                    .true_body_nodes
+                    .iter()
+                    .chain(info.false_body_nodes.iter())
+                    .copied()
+                    .max()
+                    .map(|m| m.max(branch))
+                    .unwrap_or(branch);
+                statements.keys().filter(|n| **n > body_span_max).min().copied() == Some(join)
+            }
+            None => false,
+        };
+
         let collect_body = |body_nodes: &[Node]| -> ClightStmt {
             let mut body_stmts: Vec<ClightStmt> = Vec::new();
             for &node in body_nodes {
@@ -1513,14 +1690,16 @@ fn assemble_ite(
                     }
                 }
             }
-            // Remove trailing gotos to the join point (they become fallthrough)
-            if let Some(join) = info.join_node {
-                let join_ident = ident_from_node(join);
-                while let Some(ClightStmt::Sgoto(target)) = body_stmts.last() {
-                    if *target == join_ident {
-                        body_stmts.pop();
-                    } else {
-                        break;
+            // Remove trailing gotos to the join point only when it is the textual fallthrough.
+            if should_pop_join_goto {
+                if let Some(join) = info.join_node {
+                    let join_ident = ident_from_node(join);
+                    while let Some(ClightStmt::Sgoto(target)) = body_stmts.last() {
+                        if *target == join_ident {
+                            body_stmts.pop();
+                        } else {
+                            break;
+                        }
                     }
                 }
             }

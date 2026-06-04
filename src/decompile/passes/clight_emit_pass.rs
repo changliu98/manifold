@@ -439,6 +439,8 @@ fn collect_all_referenced_structs(
                 collect_struct_refs(&f.return_type, &mut referenced);
                 for p in &f.params { collect_struct_refs(&p.ty, &mut referenced); }
                 for v in &f.local_vars { collect_struct_refs(&v.ty, &mut referenced); }
+                // A struct may only appear inside a cast in the body (e.g. ((struct_1 *)p)->ofs_8 when p is typed as a generic pointer). Walk the body so such structs are not mistaken for unreferenced and suppressed to void; mirrors rewrite_ctype_in_stmt which would otherwise rewrite those casts.
+                collect_referenced_structs_in_stmt(&f.body, &mut referenced);
             }
             TopLevelDecl::FuncDecl(f) => {
                 collect_struct_refs(&f.return_type, &mut referenced);
@@ -452,6 +454,134 @@ fn collect_all_referenced_structs(
     }
 
     referenced
+}
+
+/// Collect struct names from every CType appearing in an expression (casts, sizeof/alignof, compound literals). Mirrors rewrite_ctype_in_expr so the suppression collector sees exactly the locations the rewriter would touch.
+fn collect_referenced_structs_in_expr(expr: &CExpr, result: &mut HashSet<String>) {
+    fn collect_struct_refs(ty: &CType, result: &mut HashSet<String>) {
+        match ty {
+            CType::Struct(name) => { result.insert(name.clone()); }
+            CType::Pointer(inner, _) => collect_struct_refs(inner, result),
+            CType::Array(inner, _) => collect_struct_refs(inner, result),
+            CType::Function(ret, params, _) => {
+                collect_struct_refs(ret, result);
+                for p in params { collect_struct_refs(p, result); }
+            }
+            CType::Qualified(inner, _) => collect_struct_refs(inner, result),
+            _ => {}
+        }
+    }
+    match expr {
+        CExpr::Cast(ty, inner) => {
+            collect_struct_refs(ty, result);
+            collect_referenced_structs_in_expr(inner, result);
+        }
+        CExpr::SizeofType(ty) | CExpr::AlignofType(ty) => collect_struct_refs(ty, result),
+        CExpr::CompoundLit(ty, _) => collect_struct_refs(ty, result),
+        CExpr::Unary(_, inner) => collect_referenced_structs_in_expr(inner, result),
+        CExpr::Binary(_, l, r) | CExpr::Assign(_, l, r) => {
+            collect_referenced_structs_in_expr(l, result);
+            collect_referenced_structs_in_expr(r, result);
+        }
+        CExpr::Ternary(c, t, e) => {
+            collect_referenced_structs_in_expr(c, result);
+            collect_referenced_structs_in_expr(t, result);
+            collect_referenced_structs_in_expr(e, result);
+        }
+        CExpr::Call(f, args) => {
+            collect_referenced_structs_in_expr(f, result);
+            for a in args { collect_referenced_structs_in_expr(a, result); }
+        }
+        CExpr::Member(inner, _) | CExpr::MemberPtr(inner, _) => {
+            collect_referenced_structs_in_expr(inner, result);
+        }
+        CExpr::Index(arr, idx) => {
+            collect_referenced_structs_in_expr(arr, result);
+            collect_referenced_structs_in_expr(idx, result);
+        }
+        CExpr::SizeofExpr(inner) | CExpr::Paren(inner) => {
+            collect_referenced_structs_in_expr(inner, result);
+        }
+        _ => {}
+    }
+}
+
+/// Collect struct names from every CType in a statement (expressions and inline declarations). Mirrors rewrite_ctype_in_stmt.
+fn collect_referenced_structs_in_stmt(stmt: &CStmt, result: &mut HashSet<String>) {
+    fn collect_struct_refs(ty: &CType, result: &mut HashSet<String>) {
+        match ty {
+            CType::Struct(name) => { result.insert(name.clone()); }
+            CType::Pointer(inner, _) => collect_struct_refs(inner, result),
+            CType::Array(inner, _) => collect_struct_refs(inner, result),
+            CType::Function(ret, params, _) => {
+                collect_struct_refs(ret, result);
+                for p in params { collect_struct_refs(p, result); }
+            }
+            CType::Qualified(inner, _) => collect_struct_refs(inner, result),
+            _ => {}
+        }
+    }
+    match stmt {
+        CStmt::Expr(e) => collect_referenced_structs_in_expr(e, result),
+        CStmt::Block(items) => {
+            for item in items {
+                match item {
+                    crate::decompile::passes::c_pass::types::CBlockItem::Stmt(s) => {
+                        collect_referenced_structs_in_stmt(s, result);
+                    }
+                    crate::decompile::passes::c_pass::types::CBlockItem::Decl(decls) => {
+                        for d in decls { collect_struct_refs(&d.ty, result); }
+                    }
+                }
+            }
+        }
+        CStmt::If(c, t, e) => {
+            collect_referenced_structs_in_expr(c, result);
+            collect_referenced_structs_in_stmt(t, result);
+            if let Some(e) = e { collect_referenced_structs_in_stmt(e, result); }
+        }
+        CStmt::Switch(e, body) => {
+            collect_referenced_structs_in_expr(e, result);
+            collect_referenced_structs_in_stmt(body, result);
+        }
+        CStmt::While(c, body) => {
+            collect_referenced_structs_in_expr(c, result);
+            collect_referenced_structs_in_stmt(body, result);
+        }
+        CStmt::DoWhile(body, c) => {
+            collect_referenced_structs_in_stmt(body, result);
+            collect_referenced_structs_in_expr(c, result);
+        }
+        CStmt::For(init, cond, update, body) => {
+            if let Some(init) = init {
+                match init {
+                    crate::decompile::passes::c_pass::types::ForInit::Expr(e) => {
+                        collect_referenced_structs_in_expr(e, result);
+                    }
+                    crate::decompile::passes::c_pass::types::ForInit::Decl(decls) => {
+                        for d in decls { collect_struct_refs(&d.ty, result); }
+                    }
+                }
+            }
+            if let Some(c) = cond { collect_referenced_structs_in_expr(c, result); }
+            if let Some(u) = update { collect_referenced_structs_in_expr(u, result); }
+            collect_referenced_structs_in_stmt(body, result);
+        }
+        CStmt::Return(Some(e)) => collect_referenced_structs_in_expr(e, result),
+        CStmt::Labeled(label, body) => {
+            if let crate::decompile::passes::c_pass::types::Label::Case(e) = label {
+                collect_referenced_structs_in_expr(e, result);
+            }
+            collect_referenced_structs_in_stmt(body, result);
+        }
+        CStmt::Decl(decls) => {
+            for d in decls { collect_struct_refs(&d.ty, result); }
+        }
+        CStmt::Sequence(stmts) => {
+            for s in stmts { collect_referenced_structs_in_stmt(s, result); }
+        }
+        _ => {}
+    }
 }
 
 // Shared read set for the select/emit split; the full set keeps both halves ordered after their producers, with clight_selected_functions the typed-tree handoff.

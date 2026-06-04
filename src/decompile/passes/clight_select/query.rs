@@ -794,6 +794,16 @@ fn is_valid_ascii_content(bytes: &[u8]) -> bool {
     true
 }
 
+// A section is "allocated" (gets a runtime address) when SHF_ALLOC is set for ELF; non-allocated sections (.comment, .note.*, .debug_*) live at sh_addr=0 and are never valid pointer targets. For non-ELF formats, fall back to a nonzero load address.
+fn section_is_allocated(section: &object::Section) -> bool {
+    match section.flags() {
+        object::SectionFlags::Elf { sh_flags } => {
+            sh_flags & u64::from(object::elf::SHF_ALLOC) != 0
+        }
+        _ => section.address() != 0,
+    }
+}
+
 fn is_string_literal(bytes: &[u8]) -> Option<usize> {
     let null_pos = bytes.iter().position(|&b| b == 0)?;
 
@@ -984,32 +994,35 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
         let mut content = Vec::new();
         let is_pointer = global_ptr_ids.contains(id);
 
-        if let Some(str_content) = string_data_map.get(&name) {
-            if is_valid_ascii_content(str_content.as_bytes()) {
-                is_string = true;
-                content = str_content.as_bytes().to_vec();
-                content.push(0);
+        // Pointer globals are never string literals; skip all string detection for them.
+        if !is_pointer {
+            if let Some(str_content) = string_data_map.get(&name) {
+                if is_valid_ascii_content(str_content.as_bytes()) {
+                    is_string = true;
+                    content = str_content.as_bytes().to_vec();
+                    content.push(0);
+                }
             }
-        }
 
-        if !is_string {
-            let idx = string_addr_map.partition_point(|(start, _)| *start <= addr);
-            if idx > 0 {
-                let (start, str_content) = &string_addr_map[idx - 1];
-                let offset = (addr - start) as usize;
-                if offset == 0 {
-                    let candidate = str_content.as_bytes();
-                    if is_valid_ascii_content(candidate) {
-                        is_string = true;
-                        content = candidate.to_vec();
-                        content.push(0);
-                    }
-                } else if offset < str_content.len() {
-                    let candidate = str_content[offset..].as_bytes();
-                    if is_valid_ascii_content(candidate) {
-                        is_string = true;
-                        content = candidate.to_vec();
-                        content.push(0);
+            if !is_string {
+                let idx = string_addr_map.partition_point(|(start, _)| *start <= addr);
+                if idx > 0 {
+                    let (start, str_content) = &string_addr_map[idx - 1];
+                    let offset = (addr - start) as usize;
+                    if offset == 0 {
+                        let candidate = str_content.as_bytes();
+                        if is_valid_ascii_content(candidate) {
+                            is_string = true;
+                            content = candidate.to_vec();
+                            content.push(0);
+                        }
+                    } else if offset < str_content.len() {
+                        let candidate = str_content[offset..].as_bytes();
+                        if is_valid_ascii_content(candidate) {
+                            is_string = true;
+                            content = candidate.to_vec();
+                            content.push(0);
+                        }
                     }
                 }
             }
@@ -1022,8 +1035,13 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
             None
         };
 
-        if !is_string && scalar_value.is_none() {
+        // Pointer globals (GOT / .data.rel.ro / .bss fn-ptr slots) must never be classified as string literals: their file bytes are zero (relocated at load time), so a leading 0x00 byte (or a lone \0, zero-initialized data) does NOT mean "empty string" -- emit it as a normal scalar/pointer global instead of "".
+        if !is_string && scalar_value.is_none() && !is_pointer {
             for section in obj_file.sections() {
+                 // A global_var_ref id is a runtime address, which only loaded (SHF_ALLOC) sections have; non-allocated metadata sections (.comment, .note, .debug_*) sit at sh_addr=0, so a small integer constant that became a global ref would otherwise resolve into their bytes (e.g. .comment's toolchain version string) and render as that substring. Skip them.
+                 if !section_is_allocated(&section) {
+                     continue;
+                 }
                  let sect_addr = section.address();
                  let sect_size = section.size();
 
@@ -1032,16 +1050,11 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
                          let offset = (addr - sect_addr) as usize;
                          if offset < data.len() {
                              let remaining = &data[offset..];
-                             if !remaining.is_empty() && remaining[0] == 0 {
+                             let check_len = std::cmp::min(remaining.len(), 128);
+                             let chunk = &remaining[0..check_len];
+                             if let Some(len) = is_string_literal(chunk) {
                                  is_string = true;
-                                 content = vec![0];
-                             } else {
-                                 let check_len = std::cmp::min(remaining.len(), 128);
-                                 let chunk = &remaining[0..check_len];
-                                 if let Some(len) = is_string_literal(chunk) {
-                                     is_string = true;
-                                     content = chunk[0..len].to_vec();
-                                 }
+                                 content = chunk[0..len].to_vec();
                              }
                          }
                      }
@@ -1090,6 +1103,8 @@ pub struct LoopInfo {
     pub primary_exit: Option<PrimaryExitData>,
     /// Pre-built break statements for non-primary loop exits, mapping exit_node to ClightStmt (typically Sifthenelse(cond, Sbreak, Sskip)).
     pub break_stmts: HashMap<Node, ClightStmt>,
+    /// Non-primary exits whose target flows to a function return (exit_node -> (value_node, ret_node)); select tail-duplicates value_node + ret_node's return into the exit branch instead of a valueless break (A5 dead-return-overwrite fix).
+    pub exit_returns: HashMap<Node, (Node, Node)>,
 }
 
 pub fn extract_loop_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, LoopInfo>> {
@@ -1189,6 +1204,18 @@ pub fn extract_loop_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, Loo
         if take {
             info.break_stmts.insert(*exit_node, break_stmt.clone());
         }
+    }
+
+    // Populate exit_returns from loop_exit_to_return (non-primary exits flowing to a function return); select tail-duplicates value_node + ret_node's return into the exit branch rather than the valueless break that drops the returned value (A5).
+    for (func_addr, loop_header, exit_node, value_node, ret_node) in
+        db.rel_iter::<(Address, Node, Node, Node, Node)>("loop_exit_to_return")
+    {
+        let info = result
+            .entry(*func_addr)
+            .or_default()
+            .entry(*loop_header)
+            .or_insert_with(LoopInfo::default);
+        info.exit_returns.entry(*exit_node).or_insert((*value_node, *ret_node));
     }
 
     // Sort loop body nodes by id (address-encoded) for program order; Ascent set order is nondeterministic and may push calls past control-flow exits causing them to be eliminated as unreachable.

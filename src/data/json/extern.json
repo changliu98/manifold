@@ -2721,6 +2721,52 @@
       "name": "__memmove_chk",
       "sig_args": ["Xptr", "Xptr", "Xlong", "Xlong"],
       "sig_res": "Xptr"
+    },
+    {
+      "name": "_Znwm",
+      "sig_args": ["Xlong"],
+      "sig_res": "Xptr"
+    },
+    {
+      "name": "_Znam",
+      "sig_args": ["Xlong"],
+      "sig_res": "Xptr"
+    },
+    {
+      "name": "_ZnwmRKSt9nothrow_t",
+      "sig_args": ["Xlong", "Xptr"],
+      "sig_res": "Xptr",
+      "ptr_params": [1]
+    },
+    {
+      "name": "_ZnamRKSt9nothrow_t",
+      "sig_args": ["Xlong", "Xptr"],
+      "sig_res": "Xptr",
+      "ptr_params": [1]
+    },
+    {
+      "name": "_ZdlPv",
+      "sig_args": ["Xptr"],
+      "sig_res": "Xvoid",
+      "ptr_params": [0]
+    },
+    {
+      "name": "_ZdaPv",
+      "sig_args": ["Xptr"],
+      "sig_res": "Xvoid",
+      "ptr_params": [0]
+    },
+    {
+      "name": "_ZdlPvm",
+      "sig_args": ["Xptr", "Xlong"],
+      "sig_res": "Xvoid",
+      "ptr_params": [0]
+    },
+    {
+      "name": "_ZdaPvm",
+      "sig_args": ["Xptr", "Xlong"],
+      "sig_res": "Xvoid",
+      "ptr_params": [0]
     }
   ]
 }

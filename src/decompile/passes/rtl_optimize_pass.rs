@@ -2,7 +2,7 @@
 
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
-use crate::x86::op::Operation;
+use crate::x86::op::{Comparison, Condition, Operation};
 use crate::x86::types::*;
 use either::Either;
 use log::info;
@@ -26,6 +26,8 @@ ascent_par! {
     relation rtl_opt_func(Node, Address);
     relation rtl_opt_param(Address, RTLReg);
     relation rtl_opt_entry(Address, Node);
+    // Mem-indirect call target-load address regs (call node -> address reg), seeded from FunctionCFG::mem_call_addr_uses so the v2 mirror matches the imperative def/use model.
+    relation rtl_opt_mem_call_use(Node, RTLReg);
 
     // def/use extracted from instructions.
     relation rtl_def(Address, Node, RTLReg);
@@ -76,6 +78,11 @@ ascent_par! {
     rtl_use(func, node, *r) <--
         rtl_opt_func(node, func),
         rtl_opt_inst(node, ?RTLInst::Icall(_, Either::Left(r), _, _, _));
+
+    // A mem-indirect call also uses the regs forming its target-load address.
+    rtl_use(func, node, *r) <--
+        rtl_opt_func(node, func),
+        rtl_opt_mem_call_use(node, r);
 
     rtl_use(func, node, *u) <--
         rtl_opt_func(node, func),
@@ -309,6 +316,11 @@ fn run_rtl_optimizer_program(ctx: &PassContext) -> RTLOptimizerProgram {
         for &reg in &func.params {
             prog.rtl_opt_param.push((func_addr, reg));
         }
+        for (&node, regs) in &func.mem_call_addr_uses {
+            for &r in regs {
+                prog.rtl_opt_mem_call_use.push((node, r));
+            }
+        }
         prog.rtl_opt_entry.push((func_addr, func.entry));
     }
 
@@ -383,6 +395,12 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
         .collect();
     let per_func_var_types = std::sync::Mutex::new(per_func_var_types);
 
+    // Return-value register per function (RTLPass binding); after static-eq branch folding prunes the dead tail, a function whose recorded return reg no longer has a surviving def has lost its only return value and is genuinely void (e.g. deregister_tm_clones).
+    let func_return_reg: HashMap<Address, RTLReg> = db
+        .rel_iter::<(Address, RTLReg)>("emit_function_return")
+        .map(|&(addr, reg)| (addr, reg))
+        .collect();
+
     // RTLOptimizerProgram is the Ascent v2 of the imperative optimizer. Its outputs are only consumed by the debug-only RTL_V2_DIFF block below, so in release builds we skip it entirely (dominates the RTL pass -- ~57s on a 700KB binary).
     #[cfg(debug_assertions)]
     let ascent_v2: Option<AscentV2Snapshot> = if std::env::var("RTL_V2_DIFF").is_ok() {
@@ -419,6 +437,8 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
                     _ => None,
                 })
                 .collect();
+
+            let folded_static_branch = fold_static_eq_branches(func);
 
             let zero_rewrites = self_zero_rewrite(func);
 
@@ -482,6 +502,13 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
             let liveness = LivenessInfo::build(func, &du);
             let inlines = find_inline_temps(func, &du, &liveness);
 
+            // The function became void if static-eq folding pruned the defining node of its recorded return value, leaving the return reg with no surviving def (and not a parameter); scoped to folded functions so normal returns are untouched.
+            let became_void = folded_static_branch
+                && func_return_reg.get(&func_addr).is_some_and(|ret_reg| {
+                    !func.params.contains(ret_reg)
+                        && du.defs.get(ret_reg).map_or(true, |d| d.is_empty())
+                });
+
             (
                 RtlOptStats {
                     copies,
@@ -498,6 +525,7 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
                 iter1_copy_subst,
                 iter1_dead_store_nodes,
                 iter1_dead_call_nodes,
+                became_void,
             )
         })
         .collect();
@@ -509,8 +537,9 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
     let mut imp_copy_subst_all: HashMap<RTLReg, RTLReg> = HashMap::new();
     let mut imp_dead_store_all: HashSet<Node> = HashSet::new();
     let mut imp_dead_call_all: HashSet<Node> = HashSet::new();
+    let mut newly_void: HashSet<Address> = HashSet::new();
 
-    for (func_stats, inlines, func_vt, _fa, isz, icp, idst, idcl) in results {
+    for (func_stats, inlines, func_vt, fa, isz, icp, idst, idcl, became_void) in results {
         stats.accumulate(func_stats);
         ctx.inline_temps.extend(inlines);
         merged_var_types.extend(func_vt);
@@ -518,6 +547,7 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
         for (d, s) in icp { imp_copy_subst_all.insert(d, s); }
         imp_dead_store_all.extend(idst);
         imp_dead_call_all.extend(idcl);
+        if became_void { newly_void.insert(fa); }
     }
 
     // Diff logging: compare Ascent v2 vs imperative iteration-1 outputs (uses eprintln so diffs surface during test runs, where no env_logger is configured).
@@ -587,7 +617,53 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
 
     ctx.var_types = merged_var_types;
     ctx.write_back(db);
+
+    if !newly_void.is_empty() {
+        mark_functions_void(db, &newly_void);
+    }
     Some(stats)
+}
+
+// Retype functions that lost their only return value (to static-eq branch folding) as void: emit_function_void_candidate wins the return-type ladder in signature reconciliation (Case 1) so the function renders `void`, and the stale has-return / return-type signals are dropped so they cannot reintroduce a bogus return type.
+fn mark_functions_void(db: &mut DecompileDB, void_funcs: &HashSet<Address>) {
+    let mut void_cand: Vec<(Address,)> = db
+        .rel_iter::<(Address,)>("emit_function_void_candidate")
+        .cloned()
+        .collect();
+    for &f in void_funcs {
+        if !void_cand.iter().any(|&(a,)| a == f) {
+            void_cand.push((f,));
+        }
+    }
+    db.rel_set("emit_function_void_candidate", void_cand.into_iter().collect::<ascent::boxcar::Vec<_>>());
+
+    let has_ret: Vec<(Address,)> = db
+        .rel_iter::<(Address,)>("emit_function_has_return_candidate")
+        .filter(|&&(a,)| !void_funcs.contains(&a))
+        .cloned()
+        .collect();
+    db.rel_set("emit_function_has_return_candidate", has_ret.into_iter().collect::<ascent::boxcar::Vec<_>>());
+
+    let ret: Vec<(Address, RTLReg)> = db
+        .rel_iter::<(Address, RTLReg)>("emit_function_return")
+        .filter(|&&(a, _)| !void_funcs.contains(&a))
+        .cloned()
+        .collect();
+    db.rel_set("emit_function_return", ret.into_iter().collect::<ascent::boxcar::Vec<_>>());
+
+    let ret_ct: Vec<(Address, ClightType)> = db
+        .rel_iter::<(Address, ClightType)>("emit_function_return_type_candidate")
+        .filter(|&&(a, _)| !void_funcs.contains(&a))
+        .cloned()
+        .collect();
+    db.rel_set("emit_function_return_type_candidate", ret_ct.into_iter().collect::<ascent::boxcar::Vec<_>>());
+
+    let ret_xt: Vec<(Address, XType)> = db
+        .rel_iter::<(Address, XType)>("emit_function_return_type_xtype_candidate")
+        .filter(|&&(a, _)| !void_funcs.contains(&a))
+        .cloned()
+        .collect();
+    db.rel_set("emit_function_return_type_xtype_candidate", ret_xt.into_iter().collect::<ascent::boxcar::Vec<_>>());
 }
 
 pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
@@ -654,7 +730,13 @@ pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
     let rebuild_args = |node: Node| -> Option<Arc<Vec<RTLReg>>> {
         let mut pairs = args_by_call.get(&node)?.clone();
         pairs.sort_by_key(|(pos, _)| *pos);
-        Some(Arc::new(pairs.into_iter().map(|(_, reg)| reg).collect()))
+        // Scatter by position into a dense vector padded with DEFAULT_VAR so a dropped leading arg leaves a sentinel hole rather than left-shifting later args into its slot (Args is purely positional); contiguous positions 0..N overwrite every slot.
+        let len = pairs.last().map(|(pos, _)| *pos + 1).unwrap_or(0);
+        let mut args: Vec<RTLReg> = vec![crate::util::DEFAULT_VAR as RTLReg; len];
+        for (pos, reg) in pairs {
+            args[pos] = reg;
+        }
+        Some(Arc::new(args))
     };
 
     let mut call_nodes: HashSet<Node> = db
@@ -759,6 +841,7 @@ impl IRPass for RTLOptimizePass {
             "emit_function_param_candidate",
             "emit_var_type_candidate",
             "emit_function_signature_candidate",
+            "emit_function_return",
             "call_target_func",
             "call_arg_mapping",
             "call_args_collected_candidate",
@@ -776,7 +859,18 @@ impl IRPass for RTLOptimizePass {
             "call_arg_mapping",
             "call_arg",
             "call_args_collected_candidate",
+            // Static-eq branch folding can retype a function void; these signal that to the signature reconciliation pass.
+            "emit_function_void_candidate",
+            "emit_function_has_return_candidate",
+            "emit_function_return",
+            "emit_function_return_type_candidate",
+            "emit_function_return_type_xtype_candidate",
         ]
+    }
+
+    fn extra_reads(&self) -> &'static [&'static str] {
+        // Read imperatively in PassContext::load to add a mem-indirect call's target-load address regs as uses of the call node (keeps the vtable Iload alive through DSE).
+        &["call_through_memory_load"]
     }
 }
 
@@ -789,6 +883,8 @@ pub(crate) struct FunctionCFG {
     pub(crate) succs: HashMap<Node, Vec<Node>>,
     pub(crate) preds: HashMap<Node, Vec<Node>>,
     pub(crate) params: HashSet<RTLReg>,
+    // For a mem-indirect call (`call [base+idx*s+ofs]`), the address regs feeding the vtable/function-pointer load; rtl_pass threads these into call_through_memory_load (consumed only by cshminor for Eload rendering), so the optimizer's def/use model never saw them and DSE killed the producing Iload, collapsing the call target to an uninitialized var. Recorded here so they count as uses of the call node.
+    pub(crate) mem_call_addr_uses: HashMap<Node, Vec<RTLReg>>,
 }
 
 
@@ -820,6 +916,18 @@ impl PassContext {
             .rel_iter::<(Address, RTLReg)>("emit_function_param_candidate")
             .cloned()
             .collect();
+        // Address regs feeding a mem-indirect call's target load, per call node (node -> [base, idx?]); see FunctionCFG::mem_call_addr_uses. Declared in extra_reads().
+        let mut mem_call_addr_uses: HashMap<Node, Vec<RTLReg>> = HashMap::new();
+        for (node, _temp, _chunk, _addr, args) in
+            db.rel_iter::<(Node, RTLReg, MemoryChunk, crate::x86::op::Addressing, Arc<Vec<RTLReg>>)>("call_through_memory_load")
+        {
+            let entry = mem_call_addr_uses.entry(*node).or_default();
+            for &r in args.iter() {
+                if !entry.contains(&r) {
+                    entry.push(r);
+                }
+            }
+        }
         let var_types: HashMap<RTLReg, XType> = {
             let mut groups: HashMap<RTLReg, Vec<XType>> = HashMap::new();
             for (reg, xty) in db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate") {
@@ -961,6 +1069,10 @@ impl PassContext {
                 }
             }
 
+            let func_mem_call_uses: HashMap<Node, Vec<RTLReg>> = nodes.iter()
+                .filter_map(|n| mem_call_addr_uses.get(n).map(|regs| (*n, regs.clone())))
+                .collect();
+
             functions.insert(func_addr, FunctionCFG {
                 func_addr,
                 entry,
@@ -969,6 +1081,7 @@ impl PassContext {
                 succs,
                 preds,
                 params: func_params.remove(&func_addr).unwrap_or_default(),
+                mem_call_addr_uses: func_mem_call_uses,
             });
         }
 
@@ -1101,7 +1214,15 @@ impl DefUseInfo {
         let mut uses: HashMap<RTLReg, Vec<Node>> = HashMap::new();
 
         for (&node, inst) in &func.inst {
-            let (def, used) = inst_def_use(inst);
+            let (def, mut used) = inst_def_use(inst);
+            // A mem-indirect call uses the regs that form its target-load address (the Icall callee is only a synthetic temp); without these, DSE eliminates the producing vtable Iload and the call target collapses to an uninitialized var.
+            if let Some(extra) = func.mem_call_addr_uses.get(&node) {
+                for &r in extra {
+                    if !used.contains(&r) {
+                        used.push(r);
+                    }
+                }
+            }
             if let Some(d) = def {
                 node_def.insert(node, d);
                 defs.entry(d).or_default().push(node);
@@ -1298,6 +1419,90 @@ fn src_not_redefined_on_paths_to_uses(
     }
 
     !reachable_redefs.iter().any(|n| backward.contains(n))
+}
+
+// True for an integer equality/inequality comparison, where `cmp x, x` is statically known (equal -> Ceq true / Cne false) regardless of value; ordered comparisons (Clt/Cle/Cgt/Cge) and float comparisons are excluded so only provably-determined branches fold.
+fn const_eq_branch_taken(cond: &Condition) -> Option<bool> {
+    match cond {
+        Condition::Ccomp(c) | Condition::Ccompu(c)
+        | Condition::Ccompl(c) | Condition::Ccomplu(c) => match c {
+            Comparison::Ceq => Some(true),
+            Comparison::Cne => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// Constant-fold a two-register conditional branch whose operands provably hold the SAME value, then drop the now-unreachable nodes: CRT stubs (deregister_tm_clones) compare two LEAs of the same global with `je`, so the statically-taken branch leaves the fall-through tail (and its undefined-return-value load) dead. Operands are equal only when the same register or both the identical 0-arg constant (`single_def_const`, e.g. same Oaddrsymbol), never firing for genuine runtime compares. Returns true if a branch was folded.
+fn fold_static_eq_branches(func: &mut FunctionCFG) -> bool {
+    let mut const_of: HashMap<RTLReg, Constant> = HashMap::new();
+    for inst in func.inst.values() {
+        if let RTLInst::Iop(op, args, dst) = inst {
+            if args.is_empty() {
+                if let Some(cst) = crate::decompile::passes::cminor_pass::constant_from_operation(op) {
+                    const_of.insert(*dst, cst);
+                }
+            }
+        }
+    }
+
+    let mut folds: Vec<(Node, Node, Node)> = Vec::new();
+    for (&node, inst) in &func.inst {
+        if let RTLInst::Icond(cond, args, Either::Right(ifso), Either::Right(ifnot)) = inst {
+            if args.len() != 2 {
+                continue;
+            }
+            let same_value = args[0] == args[1]
+                || matches!((const_of.get(&args[0]), const_of.get(&args[1])),
+                    (Some(a), Some(b)) if a == b);
+            if !same_value {
+                continue;
+            }
+            match const_eq_branch_taken(cond) {
+                Some(true) => folds.push((node, *ifso, *ifnot)),
+                Some(false) => folds.push((node, *ifnot, *ifso)),
+                None => {}
+            }
+        }
+    }
+    if folds.is_empty() {
+        return false;
+    }
+
+    for &(node, taken, _dead) in &folds {
+        func.inst.insert(node, RTLInst::Ibranch(Either::Right(taken)));
+        func.succs.insert(node, vec![taken]);
+    }
+
+    // Recompute reachability from entry and drop now-unreachable nodes so the dead tail and its bogus return-value load cannot surface downstream.
+    let mut reachable: HashSet<Node> = HashSet::new();
+    let mut stack = vec![func.entry];
+    reachable.insert(func.entry);
+    while let Some(n) = stack.pop() {
+        if let Some(succs) = func.succs.get(&n) {
+            for &s in succs {
+                if func.inst.contains_key(&s) && reachable.insert(s) {
+                    stack.push(s);
+                }
+            }
+        }
+    }
+
+    func.nodes.retain(|n| reachable.contains(n));
+    func.inst.retain(|n, _| reachable.contains(n));
+    func.succs.retain(|n, _| reachable.contains(n));
+    for dsts in func.succs.values_mut() {
+        dsts.retain(|d| reachable.contains(d));
+    }
+    let mut new_preds: HashMap<Node, Vec<Node>> = HashMap::new();
+    for (&src, dsts) in &func.succs {
+        for &dst in dsts {
+            new_preds.entry(dst).or_default().push(src);
+        }
+    }
+    func.preds = new_preds;
+    true
 }
 
 pub(crate) fn self_zero_rewrite(func: &mut FunctionCFG) -> usize {

@@ -14,18 +14,19 @@ struct LinearVal {
 impl LinearVal {
     fn from_const(c: i64) -> Self { Self { coeff: 0, constant: c } }
     fn from_disc() -> Self { Self { coeff: 1, constant: 0 } }
+    // Wrapping arithmetic throughout to match eval() (machine-register algebra mod 2^64): an oversized IR constant wraps instead of panicking in debug, and non-switch shapes are rejected later by the case-count/uniqueness checks.
     fn add(self, other: Self) -> Self {
-        Self { coeff: self.coeff + other.coeff, constant: self.constant + other.constant }
+        Self { coeff: self.coeff.wrapping_add(other.coeff), constant: self.constant.wrapping_add(other.constant) }
     }
     fn sub(self, other: Self) -> Self {
-        Self { coeff: self.coeff - other.coeff, constant: self.constant - other.constant }
+        Self { coeff: self.coeff.wrapping_sub(other.coeff), constant: self.constant.wrapping_sub(other.constant) }
     }
     // Only linear-times-constant is supported; two linear-in-disc would be quadratic and silently bail.
     fn mul(self, other: Self) -> Option<Self> {
         if other.coeff == 0 {
-            Some(Self { coeff: self.coeff * other.constant, constant: self.constant * other.constant })
+            Some(Self { coeff: self.coeff.wrapping_mul(other.constant), constant: self.constant.wrapping_mul(other.constant) })
         } else if self.coeff == 0 {
-            Some(Self { coeff: self.constant * other.coeff, constant: self.constant * other.constant })
+            Some(Self { coeff: self.constant.wrapping_mul(other.coeff), constant: self.constant.wrapping_mul(other.constant) })
         } else {
             None
         }
@@ -106,11 +107,12 @@ fn detect_closed_form_in_func(
                                 _ => continue,
                             };
                             // Cge/Cgt: disc out-of-range goes to default (true branch is default). Clt/Cle: disc in-range goes to formula (false branch is default).
+                            // saturating_add keeps an out-of-range bound (e.g. i64::MAX from a non-switch compare) from overflowing before the [2,32] range guard rejects it.
                             let (case_count, default_is_true) = match cmp {
                                 crate::x86::op::Comparison::Cge => (bound, true),
-                                crate::x86::op::Comparison::Cgt => (bound + 1, true),
+                                crate::x86::op::Comparison::Cgt => (bound.saturating_add(1), true),
                                 crate::x86::op::Comparison::Clt => (bound, false),
-                                crate::x86::op::Comparison::Cle => (bound + 1, false),
+                                crate::x86::op::Comparison::Cle => (bound.saturating_add(1), false),
                                 _ => continue,
                             };
                             if case_count < 2 || case_count > 32 { continue; }

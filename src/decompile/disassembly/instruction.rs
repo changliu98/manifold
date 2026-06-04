@@ -180,7 +180,8 @@ pub fn disassemble_sections(
                         };
                         let scale = mem.scale() as i64;
                         let disp = mem.disp();
-                        op_indirects.push((id, seg, base, index, scale, disp, 0));
+                        // Capstone operand byte width; authoritative access size (B5).
+                        op_indirects.push((id, seg, base, index, scale, disp, op.size as usize));
                         op_ids[i] = id;
 
                         // Memory operand base/index registers count as reg_use
