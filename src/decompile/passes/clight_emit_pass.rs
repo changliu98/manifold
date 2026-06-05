@@ -191,9 +191,9 @@ fn identify_opaque_libc_structs_from_tu(
     }
 
     // (2) Check function signatures of known opaque-pointer functions for struct params.
+    // Only an EXTERNAL declaration (FuncDecl) is a genuine libc extern whose opaque-param typedef table (FILE*/DIR*) applies. A FuncDef is a LOCAL definition (external funcs are emitted as FuncDecl, never FuncDef - see `internal_functions` filtering), so its own recovered signature wins: a local function sharing a tabled libc name (e.g. a static helper named `fseek`) must NOT have its struct param force-tagged as FILE. The call-site scan in (1) still recovers typedefs from real calls to libc functions.
     for decl in &tu.decls {
         let (name, params) = match decl {
-            TopLevelDecl::FuncDef(f) => (f.name.as_str(), &f.params),
             TopLevelDecl::FuncDecl(f) => (f.name.as_str(), &f.params),
             _ => continue,
         };

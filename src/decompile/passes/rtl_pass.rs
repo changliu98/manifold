@@ -2326,11 +2326,13 @@ ascent_par! {
         emit_function_signature_candidate(target_addr, sig),
         let inst = RTLInst::Itailcall(Some(sig.clone()), Either::Right(target.clone()), Arc::new(vec![]));
 
+    // The extern signature table applies to a by-name target ONLY when the binary does not itself define a function of that name. !emit_function gates out local symbols that happen to collide with a tabled libc name so the binary's own evidence wins. The twin rule below (positive emit_function) covers the gated symbol via inference, closing the hole the fallback `!known_extern_signature` would otherwise leave (it is false for a tabled name). emit_function is upstream of rtl_inst_candidate, so no negative cycle.
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
         if let Either::Right(target) = callee,
         if let Either::Right(symbol) = target,
         call_args_collected_candidate(addr, args),
+        !emit_function(_, symbol, _),
         known_extern_signature(symbol, _, ret_type, known_params),
         let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: CallConv::default() },
         let inst = RTLInst::Itailcall(Some(sig), Either::Right(target.clone()), args.clone());
@@ -2344,11 +2346,23 @@ ascent_par! {
         let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
         let inst = RTLInst::Itailcall(Some(inferred_sig), Either::Right(target.clone()), args.clone());
 
+    // Hole-closer twin of the rule above: a locally-defined symbol that ALSO has a table entry (so `!known_extern_signature` is false) still gets a signature, inferred from the binary's own call-site args rather than the corpus table.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        call_args_collected_candidate(addr, args),
+        emit_function(_, symbol, _),
+        known_extern_signature(symbol, _, _, _),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Itailcall(Some(inferred_sig), Either::Right(target.clone()), args.clone());
+
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
         if let Either::Right(target) = callee,
         if let Either::Right(symbol) = target,
         !call_args_collected_candidate(addr, _),
+        !emit_function(_, symbol, _),
         known_extern_signature(symbol, _, ret_type, _known_params),
         let sig = Signature { sig_args: Arc::new(vec![]), sig_res: *ret_type, sig_cc: CallConv::default() },
         let inst = RTLInst::Itailcall(Some(sig), Either::Right(target.clone()), Arc::new(vec![]));
@@ -2359,6 +2373,17 @@ ascent_par! {
         if let Either::Right(symbol) = target,
         !call_args_collected_candidate(addr, _),
         !known_extern_signature(symbol, _, _, _),
+        let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
+        let inst = RTLInst::Itailcall(Some(default_sig), Either::Right(target.clone()), Arc::new(vec![]));
+
+    // Hole-closer twin: locally-defined symbol that also has a table entry -> default sig (matching the no-args fallback above) instead of the corpus table.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        !call_args_collected_candidate(addr, _),
+        emit_function(_, symbol, _),
+        known_extern_signature(symbol, _, _, _),
         let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
         let inst = RTLInst::Itailcall(Some(default_sig), Either::Right(target.clone()), Arc::new(vec![]));
 
@@ -2412,6 +2437,7 @@ ascent_par! {
         call_return_reg(addr, _ret_rtl),
         reg_rtl(addr, Mreg::AX, final_ret),
         next(addr, next_addr),
+        !emit_function(_, symbol, _),
         known_extern_signature(symbol, _, ret_type, known_params),
         let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: CallConv::default() },
         let inst = RTLInst::Icall(Some(sig), Either::Right(target.clone()), args.clone(), Some(*final_ret), *next_addr);
@@ -2428,6 +2454,20 @@ ascent_par! {
         let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
         let inst = RTLInst::Icall(Some(inferred_sig), Either::Right(target.clone()), args.clone(), Some(*final_ret), *next_addr);
 
+    // Hole-closer twin: locally-defined symbol that also has a table entry -> inferred sig.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        call_args_collected_candidate(addr, args),
+        call_return_reg(addr, _ret_rtl),
+        reg_rtl(addr, Mreg::AX, final_ret),
+        next(addr, next_addr),
+        emit_function(_, symbol, _),
+        known_extern_signature(symbol, _, _, _),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Right(target.clone()), args.clone(), Some(*final_ret), *next_addr);
+
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lcall(callee)),
         if let Either::Right(target) = callee,
@@ -2435,6 +2475,7 @@ ascent_par! {
         !call_return_reg(addr, _),
         call_args_collected_candidate(addr, args),
         next(addr, next_addr),
+        !emit_function(_, symbol, _),
         known_extern_signature(symbol, _, _, known_params),
         let sig = Signature { sig_args: known_params.clone(), sig_res: XType::Xvoid, sig_cc: CallConv::default() },
         let inst = RTLInst::Icall(Some(sig), Either::Right(target.clone()), args.clone(), None, *next_addr);
@@ -2447,6 +2488,19 @@ ascent_par! {
         call_args_collected_candidate(addr, args),
         next(addr, next_addr),
         !known_extern_signature(symbol, _, _, _),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Right(target.clone()), args.clone(), None, *next_addr);
+
+    // Hole-closer twin: locally-defined symbol that also has a table entry -> inferred sig.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        !call_return_reg(addr, _),
+        call_args_collected_candidate(addr, args),
+        next(addr, next_addr),
+        emit_function(_, symbol, _),
+        known_extern_signature(symbol, _, _, _),
         let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
         let inst = RTLInst::Icall(Some(inferred_sig), Either::Right(target.clone()), args.clone(), None, *next_addr);
 
@@ -3722,6 +3776,8 @@ ascent_par! {
         ltl_inst(call_site, ?LTLInst::Lcall(Either::Right(Either::Left(target)))),
         base_ident_to_symbol(target_id, name),
         if *target as usize == *target_id,
+        // Local def wins: a binary's own function sharing a tabled libc name is not an extern call.
+        !emit_function(_, name, _),
         known_extern_signature(name, _, _, _);
 
     is_external_call(call_site, *name) <--
@@ -3760,10 +3816,12 @@ ascent_par! {
     // Also match symbol-based calls (Right(Right(name))) against known signatures
     call_has_known_signature(call_site, *name, *param_count, *ret_type) <--
         ltl_inst(call_site, ?LTLInst::Lcall(Either::Right(Either::Right(name)))),
+        !emit_function(_, name, _),
         known_extern_signature(name, param_count, ret_type, _);
 
     call_has_known_signature(call_site, *name, *param_count, *ret_type) <--
         ltl_inst(call_site, ?LTLInst::Ltailcall(Either::Right(Either::Right(name)))),
+        !emit_function(_, name, _),
         known_extern_signature(name, param_count, ret_type, _);
 
     relation unknown_extern(Symbol);
@@ -5543,6 +5601,7 @@ ascent_par! {
     must_be_ptr(ret_reg) <--
         call_site(node, func_name),
         call_return_reg(node, ret_reg),
+        !emit_function(_, func_name, _),
         known_func_returns_ptr(func_name);
     must_be_ptr(rtl_reg) <--
         ltl_inst(node, ?LTLInst::Lop(Operation::Oindirectsymbol(_), _, dst_mreg)),
@@ -5559,6 +5618,7 @@ ascent_par! {
     is_char_ptr(arg_reg) <--
         call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
+        !emit_function(_, func_name, _),
         known_extern_signature(func_name, _, _, params),
         if *arg_idx < params.len(),
         if matches!(params[*arg_idx], XType::Xcharptr);
@@ -5566,11 +5626,13 @@ ascent_par! {
     is_ptr(ret_reg) <--
         call_site(node, func_name),
         call_return_reg(node, ret_reg),
+        !emit_function(_, func_name, _),
         known_func_returns_ptr(func_name);
 
     is_char_ptr(ret_reg) <--
         call_site(node, func_name),
         call_return_reg(node, ret_reg),
+        !emit_function(_, func_name, _),
         known_extern_signature(func_name, _, ret_type, _),
         if matches!(ret_type, XType::Xcharptr);
 

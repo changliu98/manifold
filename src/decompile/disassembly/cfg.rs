@@ -565,7 +565,8 @@ fn find_jump_table_info(
             if let Some(target) = read_u64_at(section_data, entry_addr) {
                 if addr_set.contains(&target) {
                     ordered_targets.push(target);
-                } else if target > 0 && target < 0x10000 {
+                } else {
+                    // Membership is the real validator: the first entry that is not a known in-binary code address ends the table (mirrors the 4-byte path above). The previous magnitude test `target < 0x10000` was asymmetric - it skipped large non-member words instead of stopping, letting the scan walk past the table end and fabricate targets, so the .min(512) ceiling could not be safely raised. Terminating on membership makes the ceiling a pure safety bound rather than a correctness-load-bearing one.
                     break;
                 }
             } else {

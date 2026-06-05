@@ -985,7 +985,7 @@ impl PassContext {
                 } else {
                     let mut candidates = candidates;
                     candidates.sort_by_cached_key(|inst| format!("{:?}", inst));
-    // Bias selection toward Icond when both Icond and Iop coexist (fused flag-setter+jcc: cmp/test/sub/and+jcc; Iop is side-effect-only, Icond carries the CFG edge); without this Iop wins tie-break and the branch is dropped. reg_usage_count is a secondary tie-breaker for fused-flag and call-arg disambiguation cases beyond cmov shadow (now resolved upstream by lop_overwrite_use_id).
+                    // Icond wins categorically when Icond and Iop collide on one node (fused flag-setter+jcc: cmp/test/sub/and+jcc; Iop is side-effect-only, Icond carries the CFG edge), so the branch is never dropped. The (is_cond, ..) tuple makes instruction kind the primary key; score+arg_bonus (reg_usage_count-based) only breaks ties among same-kind candidates (cmov shadow resolved upstream by lop_overwrite_use_id).
                     let best = candidates.into_iter().max_by_key(|inst| {
                         let mut regs = HashSet::new();
                         collect_inst_regs(inst, &mut regs);
@@ -998,8 +998,8 @@ impl PassContext {
                             RTLInst::Icond(_, args, _, _) if !args.is_empty() => 1,
                             _ => 0,
                         };
-                        let cond_bonus = if matches!(inst, RTLInst::Icond(..)) { 100 } else { 0 };
-                        score + arg_bonus + cond_bonus
+                        let is_cond = matches!(inst, RTLInst::Icond(..));
+                        (is_cond, score + arg_bonus)
                     }).unwrap();
                     insts.insert(node, best);
                 }

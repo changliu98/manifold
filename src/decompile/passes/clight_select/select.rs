@@ -2953,7 +2953,8 @@ fn is_value_stmt(stmt: &ClightStmt) -> bool {
     }
 }
 
-const MAX_IFTHENELSE_DEPTH: usize = 4;
+// Recursion/stack-depth bound for goto-chain inlining (inline_body_if_local_track). It caps how deep a single-predecessor goto chain is followed through ALL statement kinds (Ssequence/Sloop/Sswitch/Sifthenelse/Slabel), not just if-then-else. Termination is already guaranteed by the `visiting` set; this cap exists ONLY to bound native stack depth, since the downstream printer (print.rs) recurses with no depth guard and would stack-overflow on a pathologically deep chain. Corpus max observed chain depth is ~81, so 256 admits every real chain while staying safely bounded.
+const MAX_GOTO_INLINE_DEPTH: usize = 256;
 
 fn count_predecessors(successors: &HashMap<Node, Vec<Node>>) -> HashMap<Node, usize> {
     let mut preds = HashMap::new();
@@ -3321,7 +3322,7 @@ fn inline_body_if_local_track(
 
             if pred_count == 1
                 && !visiting.contains(&target_node)
-                && inline_count < MAX_IFTHENELSE_DEPTH
+                && inline_count < MAX_GOTO_INLINE_DEPTH
             {
                 if let Some(target_stmt) = statements.get(&target_node) {
                     if is_trivial_labeled_goto(target_stmt) {
