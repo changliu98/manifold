@@ -808,35 +808,11 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         tu.add_function(func_def);
     }
 
-    // Functions declared by standard #include headers -- skip forward declarations to avoid conflicting with header prototypes.
-    let header_declared: HashSet<&str> = [
-        "printf", "fprintf", "sprintf", "snprintf", "puts", "putchar", "getchar",
-        "fopen", "fclose", "fread", "fwrite", "fgets", "fputs", "fflush", "fseek",
-        "ftell", "rewind", "sscanf", "fscanf", "perror", "remove", "rename", "tmpfile",
-        "setbuf", "setvbuf", "fileno", "clearerr", "feof", "ferror", "fdopen",
-        "fwrite_unlocked", "fread_unlocked", "fputs_unlocked", "fgets_unlocked",
-        "clearerr_unlocked", "feof_unlocked", "ferror_unlocked", "fileno_unlocked",
-        "fputc_unlocked", "fgetc_unlocked", "getc_unlocked", "putc_unlocked",
-        "malloc", "calloc", "realloc", "free", "exit", "abort", "atoi", "atol", "atof",
-        "strtol", "strtoul", "strtod", "strtoll", "strtoull", "qsort", "bsearch",
-        "abs", "labs", "getenv", "system", "rand", "srand", "atexit", "realpath",
-        "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat", "strncat",
-        "memcpy", "memmove", "memset", "memcmp", "strstr", "strchr", "strrchr",
-        "strtok", "strerror", "strdup", "strndup", "stpcpy", "stpncpy", "strcoll",
-        "strspn", "strcspn", "strnlen", "strpbrk", "strerror_r",
-        "open", "close", "read", "write", "lseek", "access", "unlink", "getpid",
-        "getcwd", "chdir", "isatty", "dup", "dup2", "pipe", "fork", "execve",
-        "ftruncate", "truncate", "link", "symlink", "readlink", "rmdir",
-        "stat", "fstat", "lstat", "mkdir", "chmod", "fchmod", "chown", "fchown",
-        "time", "clock", "difftime", "mktime", "localtime", "gmtime", "strftime",
-        "assert", "__assert_fail",
-        "signal", "raise", "sigaction",
-        "mmap", "munmap", "mprotect",
-        "setlocale", "bindtextdomain", "textdomain",
-        "pthread_create", "pthread_join", "pthread_mutex_lock", "pthread_mutex_unlock",
-        "pthread_mutex_init", "pthread_mutex_destroy",
-        "fcntl",
-    ].iter().copied().collect();
+    // A function whose declaration the compiler already provides (header prototype or builtin); our own decl only yields "conflicting types". Name/prefix lists live in header_functions.json (loaded into the DB), so this is data, not hardcoded.
+    let is_compiler_provided = |n: &str| {
+        db.header_declared_functions.contains(n)
+            || db.header_declared_prefixes.iter().any(|p| n.starts_with(p))
+    };
 
     // resolved_extern_signature comes from Ascent (set-semantics, non-deterministic order) and may carry multiple rows for the same function name (one per call-site signature). Group by sanitized name, pick a single signature deterministically, then emit in sorted name order so the C file is byte-stable across runs.
     let mut extern_by_name: BTreeMap<String, Vec<(usize, XType, Arc<Vec<XType>>)>> = BTreeMap::new();
@@ -848,7 +824,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             .push((*param_count, *ret_type, param_types.clone()));
     }
     for (sanitized_name, mut sigs) in extern_by_name {
-        if emitted_func_names.contains(&sanitized_name) || header_declared.contains(sanitized_name.as_str()) {
+        if emitted_func_names.contains(&sanitized_name) || is_compiler_provided(&sanitized_name) {
             continue;
         }
         // Deterministic pick: prefer the row whose XType vector compares smallest.
@@ -886,22 +862,17 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     unknown_extern_names.sort();
     unknown_extern_names.dedup();
     for sanitized_name in unknown_extern_names {
-        if emitted_func_names.contains(&sanitized_name) || header_declared.contains(sanitized_name.as_str()) {
+        if emitted_func_names.contains(&sanitized_name) || is_compiler_provided(&sanitized_name) {
             continue;
         }
         if resolved_extern_names.contains(&sanitized_name) {
             continue;
         }
 
-        // Derive the prototype from observed call sites (S1): an unknown-signature extern called with arguments gets a matching parameter list instead of the bare `int f(void)`.
-        let params: Vec<FuncParam> = call_sigs
-            .get(&sanitized_name)
-            .map(|tys| tys.iter().map(|t| FuncParam::new(None, t.clone())).collect())
-            .unwrap_or_default();
-        let decl = crate::decompile::passes::c_pass::types::FuncDecl::new(
+        // Unknown-signature extern: emit a K&R `int name();` (unspecified, unchecked args) so calls with any argument count compile, instead of guessing a fixed arity from one call site that breaks every call that disagrees.
+        let decl = crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
             sanitized_name,
             CType::Int(crate::decompile::passes::c_pass::types::IntSize::Int, crate::decompile::passes::c_pass::types::Signedness::Signed),
-            params,
         );
         tu.add_func_decl(decl);
     }
@@ -922,18 +893,12 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         for name in sorted_called_funcs {
             let is_label = name.starts_with("L_")
                 || (name.starts_with('L') && name.len() > 1 && name[1..].chars().all(|c| c.is_ascii_hexdigit()));
-            if !declared.contains(name) && !is_label && !header_declared.contains(name.as_str()) {
-                // Derive the prototype from the function's observed call sites so calls that pass arguments type-check, instead of the bare `int f(void)` that rejects them (S1).
-                let params: Vec<crate::decompile::passes::c_pass::types::FuncParam> = call_sigs
-                    .get(name)
-                    .map(|tys| tys.iter()
-                        .map(|t| crate::decompile::passes::c_pass::types::FuncParam::new(None, t.clone()))
-                        .collect())
-                    .unwrap_or_default();
-                let decl = crate::decompile::passes::c_pass::types::FuncDecl::new(
+            if !declared.contains(name) && !is_label && !is_compiler_provided(name)
+                && !emitted_func_names.contains(name) {
+                // Called-but-undeclared external of unknown signature: emit a K&R `int name();` (unspecified, unchecked args). Guarded to externals (not emitted internal funcs) to avoid the documented internal-forward-decl regression.
+                let decl = crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
                     name.clone(),
                     CType::Int(crate::decompile::passes::c_pass::types::IntSize::Int, crate::decompile::passes::c_pass::types::Signedness::Signed),
-                    params,
                 );
                 forward_decls.push(crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(decl));
             }
@@ -942,6 +907,145 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             if let crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(fd) = decl {
                 tu.add_func_decl(fd);
             }
+        }
+    }
+
+    // Forward declarations for internal (defined) functions, so a call preceding the definition doesn't get an implicit `int name()` that conflicts with it; uses each definition's reconciled signature and is pushed directly (not via add_func_decl) to preserve the symbol->definition mapping (the printer orders FuncDecl before FuncDef).
+    {
+        let mut internal_decls = Vec::new();
+        for decl in tu.decls.iter() {
+            if let crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDef(fdef) = decl {
+                if fdef.name == "main" {
+                    continue;
+                }
+                let mut fd = crate::decompile::passes::c_pass::types::FuncDecl::new(
+                    fdef.name.clone(),
+                    fdef.return_type.clone(),
+                    fdef.params.clone(),
+                );
+                fd.is_variadic = fdef.is_variadic;
+                internal_decls.push(fd);
+            }
+        }
+        for fd in internal_decls {
+            tu.decls.push(crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(fd));
+        }
+    }
+
+    // Normalize call-site argument counts to each callee's declared fixed arity so calls agree with their (now forward-declared) prototypes/definitions; only fixed-arity callees are collected, variadic and unspecified-prototype (K&R) callees are left as-is.
+    {
+        use crate::decompile::passes::c_pass::types::TopLevelDecl;
+        let mut arity_counts: HashMap<String, usize> = HashMap::new();
+        for decl in tu.decls.iter() {
+            match decl {
+                TopLevelDecl::FuncDef(f) if !f.is_variadic => {
+                    arity_counts.insert(f.name.clone(), f.params.len());
+                }
+                TopLevelDecl::FuncDecl(d) if !d.is_variadic && !d.unspecified_params => {
+                    arity_counts.entry(d.name.clone()).or_insert(d.params.len());
+                }
+                _ => {}
+            }
+        }
+        for decl in tu.decls.iter_mut() {
+            if let TopLevelDecl::FuncDef(f) = decl {
+                f.body = normalize_call_arity_stmt(&f.body, &arity_counts);
+            }
+        }
+    }
+
+    // Compilability: insert explicit (T) casts at int<->pointer assignment / argument / return mismatches (hard errors on modern clang/gcc even under -w); runs after arity normalization so padded arguments are coerced too, using each function's final params/locals/return type and the program's callee signatures.
+    {
+        use crate::decompile::passes::c_pass::types::TopLevelDecl;
+        let mut callee_params: CalleeParams = HashMap::new();
+        let mut callee_ret: HashMap<String, CType> = HashMap::new();
+        let mut global_types: HashMap<String, CType> = HashMap::new();
+        for decl in tu.decls.iter() {
+            match decl {
+                TopLevelDecl::FuncDef(f) => {
+                    callee_params.insert(
+                        f.name.clone(),
+                        (f.params.iter().map(|p| p.ty.clone()).collect(), f.is_variadic, false),
+                    );
+                    callee_ret.insert(f.name.clone(), f.return_type.clone());
+                }
+                TopLevelDecl::FuncDecl(d) => {
+                    callee_params.entry(d.name.clone()).or_insert_with(|| {
+                        (d.params.iter().map(|p| p.ty.clone()).collect(), d.is_variadic, d.unspecified_params)
+                    });
+                    callee_ret.entry(d.name.clone()).or_insert_with(|| d.return_type.clone());
+                }
+                TopLevelDecl::VarDecl(v) => {
+                    global_types.insert(v.name.clone(), v.ty.clone());
+                }
+                _ => {}
+            }
+        }
+        for decl in tu.decls.iter_mut() {
+            if let TopLevelDecl::FuncDef(f) = decl {
+                let mut types = global_types.clone();
+                for p in &f.params {
+                    if let Some(n) = &p.name {
+                        types.insert(n.clone(), p.ty.clone());
+                    }
+                }
+                for v in &f.local_vars {
+                    types.insert(v.name.clone(), v.ty.clone());
+                }
+                let ret = f.return_type.clone();
+                f.body = insert_casts_stmt(&f.body, &types, &callee_params, &callee_ret, &ret);
+            }
+        }
+    }
+
+    // Compilability: declare any referenced-but-undeclared global-scope identifier (rodata data labels like `L_1a2b3` taken by address, named globals like `error_one_per_line`) as a tentative `long` so it stops being an "undeclared identifier"; compiler-synthesized locals (var_*, p<N>, tmp*) are excluded, since an undeclared one of those is a local-scope recovery gap to fix upstream, not a global.
+    {
+        use crate::decompile::passes::c_pass::types::TopLevelDecl;
+        let mut declared: HashSet<String> = HashSet::new();
+        let mut locals: HashSet<String> = HashSet::new();
+        for decl in tu.decls.iter() {
+            match decl {
+                TopLevelDecl::FuncDef(f) => {
+                    declared.insert(f.name.clone());
+                    for p in &f.params {
+                        if let Some(n) = &p.name {
+                            locals.insert(n.clone());
+                        }
+                    }
+                    for v in &f.local_vars {
+                        locals.insert(v.name.clone());
+                    }
+                }
+                TopLevelDecl::FuncDecl(d) => {
+                    declared.insert(d.name.clone());
+                }
+                TopLevelDecl::VarDecl(v) => {
+                    declared.insert(v.name.clone());
+                }
+                _ => {}
+            }
+        }
+        let mut referenced: HashSet<String> = HashSet::new();
+        for decl in tu.decls.iter() {
+            if let TopLevelDecl::FuncDef(f) = decl {
+                collect_var_names_from_stmt(&f.body, &mut referenced);
+            }
+        }
+        let mut undeclared: Vec<String> = referenced
+            .into_iter()
+            .filter(|n| !declared.contains(n) && !locals.contains(n) && is_global_like_name(n))
+            .collect();
+        undeclared.sort();
+        undeclared.dedup();
+        for name in undeclared {
+            tu.decls.push(TopLevelDecl::VarDecl(VarDecl {
+                name,
+                ty: CType::long(),
+                storage_class: StorageClass::default(),
+                qualifiers: TypeQualifiers::none(),
+                init: None,
+                loc: SourceLoc::unknown(),
+            }));
         }
     }
 
@@ -2051,7 +2155,10 @@ fn repair_pointer_arith(
             if lhs_ptr { to_long(lhs) } else { lhs },
             if rhs_ptr { to_long(rhs) } else { rhs },
         ),
+        // ptr + ptr is invalid; ptr - ptr we normalize to an integer (byte) difference.
         BinaryOp::Add | BinaryOp::Sub if lhs_ptr && rhs_ptr => (to_long(lhs), to_long(rhs)),
+        // int - ptr is invalid C (a pointer may only be subtracted from a pointer); cast the pointer operand to long so it becomes integer subtraction (ptr - int and ptr + int are kept).
+        BinaryOp::Sub if rhs_ptr && !lhs_ptr => (lhs, to_long(rhs)),
         _ => (lhs, rhs),
     }
 }
@@ -2163,6 +2270,295 @@ fn repair_arith_stmt(stmt: &CStmt, types: &HashMap<String, CType>) -> CStmt {
         CStmt::Sequence(stmts) => CStmt::Sequence(stmts.iter().map(|s| repair_arith_stmt(s, types)).collect()),
         other => other.clone(),
     }
+}
+
+// Pad/truncate each call's argument list to the callee's declared fixed-arity parameter count so calls agree with the prototype/definition (forward declarations make this checked), padding with 0 (a valid integer / null-pointer constant); `counts` holds only fixed-arity callees, so variadic and unspecified-prototype (K&R) calls are left untouched.
+fn normalize_call_arity_expr(e: &CExpr, counts: &HashMap<String, usize>) -> CExpr {
+    match e {
+        CExpr::Call(func, args) => {
+            let nf = normalize_call_arity_expr(func, counts);
+            let mut nargs: Vec<CExpr> = args.iter().map(|a| normalize_call_arity_expr(a, counts)).collect();
+            if let CExpr::Var(name) = &nf {
+                if let Some(&pc) = counts.get(name) {
+                    if nargs.len() > pc {
+                        nargs.truncate(pc);
+                    } else {
+                        while nargs.len() < pc {
+                            nargs.push(CExpr::int(0));
+                        }
+                    }
+                }
+            }
+            CExpr::Call(Box::new(nf), nargs)
+        }
+        CExpr::Unary(op, i) => CExpr::Unary(*op, Box::new(normalize_call_arity_expr(i, counts))),
+        CExpr::Binary(op, l, r) => CExpr::Binary(*op, Box::new(normalize_call_arity_expr(l, counts)), Box::new(normalize_call_arity_expr(r, counts))),
+        CExpr::Assign(op, l, r) => CExpr::Assign(*op, Box::new(normalize_call_arity_expr(l, counts)), Box::new(normalize_call_arity_expr(r, counts))),
+        CExpr::Ternary(c, t, f) => CExpr::Ternary(Box::new(normalize_call_arity_expr(c, counts)), Box::new(normalize_call_arity_expr(t, counts)), Box::new(normalize_call_arity_expr(f, counts))),
+        CExpr::Cast(ty, i) => CExpr::Cast(ty.clone(), Box::new(normalize_call_arity_expr(i, counts))),
+        CExpr::Member(i, f) => CExpr::Member(Box::new(normalize_call_arity_expr(i, counts)), f.clone()),
+        CExpr::MemberPtr(i, f) => CExpr::MemberPtr(Box::new(normalize_call_arity_expr(i, counts)), f.clone()),
+        CExpr::Index(a, i) => CExpr::Index(Box::new(normalize_call_arity_expr(a, counts)), Box::new(normalize_call_arity_expr(i, counts))),
+        CExpr::SizeofExpr(i) => CExpr::SizeofExpr(Box::new(normalize_call_arity_expr(i, counts))),
+        CExpr::Paren(i) => CExpr::Paren(Box::new(normalize_call_arity_expr(i, counts))),
+        CExpr::StmtExpr(stmts, i) => CExpr::StmtExpr(
+            stmts.iter().map(|s| normalize_call_arity_stmt(s, counts)).collect(),
+            Box::new(normalize_call_arity_expr(i, counts)),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn normalize_call_arity_stmt(stmt: &CStmt, counts: &HashMap<String, usize>) -> CStmt {
+    match stmt {
+        CStmt::Expr(e) => CStmt::Expr(normalize_call_arity_expr(e, counts)),
+        CStmt::Block(items) => CStmt::Block(items.iter().map(|item| match item {
+            CBlockItem::Stmt(s) => CBlockItem::Stmt(normalize_call_arity_stmt(s, counts)),
+            other => other.clone(),
+        }).collect()),
+        CStmt::If(c, t, e) => CStmt::If(
+            normalize_call_arity_expr(c, counts),
+            Box::new(normalize_call_arity_stmt(t, counts)),
+            e.as_ref().map(|x| Box::new(normalize_call_arity_stmt(x, counts))),
+        ),
+        CStmt::While(c, b) => CStmt::While(normalize_call_arity_expr(c, counts), Box::new(normalize_call_arity_stmt(b, counts))),
+        CStmt::DoWhile(b, c) => CStmt::DoWhile(Box::new(normalize_call_arity_stmt(b, counts)), normalize_call_arity_expr(c, counts)),
+        CStmt::For(init, c, u, b) => CStmt::For(
+            init.clone(),
+            c.as_ref().map(|x| normalize_call_arity_expr(x, counts)),
+            u.as_ref().map(|x| normalize_call_arity_expr(x, counts)),
+            Box::new(normalize_call_arity_stmt(b, counts)),
+        ),
+        CStmt::Return(Some(e)) => CStmt::Return(Some(normalize_call_arity_expr(e, counts))),
+        CStmt::Switch(e, b) => CStmt::Switch(normalize_call_arity_expr(e, counts), Box::new(normalize_call_arity_stmt(b, counts))),
+        CStmt::Labeled(lbl, inner) => CStmt::Labeled(lbl.clone(), Box::new(normalize_call_arity_stmt(inner, counts))),
+        CStmt::Sequence(stmts) => CStmt::Sequence(stmts.iter().map(|s| normalize_call_arity_stmt(s, counts)).collect()),
+        other => other.clone(),
+    }
+}
+
+// Compilability: insert explicit (T) casts at int<->pointer mismatches, which modern clang (>=15) and gcc (>=14) reject as HARD errors even under `-w`; only the pointer-vs-integer pair is coerced (an explicit cast between scalars is always legal), while float<->pointer (itself illegal, the upstream selector's job) and unknown-class operands (casting risks making a legal conversion illegal) are left alone.
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum ScalarClass {
+    Ptr,
+    Int,
+    Float,
+    Other,
+}
+
+fn ctype_scalar_class(t: &CType) -> ScalarClass {
+    match t {
+        CType::Pointer(..) | CType::Array(..) => ScalarClass::Ptr,
+        CType::Int(..) | CType::Bool | CType::Enum(..) => ScalarClass::Int,
+        CType::Float(..) => ScalarClass::Float,
+        _ => ScalarClass::Other,
+    }
+}
+
+// Best-effort static class of an expression's value; Other == unknown (left untouched).
+fn cexpr_scalar_class(
+    e: &CExpr,
+    types: &HashMap<String, CType>,
+    callee_ret: &HashMap<String, CType>,
+) -> ScalarClass {
+    match e {
+        CExpr::Cast(ty, _) => ctype_scalar_class(ty),
+        CExpr::Var(name) => types.get(name).map(ctype_scalar_class).unwrap_or(ScalarClass::Other),
+        CExpr::Paren(inner) => cexpr_scalar_class(inner, types, callee_ret),
+        CExpr::IntLit(_) => ScalarClass::Int,
+        CExpr::FloatLit(_) => ScalarClass::Float,
+        CExpr::StringLit(_) => ScalarClass::Ptr,
+        CExpr::Unary(UnaryOp::AddrOf, _) => ScalarClass::Ptr,
+        CExpr::Unary(UnaryOp::Neg | UnaryOp::BitNot | UnaryOp::Not | UnaryOp::Plus, _) => ScalarClass::Int,
+        CExpr::Binary(BinaryOp::Add | BinaryOp::Sub, l, r) => {
+            if cexpr_scalar_class(l, types, callee_ret) == ScalarClass::Ptr
+                || cexpr_scalar_class(r, types, callee_ret) == ScalarClass::Ptr
+            {
+                ScalarClass::Ptr
+            } else {
+                ScalarClass::Int
+            }
+        }
+        CExpr::Binary(..) => ScalarClass::Int,
+        CExpr::Call(f, _) => match f.as_ref() {
+            CExpr::Var(n) => callee_ret.get(n).map(ctype_scalar_class).unwrap_or(ScalarClass::Other),
+            _ => ScalarClass::Other,
+        },
+        _ => ScalarClass::Other,
+    }
+}
+
+// Wrap `e` in a cast to `target` only at a genuine pointer<->integer mismatch (the hard-error pair).
+fn coerce_scalar(
+    target: &CType,
+    e: CExpr,
+    types: &HashMap<String, CType>,
+    callee_ret: &HashMap<String, CType>,
+) -> CExpr {
+    let mismatch = matches!(
+        (ctype_scalar_class(target), cexpr_scalar_class(&e, types, callee_ret)),
+        (ScalarClass::Ptr, ScalarClass::Int) | (ScalarClass::Int, ScalarClass::Ptr)
+    );
+    if !mismatch {
+        return e;
+    }
+    // 0 is a valid null-pointer constant and a valid integer; it never needs a cast.
+    if let CExpr::IntLit(l) = &e {
+        if l.value == 0 {
+            return e;
+        }
+    }
+    CExpr::Cast(target.clone(), Box::new(e))
+}
+
+// Type of an lvalue, for casting an assignment's RHS to it; handles a plain variable and a deref of a pointer variable, other lvalue forms (field, index) return None and are left untouched.
+fn lvalue_ctype(e: &CExpr, types: &HashMap<String, CType>) -> Option<CType> {
+    match e {
+        CExpr::Var(n) => types.get(n).cloned(),
+        CExpr::Paren(inner) => lvalue_ctype(inner, types),
+        CExpr::Unary(UnaryOp::Deref, inner) => match lvalue_ctype(inner, types) {
+            Some(CType::Pointer(t, _)) => Some(*t),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// name -> (param types, is_variadic, is_unspecified_K&R)
+type CalleeParams = HashMap<String, (Vec<CType>, bool, bool)>;
+
+fn insert_casts_expr(
+    e: &CExpr,
+    types: &HashMap<String, CType>,
+    callee_params: &CalleeParams,
+    callee_ret: &HashMap<String, CType>,
+) -> CExpr {
+    match e {
+        CExpr::Call(f, args) => {
+            let nf = insert_casts_expr(f, types, callee_params, callee_ret);
+            let mut nargs: Vec<CExpr> = args
+                .iter()
+                .map(|a| insert_casts_expr(a, types, callee_params, callee_ret))
+                .collect();
+            if let CExpr::Var(fname) = &nf {
+                if let Some((ptypes, _variadic, unspecified)) = callee_params.get(fname) {
+                    // K&R `f()` is unchecked; for variadics, ptypes covers only the fixed leading parameters, so `ptypes.get(i)` naturally leaves the variadic tail untouched.
+                    if !unspecified {
+                        for (i, a) in nargs.iter_mut().enumerate() {
+                            if let Some(pt) = ptypes.get(i) {
+                                let arg = std::mem::replace(a, CExpr::int(0));
+                                *a = coerce_scalar(pt, arg, types, callee_ret);
+                            }
+                        }
+                    }
+                }
+            }
+            CExpr::Call(Box::new(nf), nargs)
+        }
+        CExpr::Assign(op, lhs, rhs) => {
+            let nlhs = insert_casts_expr(lhs, types, callee_params, callee_ret);
+            let nrhs = insert_casts_expr(rhs, types, callee_params, callee_ret);
+            if *op == AssignOp::Assign {
+                if let Some(lty) = lvalue_ctype(&nlhs, types) {
+                    let nrhs = coerce_scalar(&lty, nrhs, types, callee_ret);
+                    return CExpr::Assign(*op, Box::new(nlhs), Box::new(nrhs));
+                }
+            }
+            CExpr::Assign(*op, Box::new(nlhs), Box::new(nrhs))
+        }
+        CExpr::Unary(op, i) => CExpr::Unary(*op, Box::new(insert_casts_expr(i, types, callee_params, callee_ret))),
+        CExpr::Binary(op, l, r) => CExpr::Binary(
+            *op,
+            Box::new(insert_casts_expr(l, types, callee_params, callee_ret)),
+            Box::new(insert_casts_expr(r, types, callee_params, callee_ret)),
+        ),
+        CExpr::Ternary(c, t, f) => CExpr::Ternary(
+            Box::new(insert_casts_expr(c, types, callee_params, callee_ret)),
+            Box::new(insert_casts_expr(t, types, callee_params, callee_ret)),
+            Box::new(insert_casts_expr(f, types, callee_params, callee_ret)),
+        ),
+        CExpr::Cast(ty, i) => CExpr::Cast(ty.clone(), Box::new(insert_casts_expr(i, types, callee_params, callee_ret))),
+        CExpr::Member(i, fld) => CExpr::Member(Box::new(insert_casts_expr(i, types, callee_params, callee_ret)), fld.clone()),
+        CExpr::MemberPtr(i, fld) => CExpr::MemberPtr(Box::new(insert_casts_expr(i, types, callee_params, callee_ret)), fld.clone()),
+        CExpr::Index(a, i) => CExpr::Index(
+            Box::new(insert_casts_expr(a, types, callee_params, callee_ret)),
+            Box::new(insert_casts_expr(i, types, callee_params, callee_ret)),
+        ),
+        CExpr::SizeofExpr(i) => CExpr::SizeofExpr(Box::new(insert_casts_expr(i, types, callee_params, callee_ret))),
+        CExpr::Paren(i) => CExpr::Paren(Box::new(insert_casts_expr(i, types, callee_params, callee_ret))),
+        CExpr::StmtExpr(stmts, i) => CExpr::StmtExpr(
+            stmts.iter().map(|s| insert_casts_stmt(s, types, callee_params, callee_ret, &CType::Void)).collect(),
+            Box::new(insert_casts_expr(i, types, callee_params, callee_ret)),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn insert_casts_stmt(
+    stmt: &CStmt,
+    types: &HashMap<String, CType>,
+    callee_params: &CalleeParams,
+    callee_ret: &HashMap<String, CType>,
+    ret_type: &CType,
+) -> CStmt {
+    match stmt {
+        CStmt::Expr(e) => CStmt::Expr(insert_casts_expr(e, types, callee_params, callee_ret)),
+        CStmt::Block(items) => CStmt::Block(
+            items
+                .iter()
+                .map(|item| match item {
+                    CBlockItem::Stmt(s) => CBlockItem::Stmt(insert_casts_stmt(s, types, callee_params, callee_ret, ret_type)),
+                    other => other.clone(),
+                })
+                .collect(),
+        ),
+        CStmt::If(c, t, e) => CStmt::If(
+            insert_casts_expr(c, types, callee_params, callee_ret),
+            Box::new(insert_casts_stmt(t, types, callee_params, callee_ret, ret_type)),
+            e.as_ref().map(|x| Box::new(insert_casts_stmt(x, types, callee_params, callee_ret, ret_type))),
+        ),
+        CStmt::While(c, b) => CStmt::While(
+            insert_casts_expr(c, types, callee_params, callee_ret),
+            Box::new(insert_casts_stmt(b, types, callee_params, callee_ret, ret_type)),
+        ),
+        CStmt::DoWhile(b, c) => CStmt::DoWhile(
+            Box::new(insert_casts_stmt(b, types, callee_params, callee_ret, ret_type)),
+            insert_casts_expr(c, types, callee_params, callee_ret),
+        ),
+        CStmt::For(init, c, u, b) => CStmt::For(
+            init.clone(),
+            c.as_ref().map(|x| insert_casts_expr(x, types, callee_params, callee_ret)),
+            u.as_ref().map(|x| insert_casts_expr(x, types, callee_params, callee_ret)),
+            Box::new(insert_casts_stmt(b, types, callee_params, callee_ret, ret_type)),
+        ),
+        CStmt::Switch(e, b) => CStmt::Switch(
+            insert_casts_expr(e, types, callee_params, callee_ret),
+            Box::new(insert_casts_stmt(b, types, callee_params, callee_ret, ret_type)),
+        ),
+        CStmt::Labeled(lbl, inner) => CStmt::Labeled(lbl.clone(), Box::new(insert_casts_stmt(inner, types, callee_params, callee_ret, ret_type))),
+        CStmt::Sequence(ss) => CStmt::Sequence(ss.iter().map(|s| insert_casts_stmt(s, types, callee_params, callee_ret, ret_type)).collect()),
+        CStmt::Return(Some(e)) => {
+            let ne = insert_casts_expr(e, types, callee_params, callee_ret);
+            let ne = if matches!(ret_type, CType::Void) { ne } else { coerce_scalar(ret_type, ne, types, callee_ret) };
+            CStmt::Return(Some(ne))
+        }
+        other => other.clone(),
+    }
+}
+
+// Whether a referenced-but-undeclared identifier should be declared as a file-scope object; excludes compiler-synthesized local/param/temporary names (var_*, p<N>, tmp*), whose absence is a local-scope recovery gap, not a missing global, and masking it with a file-scope object would hide the real bug.
+fn is_global_like_name(n: &str) -> bool {
+    if n.is_empty() {
+        return false;
+    }
+    if n.starts_with("var_") || n.starts_with("tmp") {
+        return false;
+    }
+    if n.starts_with('p') && n.len() >= 2 && n[1..].chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    true
 }
 
 fn convert_binary_op(op: &clight::ClightBinaryOp) -> BinaryOp {

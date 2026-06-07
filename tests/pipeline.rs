@@ -76,7 +76,16 @@ fn body_from_text(source: &str, func: &str) -> String {
         let line_start = source[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
         let prefix = &source[line_start..pos];
         if !prefix.starts_with(' ') && !prefix.starts_with('\t') && prefix.contains(' ') {
-            break pos;
+            // A definition has '{' before the next ';'; skip forward declarations (`ret name(...);`).
+            let rest = &source[pos..];
+            let is_def = match (rest.find('{'), rest.find(';')) {
+                (Some(b), Some(s)) => b < s,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if is_def {
+                break pos;
+            }
         }
         search_from = pos + 1;
     };

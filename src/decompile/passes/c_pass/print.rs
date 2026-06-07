@@ -586,7 +586,12 @@ impl Printer {
         self.print_type(&decl.return_type);
         self.write(" ");
         self.write(&decl.name);
-        self.print_params(&decl.params, decl.is_variadic);
+        if decl.unspecified_params {
+            // K&R unspecified arg list: no argument checking at call sites.
+            self.write("()");
+        } else {
+            self.print_params(&decl.params, decl.is_variadic);
+        }
         self.writeln(";");
     }
 
@@ -1029,7 +1034,14 @@ fn escape_char(c: char) -> String {
         '\'' => "\\'".to_string(),
         '\0' => "\\0".to_string(),
         c if c.is_ascii_graphic() || c == ' ' => c.to_string(),
-        c => format!("\\x{:02x}", c as u32),
+        // Non-graphic / non-ASCII: emit each UTF-8 byte as a 3-digit octal escape (the C lexer caps it at 3 digits, so it never runs into a following literal hex/octal digit the way greedy `\x` did, producing out-of-range escapes).
+        c => {
+            let mut buf = [0u8; 4];
+            c.encode_utf8(&mut buf)
+                .bytes()
+                .map(|b| format!("\\{:03o}", b))
+                .collect()
+        }
     }
 }
 
@@ -1138,34 +1150,41 @@ fn collect_needed_includes(tu: &TranslationUnit) -> Vec<&'static str> {
            "fopen", "fclose", "fread", "fwrite", "fgets", "fputs", "fflush", "fseek",
            "ftell", "rewind", "sscanf", "fscanf", "perror", "stdin", "stdout", "stderr",
            "vprintf", "vfprintf", "vsprintf", "vsnprintf", "remove", "rename", "tmpfile",
-           "setbuf", "setvbuf"], "<stdio.h>"),
+           "setbuf", "setvbuf", "fseeko", "ftello", "getline", "getdelim", "fileno", "fdopen"], "<stdio.h>"),
         (&["malloc", "calloc", "realloc", "free", "exit", "abort", "atoi", "atol", "atof",
            "strtol", "strtoul", "strtod", "qsort", "bsearch", "abs", "labs", "getenv",
-           "system", "rand", "srand", "EXIT_SUCCESS", "EXIT_FAILURE"], "<stdlib.h>"),
+           "system", "rand", "srand", "setenv", "unsetenv", "putenv", "mkstemp", "realpath",
+           "posix_memalign", "EXIT_SUCCESS", "EXIT_FAILURE"], "<stdlib.h>"),
         (&["strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat", "strncat",
            "memcpy", "memmove", "memset", "memcmp", "strstr", "strchr", "strrchr",
-           "strtok", "strerror", "strdup", "strndup"], "<string.h>"),
+           "strtok", "strerror", "strdup", "strndup", "memchr", "memrchr", "mempcpy",
+           "strsep", "strcasecmp", "strncasecmp", "strnlen", "stpcpy"], "<string.h>"),
         (&["isalpha", "isdigit", "isalnum", "isspace", "isupper", "islower", "toupper",
            "tolower", "isprint", "ispunct", "isxdigit", "iscntrl", "isgraph"], "<ctype.h>"),
         (&["assert", "__assert_fail"], "<assert.h>"),
         (&["va_start", "va_end", "va_arg", "va_copy"], "<stdarg.h>"),
         (&["errno"], "<errno.h>"),
         (&["open", "close", "read", "write", "lseek", "access", "unlink", "getpid",
-           "getcwd", "chdir", "isatty", "dup", "dup2", "pipe", "fork", "execve"], "<unistd.h>"),
-        (&["stat", "fstat", "lstat", "mkdir", "chmod"], "<sys/stat.h>"),
+           "getcwd", "chdir", "isatty", "dup", "dup2", "pipe", "fork", "execve",
+           "faccessat", "fchownat", "readlinkat", "symlinkat", "unlinkat", "linkat",
+           "fchdir", "chown", "fchown", "readlink", "rmdir", "ftruncate"], "<unistd.h>"),
+        (&["stat", "fstat", "lstat", "mkdir", "chmod", "fchmod", "fstatat", "umask",
+           "mkdirat", "fchmodat", "mknod", "mknodat"], "<sys/stat.h>"),
         (&["time", "clock", "difftime", "mktime", "localtime", "gmtime", "strftime",
-           "ctime", "asctime"], "<time.h>"),
+           "ctime", "asctime", "clock_gettime", "clock_settime", "localtime_r", "gmtime_r",
+           "nanosleep", "gettimeofday"], "<time.h>"),
         (&["sin", "cos", "tan", "sqrt", "pow", "log", "log10", "exp", "fabs", "ceil",
            "floor", "round", "fmod", "atan2", "asin", "acos", "atan", "sinh", "cosh",
            "tanh", "__builtin_fabs"], "<math.h>"),
         (&["setjmp", "longjmp"], "<setjmp.h>"),
-        (&["signal", "raise"], "<signal.h>"),
+        (&["signal", "raise", "sigprocmask", "sigaction", "sigemptyset", "sigaddset",
+           "sigdelset", "sigfillset", "sigismember", "kill", "pthread_sigmask"], "<signal.h>"),
         (&["mmap", "munmap", "mprotect"], "<sys/mman.h>"),
         (&["socket", "bind", "listen", "accept", "connect", "send", "recv",
            "setsockopt", "getsockopt"], "<sys/socket.h>"),
         (&["htons", "htonl", "ntohs", "ntohl", "inet_addr", "inet_ntoa"], "<arpa/inet.h>"),
         (&["ioctl"], "<sys/ioctl.h>"),
-        (&["fcntl"], "<fcntl.h>"),
+        (&["fcntl", "openat", "creat", "posix_fadvise", "posix_fallocate"], "<fcntl.h>"),
         (&["select", "FD_SET", "FD_CLR", "FD_ISSET", "FD_ZERO"], "<sys/select.h>"),
         (&["pthread_create", "pthread_join", "pthread_mutex_lock", "pthread_mutex_unlock",
            "pthread_mutex_init", "pthread_mutex_destroy"], "<pthread.h>"),

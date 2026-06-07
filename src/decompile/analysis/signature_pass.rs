@@ -482,6 +482,30 @@ fn reconcile_signatures(db: &mut DecompileDB) {
             .collect()
     };
 
+    // Diagnostic: trace the return-type ladder inputs for a target function (by name substring), to see
+    // why a void-bodied callee whose result is used stays void (X<-void errors).
+    if let Ok(target) = std::env::var("MANIFOLD_TRACE_RET") {
+        if !target.is_empty() {
+            let crv: std::collections::HashSet<Node> = db
+                .rel_iter::<(Node, Mreg)>("call_returns_value").map(|&(n, _)| n).collect();
+            let ctf: Vec<(Node, Address)> = db
+                .rel_iter::<(Node, Address)>("call_target_func").map(|&(n, a)| (n, a)).collect();
+            for &(addr, ref name, _) in db.rel_iter::<(Address, Symbol, Node)>("emit_function") {
+                if !name.contains(target.as_str()) { continue; }
+                let sites: Vec<Node> = ctf.iter().filter(|(_, a)| *a == addr).map(|(n, _)| *n).collect();
+                let sites_used = sites.iter().filter(|n| crv.contains(n)).count();
+                eprintln!(
+                    "RET-TRACE {} @ {:#x}: void_cand={} has_ret={} xtype={:?} has_calls={} any_uses_ret={} reconciled={:?} | call_target_sites={} sites_with_used_result={}",
+                    name, addr,
+                    def_void.contains(&addr), def_has_return.contains(&addr), def_return_types.get(&addr),
+                    has_call_sites_set.contains(&addr), any_call_uses_return_set.contains(&addr),
+                    reconciled_return_type_map.get(&addr),
+                    sites.len(), sites_used,
+                );
+            }
+        }
+    }
+
     // call_targets is consumed by patch_db and the call-site arg-type lookup below.
     let call_targets: HashMap<Node, Address> = db.rel_iter::<(Node, Address)>("call_target_func")
         .map(|&(call_node, target)| (call_node, target))
@@ -1137,16 +1161,17 @@ fn patch_db(
         db.rel_set("emit_function_void", new_void.into_iter().collect::<ascent::boxcar::Vec<_>>());
     }
 
+    // reg->rtl and def-at-use maps, shared by the (dead) call_args_collected reconciliation and the
+    // Icall/Itailcall argument-arity reconciliation in the rtl_inst patch below.
+    let reg_rtl_map: HashMap<(Node, Mreg), RTLReg> = db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl")
+        .map(|&(addr, ref mreg, rtl)| ((addr, *mreg), rtl))
+        .collect();
+    let mut reg_def_at_use: HashMap<(Mreg, Address), Address> = HashMap::new();
+    for &(def_addr, ref mreg, use_addr) in db.rel_iter::<(Address, Mreg, Address)>("reg_def_used") {
+        reg_def_at_use.insert((*mreg, use_addr), def_addr);
+    }
+
     {
-        let reg_rtl_map: HashMap<(Node, Mreg), RTLReg> = db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl")
-            .map(|&(addr, ref mreg, rtl)| ((addr, *mreg), rtl))
-            .collect();
-
-        let mut reg_def_at_use: HashMap<(Mreg, Address), Address> = HashMap::new();
-        for &(def_addr, ref mreg, use_addr) in db.rel_iter::<(Address, Mreg, Address)>("reg_def_used") {
-            reg_def_at_use.insert((*mreg, use_addr), def_addr);
-        }
-
         let mut new_call_args: Vec<(Node, Arc<Vec<RTLReg>>)> = Vec::new();
         let mut patched_calls: std::collections::HashSet<Node> = std::collections::HashSet::new();
 
@@ -1216,6 +1241,45 @@ fn patch_db(
     {
         let mut new_insts: Vec<(Node, RTLInst)> = Vec::new();
         let mut patched_insts: usize = 0;
+
+        // Reconcile a call's argument list to the callee's reconciled arity. cminor builds Scall directly
+        // from Icall.args, so the call site must carry exactly proto.param_count args or clang reports
+        // "too few/too many arguments" against the (already reconciled) callee declaration. Mirrors the
+        // truncate/widen logic that previously only updated the dead call_args_collected relation.
+        let reconcile_args = |call_node: Node, args: &Args, param_count: usize| -> Args {
+            if args.len() == param_count {
+                return args.clone();
+            }
+            if args.len() > param_count {
+                // Only fixed-arity signatures are modeled; drop the extra collected args.
+                return Arc::new(args.iter().take(param_count).cloned().collect());
+            }
+            let mut widened = args.as_ref().clone();
+            for i in args.len()..param_count {
+                if i < arg_regs().len() {
+                    let mreg = arg_regs()[i];
+                    if let Some(&rtl) = reg_rtl_map.get(&(call_node, mreg)) {
+                        widened.push(rtl);
+                        continue;
+                    }
+                    if let Some(&def_addr) = reg_def_at_use.get(&(mreg, call_node)) {
+                        if let Some(&rtl) = reg_rtl_map.get(&(def_addr, mreg)) {
+                            widened.push(rtl);
+                            continue;
+                        }
+                    }
+                    widened.push(fresh_xtl_reg(call_node, mreg));
+                } else {
+                    // Stack-passed parameters (beyond the 6 GP arg registers).
+                    widened.push(crate::decompile::passes::rtl_pass::fresh_stack_param_reg(
+                        call_node,
+                        i - arg_regs().len(),
+                    ));
+                }
+            }
+            Arc::new(widened)
+        };
+
         for &(node, ref inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
             match inst {
                 RTLInst::Icall(sig_opt, callee, args, dst, succ) => {
@@ -1230,15 +1294,23 @@ fn patch_db(
                             sig_res: proto.return_type,
                             sig_cc: sig_opt.as_ref().map(|s| s.sig_cc.clone()).unwrap_or_default(),
                         };
-                        let needs_patch = sig_opt.as_ref()
+                        // Variadic callees keep their full (tail-bearing) arg list; only fixed-arity
+                        // calls are reconciled to the prototype count.
+                        let new_args = if proto.is_varargs {
+                            args.clone()
+                        } else {
+                            reconcile_args(node, args, proto.param_count)
+                        };
+                        let sig_changed = sig_opt.as_ref()
                             .map(|s| s.sig_res != new_sig.sig_res
                                   || s.sig_args.as_slice() != new_sig.sig_args.as_slice())
                             .unwrap_or(true);
-                        if needs_patch {
+                        let args_changed = new_args.as_slice() != args.as_slice();
+                        if sig_changed || args_changed {
                             let new_inst = RTLInst::Icall(
                                 Some(new_sig),
                                 callee.clone(),
-                                args.clone(),
+                                new_args,
                                 *dst,
                                 *succ,
                             );
@@ -1261,15 +1333,23 @@ fn patch_db(
                             sig_res: proto.return_type,
                             sig_cc: sig_opt.as_ref().map(|s| s.sig_cc.clone()).unwrap_or_default(),
                         };
-                        let needs_patch = sig_opt.as_ref()
+                        // Variadic callees keep their full (tail-bearing) arg list; only fixed-arity
+                        // calls are reconciled to the prototype count.
+                        let new_args = if proto.is_varargs {
+                            args.clone()
+                        } else {
+                            reconcile_args(node, args, proto.param_count)
+                        };
+                        let sig_changed = sig_opt.as_ref()
                             .map(|s| s.sig_res != new_sig.sig_res
                                   || s.sig_args.as_slice() != new_sig.sig_args.as_slice())
                             .unwrap_or(true);
-                        if needs_patch {
+                        let args_changed = new_args.as_slice() != args.as_slice();
+                        if sig_changed || args_changed {
                             let new_inst = RTLInst::Itailcall(
                                 Some(new_sig),
                                 callee.clone(),
-                                args.clone(),
+                                new_args,
                             );
                             new_insts.push((node, new_inst));
                             patched_insts += 1;

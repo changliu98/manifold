@@ -175,6 +175,10 @@ pub struct DecompileDB {
     pub trace_enabled: bool,
     pub skip_function_names: HashSet<&'static str>,
     pub skip_function_prefixes: Vec<&'static str>,
+    // Standard-library / compiler-provided functions (and name prefixes) whose declarations the compiler
+    // already supplies; the C emitter skips emitting forward decls for these. From header_functions.json.
+    pub header_declared_functions: HashSet<&'static str>,
+    pub header_declared_prefixes: Vec<&'static str>,
     pub measure_rule_times: bool,
     pub rule_time_reports: Vec<(String, String)>,
 }
@@ -196,6 +200,8 @@ impl Default for DecompileDB {
             trace_enabled: false,
             skip_function_names: HashSet::new(),
             skip_function_prefixes: Vec::new(),
+            header_declared_functions: HashSet::new(),
+            header_declared_prefixes: Vec::new(),
             measure_rule_times: false,
             rule_time_reports: Vec::new(),
         }
@@ -343,6 +349,38 @@ impl DecompileDB {
     pub fn load_preset_functions(&mut self) {
         self.load_json_signatures();
         self.load_skip_functions();
+        self.load_header_functions();
+    }
+
+    // Load standard-library / compiler-provided function names (and prefixes) from header_functions.json;
+    // the C emitter skips emitting forward declarations for these (the compiler already declares them).
+    fn load_header_functions(&mut self) {
+        let json_str = include_str!("../data/json/header_functions.json");
+        let parsed: serde_json::Value = match serde_json::from_str(json_str) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("Failed to parse header_functions.json: {}", e);
+                return;
+            }
+        };
+        for (category, names) in parsed.as_object().into_iter().flatten() {
+            if category == "_comment" {
+                continue;
+            }
+            if let Some(arr) = names.as_array() {
+                for name in arr {
+                    if let Some(s) = name.as_str() {
+                        if category == "prefixes" {
+                            self.header_declared_prefixes.push(leak(s.to_string()));
+                        } else {
+                            self.header_declared_functions.insert(leak(s.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        log::info!("Loaded {} header-declared function names, {} prefixes",
+            self.header_declared_functions.len(), self.header_declared_prefixes.len());
     }
 
     // Load CRT/library function names and prefixes to skip from skip_functions.json.

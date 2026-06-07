@@ -1,5 +1,18 @@
 {
   "functions": [
+    { "name": "dlopen", "sig_args": ["Xcharptr", "Xint"], "sig_res": "Xptr", "ptr_params": [0] },
+    { "name": "dlsym", "sig_args": ["Xptr", "Xcharptr"], "sig_res": "Xptr", "ptr_params": [0, 1] },
+    { "name": "dlclose", "sig_args": ["Xptr"], "sig_res": "Xint", "ptr_params": [0] },
+    { "name": "dlerror", "sig_args": [], "sig_res": "Xcharptr" },
+    { "name": "_Unwind_Resume", "sig_args": ["Xptr"], "sig_res": "Xvoid", "ptr_params": [0] },
+    { "name": "GC_malloc", "sig_args": ["Xlong"], "sig_res": "Xptr" },
+    { "name": "GC_malloc_atomic", "sig_args": ["Xlong"], "sig_res": "Xptr" },
+    { "name": "GC_free", "sig_args": ["Xptr"], "sig_res": "Xvoid", "ptr_params": [0] },
+    { "name": "GC_realloc", "sig_args": ["Xptr", "Xlong"], "sig_res": "Xptr", "ptr_params": [0] },
+    { "name": "GC_strdup", "sig_args": ["Xcharptr"], "sig_res": "Xcharptr", "ptr_params": [0] },
+    { "name": "XInternAtom", "sig_args": ["Xptr", "Xcharptr", "Xint"], "sig_res": "Xlong", "ptr_params": [0, 1] },
+    { "name": "XFree", "sig_args": ["Xptr"], "sig_res": "Xint", "ptr_params": [0] },
+    { "name": "XFlush", "sig_args": ["Xptr"], "sig_res": "Xint", "ptr_params": [0] },
     {
       "name": "signal",
       "sig_args": [

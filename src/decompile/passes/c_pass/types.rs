@@ -647,6 +647,8 @@ pub struct FuncDecl {
     pub return_type: CType,
     pub params: Vec<FuncParam>,
     pub is_variadic: bool,
+    /// When true, emit `()` (an unspecified, unchecked K&R argument list) instead of `(void)`.
+    pub unspecified_params: bool,
     pub loc: SourceLoc,
 }
 
@@ -657,6 +659,20 @@ impl FuncDecl {
             return_type,
             params,
             is_variadic: false,
+            unspecified_params: false,
+            loc: SourceLoc::unknown(),
+        }
+    }
+
+    // Declaration with an unspecified (K&R) parameter list `RET name();`: the compiler does no
+    // argument-count/type checking at call sites. Used for external functions of unknown signature.
+    pub fn new_unspecified(name: impl Into<String>, return_type: CType) -> Self {
+        Self {
+            name: name.into(),
+            return_type,
+            params: Vec::new(),
+            is_variadic: false,
+            unspecified_params: true,
             loc: SourceLoc::unknown(),
         }
     }

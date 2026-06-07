@@ -2,6 +2,7 @@
 
 pub mod query;
 pub mod select;
+pub mod solve;
 
 
 pub fn derive_canonical_path(path_str: &str) -> String {

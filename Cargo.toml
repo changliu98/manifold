@@ -20,8 +20,8 @@ capstone = "0.13.0"
 object = "0.38.1"
 rayon = "1.10"
 smallvec = "1.13"
-clang-sys = { version = "1", features = ["runtime"] }
 rand = { version = "0.8", features = ["small_rng"] }
+z3 = "0.20"
 
 [features]
 par = ["ascent/par"]
@@ -34,8 +34,9 @@ incremental = true
 
 [profile.release]
 lto = "none"
-codegen-units = 100
-opt-level = 1
+codegen-units = 256
+opt-level = 0
 panic = "abort"
 strip = true
 debug = 0
+incremental = true

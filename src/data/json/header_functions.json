@@ -1,0 +1,59 @@
+{
+  "_comment": "Standard-library / compiler-provided functions whose declarations clang already supplies (via system headers or builtins). The C emitter must NOT emit its own forward declaration for these -- a synthetic prototype only produces 'conflicting types'. Loaded into DecompileDB.header_declared_functions and consumed by from_relations.rs. Keep in sync with the #include selection map in c_pass/print.rs (collect_needed_includes): a name skipped here must have its header emitted there, or it becomes 'undeclared' instead of 'conflicting'. 'prefixes' lists name prefixes to skip (e.g. compiler intrinsics).",
+  "stdio": [
+    "printf", "fprintf", "sprintf", "snprintf", "puts", "putchar", "getchar",
+    "fopen", "fclose", "fread", "fwrite", "fgets", "fputs", "fflush", "fseek",
+    "ftell", "rewind", "sscanf", "fscanf", "perror", "remove", "rename", "tmpfile",
+    "setbuf", "setvbuf", "fileno", "clearerr", "feof", "ferror", "fdopen",
+    "getc", "putc", "fputc", "vsnprintf", "vfprintf", "vprintf", "vsprintf",
+    "vscanf", "vsscanf", "vfscanf",
+    "fseeko", "ftello", "getline", "getdelim"
+  ],
+  "stdio_unlocked": [
+    "fwrite_unlocked", "fread_unlocked", "fputs_unlocked", "fgets_unlocked",
+    "clearerr_unlocked", "feof_unlocked", "ferror_unlocked", "fileno_unlocked",
+    "fputc_unlocked", "fgetc_unlocked", "getc_unlocked", "putc_unlocked"
+  ],
+  "stdlib": [
+    "malloc", "calloc", "realloc", "free", "exit", "abort", "atoi", "atol", "atof",
+    "strtol", "strtoul", "strtod", "strtoll", "strtoull", "qsort", "bsearch",
+    "abs", "labs", "getenv", "system", "rand", "srand", "atexit", "realpath",
+    "posix_memalign", "aligned_alloc",
+    "setenv", "unsetenv", "putenv", "mkstemp"
+  ],
+  "string": [
+    "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat", "strncat",
+    "memcpy", "memmove", "memset", "memcmp", "strstr", "strchr", "strrchr",
+    "strtok", "strerror", "strdup", "strndup", "stpcpy", "stpncpy", "strcoll",
+    "strspn", "strcspn", "strnlen", "strpbrk", "strerror_r", "strcasecmp", "strncasecmp",
+    "memchr", "memrchr", "mempcpy", "strsep"
+  ],
+  "unistd": [
+    "open", "close", "read", "write", "lseek", "access", "unlink", "getpid",
+    "getcwd", "chdir", "isatty", "dup", "dup2", "pipe", "fork", "execve",
+    "ftruncate", "truncate", "link", "symlink", "readlink", "rmdir", "select", "fcntl",
+    "openat", "faccessat", "fchownat", "readlinkat", "symlinkat", "unlinkat", "linkat",
+    "fchdir", "chown", "fchown"
+  ],
+  "sys_stat": [
+    "stat", "fstat", "lstat", "mkdir", "chmod", "fchmod", "chown", "fchown",
+    "fstatat", "umask", "mkdirat", "fchmodat", "mknod", "mknodat"
+  ],
+  "sys_ioctl": ["ioctl"],
+  "time": [
+    "time", "clock", "difftime", "mktime", "localtime", "gmtime", "strftime",
+    "clock_gettime", "clock_settime", "localtime_r", "gmtime_r", "nanosleep", "gettimeofday"
+  ],
+  "assert": ["assert", "__assert_fail"],
+  "signal": [
+    "signal", "raise", "sigaction", "sigprocmask", "sigemptyset", "sigaddset",
+    "sigdelset", "sigfillset", "sigismember", "kill", "pthread_sigmask"
+  ],
+  "mman": ["mmap", "munmap", "mprotect"],
+  "locale_gettext": ["setlocale", "bindtextdomain", "textdomain"],
+  "pthread": [
+    "pthread_create", "pthread_join", "pthread_mutex_lock", "pthread_mutex_unlock",
+    "pthread_mutex_init", "pthread_mutex_destroy"
+  ],
+  "prefixes": ["__builtin_"]
+}

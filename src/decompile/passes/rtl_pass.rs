@@ -11,6 +11,8 @@ use crate::x86::mach::Mreg;
 use crate::x86::op::{Addressing, Comparison, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
+use ascent::Dual;
+use ascent::lattice::set::Set;
 use either::Either;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use crate::util::DEFAULT_VAR;
@@ -20,6 +22,15 @@ use log::info;
 use rayon::prelude::*;
 
 const ENDBR64_LEN: u64 = 4;
+
+// Strict-dominator set plus the node itself, mirroring structuring_pass's dom_set helper. Used by the
+// block-dominator lattice in RTLPassProgram so dominance is maintained as O(blocks * dom-depth) lattice
+// state rather than an O(blocks^2) pairwise/path-avoiding workspace.
+fn dom_set_with_self(strict: &Set<Address>, n: Address) -> Set<Address> {
+    let mut s = strict.0.clone();
+    s.insert(n);
+    Set(s)
+}
 
 ascent_par! {
     #![measure_rule_times]
@@ -2679,12 +2690,7 @@ ascent_par! {
     // (b) a float/double X0 def reaches a return (mirror of the func_has_ax_return_value X0 rule).
     func_produces_retval(func_start) <--
         instr_in_function(ret_addr, func_start),
-        ltl_inst(ret_addr, ?LTLInst::Lreturn),
-        instr_in_function(def_addr, func_start),
-        reg_def_site(def_addr, Mreg::X0),
-        instr_min_order(func_start, def_addr, def_order),
-        instr_min_order(func_start, ret_addr, ret_order),
-        if *def_order <= *ret_order;
+        def_reaches_return(ret_addr, _, Mreg::X0);
     // (c) the function forwards a local callee's result and that callee itself produces a value (positive recursion -- keeps the SCC negation-free and thus stratifiable).
     func_produces_retval(func_start) <--
         instr_in_function(call_addr, func_start),
@@ -3025,12 +3031,7 @@ ascent_par! {
     relation func_x0_def_reaches_return(Address);
     func_x0_def_reaches_return(func_start) <--
         instr_in_function(ret_addr, func_start),
-        ltl_inst(ret_addr, ?LTLInst::Lreturn),
-        instr_in_function(def_addr, func_start),
-        reg_def_site(def_addr, Mreg::X0),
-        instr_min_order(func_start, def_addr, def_order),
-        instr_min_order(func_start, ret_addr, ret_order),
-        if *def_order <= *ret_order;
+        def_reaches_return(ret_addr, _, Mreg::X0);
 
     // AX def-site reaching a return, structural (reg_def_site only) so it stays OUT of the reg_def_used/reg_use SCC (gating on ax_value_direct would put the negation below in the same stratum as the X0 reg_use this drives, unstratifiable); an AX def reaching a return means an int/ptr/bool result in AX, not a float return, correctly excluding e.g. `return p3 < fabs(p1-p2)` (bool in AX, live XMM only as a compare operand).
     #[local] relation ax_value_write(Address);
@@ -3041,12 +3042,8 @@ ascent_par! {
     relation func_ax_def_reaches_return(Address);
     func_ax_def_reaches_return(func_start) <--
         instr_in_function(ret_addr, func_start),
-        ltl_inst(ret_addr, ?LTLInst::Lreturn),
-        instr_in_function(def_addr, func_start),
-        ax_value_write(def_addr),
-        instr_min_order(func_start, def_addr, def_order),
-        instr_min_order(func_start, ret_addr, ret_order),
-        if *def_order <= *ret_order;
+        def_reaches_return(ret_addr, def_addr, Mreg::AX),
+        ax_value_write(def_addr);
 
     // An X0-to-memory store reaching a return: X0 here is a computed temp written out, not the returned value (a genuine double return leaves X0 untouched-by-store before ret).
     relation func_x0_stored_before_return(Address);
@@ -3155,21 +3152,17 @@ ascent_par! {
         live_var_used(use_block, reg, use_addr);
 
     param_reg_used_early(*func_start, *mreg) <--
-        instr_in_function(use_addr, func_start),
-        function_entry_count(func_start, use_addr, count),
-        if *count < FUNC_ARG_DIST as i64,
+        arg_reg_param_live_at(func_start, use_addr, mreg),
+        is_arg_reg(mreg),
         reg_use(use_addr, mreg),
-        !trim_instruction(use_addr),
-        is_arg_reg(mreg);
+        !trim_instruction(use_addr);
 
     reg_def_used(*func_start, *mreg, *use_addr) <--
         param_reg_used_early(func_start, mreg),
-        instr_in_function(use_addr, func_start),
-        function_entry_count(func_start, use_addr, count),
-        if *count < FUNC_ARG_DIST as i64,
+        arg_reg_param_live_at(func_start, use_addr, mreg),
+        is_arg_reg(mreg),
         reg_use(use_addr, mreg),
-        !trim_instruction(use_addr),
-        !block_last_def(use_addr, _, mreg);
+        !trim_instruction(use_addr);
 
     is_early_arg_use(func_start, addr) <--
         function_entry_count(func_start, addr, count),
@@ -3178,21 +3171,17 @@ ascent_par! {
     // Float (XMM) parameter early reaching-def, mirroring the integer param_reg_used_early / reg_def_used edge: is_arg_reg holds only int regs, so XMM args (X0-X7) never got the func_start->early-use edge and their mid-function uses stayed fresh/undefined (an XMM compare operand or fabs input). Gated only on is_float_arg_reg (not the validated set) to stay out of the func_float_param_used negation cycle; the func_start synthetic def is excluded from the float param detector (xmm_arg_use_has_internal_def below) so it cannot suppress validation.
     #[local] relation float_param_reg_used_early(Address, Mreg);
     float_param_reg_used_early(*func_start, *mreg) <--
-        instr_in_function(use_addr, func_start),
-        function_entry_count(func_start, use_addr, count),
-        if *count < FUNC_ARG_DIST as i64,
+        arg_reg_param_live_at(func_start, use_addr, mreg),
+        is_float_arg_reg(mreg),
         reg_use(use_addr, mreg),
-        !trim_instruction(use_addr),
-        is_float_arg_reg(mreg);
+        !trim_instruction(use_addr);
 
     reg_def_used(*func_start, *mreg, *use_addr) <--
         float_param_reg_used_early(func_start, mreg),
-        instr_in_function(use_addr, func_start),
-        function_entry_count(func_start, use_addr, count),
-        if *count < FUNC_ARG_DIST as i64,
+        arg_reg_param_live_at(func_start, use_addr, mreg),
+        is_float_arg_reg(mreg),
         reg_use(use_addr, mreg),
-        !trim_instruction(use_addr),
-        !block_last_def(use_addr, _, mreg);
+        !trim_instruction(use_addr);
 
     relation stack_xtl(Address, Address, i64, RTLReg);
     relation stack_var(Address, Address, i64, RTLReg);
@@ -3285,35 +3274,27 @@ ascent_par! {
         block_in_function(entry_block, func),
         code_in_block(func, entry_block);
 
-    // Block reachability from the entry block (within a function).
-    #[local] relation block_reachable_from_entry(Address, Address);
-    block_reachable_from_entry(func, entry_block) <--
+    // Block-dominator lattice (Cooper-Harvey-Kennedy), same shape as structuring_pass dom_set:
+    // dominators(block) = {block} INTERSECT-FOLD dominators(preds). Stored as Dual<Set> so the lattice
+    // join is set intersection. Storage is O(blocks * dom-tree-depth) versus the old block_path_avoiding
+    // workspace's O(blocks^2) per function -- the same construct structuring_pass replaced to drop pass
+    // peak by tens of GB. is_loop_back_edge queries dominator-set membership directly, so no pairwise
+    // block_dom relation is materialized.
+    #[local] lattice block_strict_dom_set(Address, Address, Dual<Set<Address>>);
+    lattice block_dom_set(Address, Address, Dual<Set<Address>>);
+
+    block_dom_set(*func, *entry_block, Dual(Set::singleton(*entry_block))) <--
         func_entry_block(func, entry_block);
-    block_reachable_from_entry(func, next_block) <--
-        block_reachable_from_entry(func, blk),
-        asm_block_next(blk, next_block),
-        block_in_function(next_block, func);
 
-    // path_avoiding(func, block, d): block is reachable from entry without passing through d.
-    #[local] relation block_path_avoiding(Address, Address, Address);
-    block_path_avoiding(func, entry_block, d) <--
-        func_entry_block(func, entry_block),
-        block_reachable_from_entry(func, d),
-        if *entry_block != *d;
-    block_path_avoiding(func, next_block, d) <--
-        block_path_avoiding(func, blk, d),
-        asm_block_next(blk, next_block),
-        block_in_function(next_block, func),
-        if *next_block != *d;
+    block_strict_dom_set(*func, *n, Dual(p_doms.0.clone())) <--
+        block_dom_set(func, p, p_doms),
+        asm_block_next(p, n),
+        block_in_function(n, func),
+        !func_entry_block(func, n);
 
-    // Block dominance: d dominates b iff no path from entry to b avoids d.
-    #[local] relation block_dom(Address, Address, Address);
-    block_dom(func, blk, blk) <--
-        block_reachable_from_entry(func, blk);
-    block_dom(func, blk, d) <--
-        block_reachable_from_entry(func, blk),
-        block_reachable_from_entry(func, d),
-        !block_path_avoiding(func, blk, d);
+    block_dom_set(*func, *n, Dual(dom_set_with_self(&strict.0, *n))) <--
+        block_strict_dom_set(func, n, strict),
+        !func_entry_block(func, n);
 
     // Back-edge: ltl_succ (src, dst) where dst's block dominates src's block in the same function.
     #[local] relation is_loop_back_edge(Address, Address);
@@ -3323,13 +3304,86 @@ ascent_par! {
         code_in_block(dst, dst_block),
         if *src_block != *dst_block,
         instr_in_function(src, func),
-        block_dom(func, src_block, dst_block);
+        block_dom_set(func, src_block, doms),
+        if doms.0.contains(dst_block);
     // Intra-block back-edge: dst <= src within the same block (backward jump).
     is_loop_back_edge(src, dst) <--
         rtl_next(src, dst),
         code_in_block(src, blk),
         code_in_block(dst, blk),
         if *dst <= *src;
+
+    // ---- Reaching-definition lattice -----------------------------------------------------------
+    // Forward MAY-reaching-defs of a register at each block ENTRY, restricted to argument/return
+    // registers (reg_of_interest) to bound cost. The Set lattice join is union (may-reach). This is the
+    // lattice-maintained replacement for the instr_min_order / function_entry_count magnitude proxies:
+    // "def d reaches point u for reg r" becomes block_last_def(u,d,r) intra-block, else
+    // d in reaching_def_in(func, block_of_u, r) with no in-block redef -- exact at any distance. Seeded
+    // ONLY from real def-sites (last_def_in_block), never func_param_validated, so it stays out of the
+    // param-validation negation SCC. Inert for now (no consumers); wired into G1/G2/G3 in later steps.
+    #[local] relation reg_of_interest(Mreg);
+    reg_of_interest(r) <-- is_arg_reg(r);
+    reg_of_interest(r) <-- is_xmm_arg_reg(r);
+    reg_of_interest(Mreg::AX);
+    reg_of_interest(Mreg::X0);
+
+    #[local] lattice reaching_def_in(Address, Address, Mreg, Set<Address>);
+
+    // gen: the def of r leaving block blk (its in-block last def) reaches every successor's entry and
+    // kills any incoming value of r along that block.
+    reaching_def_in(*func, *succ, *r, Set::singleton(*d)) <--
+        reg_of_interest(r),
+        last_def_in_block(blk, d, r),
+        block_in_function(blk, func),
+        asm_block_next(blk, succ),
+        instr_in_function(succ, func);
+
+    // pass-through: blk does not define r, so its incoming reaching set flows unchanged to successors.
+    reaching_def_in(*func, *succ, *r, in_set.clone()) <--
+        reaching_def_in(func, blk, r, in_set),
+        !asm_defined_in_block(blk, r),
+        asm_block_next(blk, succ),
+        instr_in_function(succ, func);
+
+    // def_addr (a def of reg r) reaches return ret_addr: intra-block via block_last_def, else cross-block
+    // via membership in the reaching set at the return's block (with no in-block def shadowing it). This
+    // is the structural replacement for the instr_min_order "def_order <= ret_order" magnitude proxy --
+    // it counts only defs that actually flow to the return, not every def positioned closer to entry. It
+    // depends only on reaching_def_in + block_last_def (both structural), so consumers stay OUT of the
+    // reg_def_used / reg_use SCC.
+    relation def_reaches_return(Address, Address, Mreg);
+    def_reaches_return(*ret_addr, *def_addr, *r) <--
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        reg_of_interest(r),
+        block_last_def(ret_addr, def_addr, r);
+    def_reaches_return(*ret_addr, *def_addr, *r) <--
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        reg_of_interest(r),
+        code_in_block(ret_addr, blk),
+        instr_in_function(ret_addr, func),
+        !block_last_def(ret_addr, _, r),
+        reaching_def_in(func, blk, r, s),
+        for def_addr in s.0.iter();
+
+    // def_addr (a def of reg r) reaches call call_addr: intra-block via block_last_def, else cross-block
+    // via the reaching set at the call's block (with no in-block def shadowing it). Mirrors
+    // def_reaches_return. This is the structural replacement for arg setup's call_backward_reach (a
+    // 128-step distance-bounded reach) + instr_min_order proximity window + order-based clobber rules:
+    // reaching_def_in already excludes any def clobbered before the call (gen/kill), so the reaching set
+    // at the call IS exactly the candidate arg value(s), with no window and no ordering.
+    relation def_reaches_call(Address, Address, Mreg);
+    def_reaches_call(*call_addr, *def_addr, *r) <--
+        is_call_instruction(call_addr),
+        reg_of_interest(r),
+        block_last_def(call_addr, def_addr, r);
+    def_reaches_call(*call_addr, *def_addr, *r) <--
+        is_call_instruction(call_addr),
+        reg_of_interest(r),
+        code_in_block(call_addr, blk),
+        instr_in_function(call_addr, func),
+        !block_last_def(call_addr, _, r),
+        reaching_def_in(func, blk, r, s),
+        for def_addr in s.0.iter();
 
     // Forward reachability: transitive closure of rtl_next excluding back-edges, scoped per function.
     #[local] relation forward_reachable(Address, Address, Address);
@@ -3395,6 +3449,51 @@ ascent_par! {
     param_live_block(func_start, block, mreg) <--
         param_block_reach(func_start, block, mreg),
         !param_def_tainted(func_start, block, mreg);
+
+    // arg_reg_param_live_at(func, addr, reg): MUST -- the arg register still holds the incoming caller
+    // value at addr (reg reaches addr from the function entry on ALL paths with no intervening def, and
+    // no in-block def precedes addr). Same reach-AND-NOT-def-tainted shape as param_live_block, but
+    // seeded STRUCTURALLY on is_arg_reg / is_float_arg_reg (not func_param_validated, to stay out of the
+    // param-validation SCC). This is the structural replacement for the function_entry_count <
+    // FUNC_ARG_DIST distance window ("addr is early") used to recognize parameter uses: it is exact and
+    // distance-independent, so a clean param use at ANY depth is recognized and a redefined reg never is.
+    #[local] relation arg_reg_param_reach(Address, Address, Mreg);
+    #[local] relation arg_reg_param_tainted(Address, Address, Mreg);
+    #[local] relation arg_reg_param_live_block(Address, Address, Mreg);
+    relation arg_reg_param_live_at(Address, Address, Mreg);
+
+    // Only seed/propagate arg regs actually used in the function; arg_reg_param_live_at is consumed only
+    // at reg uses, so unused arg regs would propagate through the whole CFG for nothing.
+    #[local] relation arg_reg_used_somewhere(Address, Mreg);
+    arg_reg_used_somewhere(*func, *r) <-- is_arg_reg(r), reg_use(addr, r), instr_in_function(addr, func);
+    arg_reg_used_somewhere(*func, *r) <-- is_float_arg_reg(r), reg_use(addr, r), instr_in_function(addr, func);
+
+    arg_reg_param_reach(*func, *entry_block, *r) <--
+        arg_reg_used_somewhere(func, r), func_entry_block(func, entry_block);
+    arg_reg_param_reach(*func, *succ, *r) <--
+        arg_reg_param_reach(func, blk, r),
+        asm_block_next(blk, succ),
+        instr_in_function(succ, func);
+
+    arg_reg_param_tainted(*func, *succ, *r) <--
+        arg_reg_param_reach(func, blk, r),
+        asm_defined_in_block(blk, r),
+        asm_block_next(blk, succ),
+        instr_in_function(succ, func);
+    arg_reg_param_tainted(*func, *succ, *r) <--
+        arg_reg_param_tainted(func, blk, r),
+        asm_block_next(blk, succ),
+        instr_in_function(succ, func);
+
+    arg_reg_param_live_block(*func, *blk, *r) <--
+        arg_reg_param_reach(func, blk, r),
+        !arg_reg_param_tainted(func, blk, r);
+
+    arg_reg_param_live_at(*func, *addr, *r) <--
+        arg_reg_param_live_block(func, blk, r),
+        code_in_block(addr, blk),
+        instr_in_function(addr, func),
+        !block_last_def(addr, _, r);
 
     alias_edge(def_id, use_id) <--
         reg_def_used(defaddr, mreg, useaddr),
@@ -4179,29 +4278,17 @@ ascent_par! {
     arg_setup_candidate(*defaddr, *dst_reg, *call_addr) <--
         ltl_inst(defaddr, ?LTLInst::Lop(_, _, dst_reg)),
         is_arg_reg(dst_reg),
-        call_backward_reach(call_addr, defaddr, _),
-        instr_in_function(defaddr, func_start),
-        instr_min_order(func_start, defaddr, def_order),
-        instr_min_order(func_start, call_addr, call_order),
-        if *call_order > *def_order && (*call_order - *def_order) < 128;
+        def_reaches_call(call_addr, defaddr, dst_reg);
 
     arg_setup_candidate(*defaddr, *dst_reg, *call_addr) <--
         ltl_inst(defaddr, ?LTLInst::Lgetstack(_slot, _ofs, _typ, dst_reg)),
         is_arg_reg(dst_reg),
-        call_backward_reach(call_addr, defaddr, _),
-        instr_in_function(defaddr, func_start),
-        instr_min_order(func_start, defaddr, def_order),
-        instr_min_order(func_start, call_addr, call_order),
-        if *call_order > *def_order && (*call_order - *def_order) < 128;
+        def_reaches_call(call_addr, defaddr, dst_reg);
 
     arg_setup_candidate(*defaddr, *dst_reg, *call_addr) <--
         ltl_inst(defaddr, ?LTLInst::Lload(_, _, _, dst_reg)),
         is_arg_reg(dst_reg),
-        call_backward_reach(call_addr, defaddr, _),
-        instr_in_function(defaddr, func_start),
-        instr_min_order(func_start, defaddr, def_order),
-        instr_min_order(func_start, call_addr, call_order),
-        if *call_order > *def_order && (*call_order - *def_order) < 128;
+        def_reaches_call(call_addr, defaddr, dst_reg);
 
     // Fix 1: live-in / pass-through parameter forwarded to a resolved call. An ABI arg register that is a validated parameter and isn't redefined before the call still holds the incoming value, so forward it as a call arg. Gated to resolved callees (known direct target or known-signature extern) so indirect calls -- whose target reg may itself be a fn-pointer param -- aren't corrupted. Fixes args dropped to literal 0 (e.g. last_component(name)).
     relation call_has_resolved_callee(Node);
@@ -4214,25 +4301,10 @@ ascent_par! {
         instr_in_function(call_addr, func_start),
         call_has_resolved_callee(call_addr);
 
-    call_clobbers_arg_reg(defaddr, mreg, call_addr) <--
-        arg_setup_candidate(defaddr, mreg, call_addr),
-        call_to_call_backward(call_addr, between_call),
-        call_backward_reach(between_call, defaddr, _),
-        instr_in_function(defaddr, func_start),
-        instr_min_order(func_start, defaddr, def_order),
-        instr_min_order(func_start, between_call, between_order),
-        instr_min_order(func_start, call_addr, call_order),
-        if *between_order > *def_order && *between_order < *call_order;
-
-    call_clobbers_arg_reg(defaddr, mreg, call_addr) <--
-        float_arg_setup_candidate(defaddr, mreg, call_addr),
-        call_to_call_backward(call_addr, between_call),
-        call_backward_reach(between_call, defaddr, _),
-        instr_in_function(defaddr, func_start),
-        instr_min_order(func_start, defaddr, def_order),
-        instr_min_order(func_start, between_call, between_order),
-        instr_min_order(func_start, call_addr, call_order),
-        if *between_order > *def_order && *between_order < *call_order;
+    // (The old order-based "between-call clobber" suppression rules are removed: arg_setup_candidate now
+    // comes from def_reaches_call / reaching_def_in, which already excludes any def clobbered before the
+    // call -- an intervening CALL is an asm_effective_def of caller-saved regs, so reaching_def_in's
+    // gen/kill drops it. Detecting the clobber by instr_min_order ordering is both redundant and unsound.)
 
     // In-block reaching def of an arg register at a call: the last def strictly before the call in the call's own basic block, which by intra-block dominance is THE value the call receives regardless of any other def in the function; restricted to defs that are themselves arg setup candidates so it never overrides the live-in param fallback with an unusable in-block def (e.g. `pop rsi` in _start, no candidate value).
     relation arg_reg_block_reaching_def(Node, Mreg, Node);
@@ -4359,29 +4431,17 @@ ascent_par! {
     float_arg_setup_candidate(*defaddr, *dst_reg, *call_addr) <--
         ltl_inst(defaddr, ?LTLInst::Lop(_, _, dst_reg)),
         is_xmm_arg_reg(dst_reg),
-        call_backward_reach(call_addr, defaddr, _),
-        instr_in_function(defaddr, func_start),
-        instr_min_order(func_start, defaddr, def_order),
-        instr_min_order(func_start, call_addr, call_order),
-        if *call_order > *def_order && (*call_order - *def_order) < 64;
+        def_reaches_call(call_addr, defaddr, dst_reg);
 
     float_arg_setup_candidate(*defaddr, *dst_reg, *call_addr) <--
         ltl_inst(defaddr, ?LTLInst::Lgetstack(_slot, _ofs, _typ, dst_reg)),
         is_xmm_arg_reg(dst_reg),
-        call_backward_reach(call_addr, defaddr, _),
-        instr_in_function(defaddr, func_start),
-        instr_min_order(func_start, defaddr, def_order),
-        instr_min_order(func_start, call_addr, call_order),
-        if *call_order > *def_order && (*call_order - *def_order) < 64;
+        def_reaches_call(call_addr, defaddr, dst_reg);
 
     float_arg_setup_candidate(*defaddr, *dst_reg, *call_addr) <--
         ltl_inst(defaddr, ?LTLInst::Lload(_, _, _, dst_reg)),
         is_xmm_arg_reg(dst_reg),
-        call_backward_reach(call_addr, defaddr, _),
-        instr_in_function(defaddr, func_start),
-        instr_min_order(func_start, defaddr, def_order),
-        instr_min_order(func_start, call_addr, call_order),
-        if *call_order > *def_order && (*call_order - *def_order) < 64;
+        def_reaches_call(call_addr, defaddr, dst_reg);
 
     relation call_float_arg_setup_detected(Node, Mreg, Node);
 
@@ -4544,201 +4604,76 @@ ascent_par! {
         func_float_arg_used_undefined(func_start, v),
         xtl_canonical(v, canonical);
 
+    // An arg register used at a point where it still holds the incoming caller value (reaches the use
+    // def-free from entry) IS a parameter use -- exactly. This single structural rule replaces the six
+    // function_entry_count<FUNC_ARG_DIST window variants (Lop/Lload/Lsetstack x external-def/no-def):
+    // arg_reg_param_live_at already subsumes the "no internal def" / "external (caller) def" conditions,
+    // and is distance-independent so a far param use is recognized too.
     arg_reg_used_early_in_func(func_start, addr, *reg) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
-        ltl_inst(addr, ?LTLInst::Lop(_, srcs, _)),
-        for reg in srcs.iter(),
+        arg_reg_param_live_at(func_start, addr, reg),
         is_arg_reg(reg),
-        reg_def_used(defaddr, reg, addr),
-        !instr_in_function(defaddr, func_start);
-
-    arg_reg_used_early_in_func(func_start, addr, *reg) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
-        ltl_inst(addr, ?LTLInst::Lop(_, srcs, _)),
-        for reg in srcs.iter(),
-        is_arg_reg(reg),
-        !reg_def_used(_, reg, addr);
-
-    arg_reg_used_early_in_func(func_start, addr, *arg) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
-        ltl_inst(addr, ?LTLInst::Lload(_, _, args, _)),
-        for arg in args.iter(),
-        is_arg_reg(arg),
-        !reg_def_used(_, arg, addr);
-
-    arg_reg_used_early_in_func(func_start, addr, *arg) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
-        ltl_inst(addr, ?LTLInst::Lload(_, _, args, _)),
-        for arg in args.iter(),
-        is_arg_reg(arg),
-        reg_def_used(defaddr, arg, addr),
-        !instr_in_function(defaddr, func_start);
-
-    arg_reg_used_early_in_func(func_start, addr, *src) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
-        ltl_inst(addr, ?LTLInst::Lsetstack(src, _, _, _)),
-        is_arg_reg(src),
-        reg_def_used(defaddr, src, addr),
-        !instr_in_function(defaddr, func_start);
-
-    arg_reg_used_early_in_func(func_start, addr, *src) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
-        ltl_inst(addr, ?LTLInst::Lsetstack(src, _, _, _)),
-        is_arg_reg(src),
-        !reg_def_used(_, src, addr);
+        reg_use(addr, reg);
 
     relation arg_reg_has_external_def(Address, Mreg);
 
     arg_reg_has_external_def(func_start, *mreg) <--
         is_arg_reg(mreg),
-        instr_in_function(use_addr, func_start),
-        function_entry_count(func_start, use_addr, count),
-        if *count < FUNC_ARG_DIST,
-        reg_def_used(def_addr, mreg, use_addr),
-        !instr_in_function(def_addr, func_start);
+        arg_reg_param_live_at(func_start, use_addr, mreg),
+        reg_use(use_addr, mreg);
 
     relation arg_reg_used_very_early(Address, Mreg);
-    relation arg_reg_has_internal_def_before_early_use(Address, Mreg);
-
-    arg_reg_has_internal_def_before_early_use(func_start, *mreg) <--
-        is_arg_reg(mreg),
-        instr_in_function(early_use_addr, func_start),
-        function_entry_count(func_start, early_use_addr, count),
-        if *count < FUNC_ARG_DIST,
-        reg_use(early_use_addr, mreg),
-        reg_def_used(def_addr, mreg, early_use_addr),
-        instr_in_function(def_addr, func_start),
-        if *def_addr != *func_start;
-
-    // Per-use check: this specific early use has an internal (non-func_start) def reaching it
-    #[local] relation arg_reg_use_has_internal_def(Address, Address, Mreg);
-
-    arg_reg_use_has_internal_def(func_start, early_use_addr, *mreg) <--
-        is_arg_reg(mreg),
-        instr_in_function(early_use_addr, func_start),
-        function_entry_count(func_start, early_use_addr, count),
-        if *count < FUNC_ARG_DIST,
-        reg_use(early_use_addr, mreg),
-        reg_def_used(def_addr, mreg, early_use_addr),
-        instr_in_function(def_addr, func_start),
-        if *def_addr != *func_start;
+    // (Dead internal-def helpers removed: arg_reg_used_very_early no longer references them --
+    // arg_reg_param_live_at already excludes a register that has an internal def before the use.)
 
     arg_reg_used_very_early(func_start, *mreg) <--
         is_arg_reg(mreg),
-        instr_in_function(early_addr, func_start),
-        function_entry_count(func_start, early_addr, count),
-        if *count < FUNC_ARG_DIST,
-        reg_use(early_addr, mreg),
-        !arg_reg_use_has_internal_def(func_start, early_addr, mreg);
+        arg_reg_param_live_at(func_start, early_addr, mreg),
+        reg_use(early_addr, mreg);
 
     relation arg_reg_used_no_def(Address, Mreg);
 
     arg_reg_used_no_def(func_start, mreg) <--
         is_arg_reg(mreg),
-        instr_in_function(use_addr, func_start),
-        function_entry_count(func_start, use_addr, count),
-        if *count < FUNC_ARG_DIST,
-        ltl_inst_uses_mreg(use_addr, mreg),
-        !reg_def_used(_, mreg, use_addr);
+        arg_reg_param_live_at(func_start, use_addr, mreg),
+        ltl_inst_uses_mreg(use_addr, mreg);
 
     relation arg_reg_spilled_to_stack(Address, Mreg);
 
+    // An arg register spilled to the stack while it still holds the incoming caller value is a parameter
+    // spill. Replaces the function_entry_count window + external/no-def variants with arg_reg_param_live_at
+    // (which subsumes "holds the caller value"); the three store shapes (Lsetstack, BP-relative Lstore via
+    // Ainstack and via Aindexed) are kept.
     arg_reg_spilled_to_stack(func_start, *src) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
         ltl_inst(addr, ?LTLInst::Lsetstack(src, _slot, _ofs, _typ)),
         is_arg_reg(src),
-        reg_def_used(defaddr, src, addr),
-        !instr_in_function(defaddr, func_start);
+        arg_reg_param_live_at(func_start, addr, src);
 
     arg_reg_spilled_to_stack(func_start, *src) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
-        ltl_inst(addr, ?LTLInst::Lsetstack(src, _slot, _ofs, _typ)),
-        is_arg_reg(src),
-        !reg_def_used(_, src, addr);
-
-    arg_reg_spilled_to_stack(func_start, *src) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
         ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Ainstack(_), _, src)),
         is_arg_reg(src),
-        reg_def_used(defaddr, src, addr),
-        !instr_in_function(defaddr, func_start);
+        arg_reg_param_live_at(func_start, addr, src);
 
     arg_reg_spilled_to_stack(func_start, *src) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
-        ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Ainstack(_), _, src)),
-        is_arg_reg(src),
-        !reg_def_used(_, src, addr);
-
-    arg_reg_spilled_to_stack(func_start, *src) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
-        ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Aindexed(ofs), args, src)),
-        if *ofs < 0,   
-        for arg in args.iter(),
-        if *arg == Mreg::BP,
-        is_arg_reg(src),
-        reg_def_used(defaddr, src, addr),
-        !instr_in_function(defaddr, func_start);
-
-    arg_reg_spilled_to_stack(func_start, *src) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
         ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Aindexed(ofs), args, src)),
         if *ofs < 0,
         for arg in args.iter(),
         if *arg == Mreg::BP,
         is_arg_reg(src),
-        !reg_def_used(_, src, addr);
+        arg_reg_param_live_at(func_start, addr, src);
 
     relation arg_reg_copied_early(Address, Mreg, Mreg);
     relation arg_reg_used_via_copy(Address, Mreg);
 
+    // An arg register move-copied to a non-arg register while it still holds the caller value: the source
+    // is a parameter forwarded through the copy. Window + external/no-def variants -> arg_reg_param_live_at.
     arg_reg_copied_early(func_start, *src, *dst) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
         ltl_inst(addr, ?LTLInst::Lop(Operation::Omove, srcs, dst)),
         if srcs.len() == 1,
         for src in srcs.iter(),
         is_arg_reg(src),
         !is_arg_reg(dst),
         if *dst != Mreg::SP && *dst != Mreg::BP,
-        reg_def_used(defaddr, src, addr),
-        !instr_in_function(defaddr, func_start);
-
-    arg_reg_copied_early(func_start, *src, *dst) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
-        ltl_inst(addr, ?LTLInst::Lop(Operation::Omove, srcs, dst)),
-        if srcs.len() == 1,
-        for src in srcs.iter(),
-        is_arg_reg(src),
-        !is_arg_reg(dst),
-        if *dst != Mreg::SP && *dst != Mreg::BP,
-        !reg_def_used(_, src, addr);
+        arg_reg_param_live_at(func_start, addr, src);
 
     arg_reg_used_via_copy(func_start, *arg_reg) <--
         arg_reg_copied_early(func_start, arg_reg, dst_reg),
@@ -4782,66 +4717,26 @@ ascent_par! {
     // SysV x86-64 variadic prologue: caller signals XMM-arg count via %al; callee runs `test %al,%al; je skip; movaps %xmm0..7, [stack]; skip:`. The 8 movaps stores spill the XMM register save area, NOT real float parameters. Detect: an XMM arg reg stack-stored within function entry distance, with the XMM reg either having no def chain or a def chain from outside this function. The two-mode check mirrors arg_reg_spilled_to_stack.
     relation xmm_arg_spilled_in_prologue(Address, Mreg);
 
-    // Lstore form: movaps %xmm, ofs(%rsp|%rbp) -- def outside this function.
+    // XMM arg reg stored to a BP/SP-relative stack slot while it holds the incoming caller value =
+    // variadic XMM save-area spill. Window + external/no-def variants -> arg_reg_param_live_at.
     xmm_arg_spilled_in_prologue(func_start, *src) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
         ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Aindexed(_), args, src)),
         is_xmm_arg_reg(src),
         for arg in args.iter(),
         if *arg == Mreg::BP || *arg == Mreg::SP,
-        reg_def_used(defaddr, src, addr),
-        !instr_in_function(defaddr, func_start);
+        arg_reg_param_live_at(func_start, addr, src);
 
-    // Lstore form: no def reaching at all.
+    // setstack form.
     xmm_arg_spilled_in_prologue(func_start, *src) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
-        ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Aindexed(_), args, src)),
-        is_xmm_arg_reg(src),
-        for arg in args.iter(),
-        if *arg == Mreg::BP || *arg == Mreg::SP,
-        !reg_def_used(_, src, addr);
-
-    // setstack form: def outside this function.
-    xmm_arg_spilled_in_prologue(func_start, *src) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
         ltl_inst(addr, ?LTLInst::Lsetstack(src, _slot, _ofs, _typ)),
         is_xmm_arg_reg(src),
-        reg_def_used(defaddr, src, addr),
-        !instr_in_function(defaddr, func_start);
+        arg_reg_param_live_at(func_start, addr, src);
 
-    // setstack form: no def at all.
+    // Lstore (Ainstack) form.
     xmm_arg_spilled_in_prologue(func_start, *src) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
-        ltl_inst(addr, ?LTLInst::Lsetstack(src, _slot, _ofs, _typ)),
-        is_xmm_arg_reg(src),
-        !reg_def_used(_, src, addr);
-
-    // Lstore (Ainstack) form: def outside this function.
-    xmm_arg_spilled_in_prologue(func_start, *src) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
         ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Ainstack(_), _, src)),
         is_xmm_arg_reg(src),
-        reg_def_used(defaddr, src, addr),
-        !instr_in_function(defaddr, func_start);
-
-    // Lstore (Ainstack) form: no def at all.
-    xmm_arg_spilled_in_prologue(func_start, *src) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
-        ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Ainstack(_), _, src)),
-        is_xmm_arg_reg(src),
-        !reg_def_used(_, src, addr);
+        arg_reg_param_live_at(func_start, addr, src);
 
     // Function has the canonical variadic-prologue XMM register save (all 8 XMMs spilled); real functions never spill all 8 XMM arg regs at entry.
     relation func_has_variadic_xmm_prologue(Address);
@@ -4857,34 +4752,16 @@ ascent_par! {
 
     relation func_float_param_used(Address, Mreg);
 
-    // Per-use: this early XMM use has a genuine INTERNAL (non-func_start) def reaching it (mirrors integer arg_reg_use_has_internal_def); the func_start synthetic param edge from float_param_reg_used_early is excluded via def_addr != func_start so it cannot suppress float-param detection, else the threading edge would kill the very rule that validates the param.
-    #[local] relation xmm_arg_use_has_internal_def(Address, Address, Mreg);
-    xmm_arg_use_has_internal_def(func_start, use_addr, *mreg) <--
-        is_float_arg_reg(mreg),
-        instr_in_function(use_addr, func_start),
-        function_entry_count(func_start, use_addr, count),
-        if *count < FUNC_ARG_DIST,
-        ltl_inst_uses_mreg(use_addr, mreg),
-        reg_def_used(def_addr, mreg, use_addr),
-        instr_in_function(def_addr, func_start),
-        if *def_addr != *func_start;
+    // (Dead helper xmm_arg_use_has_internal_def removed: func_float_param_used now uses
+    // arg_reg_param_live_at, which already excludes an XMM register with an internal def.)
 
+    // An XMM arg register used while it still holds the incoming caller value is a float parameter
+    // (excluding the variadic XMM save-area prologue). Window + internal/external-def variants ->
+    // arg_reg_param_live_at (covers X0-X7 by register value, subsumes the no-internal-def condition).
     func_float_param_used(func_start, *mreg) <--
         is_float_arg_reg(mreg),
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
+        arg_reg_param_live_at(func_start, addr, mreg),
         ltl_inst_uses_mreg(addr, mreg),
-        !xmm_arg_use_has_internal_def(func_start, addr, mreg),
-        !func_has_variadic_xmm_prologue(func_start);
-
-    func_float_param_used(func_start, *mreg) <--
-        is_float_arg_reg(mreg),
-        instr_in_function(use_addr, func_start),
-        function_entry_count(func_start, use_addr, count),
-        if *count < FUNC_ARG_DIST,
-        reg_def_used(def_addr, mreg, use_addr),
-        !instr_in_function(def_addr, func_start),
         !func_has_variadic_xmm_prologue(func_start);
 
     relation func_float_param_validated(Address, Mreg, usize);
@@ -5037,35 +4914,29 @@ ascent_par! {
 
     relation dx_has_non_div_use(Address);
 
+    // DX used (non-div) while it still holds the incoming caller value = DX is a genuine parameter,
+    // not just the high half of a division. Window -> arg_reg_param_live_at.
     dx_has_non_div_use(func_start) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
+        arg_reg_param_live_at(func_start, addr, ?Mreg::DX),
         ltl_inst(addr, ?LTLInst::Lop(_, args, _)),
         for arg in args.iter(),
         if *arg == Mreg::DX,
         !pdiv(addr, _, _);
 
     dx_has_non_div_use(func_start) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
+        arg_reg_param_live_at(func_start, addr, ?Mreg::DX),
         ltl_inst(addr, ?LTLInst::Lstore(_, _, _, src)),
         if *src == Mreg::DX,
         !pdiv(addr, _, _);
 
     dx_has_non_div_use(func_start) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
+        arg_reg_param_live_at(func_start, addr, ?Mreg::DX),
         ltl_inst(addr, ?LTLInst::Lload(_, _, args, _)),
         for arg in args.iter(),
         if *arg == Mreg::DX;
 
     dx_has_non_div_use(func_start) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
+        arg_reg_param_live_at(func_start, addr, ?Mreg::DX),
         ltl_inst(addr, ?LTLInst::Lcond(_, args, _, _)),
         for arg in args.iter(),
         if *arg == Mreg::DX;
@@ -5093,34 +4964,28 @@ ascent_par! {
 
     relation cx_has_non_shift_use(Address);
 
+    // CX used (non-shift) while it still holds the incoming caller value = CX is a genuine parameter,
+    // not just a shift count. Window -> arg_reg_param_live_at (CX holds the caller value at the use).
     cx_has_non_shift_use(func_start) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
+        arg_reg_param_live_at(func_start, addr, ?Mreg::CX),
         ltl_inst(addr, ?LTLInst::Lop(op, args, _)),
         for arg in args.iter(),
         if *arg == Mreg::CX,
         if !is_shift_or_rotate_op(op);
 
     cx_has_non_shift_use(func_start) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
+        arg_reg_param_live_at(func_start, addr, ?Mreg::CX),
         ltl_inst(addr, ?LTLInst::Lstore(_, _, _, src)),
         if *src == Mreg::CX;
 
     cx_has_non_shift_use(func_start) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
+        arg_reg_param_live_at(func_start, addr, ?Mreg::CX),
         ltl_inst(addr, ?LTLInst::Lload(_, _, args, _)),
         for arg in args.iter(),
         if *arg == Mreg::CX;
 
     cx_has_non_shift_use(func_start) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
+        arg_reg_param_live_at(func_start, addr, ?Mreg::CX),
         ltl_inst(addr, ?LTLInst::Lcond(_, args, _, _)),
         for arg in args.iter(),
         if *arg == Mreg::CX;
@@ -5136,32 +5001,10 @@ ascent_par! {
         !cx_has_non_shift_use(func_start),
         func_has_shift_instr(func_start);
 
-    // Scratch register filter: reg defined before use in entry block is not a parameter.
-    relation arg_reg_first_action_is_def(Address, Mreg);
-    #[local] relation arg_reg_used_strictly_before(Address, Mreg, Address);
-
-    // There exists a use of mreg at use_addr that is strictly before def_addr (by entry count)
-    arg_reg_used_strictly_before(func_start, *mreg, *def_addr) <--
-        is_arg_reg(mreg),
-        instr_in_function(use_addr, func_start),
-        function_entry_count(func_start, use_addr, use_count),
-        if *use_count < FUNC_ARG_DIST,
-        reg_use(use_addr, mreg),
-        instr_in_function(def_addr, func_start),
-        function_entry_count(func_start, def_addr, def_count),
-        if *def_count < FUNC_ARG_DIST,
-        asm_effective_def(def_addr, mreg),
-        if use_count < def_count;
-
-    // The register's first action in the entry block is a definition (no use precedes it)
-    arg_reg_first_action_is_def(func_start, *mreg) <--
-        is_arg_reg(mreg),
-        instr_in_function(def_addr, func_start),
-        function_entry_count(func_start, def_addr, def_count),
-        if *def_count < FUNC_ARG_DIST,
-        asm_effective_def(def_addr, mreg),
-        !arg_reg_spilled_to_stack(func_start, mreg),
-        !arg_reg_used_strictly_before(func_start, mreg, def_addr);
+    // (The "scratch register filter" -- arg_reg_first_action_is_def / arg_reg_used_strictly_before, which
+    // used a `use_count < def_count` entry-order comparison to decide "used before defined" -- is removed:
+    // func_arg_reg_used is now derived from arg_reg_param_live_at, which already excludes a defined-first
+    // scratch register (its post-def uses do not hold the caller value), so the filter is redundant.)
 
     // Func param positions use max-evidence: all positions up to max are filled per ABI
     relation func_has_param_evidence(Address, usize);
@@ -5170,26 +5013,21 @@ ascent_par! {
         func_arg_reg_used(func_start, Mreg::DI);
 
     func_has_param_evidence(func_start, 1) <--
-        func_arg_reg_used(func_start, Mreg::SI),
-        !arg_reg_first_action_is_def(func_start, Mreg::SI);
+        func_arg_reg_used(func_start, Mreg::SI);
 
     func_has_param_evidence(func_start, 2) <--
         func_arg_reg_used(func_start, Mreg::DX),
-        !dx_used_only_in_div(func_start),
-        !arg_reg_first_action_is_def(func_start, Mreg::DX);
+        !dx_used_only_in_div(func_start);
 
     func_has_param_evidence(func_start, 3) <--
         func_arg_reg_used(func_start, Mreg::CX),
-        !cx_used_only_in_shift(func_start),
-        !arg_reg_first_action_is_def(func_start, Mreg::CX);
+        !cx_used_only_in_shift(func_start);
 
     func_has_param_evidence(func_start, 4) <--
-        func_arg_reg_used(func_start, Mreg::R8),
-        !arg_reg_first_action_is_def(func_start, Mreg::R8);
+        func_arg_reg_used(func_start, Mreg::R8);
 
     func_has_param_evidence(func_start, 5) <--
-        func_arg_reg_used(func_start, Mreg::R9),
-        !arg_reg_first_action_is_def(func_start, Mreg::R9);
+        func_arg_reg_used(func_start, Mreg::R9);
 
     relation func_max_param_position(Address, usize);
 
@@ -5246,18 +5084,14 @@ ascent_par! {
 
     param_register_width(func_start, *src, width) <--
         arg_reg_spilled_to_stack(func_start, src),
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
+        arg_reg_param_live_at(func_start, addr, src),
         ltl_inst(addr, ?LTLInst::Lstore(chunk, Addressing::Ainstack(_), _, store_src)),
         if *store_src == *src,
         let width = chunk_size_bits(chunk);
 
     param_register_width(func_start, *src, width) <--
         arg_reg_spilled_to_stack(func_start, src),
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
+        arg_reg_param_live_at(func_start, addr, src),
         ltl_inst(addr, ?LTLInst::Lstore(chunk, Addressing::Aindexed(ofs), args, store_src)),
         if *ofs < 0,
         for arg in args.iter(),
@@ -5267,9 +5101,7 @@ ascent_par! {
 
     param_register_width(func_start, *src, width) <--
         arg_reg_spilled_to_stack(func_start, src),
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST,
+        arg_reg_param_live_at(func_start, addr, src),
         ltl_inst(addr, ?LTLInst::Lsetstack(set_src, _slot, _ofs, typ)),
         if *set_src == *src,
         let width = match typ { 
@@ -5521,12 +5353,7 @@ ascent_par! {
     // Float/double returns place the result in XMM0 (X0), which the AX-keyed machinery misses; treat an X0 def reaching a return as a return value so they are not misclassified as void.
     func_has_ax_return_value(func_start) <--
         instr_in_function(ret_point, func_start),
-        ltl_inst(ret_point, ?LTLInst::Lreturn),
-        instr_in_function(def_addr, func_start),
-        reg_def_site(def_addr, Mreg::X0),
-        instr_min_order(func_start, def_addr, def_order),
-        instr_min_order(func_start, ret_point, ret_order),
-        if *def_order <= *ret_order;
+        def_reaches_return(ret_point, _, Mreg::X0);
 
     // Genuine void: a function whose return points have no AX/X0 value source at all; without this the void fallback fabricates an undefined AX reg typed as `long`, emitting `return <uninitialized var>`.
     emit_function_void_candidate(func_start) <--
