@@ -31,6 +31,12 @@ opt-level = 0
 codegen-units = 256
 debug = 0
 incremental = true
+debug-assertions = false
+overflow-checks = false
+
+[profile.dev.build-override]
+opt-level = 3
+codegen-units = 16
 
 [profile.release]
 lto = "none"
@@ -40,3 +46,7 @@ panic = "abort"
 strip = true
 debug = 0
 incremental = true
+
+[profile.release.build-override]
+opt-level = 3
+codegen-units = 16

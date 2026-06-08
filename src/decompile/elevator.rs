@@ -175,8 +175,7 @@ pub struct DecompileDB {
     pub trace_enabled: bool,
     pub skip_function_names: HashSet<&'static str>,
     pub skip_function_prefixes: Vec<&'static str>,
-    // Standard-library / compiler-provided functions (and name prefixes) whose declarations the compiler
-    // already supplies; the C emitter skips emitting forward decls for these. From header_functions.json.
+    // Standard-library / compiler-provided functions (and name prefixes) whose declarations the compiler already supplies; the C emitter skips emitting forward decls for these. From header_functions.json.
     pub header_declared_functions: HashSet<&'static str>,
     pub header_declared_prefixes: Vec<&'static str>,
     pub measure_rule_times: bool,
@@ -352,8 +351,7 @@ impl DecompileDB {
         self.load_header_functions();
     }
 
-    // Load standard-library / compiler-provided function names (and prefixes) from header_functions.json;
-    // the C emitter skips emitting forward declarations for these (the compiler already declares them).
+    // Load standard-library / compiler-provided function names (and prefixes) from header_functions.json; the C emitter skips emitting forward declarations for these (the compiler already declares them).
     fn load_header_functions(&mut self) {
         let json_str = include_str!("../data/json/header_functions.json");
         let parsed: serde_json::Value = match serde_json::from_str(json_str) {
@@ -527,6 +525,7 @@ impl DecompileDB {
         use crate::decompile::passes::pass::{IRPass, PassScheduler};
         use crate::decompile::passes::*;
         use crate::decompile::analysis::*;
+        use crate::decompile::postselect::*;
 
         let passes: Vec<Box<dyn IRPass>> = vec![
             Box::new(abi_pass::AbiPass),
@@ -551,6 +550,7 @@ impl DecompileDB {
             Box::new(clight_pass::ClightFieldPass),
             Box::new(clight_emit_pass::ClightSelectPass),
             Box::new(clight_emit_pass::ClightEmitPass),
+            Box::new(var_reduce::VarReducePass),
         ];
 
         let schedule = PassScheduler::build_schedule(&passes);

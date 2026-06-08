@@ -10,7 +10,7 @@ fn all_functions_present() {
     }
 }
 
-// --- angr test_struct_access: nested field access chains ---
+// angr test_struct_access: nested field access chains
 #[test]
 fn read_nested_has_field_access() {
     // Should access nested struct fields through array indexing
@@ -32,7 +32,7 @@ fn write_nested_has_assignments() {
             "expected multiple assignments for struct field writes:\n{b}");
 }
 
-// --- array of structs: loop with struct field access ---
+// array of structs: loop with struct field access
 #[test]
 fn array_of_structs_has_loop() {
     assert!(has_any_loop(&OUTPUT, "array_of_structs_sum"), "expected loop");
@@ -44,7 +44,7 @@ fn array_of_structs_has_addition() {
             "expected addition in sum loop");
 }
 
-// --- linked list: pointer chasing loop ---
+// linked list: pointer chasing loop
 #[test]
 fn linked_list_sum_has_loop() {
     assert!(has_any_loop(&OUTPUT, "linked_list_sum"), "expected loop");
@@ -64,7 +64,7 @@ fn linked_list_length_has_loop() {
     assert!(has_any_loop(&OUTPUT, "linked_list_length"), "expected loop");
 }
 
-// --- struct chain: access through pointer member ---
+// struct chain: access through pointer member
 #[test]
 fn struct_chain_access_has_deref() {
     assert!(has_deref(&OUTPUT, "struct_chain_access")
@@ -72,7 +72,7 @@ fn struct_chain_access_has_deref() {
             "expected pointer dereference for chain access");
 }
 
-// --- modify through pointer: read-modify-write pattern ---
+// modify through pointer: read-modify-write pattern
 #[test]
 fn modify_through_pointer_has_assignment() {
     assert!(has_assign(&OUTPUT, "modify_through_pointer"),

@@ -10,7 +10,7 @@ fn all_functions_present() {
     }
 }
 
-// --- angr test_call_expr_folding_call_order: side-effect call ordering ---
+// angr test_call_expr_folding_call_order: side-effect call ordering
 #[test]
 fn call_ordering_has_two_calls() {
     let b = body(&OUTPUT, "call_ordering");
@@ -18,7 +18,7 @@ fn call_ordering_has_two_calls() {
             "expected two calls to side_effect_func:\n{b}");
 }
 
-// --- call result in condition ---
+// call result in condition
 #[test]
 fn call_in_branch_calls_pure_func() {
     assert!(has_call_to(&OUTPUT, "call_in_branch", "pure_func"),
@@ -31,7 +31,7 @@ fn call_in_branch_has_condition() {
             "expected if checking call result");
 }
 
-// --- angr test_decompiling_morton: multiple calls to same function ---
+// angr test_decompiling_morton: multiple calls to same function
 #[test]
 fn multiple_same_calls_has_three_calls() {
     let b = body(&OUTPUT, "multiple_same_calls");
@@ -45,7 +45,7 @@ fn multiple_same_calls_has_three_params() {
                "multiple_same_calls takes 3 params");
 }
 
-// --- angr test_tail_calls: recursive tail call ---
+// angr test_tail_calls: recursive tail call
 #[test]
 fn tail_call_helper_is_recursive() {
     // clang may eliminate tail recursion into a loop
@@ -60,7 +60,7 @@ fn tail_call_wrapper_calls_helper() {
             "expected call from wrapper to helper");
 }
 
-// --- angr test_function_pointer_identification: function pointer dispatch ---
+// angr test_function_pointer_identification: function pointer dispatch
 #[test]
 fn apply_op_has_indirect_call() {
     let f = func_def(&OUTPUT, "apply_op");
@@ -80,7 +80,7 @@ fn dispatch_by_flag_calls_apply() {
             "expected call to apply_op");
 }
 
-// --- chained calls: call tree preservation ---
+// chained calls: call tree preservation
 #[test]
 fn chain_a_calls_pure_func() {
     assert!(has_call_to(&OUTPUT, "chain_a", "pure_func"),
@@ -99,7 +99,7 @@ fn chain_c_calls_chain_b() {
             "expected chain_c to call chain_b");
 }
 
-// --- angr: many arguments including stack args ---
+// angr: many arguments including stack args
 #[test]
 fn many_args_callee_has_eight_params() {
     assert_eq!(param_count(&OUTPUT, "many_args_callee"), 8,
@@ -112,7 +112,7 @@ fn many_args_caller_calls_callee() {
             "expected call with stack arguments");
 }
 
-// --- callback pattern: function pointer in loop ---
+// callback pattern: function pointer in loop
 #[test]
 fn with_callback_has_loop() {
     assert!(has_any_loop(&OUTPUT, "with_callback"), "expected loop");

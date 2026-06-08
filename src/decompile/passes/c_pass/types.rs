@@ -664,8 +664,7 @@ impl FuncDecl {
         }
     }
 
-    // Declaration with an unspecified (K&R) parameter list `RET name();`: the compiler does no
-    // argument-count/type checking at call sites. Used for external functions of unknown signature.
+    // Declaration with an unspecified (K&R) parameter list `RET name();`: the compiler does no argument-count/type checking at call sites. Used for external functions of unknown signature.
     pub fn new_unspecified(name: impl Into<String>, return_type: CType) -> Self {
         Self {
             name: name.into(),
@@ -787,8 +786,7 @@ impl TranslationUnit {
         self.symbols.insert(name, idx);
     }
 
-    /// Rebuild `symbols` from actual `decls` positions.
-    /// Must be called after any operation that reorders or prepends to `decls`.
+    /// Rebuild `symbols` from actual `decls` positions. Must be called after any operation that reorders or prepends to `decls`.
     pub fn rebuild_symbols(&mut self) {
         self.symbols.clear();
         for (i, decl) in self.decls.iter().enumerate() {

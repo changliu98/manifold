@@ -235,7 +235,7 @@ ascent_par! {
     // Return-type ladder. Case 7 (no info -> Xvoid) is implicit: no row emitted, caller reads Xvoid default.
     relation reconciled_return_type(Address, XType);
 
-    // Case 1: definition says void -- always wins
+    // Case 1: definition says void; always wins
     reconciled_return_type(f, XType::Xvoid) <--
         emit_function_void_candidate(f);
 
@@ -482,8 +482,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
             .collect()
     };
 
-    // Diagnostic: trace the return-type ladder inputs for a target function (by name substring), to see
-    // why a void-bodied callee whose result is used stays void (X<-void errors).
+    // Diagnostic: trace the return-type ladder inputs for a target function (by name substring), to see why a void-bodied callee whose result is used stays void (X<-void errors).
     if let Ok(target) = std::env::var("MANIFOLD_TRACE_RET") {
         if !target.is_empty() {
             let crv: std::collections::HashSet<Node> = db
@@ -665,7 +664,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         } else if call_site_mode > position_based_count
             && consensus_ratio >= 0.6 && total_sites >= 2
         {
-            // Call sites strongly agree on more params -- trust them
+            // Call sites strongly agree on more params; trust them
             call_site_mode
         } else {
             position_based_count
@@ -1161,8 +1160,7 @@ fn patch_db(
         db.rel_set("emit_function_void", new_void.into_iter().collect::<ascent::boxcar::Vec<_>>());
     }
 
-    // reg->rtl and def-at-use maps, shared by the (dead) call_args_collected reconciliation and the
-    // Icall/Itailcall argument-arity reconciliation in the rtl_inst patch below.
+    // reg->rtl and def-at-use maps, shared by the (dead) call_args_collected reconciliation and the Icall/Itailcall argument-arity reconciliation in the rtl_inst patch below.
     let reg_rtl_map: HashMap<(Node, Mreg), RTLReg> = db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl")
         .map(|&(addr, ref mreg, rtl)| ((addr, *mreg), rtl))
         .collect();
@@ -1242,10 +1240,7 @@ fn patch_db(
         let mut new_insts: Vec<(Node, RTLInst)> = Vec::new();
         let mut patched_insts: usize = 0;
 
-        // Reconcile a call's argument list to the callee's reconciled arity. cminor builds Scall directly
-        // from Icall.args, so the call site must carry exactly proto.param_count args or clang reports
-        // "too few/too many arguments" against the (already reconciled) callee declaration. Mirrors the
-        // truncate/widen logic that previously only updated the dead call_args_collected relation.
+        // Reconcile a call's argument list to the callee's reconciled arity. cminor builds Scall directly from Icall.args, so the call site must carry exactly proto.param_count args or clang reports "too few/too many arguments" against the (already reconciled) callee declaration. Mirrors the truncate/widen logic that previously only updated the dead call_args_collected relation.
         let reconcile_args = |call_node: Node, args: &Args, param_count: usize| -> Args {
             if args.len() == param_count {
                 return args.clone();
@@ -1294,8 +1289,7 @@ fn patch_db(
                             sig_res: proto.return_type,
                             sig_cc: sig_opt.as_ref().map(|s| s.sig_cc.clone()).unwrap_or_default(),
                         };
-                        // Variadic callees keep their full (tail-bearing) arg list; only fixed-arity
-                        // calls are reconciled to the prototype count.
+                        // Variadic callees keep their full (tail-bearing) arg list; only fixed-arity calls are reconciled to the prototype count.
                         let new_args = if proto.is_varargs {
                             args.clone()
                         } else {
@@ -1333,8 +1327,7 @@ fn patch_db(
                             sig_res: proto.return_type,
                             sig_cc: sig_opt.as_ref().map(|s| s.sig_cc.clone()).unwrap_or_default(),
                         };
-                        // Variadic callees keep their full (tail-bearing) arg list; only fixed-arity
-                        // calls are reconciled to the prototype count.
+                        // Variadic callees keep their full (tail-bearing) arg list; only fixed-arity calls are reconciled to the prototype count.
                         let new_args = if proto.is_varargs {
                             args.clone()
                         } else {

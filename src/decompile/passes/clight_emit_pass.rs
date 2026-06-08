@@ -190,8 +190,7 @@ fn identify_opaque_libc_structs_from_tu(
         }
     }
 
-    // (2) Check function signatures of known opaque-pointer functions for struct params.
-    // Only an EXTERNAL declaration (FuncDecl) is a genuine libc extern whose opaque-param typedef table (FILE*/DIR*) applies. A FuncDef is a LOCAL definition (external funcs are emitted as FuncDecl, never FuncDef - see `internal_functions` filtering), so its own recovered signature wins: a local function sharing a tabled libc name (e.g. a static helper named `fseek`) must NOT have its struct param force-tagged as FILE. The call-site scan in (1) still recovers typedefs from real calls to libc functions.
+    // (2) Check function signatures of known opaque-pointer functions for struct params. Only an EXTERNAL declaration (FuncDecl) is a genuine libc extern whose opaque-param typedef table (FILE*/DIR*) applies. A FuncDef is a LOCAL definition (external funcs are emitted as FuncDecl, never FuncDef - see `internal_functions` filtering), so its own recovered signature wins: a local function sharing a tabled libc name (e.g. a static helper named `fseek`) must NOT have its struct param force-tagged as FILE. The call-site scan in (1) still recovers typedefs from real calls to libc functions.
     for decl in &tu.decls {
         let (name, params) = match decl {
             TopLevelDecl::FuncDecl(f) => (f.name.as_str(), &f.params),
@@ -1006,7 +1005,7 @@ impl IRPass for ClightEmitPass {
                 }
             }
 
-            // func.successors is a HashMap; iterating directly leaks non-deterministic ordering into func_edges -> all_edges -> remapped_edges. order_nodes_dfs sorts adjacency lists, but it relies on the *set* of (src, dst) pairs being the same, which it is -- so the impact is mainly on diagnostic stability. Sort by source for a stable iteration order anyway.
+            // func.successors is a HashMap; iterating directly leaks non-deterministic ordering into func_edges -> all_edges -> remapped_edges. order_nodes_dfs sorts adjacency lists, but it relies on the *set* of (src, dst) pairs being the same, which it is, so the impact is mainly on diagnostic stability. Sort by source for a stable iteration order anyway.
             let mut succ_nodes: Vec<Node> = func.successors.keys().copied().collect();
             succ_nodes.sort();
             for node in succ_nodes {

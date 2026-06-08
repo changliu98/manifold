@@ -1,19 +1,12 @@
 // Corpus calibration / robustness suite over the full deephistory Linux set.
 //
-// The full set (~203k x86-64 ELF binaries, see eval/deephistory/manifest_full.tsv)
-// is far too large to decompile on every run, so this target REGISTERS the whole
-// corpus as available and SAMPLES a runtime-configurable subset to decompile.
+// The full set (~203k x86-64 ELF binaries, see eval/deephistory/manifest_full.tsv) is far too large to decompile on every run, so this target REGISTERS the whole corpus as available and SAMPLES a runtime-configurable subset to decompile.
 //
-// Each sampled binary is decompiled in an isolated subprocess (the cargo-built
-// `manifold` binary) with a per-binary timeout, so a hang / OOM / panic in one
-// binary is recorded as a failure instead of taking down the test process.
+// Each sampled binary is decompiled in an isolated subprocess (the cargo-built `manifold` binary) with a per-binary timeout, so a hang / OOM / panic in one binary is recorded as a failure instead of taking down the test process.
 //
-// The corpus lives outside git (eval/ is git-ignored); when the manifest is
-// absent this test is a no-op so normal checkouts and CI stay green.
+// The corpus lives outside git (eval/ is git-ignored); when the manifest is absent this test is a no-op so normal checkouts and CI stay green.
 //
-// Pass criterion is robustness: the pipeline must exit successfully and emit a
-// non-empty .c. Quality metrics (vs Ghidra / source GT) stay in the Python
-// harness at eval/deephistory/compare.py.
+// Pass criterion is robustness: the pipeline must exit successfully and emit a non-empty .c. Quality metrics (vs Ghidra / source GT) stay in the Python harness at eval/deephistory/compare.py.
 //
 // Control via environment variables (all optional):
 //   CORPUS_SAMPLE         number of binaries to decompile, or "all". Unset/0 => skip (opt-in).
@@ -49,8 +42,7 @@ struct Entry {
     path: String,
 }
 
-// Self-contained seeded PRNG (xorshift64) so sampling is reproducible without an
-// external dependency. A fixed scramble of the seed avoids the all-zero state.
+// Self-contained seeded PRNG (xorshift64) so sampling is reproducible without an external dependency. A fixed scramble of the seed avoids the all-zero state.
 struct Rng(u64);
 impl Rng {
     fn new(seed: u64) -> Self {
@@ -338,8 +330,7 @@ fn corpus_calibration() {
         rate * 100.0,
         min_pass * 100.0
     );
-    // Catch a catastrophic regression: with a non-trivial sample, zero successes
-    // means the pipeline is broken regardless of the (default 0.0) threshold.
+    // Catch a catastrophic regression: with a non-trivial sample, zero successes means the pipeline is broken regardless of the (default 0.0) threshold.
     if run >= 3 {
         assert!(ok > 0, "0/{run} binaries decompiled successfully -- pipeline likely broken");
     }

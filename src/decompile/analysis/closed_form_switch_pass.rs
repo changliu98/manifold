@@ -1,8 +1,35 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
+use crate::x86::op::Condition;
 use crate::x86::types::*;
+
+// Convert an Osel-derived condition expression back into a (Condition, args) pair for Sifthenelse. Returns None for non-comparison conditions, which are left as ternaries.
+fn cond_from_select_expr(e: &CsharpminorExpr) -> Option<(Condition, Vec<CsharpminorExpr>)> {
+    let CsharpminorExpr::Ebinop(op, lhs, rhs) = e else { return None; };
+    let lhs_c = (**lhs).clone();
+    let imm = match rhs.as_ref() {
+        CsharpminorExpr::Econst(Constant::Ointconst(c)) => Some(*c as i64),
+        CsharpminorExpr::Econst(Constant::Olongconst(c)) => Some(*c),
+        _ => None,
+    };
+    Some(match (op, imm) {
+        (CminorBinop::Ocmp(c), Some(k)) => (Condition::Ccompimm(*c, k), vec![lhs_c]),
+        (CminorBinop::Ocmpu(c), Some(k)) => (Condition::Ccompuimm(*c, k), vec![lhs_c]),
+        (CminorBinop::Ocmpl(c), Some(k)) => (Condition::Ccomplimm(*c, k), vec![lhs_c]),
+        (CminorBinop::Ocmplu(c), Some(k)) => (Condition::Ccompluimm(*c, k), vec![lhs_c]),
+        (CminorBinop::Ocmp(c), None) => (Condition::Ccomp(*c), vec![lhs_c, (**rhs).clone()]),
+        (CminorBinop::Ocmpu(c), None) => (Condition::Ccompu(*c), vec![lhs_c, (**rhs).clone()]),
+        (CminorBinop::Ocmpl(c), None) => (Condition::Ccompl(*c), vec![lhs_c, (**rhs).clone()]),
+        (CminorBinop::Ocmplu(c), None) => (Condition::Ccomplu(*c), vec![lhs_c, (**rhs).clone()]),
+        (CminorBinop::Ocmpf(c), _) => (Condition::Ccompf(*c), vec![lhs_c, (**rhs).clone()]),
+        (CminorBinop::Ocmpfs(c), _) => (Condition::Ccompfs(*c), vec![lhs_c, (**rhs).clone()]),
+        (CminorBinop::Ocmpnotf(c), _) => (Condition::Cnotcompf(*c), vec![lhs_c, (**rhs).clone()]),
+        (CminorBinop::Ocmpnotfs(c), _) => (Condition::Cnotcompfs(*c), vec![lhs_c, (**rhs).clone()]),
+        _ => return None,
+    })
+}
 
 // Linear-in-disc value: `coeff * disc + constant`. Used to symbolically evaluate the RHS of Sset chains in closed-form switch detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,8 +133,7 @@ fn detect_closed_form_in_func(
                                 Constant::Olongconst(v) => *v,
                                 _ => continue,
                             };
-                            // Cge/Cgt: disc out-of-range goes to default (true branch is default). Clt/Cle: disc in-range goes to formula (false branch is default).
-                            // saturating_add keeps an out-of-range bound (e.g. i64::MAX from a non-switch compare) from overflowing before the [2,32] range guard rejects it.
+                            // Cge/Cgt: disc out-of-range goes to default (true branch is default). Clt/Cle: disc in-range goes to formula (false branch is default). saturating_add keeps an out-of-range bound (e.g. i64::MAX from a non-switch compare) from overflowing before the [2,32] range guard rejects it.
                             let (case_count, default_is_true) = match cmp {
                                 crate::x86::op::Comparison::Cge => (bound, true),
                                 crate::x86::op::Comparison::Cgt => (bound.saturating_add(1), true),
@@ -351,13 +377,48 @@ impl IRPass for ClosedFormSwitchPass {
             case_rel.push(*c);
         }
         db.rel_set("closed_form_switch_case", case_rel);
+
+        // Lift dispatch-style reuse-cmov selects (marked by rtl_pass) into if/else, skipping any node just detected as a closed-form switch (clight builds those from the facts above). Runs after detection so closed-form recovery sees the original conditional expression first.
+        let reuse: HashSet<Node> = db.rel_iter::<(Node,)>("cmov_reuse_node").map(|(n,)| *n).collect();
+        if !reuse.is_empty() {
+            let switch_nodes: HashSet<Node> = new_entries.iter().map(|(n, ..)| *n).collect();
+            let lifted: Vec<(Node, CsharpminorStmt)> = db
+                .rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt")
+                .filter_map(|(n, s)| {
+                    if !reuse.contains(n) || switch_nodes.contains(n) {
+                        return None;
+                    }
+                    if let CsharpminorStmt::Sset(reg, CsharpminorExpr::Econdition(cond_expr, true_val, false_val)) = s {
+                        if let Some((cond, cond_args)) = cond_from_select_expr(cond_expr) {
+                            let then_stmt = Box::new(CsharpminorStmt::Sset(*reg, (**true_val).clone()));
+                            let else_stmt = Box::new(CsharpminorStmt::Sset(*reg, (**false_val).clone()));
+                            return Some((*n, CsharpminorStmt::Sifthenelse(cond, cond_args, then_stmt, else_stmt)));
+                        }
+                    }
+                    None
+                })
+                .collect();
+            if !lifted.is_empty() {
+                let lifted_nodes: HashSet<Node> = lifted.iter().map(|(n, _)| *n).collect();
+                let new_stmt_rel = ascent::boxcar::Vec::<(Node, CsharpminorStmt)>::new();
+                for (n, s) in db.rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt") {
+                    if !lifted_nodes.contains(n) {
+                        new_stmt_rel.push((*n, s.clone()));
+                    }
+                }
+                for t in lifted {
+                    new_stmt_rel.push(t);
+                }
+                db.rel_set("csharp_stmt", new_stmt_rel);
+            }
+        }
     }
 
     fn inputs(&self) -> &'static [&'static str] {
-        &["csharp_stmt", "instr_in_function"]
+        &["csharp_stmt", "instr_in_function", "cmov_reuse_node"]
     }
 
     fn outputs(&self) -> &'static [&'static str] {
-        &["closed_form_switch", "closed_form_switch_case"]
+        &["closed_form_switch", "closed_form_switch_case", "csharp_stmt"]
     }
 }

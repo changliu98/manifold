@@ -15,7 +15,7 @@ ascent_par! {
     #[swap_db]
     pub struct StackAnalysisProgram;
 
-    // --- Input relations -----------------------------------------------
+    // Input relations
     relation code_in_block(Address, Address);
     relation block_boundaries(Address, Address, Address);
     relation next(Address, Address);
@@ -28,7 +28,7 @@ ascent_par! {
     relation adjusts_stack(Address, Symbol, i64);
     relation stack_base_move(Address, Symbol, Symbol);
 
-    // --- Block topology ------------------------------------------------
+    // Block topology
 
     #[local] relation block_instruction_next(Address, Address, Address);
     block_instruction_next(block, before, after) <--
@@ -48,7 +48,7 @@ ascent_par! {
         block_in_function(src_block, func),
         block_in_function(dst, func);
 
-    // --- Stack modification tracking -----------------------------------
+    // Stack modification tracking
 
     #[local] relation adjusts_stack_in_block(Address, Address, Symbol, i64);
     adjusts_stack_in_block(block, ea, reg, offset) <--
@@ -81,7 +81,7 @@ ascent_par! {
         base_reg_def(ea, base),
         code_in_block(ea, block);
 
-    // --- def/used helpers ----------------------------------------------
+    // def/used helpers
 
     #[local] relation defined_in_block(Address, Symbol, i64);
     defined_in_block(block, base, ofs) <--
@@ -97,7 +97,7 @@ ascent_par! {
     ref_in_block(block, base, ofs) <-- defined_in_block(block, base, ofs);
     ref_in_block(block, base, ofs) <-- used_in_block(block, _, base, ofs);
 
-    // --- block_last_def: last definition of [base, ofs] visible at each instruction within a block ---
+    // block_last_def: last definition of [base, ofs] visible at each instruction within a block
 
     #[local] relation block_last_def(Address, Address, Symbol, i64);
 
@@ -115,7 +115,7 @@ ascent_par! {
         code_in_block(ea, blk),
         code_in_block(next_addr, blk);
 
-    // --- last_def_in_block: summary of last def visible at the end of each block ---
+    // last_def_in_block: summary of last def visible at the end of each block
 
     #[local] relation last_def_in_block(Address, Address, Symbol, i64);
 
@@ -129,14 +129,14 @@ ascent_par! {
         !stack_def(last_insn, base, ofs),
         !base_reg_def(last_insn, base);
 
-    // --- live_var_def: a def live at end of its block, eligible for inter-block use pairing ---
+    // live_var_def: a def live at end of its block, eligible for inter-block use pairing
 
     #[local] relation live_var_def(Address, Symbol, i64, Address);
 
     live_var_def(block, base, ofs, def_addr) <--
         last_def_in_block(block, def_addr, base, ofs);
 
-    // --- live_var_used: a use with no intra-block def, starting backward inter-block search. Schema: (Block, LiveBase, LiveOfs, UsedBase, UsedOfs, EA_used, Moves) ---
+    // live_var_used: a use with no intra-block def, starting backward inter-block search. Schema: (Block, LiveBase, LiveOfs, UsedBase, UsedOfs, EA_used, Moves)
 
     #[local] relation live_var_used(Address, Symbol, i64, Symbol, i64, Address, u32);
 
@@ -146,7 +146,7 @@ ascent_par! {
         !block_last_def(ea_used, _, base, ofs),
         !block_has_stack_mod_for(block, base);
 
-    // --- live_var_used_in_block: per-instruction backward propagation within a block, tracking offset transformations through stack adjustments and base-register moves. Schema: (Block, EA, LiveBase, LiveOfs, UsedBase, UsedOfs, EA_used, Moves) ---
+    // live_var_used_in_block: per-instruction backward propagation within a block, tracking offset transformations through stack adjustments and base-register moves. Schema: (Block, EA, LiveBase, LiveOfs, UsedBase, UsedOfs, EA_used, Moves)
 
     #[local] relation live_var_used_in_block(Address, Address, Symbol, i64, Symbol, i64, Address, u32);
 
@@ -158,7 +158,7 @@ ascent_par! {
     live_var_used_in_block(block, ea_used, base, ofs, base, ofs, ea_used, 0) <--
         used_in_block(block, ea_used, base, ofs);
 
-    // --- Inter-block entry into per-instruction traversal: when live_var_at_block_end reaches a block with stack mods, enters backward traversal at last instruction (three cases based on last instruction's effect) ---
+    // Inter-block entry into per-instruction traversal: when live_var_at_block_end reaches a block with stack mods, enters backward traversal at last instruction (three cases based on last instruction's effect)
 
     // Entry case 1: last instruction adjusts stack -> transform offset
     live_var_used_in_block(block, last_ea, base, ofs + adj, used_base, used_ofs, ea_used, moves + 1) <--
@@ -195,7 +195,7 @@ ascent_par! {
         !base_reg_def(last_ea, base),
         !stack_def(last_ea, base, ofs);
 
-    // --- Backward propagation within block -----------------------------
+    // Backward propagation within block
 
     // Skip: no modification at this instruction
     live_var_used_in_block(block, ea, base, ofs, used_base, used_ofs, ea_used, moves) <--
@@ -223,7 +223,7 @@ ascent_par! {
         live_var_used_in_block(block, ea, live_base, live_ofs, used_base, used_ofs, ea_used, moves),
         if *ea == *block;
 
-    // --- live_var_at_block_end: backward propagation across blocks, variable is live at end of Block for a use in BlockUsed ---
+    // live_var_at_block_end: backward propagation across blocks, variable is live at end of Block for a use in BlockUsed
 
     #[local] relation live_var_at_block_end(Address, Address, Symbol, i64);
 
@@ -239,7 +239,7 @@ ascent_par! {
         !base_reg_def_in_block(block, base),
         block_next(prev_block, block);
 
-    // --- live_var_at_prior_used: forward chaining to propagate a def through a found use to reach subsequent uses of the same stack location ---
+    // live_var_at_prior_used: forward chaining to propagate a def through a found use to reach subsequent uses of the same stack location
 
     #[local] relation live_var_at_prior_used(Address, Address, Symbol, i64);
 
@@ -249,7 +249,7 @@ ascent_par! {
         !base_reg_def_in_block(block, base),
         !defined_in_block(block, base, ofs);
 
-    // --- stack_def_used: final output def-use chains with both def-side and use-side variables ---
+    // stack_def_used: final output def-use chains with both def-side and use-side variables
 
     relation stack_def_used(Address, Symbol, i64, Address, Symbol, i64);
 

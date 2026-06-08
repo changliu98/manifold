@@ -1103,7 +1103,7 @@ fn detect_comparison_tree_switches(
             }
         }
 
-        // Match Scond with arg either Evar(reg) or Ebinop(Oaddl/Oadd, Evar(reg), Econst(offset)) -- the inline-temp pattern GCC/clang emits for `(disc - K) <op> imm`.
+        // Match Scond with arg either Evar(reg) or Ebinop(Oaddl/Oadd, Evar(reg), Econst(offset)); the inline-temp pattern GCC/clang emits for `(disc - K) <op> imm`.
         let cmp = match stmt_map.get(&node) {
             Some(CsharpminorStmt::Scond(cond, args, ifso, ifnot)) if args.len() == 1 => {
                 let (reg_opt, inline_off) = match &args[0] {
@@ -1950,7 +1950,7 @@ ascent_par! {
         before_in_block(intro, u),
         !copy_killed_between(intro, dst, src, u);
 
-    // The copy at `intro` has a use of `dst` it does NOT cover (dst read where the copy is inactive: another block, or before `intro` via a back-edge -- the loop-carried read); such uses cannot be rewritten to `src`, so killing/substituting the copy would strip dst's def and collapse the loop-carried value to its pre-loop definition (a frozen counter/accumulator).
+    // The copy at `intro` has a use of `dst` it does NOT cover (dst read where the copy is inactive: another block, or before `intro` via a back-edge, the loop-carried read); such uses cannot be rewritten to `src`, so killing/substituting the copy would strip dst's def and collapse the loop-carried value to its pre-loop definition (a frozen counter/accumulator).
     relation copy_use_uncovered(Node);
     copy_use_uncovered(*intro) <--
         copy_intro(intro, dst, src),

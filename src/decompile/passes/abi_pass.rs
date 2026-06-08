@@ -509,7 +509,7 @@ fn populate_hardcoded_signatures(db: &mut DecompileDB) {
 fn populate_known_global_types(db: &mut DecompileDB) {
     use XType::*;
 
-    // REMOVED only `Version`: it is a GENERIC identifier (the audit's top global-type overfit) that force-typed any program's unrelated `int`/`struct Version` to char*; it now takes the binary's own recovered evidence (void* on unstripped gnulib -- an acceptable pointer). program_name and exit_failure are KEPT: they are specific/low-collision gnulib names AND empirically (gcc -fsyntax-only on unstripped `[`) their recovered evidence is too weak -- dropping program_name regressed char*->long -- so the table type is the better default. NB: on STRIPPED binaries none of these internal symbol names survive, so the table only ever matches genuine dynamic imports there; this change is a no-op on the stripped eval corpus and only affects unstripped collisions.
+    // REMOVED only `Version`: it is a GENERIC identifier (the audit's top global-type overfit) that force-typed any program's unrelated `int`/`struct Version` to char*; it now takes the binary's own recovered evidence (void* on unstripped gnulib, an acceptable pointer). program_name and exit_failure are KEPT: they are specific/low-collision gnulib names AND empirically (gcc -fsyntax-only on unstripped `[`) their recovered evidence is too weak (dropping program_name regressed char*->long), so the table type is the better default. NB: on STRIPPED binaries none of these internal symbol names survive, so the table only ever matches genuine dynamic imports there; this change is a no-op on the stripped eval corpus and only affects unstripped collisions.
     let known_globals: &[(&str, XType)] = &[
         ("stdout", Xptr),
         ("stderr", Xptr),

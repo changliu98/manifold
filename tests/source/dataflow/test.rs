@@ -18,7 +18,7 @@ fn all_functions_present() {
     }
 }
 
-// --- Operator checks ---
+// Operator checks
 
 #[test]
 fn div_mod_has_div_and_mod() {
@@ -84,8 +84,7 @@ fn large_consts_has_xor_and_const() {
 
 #[test]
 fn overlapping_lifetimes_has_arithmetic() {
-    // gcc -O1 optimizes *2 to add-self and /2 to arithmetic shift sequence.
-    // The if/else recovery is non-deterministic so only check stable parts.
+    // gcc -O1 optimizes *2 to add-self and /2 to arithmetic shift sequence. The if/else recovery is non-deterministic so only check stable parts.
     assert!(has_binop(&OUTPUT, "test_overlapping_lifetimes", BinaryOp::Add),
             "expected arithmetic for overlapping lifetimes");
 }
@@ -97,7 +96,7 @@ fn register_pressure_has_many_arithmetic() {
     assert!(b.matches("*").count() >= 2, "expected multiple multiplications:\n{b}");
 }
 
-// --- Control flow checks ---
+// Control flow checks
 
 #[test]
 fn cond_def_has_branch() {
@@ -160,7 +159,7 @@ fn sign_extension_has_comparison() {
             "expected comparison or function present");
 }
 
-// --- Function call checks ---
+// Function call checks
 
 #[test]
 fn call_arg_passing_calls_two_params() {
@@ -195,7 +194,7 @@ fn tail_call_has_call() {
             "expected tail call to test_identity");
 }
 
-// --- Global / assignment checks ---
+// Global / assignment checks
 
 #[test]
 fn global_var_update_accesses_global() {
@@ -226,7 +225,7 @@ fn stack_struct_has_fields() {
             "expected struct field access or assignments:\n{b}");
 }
 
-// --- Parameter count checks ---
+// Parameter count checks
 
 #[test]
 fn identity_has_one_param() {

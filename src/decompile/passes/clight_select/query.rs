@@ -391,14 +391,7 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
 
     let goto_targets: HashSet<Node> = db.rel_iter::<(Address, Node)>("emit_goto_target").map(|(_, target)| *target).collect();
 
-    // emit_clight_stmt is multi-valued: instr_in_function lists a shared node (e.g. a compiler-merged
-    // abort/error trampoline reached by `jae`/`jb` bounds-check edges from many functions) under EVERY
-    // reaching function. Pushing each node's statement into all of them duplicates one function's whole
-    // body into every reacher (observed: function 0x1f460's body emitted into 27 functions, each then
-    // starting with a spurious abort()). Resolve each node to the single function that CONTAINS it --
-    // the nearest preceding entry by address among the functions that claim it (masking the synthetic
-    // bit so split nodes resolve like their real address) -- and emit the statement only under that
-    // owner. This mirrors the node_to_func resolution above and in clight_select/query node_to_func.
+    // emit_clight_stmt is multi-valued: instr_in_function lists a shared node (e.g. a compiler-merged abort/error trampoline reached by `jae`/`jb` bounds-check edges from many functions) under EVERY reaching function. Pushing each node's statement into all of them duplicates one function's whole body into every reacher (observed: function 0x1f460's body emitted into 27 functions, each then starting with a spurious abort()). Resolve each node to the single function that CONTAINS it: the nearest preceding entry by address among the functions that claim it (masking the synthetic bit so split nodes resolve like their real address), and emit the statement only under that owner. This mirrors the node_to_func resolution above and in clight_select/query node_to_func.
     const SYNTH_BIT: u64 = 1u64 << 62;
     let mut node_candidate_addrs: HashMap<Node, Vec<Address>> = HashMap::new();
     for (addr, node, _stmt) in db.rel_iter::<(Address, Node, ClightStmt)>("emit_clight_stmt") {
@@ -1035,7 +1028,7 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
             None
         };
 
-        // Pointer globals (GOT / .data.rel.ro / .bss fn-ptr slots) must never be classified as string literals: their file bytes are zero (relocated at load time), so a leading 0x00 byte (or a lone \0, zero-initialized data) does NOT mean "empty string" -- emit it as a normal scalar/pointer global instead of "".
+        // Pointer globals (GOT / .data.rel.ro / .bss fn-ptr slots) must never be classified as string literals: their file bytes are zero (relocated at load time), so a leading 0x00 byte (or a lone \0, zero-initialized data) does NOT mean "empty string"; emit it as a normal scalar/pointer global instead of "".
         if !is_string && scalar_value.is_none() && !is_pointer {
             for section in obj_file.sections() {
                  // A global_var_ref id is a runtime address, which only loaded (SHF_ALLOC) sections have; non-allocated metadata sections (.comment, .note, .debug_*) sit at sh_addr=0, so a small integer constant that became a global ref would otherwise resolve into their bytes (e.g. .comment's toolchain version string) and render as that substring. Skip them.

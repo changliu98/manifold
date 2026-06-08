@@ -7,7 +7,7 @@ fn all_functions_present() {
     }
 }
 
-// --- angr test_decompiling_dirname_last_component_missing_loop: multiple for-loops ---
+// angr test_decompiling_dirname_last_component_missing_loop: multiple for-loops
 #[test]
 fn multiple_sequential_loops_has_three_loops() {
     let b = body(&OUTPUT, "multiple_sequential_loops");
@@ -22,7 +22,7 @@ fn multiple_sequential_loops_has_comparison() {
             "expected comparison in max-finding loop");
 }
 
-// --- sentinel loop: while(*p) pattern ---
+// sentinel loop: while(*p) pattern
 #[test]
 fn sentinel_loop_has_loop() {
     assert!(has_any_loop(&OUTPUT, "sentinel_loop"), "expected loop");
@@ -35,7 +35,7 @@ fn sentinel_loop_has_deref() {
             "expected pointer dereference in sentinel loop");
 }
 
-// --- do-while with break ---
+// do-while with break
 #[test]
 fn do_while_with_break_has_loop() {
     assert!(has_any_loop(&OUTPUT, "do_while_with_break"), "expected loop");
@@ -47,7 +47,7 @@ fn do_while_with_break_no_goto() {
     assert!(!b.contains("goto "), "do-while+break should not need goto:\n{b}");
 }
 
-// --- countdown: simple while loop ---
+// countdown: simple while loop
 #[test]
 fn countdown_has_loop() {
     // clang may replace simple countdown with closed-form arithmetic
@@ -67,7 +67,7 @@ fn countdown_has_decrement() {
             "expected decrement or arithmetic operation");
 }
 
-// --- angr: loop with multiple exits (break + return) without goto ---
+// angr: loop with multiple exits (break + return) without goto
 #[test]
 fn loop_multi_exit_has_loop() {
     assert!(has_any_loop(&OUTPUT, "loop_multi_exit"), "expected loop");
@@ -86,7 +86,7 @@ fn loop_multi_exit_has_condition() {
             "expected if inside loop");
 }
 
-// --- nested loops: triangle sum ---
+// nested loops: triangle sum
 #[test]
 fn triangle_sum_has_nested_loops() {
     // clang may replace nested loops with closed-form arithmetic
@@ -98,7 +98,7 @@ fn triangle_sum_has_nested_loops() {
             "expected nested loops or arithmetic:\n{b}");
 }
 
-// --- angr test_call_expr_folding_call_loop: call inside loop ---
+// angr test_call_expr_folding_call_loop: call inside loop
 #[test]
 fn loop_with_call_has_loop() {
     assert!(has_any_loop(&OUTPUT, "loop_with_call"), "expected loop");
@@ -110,7 +110,7 @@ fn loop_with_call_calls_countdown() {
             "expected call to countdown inside loop");
 }
 
-// --- while(true) + break pattern ---
+// while(true) + break pattern
 #[test]
 fn while_true_pattern_has_loop() {
     assert!(has_any_loop(&OUTPUT, "while_true_pattern"), "expected loop");

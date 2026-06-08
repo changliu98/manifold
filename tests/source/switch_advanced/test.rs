@@ -7,7 +7,7 @@ fn all_functions_present() {
     }
 }
 
-// --- angr switch0: switch with default ---
+// angr switch0: switch with default
 #[test]
 fn switch_with_default_has_switch_or_ifs() {
     assert!(has_switch(&OUTPUT, "switch_with_default")
@@ -23,7 +23,7 @@ fn switch_with_default_has_default_path() {
             "expected default value -1:\n{b}");
 }
 
-// --- angr switch1: switch without default ---
+// angr switch1: switch without default
 #[test]
 fn switch_no_default_has_switch_or_ifs() {
     assert!(has_switch(&OUTPUT, "switch_no_default")
@@ -31,7 +31,7 @@ fn switch_no_default_has_switch_or_ifs() {
             "expected switch or if-chain for 4-case switch");
 }
 
-// --- angr: sparse switch values ---
+// angr: sparse switch values
 #[test]
 fn switch_sparse_has_dispatch() {
     assert!(has_switch(&OUTPUT, "switch_sparse")
@@ -39,7 +39,7 @@ fn switch_sparse_has_dispatch() {
             "expected switch or if-chain for sparse values");
 }
 
-// --- angr: switch inside loop ---
+// angr: switch inside loop
 #[test]
 fn switch_in_loop_has_loop_and_dispatch() {
     assert!(has_any_loop(&OUTPUT, "switch_in_loop"), "expected loop");
@@ -48,7 +48,7 @@ fn switch_in_loop_has_loop_and_dispatch() {
             "expected switch or if-chain inside loop");
 }
 
-// --- angr: nested switch (compiler may flatten at -O1) ---
+// angr: nested switch (compiler may flatten at -O1)
 #[test]
 fn switch_nested_has_dispatch() {
     assert!(has_switch(&OUTPUT, "switch_nested")
@@ -56,7 +56,7 @@ fn switch_nested_has_dispatch() {
             "expected dispatch for nested switch");
 }
 
-// --- angr switch2: switch with fallthrough ---
+// angr switch2: switch with fallthrough
 #[test]
 fn switch_with_fallthrough_has_dispatch() {
     assert!(has_switch(&OUTPUT, "switch_with_fallthrough")
@@ -64,7 +64,7 @@ fn switch_with_fallthrough_has_dispatch() {
             "expected switch or if-chain for fallthrough pattern");
 }
 
-// --- angr: large jump table switch (16 cases) ---
+// angr: large jump table switch (16 cases)
 #[test]
 fn switch_many_cases_has_dispatch() {
     assert!(has_switch(&OUTPUT, "switch_many_cases")

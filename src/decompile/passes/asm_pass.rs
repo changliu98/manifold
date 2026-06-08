@@ -2085,12 +2085,16 @@ ascent_par! {
         };
 
 
+    // osel_compare_site(cmov_addr, compare_addr): the compare/test whose flags this cmov consumes. rtl_pass resolves the cmov condition operands at compare_addr, since clang may reuse the compared register as a value holder between the compare and the cmov.
+    relation osel_compare_site(Address, Address);
+
     // CMP-imm + CMOV -> Osel: anchored at CMOV address so dst_mreg def is visible to downstream uses (avoids DSE when there is a gap).
     mach_inst(addr1, MachInst::Mop(
         Operation::Osel(condition, typ),
         Arc::new(vec![*dst_mreg, *src_mreg, *cmp_arg1]),
         *dst_mreg
-    )) <--
+    )),
+    osel_compare_site(*addr1, *addr0) <--
         pcmp(addr0, cmp_r1, cmp_r2),
         op_register(cmp_r1, cmp_reg_str),
         op_immediate(cmp_r2, imm_val, _),
@@ -2123,7 +2127,8 @@ ascent_par! {
         Operation::Osel(condition, typ),
         Arc::new(vec![*dst_mreg, *src_mreg, *cmp_arg1, *cmp_arg2]),
         *dst_mreg
-    )) <--
+    )),
+    osel_compare_site(*addr1, *addr0) <--
         pcmp(addr0, cmp_r1, cmp_r2),
         op_register(cmp_r1, cmp_str1),
         op_register(cmp_r2, cmp_str2),
@@ -2151,7 +2156,8 @@ ascent_par! {
         Operation::Osel(condition, typ),
         Arc::new(vec![*dst_mreg, *src_mreg, *neg_arg]),
         *dst_mreg
-    )) <--
+    )),
+    osel_compare_site(*addr1, *addr0) <--
         pneg(addr0, neg_r),
         op_register(neg_r, neg_reg_str),
         ireg_of(preg_of_neg, Ireg::from(neg_reg_str)),
@@ -3358,8 +3364,7 @@ ascent_par! {
         psub(sub_addr, _, _),
         divide_q(_, _, divisor, input_ireg, is_long);
 
-    // low-32 alias of any MOVSXD/MOV.
-    // divide_q (few idiv sites) drives so the mov_src==input_ireg filter prunes pmov early and psub is crossed LAST; leading with psub instead made every subtract multiply the divide_q x pmov cross-product (O(psub*divide_q*pmov), 36s on large binaries). Clause order is semantics-neutral in Datalog.
+    // low-32 alias of any MOVSXD/MOV. divide_q (few idiv sites) drives so the mov_src==input_ireg filter prunes pmov early and psub is crossed LAST; leading with psub instead made every subtract multiply the divide_q x pmov cross-product (O(psub*divide_q*pmov), 36s on large binaries). Clause order is semantics-neutral in Datalog.
     dividend_holder(*sub_addr, low32_ireg, *input_ireg, *divisor, *is_long) <--
         divide_q(_, _, divisor, input_ireg, is_long),
         pmov(_mov_addr, mov_dst_sym, mov_src_sym),
@@ -4123,6 +4128,23 @@ ascent_par! {
         } else {
             Operation::Oaddlimm(imm_int)
         };
+
+    // INC reg / DEC reg: capstone emits these as their own mnemonics (not ADD/SUB), so lower them as add of immediate +/-1; without this they emit no Mach op and are silently dropped, corrupting dataflow (e.g. a setcc then inc idiom loses its +1).
+    mach_inst(address, MachInst::Mop(op, Arc::new(vec![*res]), *res)) <--
+        instruction(address, _, _, "INC", dst, _, _, _, _, _),
+        op_register(dst, dst_str),
+        ireg_of(preg_of_dst, Ireg::from(dst_str)),
+        preg_of(res, preg_of_dst),
+        reg_is_64(dst_str, is_64),
+        let op = if *is_64 { Operation::Oaddlimm(1) } else { Operation::Oaddimm(1) };
+
+    mach_inst(address, MachInst::Mop(op, Arc::new(vec![*res]), *res)) <--
+        instruction(address, _, _, "DEC", dst, _, _, _, _, _),
+        op_register(dst, dst_str),
+        ireg_of(preg_of_dst, Ireg::from(dst_str)),
+        preg_of(res, preg_of_dst),
+        reg_is_64(dst_str, is_64),
+        let op = if *is_64 { Operation::Oaddlimm(-1) } else { Operation::Oaddimm(-1) };
 
     // ADD/SUB with memory source, register destination: add reg, [mem].
     arith_load_op(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(dst_str)) <--
@@ -5526,8 +5548,7 @@ ascent_par! {
         let args = vec![arg];
 
 
-    // Float/SSE op with a MEMORY source: the reg-reg rules require op_register on the source, so `mulss xmm0,[mem]` / `cvtss2sd xmm0,[mem]` match no mach_inst rule and the whole instruction is dropped (float body collapses to `return 0`, or a loaded float never reaches its use); capture as a fused load+op (float_load_op) lowered in rtl_pass like arith_load_op, excluding BP/SP (stack slots) and RIP (constant pool) bases.
-    // float_mem_op_raw: (addr, float_op, source_chunk, mem_operand, dst_xmm, is_unary_conversion)
+    // Float/SSE op with a MEMORY source: the reg-reg rules require op_register on the source, so `mulss xmm0,[mem]` / `cvtss2sd xmm0,[mem]` match no mach_inst rule and the whole instruction is dropped (float body collapses to `return 0`, or a loaded float never reaches its use); capture as a fused load+op (float_load_op) lowered in rtl_pass like arith_load_op, excluding BP/SP (stack slots) and RIP (constant pool) bases. float_mem_op_raw: (addr, float_op, source_chunk, mem_operand, dst_xmm, is_unary_conversion)
     relation float_mem_op_raw(Address, Operation, MemoryChunk, Symbol, Mreg, bool);
 
     float_mem_op_raw(addr, Operation::Oaddfs, MemoryChunk::MFloat32, *src, Mreg::from(d), false) <--

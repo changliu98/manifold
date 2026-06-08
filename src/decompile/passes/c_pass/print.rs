@@ -769,8 +769,7 @@ impl Printer {
             self.newline();
         }
 
-        // Print in C declaration order: types, globals, forward decls, definitions.
-        // This avoids sorting tu.decls (which would invalidate tu.symbols indices).
+        // Print in C declaration order: types, globals, forward decls, definitions. This avoids sorting tu.decls (which would invalidate tu.symbols indices).
         let order = |d: &TopLevelDecl| -> u8 {
             match d {
                 TopLevelDecl::StructDef(_) | TopLevelDecl::EnumDef(_) | TopLevelDecl::Typedef(_) => 0,

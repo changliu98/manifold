@@ -814,8 +814,7 @@ fn replace_break_with(stmt: &ClightStmt, tail: &ClightStmt) -> ClightStmt {
     }
 }
 
-// Assemble compound if-then-else from structural metadata (analogous to assemble_loops); operates on already-typed ClightStmt so no type decisions are made.
-// Count ClightStmt tree nodes; bounds assemble_ite against pathological overlapping if-bodies.
+// Assemble compound if-then-else from structural metadata (analogous to assemble_loops); operates on already-typed ClightStmt so no type decisions are made. Count ClightStmt tree nodes; bounds assemble_ite against pathological overlapping if-bodies.
 fn clight_stmt_size(s: &ClightStmt) -> usize {
     match s {
         ClightStmt::Ssequence(v) => 1 + v.iter().map(clight_stmt_size).sum::<usize>(),
@@ -843,9 +842,7 @@ fn assemble_ite(
         a_size.cmp(&b_size).then(b.0.cmp(a.0))
     });
 
-    // Per-branch ceiling on assembled-compound size; bounds the 2^depth shared-node duplication
-    // blowup on degenerate control flow. Far above any real function's nesting, so it only trips
-    // on pathological structuring (configurable via ITE_MAX_NODES).
+    // Per-branch ceiling on assembled-compound size; bounds the 2^depth shared-node duplication blowup on degenerate control flow. Far above any real function's nesting, so it only trips on pathological structuring (configurable via ITE_MAX_NODES).
     let node_cap: usize = std::env::var("ITE_MAX_NODES").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
 
     for (&branch, info) in &branches {
@@ -880,7 +877,7 @@ fn assemble_ite(
             let mut body_stmts: Vec<ClightStmt> = Vec::new();
             for &node in body_nodes {
                 if let Some(stmt) = statements.get(&node) {
-                    // Strip outer label -- the node identity is subsumed by the compound
+                    // Strip outer label; the node identity is subsumed by the compound
                     let stripped = match stmt {
                         ClightStmt::Slabel(_, inner) => (**inner).clone(),
                         other => other.clone(),
@@ -913,7 +910,7 @@ fn assemble_ite(
         let mut then_body = collect_body(&info.true_body_nodes);
         let mut else_body = collect_body(&info.false_body_nodes);
 
-        // A branch side whose body was not inlined because its target is a (merging) shared landing pad -- excluded from the if-body seeds in the structuring pass -- must keep its original `goto target` rather than collapse to an empty Sskip that silently drops the control edge and loses the condition. Only restore the goto when the target is a real jump elsewhere (not the join point, where an empty side is a legitimate fallthrough). then_target/else_target are the flat Scond's `Sgoto(ident)` statements from clight_pass.
+        // A branch side whose body was not inlined because its target is a (merging) shared landing pad (excluded from the if-body seeds in the structuring pass) must keep its original `goto target` rather than collapse to an empty Sskip that silently drops the control edge and loses the condition. Only restore the goto when the target is a real jump elsewhere (not the join point, where an empty side is a legitimate fallthrough). then_target/else_target are the flat Scond's `Sgoto(ident)` statements from clight_pass.
         let join_ident = info.join_node.map(ident_from_node);
         let goto_is_to_join = |g: &ClightStmt| matches!(g, ClightStmt::Sgoto(t) if Some(*t) == join_ident);
         if info.true_body_nodes.is_empty()
@@ -933,13 +930,7 @@ fn assemble_ite(
 
         let compound = ClightStmt::Sifthenelse(cond, Box::new(then_body), Box::new(else_body));
 
-        // Duplicating a shared node into both arms is intentional (it avoids gotos), but on dense
-        // reconverging control flow that duplication compounds 2^depth across deeply nested
-        // branches and exhausts memory (362705: 122 branches, ~all body nodes shared by both sides
-        // -> a single compound reaching billions of nodes). Bound it: if one branch's assembled
-        // compound is absurdly large, leave that branch flat (its scond keeps its goto edges)
-        // rather than nest it. Real functions are orders of magnitude smaller, so this only trips
-        // on degenerate structuring; the skipped branch's body nodes stay top-level for the gotos.
+        // Duplicating a shared node into both arms is intentional (it avoids gotos), but on dense reconverging control flow that duplication compounds 2^depth across deeply nested branches and exhausts memory (362705: 122 branches, ~all body nodes shared by both sides -> a single compound reaching billions of nodes). Bound it: if one branch's assembled compound is absurdly large, leave that branch flat (its scond keeps its goto edges) rather than nest it. Real functions are orders of magnitude smaller, so this only trips on degenerate structuring; the skipped branch's body nodes stay top-level for the gotos.
         let csize = clight_stmt_size(&compound);
         if csize > node_cap {
             eprintln!("[assemble_ite] branch {:x}: compound too large ({} nodes > cap {}); left flat with gotos to avoid 2^depth blowup", branch, csize, node_cap);
@@ -1214,11 +1205,7 @@ fn inline_control_flow_bodies(
             visiting.insert(node);
             let (inlined, newly_inlined) =
                 inline_stmt_recursive_track(&stmt, statements, &preds, &mut visiting, 0);
-            // Free absorbed children immediately. Each inlined node has pred_count==1 (its only
-            // predecessor is the node we just inlined it into), so it is not referenced elsewhere
-            // and its content now lives inside `inlined`. Without this, every node's fully-inlined
-            // tree coexists in `statements` until the retain below -- O(n^2) memory on long pred==1
-            // chains, which OOMs large functions (e.g. 136803, stuck here at >11G).
+            // Free absorbed children immediately. Each inlined node has pred_count==1 (its only predecessor is the node we just inlined it into), so it is not referenced elsewhere and its content now lives inside `inlined`. Without this, every node's fully-inlined tree coexists in `statements` until the retain below; O(n^2) memory on long pred==1 chains, which OOMs large functions (e.g. 136803, stuck here at >11G).
             for &n in &newly_inlined {
                 statements.remove(&n);
             }

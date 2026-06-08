@@ -401,7 +401,7 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
         .map(|&(addr, reg)| (addr, reg))
         .collect();
 
-    // RTLOptimizerProgram is the Ascent v2 of the imperative optimizer. Its outputs are only consumed by the debug-only RTL_V2_DIFF block below, so in release builds we skip it entirely (dominates the RTL pass -- ~57s on a 700KB binary).
+    // RTLOptimizerProgram is the Ascent v2 of the imperative optimizer. Its outputs are only consumed by the debug-only RTL_V2_DIFF block below, so in release builds we skip it entirely (dominates the RTL pass at ~57s on a 700KB binary).
     #[cfg(debug_assertions)]
     let ascent_v2: Option<AscentV2Snapshot> = if std::env::var("RTL_V2_DIFF").is_ok() {
         let ascent_opt = run_rtl_optimizer_program(&ctx);
@@ -1701,7 +1701,6 @@ pub(crate) fn subst_ba(ba: &BuiltinArg<RTLReg>, map: &HashMap<RTLReg, RTLReg>) -
         other => other.clone(),
     }
 }
-
 
 pub(crate) fn dead_store_elimination(
     func: &mut FunctionCFG,

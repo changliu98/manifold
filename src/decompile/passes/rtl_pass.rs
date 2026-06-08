@@ -23,9 +23,7 @@ use rayon::prelude::*;
 
 const ENDBR64_LEN: u64 = 4;
 
-// Strict-dominator set plus the node itself, mirroring structuring_pass's dom_set helper. Used by the
-// block-dominator lattice in RTLPassProgram so dominance is maintained as O(blocks * dom-depth) lattice
-// state rather than an O(blocks^2) pairwise/path-avoiding workspace.
+// Strict-dominator set plus the node itself, mirroring structuring_pass's dom_set helper. Used by the block-dominator lattice in RTLPassProgram so dominance is maintained as O(blocks * dom-depth) lattice state rather than an O(blocks^2) pairwise/path-avoiding workspace.
 fn dom_set_with_self(strict: &Set<Address>, n: Address) -> Set<Address> {
     let mut s = strict.0.clone();
     s.insert(n);
@@ -102,6 +100,8 @@ ascent_par! {
     relation op_produces_ptr(Node, RTLReg);
     relation padd(Address, Symbol, Symbol);
     relation pcmp(Address, Symbol, Symbol);
+    // osel_compare_site(cmov_addr, compare_addr): from asm_pass; the compare whose flags this cmov consumes, so condition operands resolve at the compare site rather than the (possibly register-reusing) cmov site.
+    relation osel_compare_site(Address, Address);
     relation pdiv(Address, Symbol, Symbol);
     relation pidiv(Address, Symbol, Symbol);
     relation pudiv(Address, Symbol, Symbol);
@@ -289,6 +289,27 @@ ascent_par! {
         if *base_str != "NONE";
 
 
+    // osel_cond_pos(addr, pos, cmp_rtl): a cmov condition operand (position >= 2) that is the same register the cmov writes, where clang reused that register between the compare and the cmov so the value reaching the compare (cmp_rtl) differs from the cmov-site shadow value. Non-reuse cmovs (e.g. jump-table index clamps) are not marked, so their existing register shapes and switch/jump-table recovery are unaffected.
+    relation osel_cond_pos(Node, usize, RTLReg);
+    osel_cond_pos(addr, pos, cmp_rtl) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Osel(_, _), mregs, dst_reg)),
+        osel_compare_site(addr, cmp_addr),
+        lop_overwrites_input(addr, dst_reg),
+        lop_overwrite_use_id(addr, *dst_reg, src_xtl),
+        xtl_canonical(src_xtl, shadow_rtl),
+        for (pos, arg) in mregs.iter().enumerate(),
+        if pos >= 2,
+        if arg == dst_reg,
+        reg_rtl(cmp_addr, *arg, cmp_rtl),
+        if cmp_rtl != shadow_rtl;
+
+    // cmov_reuse_node(addr): cmov whose flag register was reused as a value holder. The structuring select-to-if lift targets exactly these (dispatch-style selects), leaving other branchless selects for their own recovery passes (jump tables, closed-form switches, plain ternaries).
+    relation cmov_reuse_node(Node);
+    cmov_reuse_node(addr) <-- osel_cond_pos(addr, _, _);
+
+    op_arg_mapping(addr, pos, cmp_rtl) <--
+        osel_cond_pos(addr, pos, cmp_rtl);
+
     op_arg_mapping(addr, pos, arg_rtl) <--
         ltl_inst(addr, ?LTLInst::Lop(_, mregs, dst_reg)),
         for (pos, arg) in mregs.iter().enumerate(),
@@ -306,6 +327,7 @@ ascent_par! {
         ltl_inst(addr, ?LTLInst::Lop(_, mregs, dst_reg)),
         for (pos, arg) in mregs.iter().enumerate(),
         if arg == dst_reg,
+        !osel_cond_pos(addr, pos, _),
         lop_overwrite_use_id(addr, *dst_reg, src_xtl),
         xtl_canonical(src_xtl, arg_rtl_use);
 
@@ -477,12 +499,7 @@ ascent_par! {
     global_addr_reg(*ident, b) <-- global_addr_reg(ident, a), alias_edge(a, b);
     global_addr_reg(*ident, a) <-- global_addr_reg(ident, b), alias_edge(a, b);
 
-    // When a global address register is used as base for a load at offset 0, track the chunk.
-    // Drive off the load instruction, bind base_rtl, then match global_addr_reg BY that register
-    // (indexed lookup on col 1). The original led with global_addr_reg and scanned ltl_inst, then
-    // related them only via the trailing addr_rtl==base_rtl filter -- an O(global_addr_reg*ltl_inst)
-    // cross-product (26s). Clause order is semantics-neutral; matching base_rtl in the body
-    // position is equivalent to the equality filter.
+    // When a global address register is used as base for a load at offset 0, track the chunk. Drive off the load instruction, bind base_rtl, then match global_addr_reg BY that register (indexed lookup on col 1). The original led with global_addr_reg and scanned ltl_inst, then related them only via the trailing addr_rtl==base_rtl filter; an O(global_addr_reg*ltl_inst) cross-product (26s). Clause order is semantics-neutral; matching base_rtl in the body position is equivalent to the equality filter.
     global_load_chunk(*ident, chunk.clone()) <--
         ltl_inst(node, ?LTLInst::Lload(chunk, Addressing::Aindexed(0), args, _)),
         if !args.is_empty(),
@@ -1014,7 +1031,7 @@ ascent_par! {
         let synthetic_addr = *addr | (1u64 << 62),
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, temp]), *dst_rtl);
 
-    // Unary conversion (cvtss2sd/cvtsd2ss): dst = convert(loaded); dst is write-only so it may be a fresh def -- handle both the existing-canonical and fresh-reg cases.
+    // Unary conversion (cvtss2sd/cvtsd2ss): dst = convert(loaded); dst is write-only so it may be a fresh def; handle both the existing-canonical and fresh-reg cases.
     rtl_inst_candidate(synthetic_addr, op_inst) <--
         float_load_op(addr, op, _, _, _, dst, true),
         !has_ltl_op(addr),
@@ -1052,8 +1069,7 @@ ascent_par! {
 
     synth_only_addr(addr) <-- float_load_op(addr, _, _, _, _, _, _), !has_ltl_op(addr);
 
-    // arith_store_reg: memory-dest arithmetic with register source; only fires without a real ltl op.
-    // BP-relative read-modify-write (e.g. add %eax, -4(%rbp)) operates IN-PLACE on the slot's stack_rtl so the update threads to later reads of the same slot; otherwise load/op land in a fresh RTEMP disconnected from the slot var and a memory-spilled loop counter/accumulator stays frozen at its initializer. Mirrors arith_load_op's stack_rtl binding on the read side.
+    // arith_store_reg: memory-dest arithmetic with register source; only fires without a real ltl op. BP-relative read-modify-write (e.g. add %eax, -4(%rbp)) operates IN-PLACE on the slot's stack_rtl so the update threads to later reads of the same slot; otherwise load/op land in a fresh RTEMP disconnected from the slot var and a memory-spilled loop counter/accumulator stays frozen at its initializer. Mirrors arith_load_op's stack_rtl binding on the read side.
     #[local] relation arith_store_reg_uses_stack_var(Node);
     arith_store_reg_uses_stack_var(addr) <--
         arith_store_reg(addr, _, _, base_mreg, disp, _),
@@ -1139,8 +1155,7 @@ ascent_par! {
         let synth2 = *addr | (1u64 << 63),
         next(addr, next);
 
-    // arith_store_imm: memory-dest arithmetic with immediate; only fires without a real ltl op.
-    // BP-relative read-modify-write (e.g. addl $1, -4(%rbp)) operates IN-PLACE on the slot's stack_rtl so the updated value threads to later reads of the same slot (see arith_store_reg).
+    // arith_store_imm: memory-dest arithmetic with immediate; only fires without a real ltl op. BP-relative read-modify-write (e.g. addl $1, -4(%rbp)) operates IN-PLACE on the slot's stack_rtl so the updated value threads to later reads of the same slot (see arith_store_reg).
     #[local] relation arith_store_imm_uses_stack_var(Node);
     arith_store_imm_uses_stack_var(addr) <--
         arith_store_imm(addr, _, _, base_mreg, disp),
@@ -1627,7 +1642,7 @@ ascent_par! {
         let synth = *addr | (1u64 << 62),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2(0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *dst_rtl);
 
-    // SP-indexed load: edge rewiring -- redirect addr's successors through the synthetic node
+    // SP-indexed load: edge rewiring; redirect addr's successors through the synthetic node
     rtl_edge_negated(addr, next) <--
         sp_indexed_load(addr),
         ltl_succ(addr, next);
@@ -2656,8 +2671,7 @@ ascent_par! {
         ltl_inst(ret_addr, ?LTLInst::Lreturn),
         reg_def_used(def_addr, Mreg::AX, ret_addr);
 
-    // Availability-based void detection.
-    // ltl_inst_uses_mreg(Lreturn, AX) is unconditional, so ANY AX def reaching a return (dead call clobber, compare-operand load) looks like a return value, making void stubs (__do_global_dtors_aux, void loops calling a subroutine) emit a fabricated `return <uninitialized var>`; detect genuine void functions structurally as a function some of whose returns are reachable on a CFG path setting no genuine return value.
+    // Availability-based void detection. ltl_inst_uses_mreg(Lreturn, AX) is unconditional, so ANY AX def reaching a return (dead call clobber, compare-operand load) looks like a return value, making void stubs (__do_global_dtors_aux, void loops calling a subroutine) emit a fabricated `return <uninitialized var>`; detect genuine void functions structurally as a function some of whose returns are reachable on a CFG path setting no genuine return value.
 
     // A return-value AX def: an AX def-site NOT consumed by a non-return use, excluding compare-operand loads and intermediate computations while keeping mov-imm/arithmetic/used-call results; the dead-call-then-return shape is resolved by the control-flow availability below.
     relation ltl_is_return(Address);
@@ -2675,8 +2689,7 @@ ascent_par! {
         reg_def_site(def_addr, Mreg::AX),
         !ax_def_consumed_nonret(def_addr);
 
-    // Void-callee return-value exclusion (dual of the void detection above).
-    // A call whose callee leaves no value in AX produces a dead AX clobber, not a return value; when a caller's only return-value source is such a clobber the caller has no real value and is itself void (else it fabricates `return <undef>` reading the absent dest).
+    // Void-callee return-value exclusion (dual of the void detection above). A call whose callee leaves no value in AX produces a dead AX clobber, not a return value; when a caller's only return-value source is such a clobber the caller has no real value and is itself void (else it fabricates `return <undef>` reading the absent dest).
 
     // A function genuinely produces a return value if a real AX/X0 value source reaches one of its returns; structural (no dependency on func_void_avail / ax_value_addr / final ax_retval_def) so it can gate the void-callee exclusion below, and built on ax_retval_def_base so a void callee whose only AX writes are dead/intermediate is seen as producing no value.
     relation func_produces_retval(Address);
@@ -2691,7 +2704,7 @@ ascent_par! {
     func_produces_retval(func_start) <--
         instr_in_function(ret_addr, func_start),
         def_reaches_return(ret_addr, _, Mreg::X0);
-    // (c) the function forwards a local callee's result and that callee itself produces a value (positive recursion -- keeps the SCC negation-free and thus stratifiable).
+    // (c) the function forwards a local callee's result and that callee itself produces a value (positive recursion; keeps the SCC negation-free and thus stratifiable).
     func_produces_retval(func_start) <--
         instr_in_function(call_addr, func_start),
         ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Left(callee)))),
@@ -2750,7 +2763,7 @@ ascent_par! {
         ax_retval_undef_at_block(ret_blk),
         !block_has_ax_retval_def(ret_blk);
 
-    // Gate the return-value binding on the function not being void: a void function has no ax_value_addr, so it gets no function_return_point_reg / has-return and its returns lower to the void Ireturn path -- identical to the established void rendering.
+    // Gate the return-value binding on the function not being void: a void function has no ax_value_addr, so it gets no function_return_point_reg / has-return and its returns lower to the void Ireturn path; identical to the established void rendering.
     ax_value_addr(ret_addr, def_addr) <--
         ax_value_direct(ret_addr, def_addr),
         instr_in_function(ret_addr, vfunc),
@@ -3026,8 +3039,7 @@ ascent_par! {
     reg_use(addr, Mreg::AX) <--
         ltl_inst(addr, ?LTLInst::Lreturn);
 
-    // Float/double (XMM0) returns.
-    // Returns place a double/float result in X0 (XMM0), unseen by the AX-keyed return machinery (the only return reg_use was AX above), so double-returning functions bound no value and fell to the fabricated/void path; a function returns float iff some return is reached by an in-function X0 def AND no AX value reaches any return (an AX-binding function is int/ptr-returning). Add an X0 return reg_use only for those, then mirror the AX direct def-use binding with x0_value_direct / x0_value_addr.
+    // Float/double (XMM0) returns. Returns place a double/float result in X0 (XMM0), unseen by the AX-keyed return machinery (the only return reg_use was AX above), so double-returning functions bound no value and fell to the fabricated/void path; a function returns float iff some return is reached by an in-function X0 def AND no AX value reaches any return (an AX-binding function is int/ptr-returning). Add an X0 return reg_use only for those, then mirror the AX direct def-use binding with x0_value_direct / x0_value_addr.
     relation func_x0_def_reaches_return(Address);
     func_x0_def_reaches_return(func_start) <--
         instr_in_function(ret_addr, func_start),
@@ -3274,12 +3286,7 @@ ascent_par! {
         block_in_function(entry_block, func),
         code_in_block(func, entry_block);
 
-    // Block-dominator lattice (Cooper-Harvey-Kennedy), same shape as structuring_pass dom_set:
-    // dominators(block) = {block} INTERSECT-FOLD dominators(preds). Stored as Dual<Set> so the lattice
-    // join is set intersection. Storage is O(blocks * dom-tree-depth) versus the old block_path_avoiding
-    // workspace's O(blocks^2) per function -- the same construct structuring_pass replaced to drop pass
-    // peak by tens of GB. is_loop_back_edge queries dominator-set membership directly, so no pairwise
-    // block_dom relation is materialized.
+    // Block-dominator lattice (Cooper-Harvey-Kennedy), same shape as structuring_pass dom_set: dominators(block) = {block} INTERSECT-FOLD dominators(preds). Stored as Dual<Set> so the lattice join is set intersection. Storage is O(blocks * dom-tree-depth) versus the old block_path_avoiding workspace's O(blocks^2) per function; the same construct structuring_pass replaced to drop pass peak by tens of GB. is_loop_back_edge queries dominator-set membership directly, so no pairwise block_dom relation is materialized.
     #[local] lattice block_strict_dom_set(Address, Address, Dual<Set<Address>>);
     lattice block_dom_set(Address, Address, Dual<Set<Address>>);
 
@@ -3313,14 +3320,7 @@ ascent_par! {
         code_in_block(dst, blk),
         if *dst <= *src;
 
-    // ---- Reaching-definition lattice -----------------------------------------------------------
-    // Forward MAY-reaching-defs of a register at each block ENTRY, restricted to argument/return
-    // registers (reg_of_interest) to bound cost. The Set lattice join is union (may-reach). This is the
-    // lattice-maintained replacement for the instr_min_order / function_entry_count magnitude proxies:
-    // "def d reaches point u for reg r" becomes block_last_def(u,d,r) intra-block, else
-    // d in reaching_def_in(func, block_of_u, r) with no in-block redef -- exact at any distance. Seeded
-    // ONLY from real def-sites (last_def_in_block), never func_param_validated, so it stays out of the
-    // param-validation negation SCC. Inert for now (no consumers); wired into G1/G2/G3 in later steps.
+    // Reaching-definition lattice Forward MAY-reaching-defs of a register at each block ENTRY, restricted to argument/return registers (reg_of_interest) to bound cost. The Set lattice join is union (may-reach). This is the lattice-maintained replacement for the instr_min_order / function_entry_count magnitude proxies: "def d reaches point u for reg r" becomes block_last_def(u,d,r) intra-block, else d in reaching_def_in(func, block_of_u, r) with no in-block redef: exact at any distance. Seeded ONLY from real def-sites (last_def_in_block), never func_param_validated, so it stays out of the param-validation negation SCC. Inert for now (no consumers); wired into G1/G2/G3 in later steps.
     #[local] relation reg_of_interest(Mreg);
     reg_of_interest(r) <-- is_arg_reg(r);
     reg_of_interest(r) <-- is_xmm_arg_reg(r);
@@ -3329,8 +3329,7 @@ ascent_par! {
 
     #[local] lattice reaching_def_in(Address, Address, Mreg, Set<Address>);
 
-    // gen: the def of r leaving block blk (its in-block last def) reaches every successor's entry and
-    // kills any incoming value of r along that block.
+    // gen: the def of r leaving block blk (its in-block last def) reaches every successor's entry and kills any incoming value of r along that block.
     reaching_def_in(*func, *succ, *r, Set::singleton(*d)) <--
         reg_of_interest(r),
         last_def_in_block(blk, d, r),
@@ -3345,12 +3344,7 @@ ascent_par! {
         asm_block_next(blk, succ),
         instr_in_function(succ, func);
 
-    // def_addr (a def of reg r) reaches return ret_addr: intra-block via block_last_def, else cross-block
-    // via membership in the reaching set at the return's block (with no in-block def shadowing it). This
-    // is the structural replacement for the instr_min_order "def_order <= ret_order" magnitude proxy --
-    // it counts only defs that actually flow to the return, not every def positioned closer to entry. It
-    // depends only on reaching_def_in + block_last_def (both structural), so consumers stay OUT of the
-    // reg_def_used / reg_use SCC.
+    // def_addr (a def of reg r) reaches return ret_addr: intra-block via block_last_def, else cross-block via membership in the reaching set at the return's block (with no in-block def shadowing it). This is the structural replacement for the instr_min_order "def_order <= ret_order" magnitude proxy: it counts only defs that actually flow to the return, not every def positioned closer to entry. It depends only on reaching_def_in + block_last_def (both structural), so consumers stay OUT of the reg_def_used / reg_use SCC.
     relation def_reaches_return(Address, Address, Mreg);
     def_reaches_return(*ret_addr, *def_addr, *r) <--
         ltl_inst(ret_addr, ?LTLInst::Lreturn),
@@ -3365,12 +3359,7 @@ ascent_par! {
         reaching_def_in(func, blk, r, s),
         for def_addr in s.0.iter();
 
-    // def_addr (a def of reg r) reaches call call_addr: intra-block via block_last_def, else cross-block
-    // via the reaching set at the call's block (with no in-block def shadowing it). Mirrors
-    // def_reaches_return. This is the structural replacement for arg setup's call_backward_reach (a
-    // 128-step distance-bounded reach) + instr_min_order proximity window + order-based clobber rules:
-    // reaching_def_in already excludes any def clobbered before the call (gen/kill), so the reaching set
-    // at the call IS exactly the candidate arg value(s), with no window and no ordering.
+    // def_addr (a def of reg r) reaches call call_addr: intra-block via block_last_def, else cross-block via the reaching set at the call's block (with no in-block def shadowing it). Mirrors def_reaches_return. This is the structural replacement for arg setup's call_backward_reach (a 128-step distance-bounded reach) + instr_min_order proximity window + order-based clobber rules: reaching_def_in already excludes any def clobbered before the call (gen/kill), so the reaching set at the call IS exactly the candidate arg value(s), with no window and no ordering.
     relation def_reaches_call(Address, Address, Mreg);
     def_reaches_call(*call_addr, *def_addr, *r) <--
         is_call_instruction(call_addr),
@@ -3399,10 +3388,7 @@ ascent_par! {
         !is_loop_back_edge(mid, dst);
 
     relation has_intervening_def(Address, Address, Mreg);
-    // Reachability checks are moved ahead of instr_in_function(mid_addr,func) so the def->mid->use
-    // path constraint prunes candidate mids before the remaining (multi-valued) instr lookup -- the
-    // join was reg_def_used x defs-per-mreg with the strongest filters applied last (8.9s + 18.3s).
-    // Pure clause reorder: same derived set.
+    // Reachability checks are moved ahead of instr_in_function(mid_addr,func) so the def->mid->use path constraint prunes candidate mids before the remaining (multi-valued) instr lookup; the join was reg_def_used x defs-per-mreg with the strongest filters applied last (8.9s + 18.3s). Pure clause reorder: same derived set.
     has_intervening_def(def_addr, use_addr, mreg) <--
         reg_def_used(def_addr, mreg, use_addr),
         reg_def_site(mid_addr, mreg),
@@ -3421,7 +3407,7 @@ ascent_par! {
         forward_reachable(func, mid_addr, use_addr),
         instr_in_function(mid_addr, func);
 
-    // param_live_block: MUST-live -- the param reaches the block on ALL paths from entry with no intervening def of mreg; the earlier MAY-reach (existential, def-free on SOME predecessor) marked a block live even when mreg was redefined on another incoming path, binding the param at join points where it no longer holds (a false arg binding the FUNC_ARG_DIST window only bounded to early uses). As reach AND NOT def-tainted this is exact, so the window is unnecessary and a clean use at ANY distance binds correctly.
+    // param_live_block: MUST-live; the param reaches the block on ALL paths from entry with no intervening def of mreg; the earlier MAY-reach (existential, def-free on SOME predecessor) marked a block live even when mreg was redefined on another incoming path, binding the param at join points where it no longer holds (a false arg binding the FUNC_ARG_DIST window only bounded to early uses). As reach AND NOT def-tainted this is exact, so the window is unnecessary and a clean use at ANY distance binds correctly.
     relation param_block_reach(Address, Address, Mreg);
     relation param_def_tainted(Address, Address, Mreg);
     relation param_live_block(Address, Address, Mreg);
@@ -3450,20 +3436,13 @@ ascent_par! {
         param_block_reach(func_start, block, mreg),
         !param_def_tainted(func_start, block, mreg);
 
-    // arg_reg_param_live_at(func, addr, reg): MUST -- the arg register still holds the incoming caller
-    // value at addr (reg reaches addr from the function entry on ALL paths with no intervening def, and
-    // no in-block def precedes addr). Same reach-AND-NOT-def-tainted shape as param_live_block, but
-    // seeded STRUCTURALLY on is_arg_reg / is_float_arg_reg (not func_param_validated, to stay out of the
-    // param-validation SCC). This is the structural replacement for the function_entry_count <
-    // FUNC_ARG_DIST distance window ("addr is early") used to recognize parameter uses: it is exact and
-    // distance-independent, so a clean param use at ANY depth is recognized and a redefined reg never is.
+    // arg_reg_param_live_at(func, addr, reg): MUST; the arg register still holds the incoming caller value at addr (reg reaches addr from the function entry on ALL paths with no intervening def, and no in-block def precedes addr). Same reach-AND-NOT-def-tainted shape as param_live_block, but seeded STRUCTURALLY on is_arg_reg / is_float_arg_reg (not func_param_validated, to stay out of the param-validation SCC). This is the structural replacement for the function_entry_count < FUNC_ARG_DIST distance window ("addr is early") used to recognize parameter uses: it is exact and distance-independent, so a clean param use at ANY depth is recognized and a redefined reg never is.
     #[local] relation arg_reg_param_reach(Address, Address, Mreg);
     #[local] relation arg_reg_param_tainted(Address, Address, Mreg);
     #[local] relation arg_reg_param_live_block(Address, Address, Mreg);
     relation arg_reg_param_live_at(Address, Address, Mreg);
 
-    // Only seed/propagate arg regs actually used in the function; arg_reg_param_live_at is consumed only
-    // at reg uses, so unused arg regs would propagate through the whole CFG for nothing.
+    // Only seed/propagate arg regs actually used in the function; arg_reg_param_live_at is consumed only at reg uses, so unused arg regs would propagate through the whole CFG for nothing.
     #[local] relation arg_reg_used_somewhere(Address, Mreg);
     arg_reg_used_somewhere(*func, *r) <-- is_arg_reg(r), reg_use(addr, r), instr_in_function(addr, func);
     arg_reg_used_somewhere(*func, *r) <-- is_float_arg_reg(r), reg_use(addr, r), instr_in_function(addr, func);
@@ -3552,8 +3531,7 @@ ascent_par! {
         param_live_block(func_start, block, mreg),
         !block_last_def(use_addr, _, mreg);
 
-    // Float-param liveness mirroring param_live_block / param_still_live for XMM args, driving the threading rule below so an XMM-param use reachable from entry with no intervening def binds to the func_start param reg instead of a fresh undefined one.
-    // float_param_live_block: MUST-live for XMM params (reach AND NOT def-tainted, confined to the function), mirroring the integer param_live_block fix and replacing the old MAY-reach + window.
+    // Float-param liveness mirroring param_live_block / param_still_live for XMM args, driving the threading rule below so an XMM-param use reachable from entry with no intervening def binds to the func_start param reg instead of a fresh undefined one. float_param_live_block: MUST-live for XMM params (reach AND NOT def-tainted, confined to the function), mirroring the integer param_live_block fix and replacing the old MAY-reach + window.
     relation float_param_block_reach(Address, Address, Mreg);
     relation float_param_def_tainted(Address, Address, Mreg);
     relation float_param_live_block(Address, Address, Mreg);
@@ -4290,7 +4268,7 @@ ascent_par! {
         is_arg_reg(dst_reg),
         def_reaches_call(call_addr, defaddr, dst_reg);
 
-    // Fix 1: live-in / pass-through parameter forwarded to a resolved call. An ABI arg register that is a validated parameter and isn't redefined before the call still holds the incoming value, so forward it as a call arg. Gated to resolved callees (known direct target or known-signature extern) so indirect calls -- whose target reg may itself be a fn-pointer param -- aren't corrupted. Fixes args dropped to literal 0 (e.g. last_component(name)).
+    // Fix 1: live-in / pass-through parameter forwarded to a resolved call. An ABI arg register that is a validated parameter and isn't redefined before the call still holds the incoming value, so forward it as a call arg. Gated to resolved callees (known direct target or known-signature extern) so indirect calls (whose target reg may itself be a fn-pointer param) aren't corrupted. Fixes args dropped to literal 0 (e.g. last_component(name)).
     relation call_has_resolved_callee(Node);
     call_has_resolved_callee(call_addr) <-- call_target_func(call_addr, _);
     call_has_resolved_callee(call_addr) <-- call_has_known_signature(call_addr, _, _, _);
@@ -4301,10 +4279,7 @@ ascent_par! {
         instr_in_function(call_addr, func_start),
         call_has_resolved_callee(call_addr);
 
-    // (The old order-based "between-call clobber" suppression rules are removed: arg_setup_candidate now
-    // comes from def_reaches_call / reaching_def_in, which already excludes any def clobbered before the
-    // call -- an intervening CALL is an asm_effective_def of caller-saved regs, so reaching_def_in's
-    // gen/kill drops it. Detecting the clobber by instr_min_order ordering is both redundant and unsound.)
+    // (The old order-based "between-call clobber" suppression rules are removed: arg_setup_candidate now comes from def_reaches_call / reaching_def_in, which already excludes any def clobbered before the call; an intervening CALL is an asm_effective_def of caller-saved regs, so reaching_def_in's gen/kill drops it. Detecting the clobber by instr_min_order ordering is both redundant and unsound.)
 
     // In-block reaching def of an arg register at a call: the last def strictly before the call in the call's own basic block, which by intra-block dominance is THE value the call receives regardless of any other def in the function; restricted to defs that are themselves arg setup candidates so it never overrides the live-in param fallback with an unusable in-block def (e.g. `pop rsi` in _start, no candidate value).
     relation arg_reg_block_reaching_def(Node, Mreg, Node);
@@ -4604,11 +4579,7 @@ ascent_par! {
         func_float_arg_used_undefined(func_start, v),
         xtl_canonical(v, canonical);
 
-    // An arg register used at a point where it still holds the incoming caller value (reaches the use
-    // def-free from entry) IS a parameter use -- exactly. This single structural rule replaces the six
-    // function_entry_count<FUNC_ARG_DIST window variants (Lop/Lload/Lsetstack x external-def/no-def):
-    // arg_reg_param_live_at already subsumes the "no internal def" / "external (caller) def" conditions,
-    // and is distance-independent so a far param use is recognized too.
+    // An arg register used at a point where it still holds the incoming caller value (reaches the use def-free from entry) IS a parameter use, exactly. This single structural rule replaces the six function_entry_count<FUNC_ARG_DIST window variants (Lop/Lload/Lsetstack x external-def/no-def): arg_reg_param_live_at already subsumes the "no internal def" / "external (caller) def" conditions, and is distance-independent so a far param use is recognized too.
     arg_reg_used_early_in_func(func_start, addr, *reg) <--
         arg_reg_param_live_at(func_start, addr, reg),
         is_arg_reg(reg),
@@ -4622,8 +4593,7 @@ ascent_par! {
         reg_use(use_addr, mreg);
 
     relation arg_reg_used_very_early(Address, Mreg);
-    // (Dead internal-def helpers removed: arg_reg_used_very_early no longer references them --
-    // arg_reg_param_live_at already excludes a register that has an internal def before the use.)
+    // (Dead internal-def helpers removed: arg_reg_used_very_early no longer references them; arg_reg_param_live_at already excludes a register that has an internal def before the use.)
 
     arg_reg_used_very_early(func_start, *mreg) <--
         is_arg_reg(mreg),
@@ -4639,10 +4609,7 @@ ascent_par! {
 
     relation arg_reg_spilled_to_stack(Address, Mreg);
 
-    // An arg register spilled to the stack while it still holds the incoming caller value is a parameter
-    // spill. Replaces the function_entry_count window + external/no-def variants with arg_reg_param_live_at
-    // (which subsumes "holds the caller value"); the three store shapes (Lsetstack, BP-relative Lstore via
-    // Ainstack and via Aindexed) are kept.
+    // An arg register spilled to the stack while it still holds the incoming caller value is a parameter spill. Replaces the function_entry_count window + external/no-def variants with arg_reg_param_live_at (which subsumes "holds the caller value"); the three store shapes (Lsetstack, BP-relative Lstore via Ainstack and via Aindexed) are kept.
     arg_reg_spilled_to_stack(func_start, *src) <--
         ltl_inst(addr, ?LTLInst::Lsetstack(src, _slot, _ofs, _typ)),
         is_arg_reg(src),
@@ -4664,8 +4631,7 @@ ascent_par! {
     relation arg_reg_copied_early(Address, Mreg, Mreg);
     relation arg_reg_used_via_copy(Address, Mreg);
 
-    // An arg register move-copied to a non-arg register while it still holds the caller value: the source
-    // is a parameter forwarded through the copy. Window + external/no-def variants -> arg_reg_param_live_at.
+    // An arg register move-copied to a non-arg register while it still holds the caller value: the source is a parameter forwarded through the copy. Window + external/no-def variants -> arg_reg_param_live_at.
     arg_reg_copied_early(func_start, *src, *dst) <--
         ltl_inst(addr, ?LTLInst::Lop(Operation::Omove, srcs, dst)),
         if srcs.len() == 1,
@@ -4717,8 +4683,7 @@ ascent_par! {
     // SysV x86-64 variadic prologue: caller signals XMM-arg count via %al; callee runs `test %al,%al; je skip; movaps %xmm0..7, [stack]; skip:`. The 8 movaps stores spill the XMM register save area, NOT real float parameters. Detect: an XMM arg reg stack-stored within function entry distance, with the XMM reg either having no def chain or a def chain from outside this function. The two-mode check mirrors arg_reg_spilled_to_stack.
     relation xmm_arg_spilled_in_prologue(Address, Mreg);
 
-    // XMM arg reg stored to a BP/SP-relative stack slot while it holds the incoming caller value =
-    // variadic XMM save-area spill. Window + external/no-def variants -> arg_reg_param_live_at.
+    // XMM arg reg stored to a BP/SP-relative stack slot while it holds the incoming caller value = variadic XMM save-area spill. Window + external/no-def variants -> arg_reg_param_live_at.
     xmm_arg_spilled_in_prologue(func_start, *src) <--
         ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Aindexed(_), args, src)),
         is_xmm_arg_reg(src),
@@ -4752,12 +4717,9 @@ ascent_par! {
 
     relation func_float_param_used(Address, Mreg);
 
-    // (Dead helper xmm_arg_use_has_internal_def removed: func_float_param_used now uses
-    // arg_reg_param_live_at, which already excludes an XMM register with an internal def.)
+    // (Dead helper xmm_arg_use_has_internal_def removed: func_float_param_used now uses arg_reg_param_live_at, which already excludes an XMM register with an internal def.)
 
-    // An XMM arg register used while it still holds the incoming caller value is a float parameter
-    // (excluding the variadic XMM save-area prologue). Window + internal/external-def variants ->
-    // arg_reg_param_live_at (covers X0-X7 by register value, subsumes the no-internal-def condition).
+    // An XMM arg register used while it still holds the incoming caller value is a float parameter (excluding the variadic XMM save-area prologue). Window + internal/external-def variants -> arg_reg_param_live_at (covers X0-X7 by register value, subsumes the no-internal-def condition).
     func_float_param_used(func_start, *mreg) <--
         is_float_arg_reg(mreg),
         arg_reg_param_live_at(func_start, addr, mreg),
@@ -4914,8 +4876,7 @@ ascent_par! {
 
     relation dx_has_non_div_use(Address);
 
-    // DX used (non-div) while it still holds the incoming caller value = DX is a genuine parameter,
-    // not just the high half of a division. Window -> arg_reg_param_live_at.
+    // DX used (non-div) while it still holds the incoming caller value = DX is a genuine parameter, not just the high half of a division. Window -> arg_reg_param_live_at.
     dx_has_non_div_use(func_start) <--
         arg_reg_param_live_at(func_start, addr, ?Mreg::DX),
         ltl_inst(addr, ?LTLInst::Lop(_, args, _)),
@@ -4964,8 +4925,7 @@ ascent_par! {
 
     relation cx_has_non_shift_use(Address);
 
-    // CX used (non-shift) while it still holds the incoming caller value = CX is a genuine parameter,
-    // not just a shift count. Window -> arg_reg_param_live_at (CX holds the caller value at the use).
+    // CX used (non-shift) while it still holds the incoming caller value = CX is a genuine parameter, not just a shift count. Window -> arg_reg_param_live_at (CX holds the caller value at the use).
     cx_has_non_shift_use(func_start) <--
         arg_reg_param_live_at(func_start, addr, ?Mreg::CX),
         ltl_inst(addr, ?LTLInst::Lop(op, args, _)),
@@ -5001,10 +4961,7 @@ ascent_par! {
         !cx_has_non_shift_use(func_start),
         func_has_shift_instr(func_start);
 
-    // (The "scratch register filter" -- arg_reg_first_action_is_def / arg_reg_used_strictly_before, which
-    // used a `use_count < def_count` entry-order comparison to decide "used before defined" -- is removed:
-    // func_arg_reg_used is now derived from arg_reg_param_live_at, which already excludes a defined-first
-    // scratch register (its post-def uses do not hold the caller value), so the filter is redundant.)
+    // (The "scratch register filter", arg_reg_first_action_is_def / arg_reg_used_strictly_before, which used a `use_count < def_count` entry-order comparison to decide "used before defined", is removed: func_arg_reg_used is now derived from arg_reg_param_live_at, which already excludes a defined-first scratch register (its post-def uses do not hold the caller value), so the filter is redundant.)
 
     // Func param positions use max-evidence: all positions up to max are filled per ABI
     relation func_has_param_evidence(Address, usize);

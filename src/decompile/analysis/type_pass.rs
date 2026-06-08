@@ -42,7 +42,7 @@ fn op_output_xtype(op: &Operation) -> Option<XType> {
         Odivuimm(_) | Omoduimm(_) |
         Ocast32unsigned | Omulhu => Some(XType::Xintunsigned),
 
-        // Ambiguous 32-bit (add/sub/mul/logic -- same for signed and unsigned)
+        // Ambiguous 32-bit (add/sub/mul/logic, same for signed and unsigned)
         Oadd | Osub | Omul | Oaddimm(_) | Omulimm(_) |
         Oand | Oor | Oxor | Onot | Oneg |
         Oandimm(_) | Oorimm(_) | Oxorimm(_) |
@@ -187,7 +187,7 @@ ascent_par! {
         call_arg_mapping(node, pos, reg);
 
 
-    // 1. Direct type emission from instructions -- each instruction encodes width and signedness, emitting concrete types directly
+    // 1. Direct type emission from instructions; each instruction encodes width and signedness, emitting concrete types directly
 
     // From operations: op encodes the full output type
     emit_var_type_candidate(rtl_reg, xtype) <--
@@ -239,7 +239,7 @@ ascent_par! {
         if args.contains(&rtl_reg);
 
 
-    // 3. Pointer evidence (no is_not_ptr -- pointers are a subtype of 8-byte int, no conflict)
+    // 3. Pointer evidence (no is_not_ptr; pointers are a subtype of 8-byte int, no conflict)
 
     relation is_ptr(RTLReg);
     relation is_char_ptr(RTLReg);
@@ -452,8 +452,8 @@ ascent_par! {
 
     relation ptr_deref(RTLReg, RTLReg);
     // Directed relations: track store sources and load destinations separately
-    relation ptr_store(RTLReg, RTLReg); // ptr_store(ptr, src) -- *ptr = src
-    relation ptr_load(RTLReg, RTLReg);  // ptr_load(ptr, dst) -- dst = *ptr
+    relation ptr_store(RTLReg, RTLReg); // ptr_store(ptr, src): *ptr = src
+    relation ptr_load(RTLReg, RTLReg);  // ptr_load(ptr, dst): dst = *ptr
     // Chunked variants: store->load propagation verifies same access width.
     relation ptr_store_chunk(RTLReg, RTLReg, MemoryChunk);
     relation ptr_load_chunk(RTLReg, RTLReg, MemoryChunk);
@@ -595,10 +595,6 @@ ascent_par! {
     emit_var_type_candidate(reg, XType::Xptr) <-- is_ptr(reg);
 
     // Disabled: bidirectional int/ptr pollution causes every int to become ptr candidate
-    // emit_var_type_candidate(reg, XType::Xlong) <-- emit_var_type_candidate(reg, XType::Xptr);
-    // emit_var_type_candidate(reg, XType::Xint) <-- emit_var_type_candidate(reg, XType::Xptr);
-    // emit_var_type_candidate(reg, XType::Xptr) <-- emit_var_type_candidate(reg, XType::Xint);
-    // emit_var_type_candidate(reg, XType::Xptr) <-- emit_var_type_candidate(reg, XType::Xlong);
 
     // 7b. Pointer arithmetic propagation: add/sub on a known pointer produces a pointer (Olea/Oleal/Oaddl/Osubl)
     is_ptr(dst_rtl) <--
@@ -641,7 +637,7 @@ ascent_par! {
         is_ptr(src_rtl),
         reg_rtl(node, *dst_mreg, dst_rtl);
 
-    // Osel(cond, typ): conditional select -- if either operand is ptr, result is ptr
+    // Osel(cond, typ): conditional select; if either operand is ptr, result is ptr
     is_ptr(dst_rtl) <--
         ltl_inst(node, ?LTLInst::Lop(Operation::Osel(_, _), args, dst_mreg)),
         if args.len() >= 2,

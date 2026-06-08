@@ -439,7 +439,7 @@ fn find_jump_table_info(
                     lea_candidates.push((base_addr, idx));
                 }
             }
-            // Clang -O0 non-PIE pattern: mov table(,%index,scale), %reg; jmp *%reg -- the absolute table address is the displacement in the memory operand.
+            // Clang -O0 non-PIE pattern: mov table(,%index,scale), %reg; jmp *%reg; the absolute table address is the displacement in the memory operand.
             "MOV" => {
                 for op in [op1, op2] {
                     if let Some(&(_seg, base, index, scale, disp)) = op_indirect_map.get(op) {

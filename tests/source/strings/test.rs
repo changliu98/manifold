@@ -6,7 +6,7 @@ fn all_functions_present() {
     }
 }
 
-// --- angr test_decompiling_strings_local_strlen: strlen-like loop pattern ---
+// angr test_decompiling_strings_local_strlen: strlen-like loop pattern
 #[test]
 fn strlen_has_loop() {
     assert!(has_any_loop(&OUTPUT, "my_strlen"), "strlen should have a loop");
@@ -17,7 +17,7 @@ fn strlen_has_one_param() {
     assert_eq!(param_count(&OUTPUT, "my_strlen"), 1, "strlen takes one pointer param");
 }
 
-// --- angr test_decompiling_strings_local_strcat: two-pointer string function ---
+// angr test_decompiling_strings_local_strcat: two-pointer string function
 #[test]
 fn strcmp_has_two_params() {
     assert_eq!(param_count(&OUTPUT, "my_strcmp"), 2, "strcmp takes two pointer params");
@@ -32,7 +32,7 @@ fn strcmp_has_loop_and_comparison() {
             "strcmp should compare characters");
 }
 
-// --- count_char: loop with conditional increment ---
+// count_char: loop with conditional increment
 #[test]
 fn count_char_has_loop_and_if() {
     assert!(has_any_loop(&OUTPUT, "count_char"), "expected loop");
@@ -41,7 +41,7 @@ fn count_char_has_loop_and_if() {
             "expected comparison in character counting");
 }
 
-// --- reverse_inplace: calls my_strlen, has loop ---
+// reverse_inplace: calls my_strlen, has loop
 #[test]
 fn reverse_calls_strlen() {
     assert!(has_call_to(&OUTPUT, "reverse_inplace", "my_strlen"),
@@ -53,7 +53,7 @@ fn reverse_has_loop() {
     assert!(has_any_loop(&OUTPUT, "reverse_inplace"), "reverse should have a loop");
 }
 
-// --- string_search: nested loops ---
+// string_search: nested loops
 #[test]
 fn string_search_has_nested_loops() {
     let b = body(&OUTPUT, "string_search");
@@ -67,7 +67,7 @@ fn string_search_calls_strlen() {
             "string_search should call my_strlen");
 }
 
-// --- angr test_decompiling_strings_c_representation: string literal recovery ---
+// angr test_decompiling_strings_c_representation: string literal recovery
 #[test]
 fn use_string_literal_has_string_refs() {
     let b = body(&OUTPUT, "use_string_literal");
@@ -80,7 +80,7 @@ fn use_string_literal_has_conditional() {
     assert!(has_if_stmt(&OUTPUT, "use_string_literal"), "expected if statement");
 }
 
-// --- angr test_simple_strcpy: post-increment loop pattern ---
+// angr test_simple_strcpy: post-increment loop pattern
 #[test]
 fn strcpy_has_loop() {
     assert!(has_any_loop(&OUTPUT, "my_strcpy"), "strcpy should have a loop");

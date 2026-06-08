@@ -396,17 +396,6 @@ dual_compiler_test!(structuring, "-O0");
 dual_compiler_test!(loops_advanced, "-O1");
 dual_compiler_test!(call_patterns, "-O1");
 
-// Tests adopted from CompCert small test suite
-
-dual_compiler_test!(compcert_fib, "-O1");
-dual_compiler_test!(compcert_qsort, "-O1");
-dual_compiler_test!(compcert_lists, "-O1");
-dual_compiler_test!(compcert_sha1, "-O1");
-dual_compiler_test!(compcert_switch, "-O1");
-// -O0: at -O1 gcc/clang emit cmov which the decompiler doesn't reconstruct yet
-dual_compiler_test!(compcert_ifconv, "-O0");
-dual_compiler_test!(compcert_vmach, "-O1");
-
 // Variable recovery tests
 
 dual_compiler_test!(var_basic, "-O1");

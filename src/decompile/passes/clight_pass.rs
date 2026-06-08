@@ -615,7 +615,7 @@ ascent_par! {
     goto_dst(*b) <-- csharp_stmt(_, ?CsharpminorStmt::Scond(_, _, _, b));
     goto_dst(*t) <-- csharp_stmt(_, ?CsharpminorStmt::Sjump(t));
 
-    // final_goto(orig, dst): single-valued, total over goto_dst -- the chain end if orig forwards, else orig itself.
+    // final_goto(orig, dst): single-valued, total over goto_dst; the chain end if orig forwards, else orig itself.
     #[local] relation final_goto(Node, Node);
     final_goto(*n, *f) <-- goto_chain_end(n, f);
     final_goto(*n, *n) <-- goto_dst(n), !goto_chain_end(n, _);
@@ -2812,7 +2812,7 @@ pub(crate) fn check_clight_stmt(stmt: &ClightStmt) -> Option<ClightStmt> {
         }
         ClightStmt::Scall(dst, func_expr, args) => {
             let func_ty = clight_expr_type(func_expr);
-            // A named symbol (EvarSymbol) is a direct function designator -- it is callable as `name(...)` regardless of the type stored on the node, and some symbols (e.g. the __builtin_unreachable / abort cold-call lowering carries default_void_ptr_type) reject being called through a function-pointer cast. Treat such a callee as well-formed so it is emitted bare; only genuine indirect-value callees (derefs, arithmetic, tempvars, data Evar) get the synthesized fnptr cast below.
+            // A named symbol (EvarSymbol) is a direct function designator; it is callable as `name(...)` regardless of the type stored on the node, and some symbols (e.g. the __builtin_unreachable / abort cold-call lowering carries default_void_ptr_type) reject being called through a function-pointer cast. Treat such a callee as well-formed so it is emitted bare; only genuine indirect-value callees (derefs, arithmetic, tempvars, data Evar) get the synthesized fnptr cast below.
             let func_ok = is_function_type(&func_ty)
                 || is_function_pointer_type(&func_ty)
                 || matches!(func_expr, ClightExpr::EvarSymbol(_, _));
@@ -3182,7 +3182,7 @@ fn extract_deref_field_pattern(inner: &ClightExpr) -> Option<(Ident, i64)> {
             ) {
                 return Some((base_ident, offset.abs()));
             }
-            // 2. `(base + idx*scale) + const_offset` -- clang-style indexed loads.
+            // 2. `(base + idx*scale) + const_offset`: clang-style indexed loads.
             if let Some(offset) = extract_const_offset_clight(rhs) {
                 if let ClightExpr::Ebinop(ClightBinaryOp::Oadd, inner_l, inner_r, _) =
                     match lhs.as_ref() {
@@ -3758,7 +3758,7 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
                 root_to_id.insert(*root, existing);
                 continue;
             }
-            // No exact match -- allocate a new ID and register its hash so subsequent identical shapes reuse it.
+            // No exact match; allocate a new ID and register its hash so subsequent identical shapes reuse it.
             let id = next_id as Ident;
             next_id += 1;
             shape_to_id.insert(h, id);
@@ -3784,7 +3784,7 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
     }
 
     if func_field_info.is_empty() {
-        // No struct fields -- copy clight_stmt_without_field directly to clight_stmt
+        // No struct fields; copy clight_stmt_without_field directly to clight_stmt
         let pass_through: ascent::boxcar::Vec<_> = db
             .rel_iter::<(Node, ClightStmt)>("clight_stmt_without_field")
             .map(|(n, s)| (*n, s.clone()))

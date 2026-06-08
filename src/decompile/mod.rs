@@ -3,3 +3,4 @@ pub mod elevator;
 pub mod analysis;
 pub mod disassembly;
 pub mod passes;
+pub mod postselect;
