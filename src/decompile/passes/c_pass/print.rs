@@ -492,28 +492,30 @@ impl Printer {
                 self.writeln(";");
             }
 
-            CStmt::Labeled(label, body) => {
-                let saved_indent = self.indent_level;
-                self.indent_level = 0;
-
-                match label {
-                    Label::Named(name) => {
-                        self.write(name);
-                        self.writeln(":");
-                    }
-                    Label::Case(expr) => {
-                        self.write("case ");
-                        self.print_expr(expr);
-                        self.writeln(":");
-                    }
-                    Label::Default => {
-                        self.writeln("default:");
-                    }
+            CStmt::Labeled(label, body) => match label {
+                // Goto targets conventionally sit at column 0.
+                Label::Named(name) => {
+                    let saved_indent = self.indent_level;
+                    self.indent_level = 0;
+                    self.write(name);
+                    self.writeln(":");
+                    self.indent_level = saved_indent;
+                    self.print_stmt(body);
                 }
-
-                self.indent_level = saved_indent;
-                self.print_stmt(body);
-            }
+                // case/default labels are indented with the enclosing switch body.
+                Label::Case(expr) => {
+                    self.write_indent();
+                    self.write("case ");
+                    self.print_expr(expr);
+                    self.writeln(":");
+                    self.print_case_body(body);
+                }
+                Label::Default => {
+                    self.write_indent();
+                    self.writeln("default:");
+                    self.print_case_body(body);
+                }
+            },
 
             CStmt::Decl(decls) => {
                 for decl in decls {
@@ -526,6 +528,16 @@ impl Printer {
                     self.print_stmt(stmt);
                 }
             }
+        }
+    }
+
+    /// Body of a `case`/`default` arm. A stacked fall-through label (`case a: case b:`) stays at the label's level; any real statement body is indented one level beneath the label.
+    fn print_case_body(&mut self, body: &CStmt) {
+        match body {
+            CStmt::Labeled(Label::Case(_), _) | CStmt::Labeled(Label::Default, _) => {
+                self.print_stmt(body)
+            }
+            _ => self.indent(|p| p.print_stmt(body)),
         }
     }
 
