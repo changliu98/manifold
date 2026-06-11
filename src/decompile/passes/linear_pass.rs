@@ -88,6 +88,8 @@ ascent_par! {
     relation ltl_branch_candidate(Node, Node);
     relation label_classified(Node);
     relation lcond_real_fallthrough(Node, Node);
+    // Produced by asm_pass: this Lcond sits at a secondary jcc's own address (not at its compare), so its fall-through is next(addr) rather than skip-one-paired-jcc.
+    relation mcond_at_jcc(Address);
     relation ltl_fallthrough(Node, Node);
     relation ltl_branch_target(Node, Node);
     relation ltl_jumptable_index(Node, usize);
@@ -338,11 +340,13 @@ ascent_par! {
 
     lcond_real_fallthrough(cmp_addr, real_ft) <--
         linear_inst(cmp_addr, ?LinearInst::Lcond(_, _, _)),
+        !mcond_at_jcc(cmp_addr),
         next(cmp_addr, jcc_addr),
         next(jcc_addr, real_ft);
-    
+
     lcond_real_fallthrough(cmp_addr, real_ft) <--
         linear_inst(cmp_addr, ?LinearInst::Lcond(_, _, _)),
+        !mcond_at_jcc(cmp_addr),
         next(cmp_addr, jcc_addr),
         !next(jcc_addr, _),
         code_in_block(jcc_addr, block),
@@ -352,9 +356,16 @@ ascent_par! {
 
     lcond_real_fallthrough(cmp_addr, real_ft) <--
         linear_inst(cmp_addr, ?LinearInst::Lcond(_, _, _)),
+        !mcond_at_jcc(cmp_addr),
         next(cmp_addr, jcc_addr),
         instruction(jcc_addr, size, _, _, _, _, _, _, _, _),
         let real_ft = ((*jcc_addr as i64) + (*size as i64)) as Address;
+
+    // An Lcond placed AT a secondary jcc's own address (mcond_at_jcc, see asm_pass secondary_flags_consumer): its fall-through is simply its next instruction - there is no paired jcc to skip over.
+    lcond_real_fallthrough(addr, real_ft) <--
+        linear_inst(addr, ?LinearInst::Lcond(_, _, _)),
+        mcond_at_jcc(addr),
+        next(addr, real_ft);
 
     ltl_inst(addr, ltlinst) <--
         linear_inst(addr, ?LinearInst::Lcond(cond, args, target_sym)),

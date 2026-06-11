@@ -67,6 +67,19 @@ impl IRPass for StructuringPass {
             .map(|&(a, b)| (a, b))
             .collect();
 
+        // CF-6: include cminor_succ preds so taint-mirror can catch edges clight sees but the function-local stmt view misses (cross-function preds, preds with no csharp stmt); values sorted for determinism.
+        let cminor_preds: HashMap<Node, Vec<Node>> = {
+            let mut m: HashMap<Node, Vec<Node>> = HashMap::new();
+            for &(src, dst) in db.rel_iter::<(Node, Node)>("cminor_succ") {
+                m.entry(dst).or_default().push(src);
+            }
+            for v in m.values_mut() {
+                v.sort_unstable();
+                v.dedup();
+            }
+            m
+        };
+
         // Authoritative function entry from emit_function; may point to a non-stmt node that structure() resolves through next_map.
         let func_entry: HashMap<Address, Node> = db
             .rel_iter::<(Address, Symbol, Node)>("emit_function")
@@ -114,7 +127,7 @@ impl IRPass for StructuringPass {
                 }
 
                 let declared_entry = func_entry.get(func_addr).copied();
-                let structured = structure(stmts, &next_map, declared_entry);
+                let structured = structure(stmts, &next_map, declared_entry, &cminor_preds);
                 (*func_addr, structured)
             })
             .collect();
@@ -719,6 +732,7 @@ pub fn structure(
     stmts: &[(Node, CsharpminorStmt)],
     next_map: &HashMap<Node, Node>,
     declared_entry: Option<Node>,
+    cminor_preds: &HashMap<Node, Vec<Node>>,
 ) -> StructuringResult {
     if stmts.is_empty() {
         return StructuringResult {
@@ -747,20 +761,8 @@ pub fn structure(
         if stmt_nodes.contains(&real_addr) {
             return real_addr;
         }
-        // Walk `next` chain to first statement node
-        let mut cur = real_addr;
-        let mut visited = HashSet::new();
-        while visited.insert(cur) {
-            if let Some(&nxt) = next_map.get(&cur) {
-                if stmt_nodes.contains(&nxt) {
-                    return nxt;
-                }
-                cur = nxt;
-            } else {
-                break;
-            }
-        }
-        target
+        // Resolves into synthetic chains too: a branch may land on a fused store (e.g. `global = CONST`) whose real head has no statement after const folding.
+        walk_next_to_stmt(real_addr, next_map, &stmt_nodes).unwrap_or(target)
     };
 
     for (_, stmt) in &mut current_stmts {
@@ -921,20 +923,292 @@ pub fn structure(
         .iter()
         .map(|(_, member, _, _, _)| *member)
         .collect();
-    let tree_results = detect_comparison_tree_switches(&current_stmts, next_map, &loop_exit_cond_nodes);
+
+    // CF-1: canonicalize identical dispatch roots. The walker treats every re-entry point into a shared compare cascade as a fresh switch root and each root expands the FULL dispatch (one binary dispatch observed as 25 byte-identical C switches in __strftime_internal). Two roots with the same discriminant, the same walked MEMBER NODES, and the same (value -> target) mapping are the same physical dispatch entered at different points - shared members imply the shared tail, hence the same no-match/default continuation - so every duplicate root's statement collapses to `goto canonical_head` and contributes no switch of its own.
+    let mut canon_by_shape: HashMap<(u64, Vec<Node>, Vec<(i64, Node)>), Node> = HashMap::new();
+    let mut dup_redirects: Vec<(Node, Node)> = Vec::new();
+    {
+        let mut by_head: HashMap<Node, (u64, Vec<Node>, Vec<(i64, Node)>)> = HashMap::new();
+        for (head, member, reg, val, target) in &switch_chain_members {
+            let e = by_head.entry(*head).or_insert((*reg, Vec::new(), Vec::new()));
+            e.1.push(*member);
+            e.2.push((*val, *target));
+        }
+        // Sorted member set + sorted (value -> target) map form the shape key; heads visit in ascending order so the lowest head is deterministically canonical.
+        let mut heads: Vec<Node> = by_head.keys().copied().collect();
+        heads.sort_unstable();
+        let mut dup_heads: HashSet<Node> = HashSet::new();
+        for h in heads {
+            let (reg, mut members, mut pairs) = by_head.remove(&h).expect("head collected above");
+            members.sort_unstable();
+            members.dedup();
+            pairs.sort_unstable();
+            pairs.dedup();
+            match canon_by_shape.entry((reg, members, pairs)) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    dup_redirects.push((h, *e.get()));
+                    dup_heads.insert(h);
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(h);
+                }
+            }
+        }
+        switch_chain_members.retain(|(head, _, _, _, _)| !dup_heads.contains(head));
+        valid_switches.retain(|(head, _)| !dup_heads.contains(head));
+    }
+
+    // Walker fallback roots flow through the same shape canonicalization: a root whose head already belongs to an Ascent chain is skipped outright, and a root whose shape duplicates an already-kept switch (Ascent or earlier walker root) collapses to a redirect instead of a fresh switch. Roots process LARGEST-first so a full-cascade walk canonicalizes before the mid-entry walks that see only its tail.
+    let mut tree_results = detect_comparison_tree_switches(&current_stmts, next_map, &loop_exit_cond_nodes);
+    tree_results.sort_by(|a, b| b.2.len().cmp(&a.2.len()).then(a.0.cmp(&b.0)));
+    // CF-6 diagnostics: per-function dump of walker inputs/results and canonicalization decisions. Buffered into one eprint per function so parallel structure() calls do not interleave lines.
+    let cf6_trace = std::env::var("MANIFOLD_CF6_TRACE").is_ok();
+    if cf6_trace {
+        let mut buf = String::new();
+        buf.push_str(&format!("[CF6] === function entry {:#x} ===\n", entry_node));
+        for (n, s) in &current_stmts {
+            match s {
+                CsharpminorStmt::Scond(cond, args, t, f) => {
+                    buf.push_str(&format!("[CF6] stmt {:#x}: Scond {:?} args={:?} t={:#x} f={:#x} break={}\n",
+                        n, cond, args, t, f, loop_exit_cond_nodes.contains(n)));
+                }
+                CsharpminorStmt::Sset(d, e) => {
+                    buf.push_str(&format!("[CF6] stmt {:#x}: Sset r{} = {:?}\n", n, d, e));
+                }
+                CsharpminorStmt::Sjump(t) => {
+                    buf.push_str(&format!("[CF6] stmt {:#x}: Sjump {:#x}\n", n, t));
+                }
+                _ => {}
+            }
+        }
+        let mut ac: Vec<(Node, Node, u64, i64, Node)> = switch_chain_members.clone();
+        ac.sort_unstable();
+        for (h, m, r, v, t) in ac {
+            buf.push_str(&format!("[CF6] ascent row: head={:#x} member={:#x} reg=r{} val={} target={:#x}\n", h, m, r, v, t));
+        }
+        for (head, reg, cases) in &tree_results {
+            buf.push_str(&format!("[CF6] walker root {:#x} reg=r{} cases={:?}\n", head, reg,
+                cases.iter().map(|(v, t, m)| format!("{}=>{:#x}@{:#x}", v, t, m)).collect::<Vec<_>>()));
+        }
+        eprint!("{}", buf);
+    }
+    // Per-reg union of member nodes already claimed by kept switches (Ascent rows seed it; walker keeps extend it). A later root whose member NODES are all already claimed is the same physical dispatch entered mid-cascade; when its (value -> target) pairs do NOT match the kept switch (the values live in a different space because the entry sits after an in-place discriminant rebase), redirecting is UNSOUND (the kept head would re-test the rebased value in root space), so the root is skipped outright: its raw statements remain and the kept switch already owns the shared members.
+    let mut kept_members_by_reg: HashMap<u64, HashSet<Node>> = HashMap::new();
+    for (_, member, reg, _, _) in &switch_chain_members {
+        kept_members_by_reg.entry(*reg).or_default().insert(*member);
+    }
     for (head, reg, ref cases) in &tree_results {
         if ascent_chain_nodes.contains(head) { continue; }
         if cases.len() >= 3 {
+            let mut members: Vec<Node> = cases.iter().map(|(_, _, m)| *m).collect();
+            members.sort_unstable();
+            members.dedup();
+            let mut pairs: Vec<(i64, Node)> = cases.iter().map(|(v, t, _)| (*v, *t)).collect();
+            pairs.sort_unstable();
+            pairs.dedup();
+            // Subset merge on shared physical nodes: a mid-cascade entry redirects to its containing switch's head. Use min() over all containing switches (not find_map) -- two containing switches caused a random redirect target (FUN_14f00 flicker); lowest head is canonical, matching the ascending-heads policy above. Disjoint-member sibling cascades (compiler-duplicated, e.g. gcc tail-duplication) keep separate switches.
+            let subset_canon = canon_by_shape
+                .iter()
+                .filter_map(|((kreg, kmembers, kpairs), khead)| {
+                    if *kreg == *reg
+                        && members.iter().all(|m| kmembers.binary_search(m).is_ok())
+                        && pairs.iter().all(|p| kpairs.binary_search(p).is_ok())
+                    {
+                        Some(*khead)
+                    } else {
+                        None
+                    }
+                })
+                .min();
+            if let Some(canon) = subset_canon {
+                if canon != *head {
+                    dup_redirects.push((*head, canon));
+                }
+                continue;
+            }
+            // Cross-space mid-entry: every member node already claimed by kept same-reg switches, but the value pairs differ (entry after an in-place rebase). Skip without redirect.
+            if let Some(kept) = kept_members_by_reg.get(reg) {
+                if !members.is_empty() && members.iter().all(|m| kept.contains(m)) {
+                    if cf6_trace {
+                        eprintln!("[CF6] root {:#x} skipped: member nodes already claimed by kept same-reg switches", head);
+                    }
+                    continue;
+                }
+            }
+            canon_by_shape.insert((*reg, members, pairs), *head);
+            let kept = kept_members_by_reg.entry(*reg).or_default();
             for &(val, target, member_node) in cases {
                 switch_chain_members.push((*head, member_node, *reg, val, target));
+                kept.insert(member_node);
             }
             valid_switches.push((*head, *reg));
         }
     }
 
+    // CF-6: clight suppresses clean chain members, killing the last compare's no-match exit edge; rewrite each untainted leaf (one chain-exiting branch) to `Sjump(exit)` and reattribute its case rows to the head, so the surviving goto IS the default routing. Tainted leaves keep their raw compare. Applies to both Ascent-recovered chains and walker trees.
+    let mut leaf_rewrites: Vec<(Node, Node)> = Vec::new();
+    {
+        // Local CFG pred map mirrors the edge set clight's chain_member_tainted sees via cminor_succ.
+        let seq_map: HashMap<Node, Node> = seq_edges.iter().copied().collect();
+        let mut pred_map: HashMap<Node, Vec<Node>> = HashMap::new();
+        for (n, s) in &current_stmts {
+            let mut outs: Vec<Node> = Vec::new();
+            match s {
+                CsharpminorStmt::Scond(_, _, t, f) => {
+                    outs.push(*t);
+                    outs.push(*f);
+                }
+                CsharpminorStmt::Sjump(t) => outs.push(*t),
+                CsharpminorStmt::Sjumptable(_, ts) => outs.extend(ts.iter().copied()),
+                _ => {}
+            }
+            if !is_terminal_stmt(s) {
+                if let Some(&nx) = seq_map.get(n) {
+                    outs.push(nx);
+                }
+            }
+            for o in outs {
+                pred_map.entry(o).or_default().push(*n);
+            }
+        }
+
+        // Only sole-owner non-head members are rewrite-eligible: a node claimed by another switch would have its goto suppressed or collide with that switch's Sswitch materialization.
+        let mut member_heads: HashMap<Node, Vec<Node>> = HashMap::new();
+        for (h, m, _, _, _) in &switch_chain_members {
+            if *m != *h {
+                member_heads.entry(*m).or_default().push(*h);
+            }
+        }
+        for v in member_heads.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+        let head_set: HashSet<Node> = valid_switches.iter().map(|(h, _)| *h).collect();
+
+        // Heads in ascending order for deterministic processing.
+        let mut heads: Vec<Node> = valid_switches.iter().map(|(h, _)| *h).collect();
+        heads.sort_unstable();
+        heads.dedup();
+        let mut demoted_heads: HashSet<Node> = HashSet::new();
+        for head in heads {
+            let rows: Vec<(Node, Node)> = switch_chain_members
+                .iter()
+                .filter(|(h, _, _, _, _)| *h == head)
+                .map(|(_, m, _, _, t)| (*m, *t))
+                .collect();
+            let mut chain: HashSet<Node> = rows.iter().map(|(m, _)| *m).collect();
+            chain.insert(head);
+            let case_targets: HashSet<Node> = rows.iter().map(|(_, t)| *t).collect();
+            // Taint fixpoint mirroring clight's chain_member_tainted: union of local and cminor_succ preds is a superset, so the mirror can only over-taint (safe: skips rewrites), never under-taint.
+            let mut tainted: HashSet<Node> = HashSet::new();
+            loop {
+                let mut changed = false;
+                for &(m, _) in &rows {
+                    if m == head || tainted.contains(&m) {
+                        continue;
+                    }
+                    let local = pred_map.get(&m).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let global = cminor_preds.get(&m).map(|v| v.as_slice()).unwrap_or(&[]);
+                    if local
+                        .iter()
+                        .chain(global.iter())
+                        .any(|p| !chain.contains(p) || tainted.contains(p))
+                    {
+                        tainted.insert(m);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            let mut members: Vec<Node> = rows.iter().map(|(m, _)| *m).filter(|m| *m != head).collect();
+            members.sort_unstable();
+            members.dedup();
+            // Leaf = exactly one chain-exiting branch. Rewrite is sound: untainted leaves are only reached through suppressed in-chain compares, so `goto exit` IS the no-match branch.
+            let mut head_leaves: Vec<(Node, Node)> = Vec::new();
+            let mut exits: std::collections::BTreeSet<Node> = std::collections::BTreeSet::new();
+            for &m in &members {
+                if let Some(CsharpminorStmt::Scond(_, _, t, f)) = stmt_map.get(&m) {
+                    let t_exit = !chain.contains(t) && !case_targets.contains(t);
+                    let f_exit = !chain.contains(f) && !case_targets.contains(f);
+                    match (t_exit, f_exit) {
+                        (true, false) => {
+                            exits.insert(*t);
+                            head_leaves.push((m, *t));
+                        }
+                        (false, true) => {
+                            exits.insert(*f);
+                            head_leaves.push((m, *f));
+                        }
+                        // Both in-chain: suppressible. Both exiting: not one goto -- leave raw compare.
+                        _ => {}
+                    }
+                }
+            }
+            // A splitter head (neither branch hits a case target, e.g. gcc's top-level `jg`) with multiple no-match exits is unsound as a defaultless Sswitch: rowless values would misroute silently. Demote such heads; a non-splitter head's multiple leaf exits are fine because routing guards between funnels survive as non-members or taint their successors.
+            let head_splitter = match stmt_map.get(&head) {
+                Some(CsharpminorStmt::Scond(_, _, t, f)) => {
+                    // A head branch exiting the chain without hitting a case target is a no-match destination.
+                    if !chain.contains(t) && !case_targets.contains(t) {
+                        exits.insert(*t);
+                    }
+                    if !chain.contains(f) && !case_targets.contains(f) {
+                        exits.insert(*f);
+                    }
+                    !case_targets.contains(t) && !case_targets.contains(f)
+                }
+                // Non-compare head: treat conservatively as splitter to demote multi-exit chains.
+                _ => true,
+            };
+            if head_splitter && exits.len() > 1 {
+                demoted_heads.insert(head);
+                if cf6_trace {
+                    eprintln!(
+                        "[CF6] head {:#x} demoted: splitter head with {} distinct no-match exits {:?}",
+                        head,
+                        exits.len(),
+                        exits.iter().map(|e| format!("{:#x}", e)).collect::<Vec<_>>()
+                    );
+                }
+                continue;
+            }
+            for (m, exit) in head_leaves {
+                if tainted.contains(&m) {
+                    continue;
+                }
+                if head_set.contains(&m) {
+                    continue;
+                }
+                if member_heads.get(&m).map_or(false, |hs| hs.as_slice() != [head]) {
+                    continue;
+                }
+                leaf_rewrites.push((m, exit));
+            }
+        }
+        if !demoted_heads.is_empty() {
+            valid_switches.retain(|(h, _)| !demoted_heads.contains(h));
+            switch_chain_members.retain(|(h, _, _, _, _)| !demoted_heads.contains(h));
+        }
+        if cf6_trace {
+            for (m, ex) in &leaf_rewrites {
+                eprintln!("[CF6] leaf member {:#x} rewritten to goto {:#x} (no-match routing)", m, ex);
+            }
+        }
+        // Reattribute rewritten leaves' case rows to their head so chain_member_node no longer suppresses the node (its statement is now the default goto).
+        let leaf_set: HashSet<Node> = leaf_rewrites.iter().map(|(m, _)| *m).collect();
+        for row in switch_chain_members.iter_mut() {
+            if leaf_set.contains(&row.1) {
+                row.1 = row.0;
+            }
+        }
+    }
+
+    // Includes rewritten leaf nodes so they are excluded from if-then-else metadata: their scond_node/join facts describe a compare that no longer exists.
     let switch_member_nodes: HashSet<Node> = switch_chain_members
         .iter()
         .map(|(_, member, _, _, _)| *member)
+        .chain(leaf_rewrites.iter().map(|(m, _)| *m))
         .collect();
 
     // Determine valid if-then-else branches for metadata export, excluding loop exit conditions and switch members.
@@ -955,6 +1229,24 @@ pub fn structure(
     result_stmts.retain(|(node, stmt)| {
         !(trimmed.contains(node) && matches!(stmt, CsharpminorStmt::Sjump(_)))
     });
+
+    // Apply CF-1 duplicate-root redirects: the duplicate's compare statement is replaced by a jump to the canonical dispatch head. Sound because shape identity (same discriminant, same member nodes, same value->target map) means the canonical head performs the identical dispatch including the shared no-match continuation.
+    for (dup, canon) in &dup_redirects {
+        for entry in result_stmts.iter_mut() {
+            if entry.0 == *dup {
+                entry.1 = CsharpminorStmt::Sjump(*canon);
+            }
+        }
+    }
+
+    // Apply CF-6 leaf rewrites after dup_redirects: a node claimed by both gets the direct default goto (shorter than re-dispatching through the canonical head; both are correct).
+    for (leaf, exit) in &leaf_rewrites {
+        for entry in result_stmts.iter_mut() {
+            if entry.0 == *leaf {
+                entry.1 = CsharpminorStmt::Sjump(*exit);
+            }
+        }
+    }
 
     result_stmts.sort_by_key(|(n, _)| *n);
 
@@ -1020,6 +1312,100 @@ fn switch_disc_offset(op: &crate::x86::types::CminorBinop, cst: &Constant) -> Op
     Some(raw)
 }
 
+// Path-interval helpers for the comparison-tree walker (inclusive bounds in root-discriminant space; None = unbounded).
+fn clamp_lo(lo: Option<i64>, v: i64) -> Option<i64> {
+    Some(lo.map_or(v, |l| l.max(v)))
+}
+fn clamp_hi(hi: Option<i64>, v: i64) -> Option<i64> {
+    Some(hi.map_or(v, |h| h.min(v)))
+}
+// A finite, small, non-negative interval that may be enumerated as switch cases. Width and sign policy mirror the established unsigned range arms (< 32 values, lower bound >= 0).
+fn enumerable_range(lo: Option<i64>, hi: Option<i64>) -> Option<(i64, i64)> {
+    let (l, h) = (lo?, hi?);
+    if l >= 0 && h >= l && h.checked_sub(l).map_or(false, |w| w < 32) {
+        Some((l, h))
+    } else {
+        None
+    }
+}
+
+/// True when a range-guard branch target is INTERIOR dispatch (further tests/rebases of the same discriminant, a jump table, or a loop-exit compare) rather than a case body. Enumerating an interval as cases is only sound when the branch lands on a body: an interior target means the values subdivide further and the deeper Ceq/Cne/jumptable nodes own them. Follows pure jump/nop/rebase preludes a bounded number of hops; unresolved chains conservatively count as interior (no enumeration).
+fn range_target_is_interior(
+    start: Node,
+    disc_reg: RTLReg,
+    stmt_map: &HashMap<Node, &CsharpminorStmt>,
+    seq_next_map: &HashMap<Node, Node>,
+    resolve_reg: &dyn Fn(RTLReg) -> (RTLReg, i64),
+    cond_break_nodes: &HashSet<Node>,
+) -> bool {
+    let mut cur = start;
+    for _ in 0..8 {
+        if cond_break_nodes.contains(&cur) {
+            return true;
+        }
+        match stmt_map.get(&cur) {
+            Some(CsharpminorStmt::Scond(cond, args, _, _)) if args.len() == 1 => {
+                let reg_opt = match &args[0] {
+                    CsharpminorExpr::Evar(r) => Some(*r),
+                    CsharpminorExpr::Ebinop(_, lhs, rhs) => match (lhs.as_ref(), rhs.as_ref()) {
+                        (CsharpminorExpr::Evar(r), CsharpminorExpr::Econst(_)) => Some(*r),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                return match reg_opt {
+                    Some(r) => {
+                        let is_cmp = matches!(
+                            cond,
+                            Condition::Ccompimm(_, _)
+                                | Condition::Ccompuimm(_, _)
+                                | Condition::Ccomplimm(_, _)
+                                | Condition::Ccompluimm(_, _)
+                                | Condition::Cmaskzero(_)
+                                | Condition::Cmasknotzero(_)
+                        );
+                        is_cmp && resolve_reg(r).0 == disc_reg
+                    }
+                    None => false,
+                };
+            }
+            Some(CsharpminorStmt::Scond(_, _, _, _)) => return false,
+            Some(CsharpminorStmt::Sjumptable(_, _)) => return true,
+            Some(CsharpminorStmt::Sjump(t)) => {
+                if *t == cur {
+                    return false;
+                }
+                cur = *t;
+            }
+            Some(CsharpminorStmt::Snop) => match seq_next_map.get(&cur) {
+                Some(&n) => cur = n,
+                None => return false,
+            },
+            Some(CsharpminorStmt::Sset(_, expr)) => {
+                // Discriminant-rebasing prelude (dst = disc +/- const, in-place or derived copy) precedes deeper dispatch; any other statement begins a case body.
+                let rebase = match expr {
+                    CsharpminorExpr::Ebinop(op, lhs, rhs) => match (lhs.as_ref(), rhs.as_ref()) {
+                        (CsharpminorExpr::Evar(src), CsharpminorExpr::Econst(cst)) => {
+                            switch_disc_offset(op, cst).is_some() && resolve_reg(*src).0 == disc_reg
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if !rebase {
+                    return false;
+                }
+                match seq_next_map.get(&cur) {
+                    Some(&n) => cur = n,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Walk GCC comparison trees (mixed eq/ne/range checks) to extract switch case values.
 fn detect_comparison_tree_switches(
     stmts: &[(Node, CsharpminorStmt)],
@@ -1069,37 +1455,48 @@ fn detect_comparison_tree_switches(
         (current, total_offset)
     };
 
-    // Walk comparison tree, collecting (case_value, target, member_node) per branch. `local_disc_offset` tracks in-place updates to disc_reg seen so far along this DFS path (e.g., `eax = eax + (-2); cmp $1, eax` means the cmp tests `disc_orig + (-2)` against 1).
+    // Walk comparison tree, collecting (case_value, target, member_node) per branch. `local_disc_offset` tracks in-place updates to disc_reg seen so far along this DFS path (e.g., `eax = eax + (-2); cmp $1, eax` means the cmp tests `disc_orig + (-2)` against 1). `path_lo`/`path_hi` carry the inclusive interval (in ROOT discriminant space) that the discriminant is known to lie in on this DFS path, accumulated from signed range guards; a guard branch whose interval becomes finite and small is a case cluster (gcc's signed binary-search `jg`/`jle` partition shape).
     fn walk_tree(
         node: Node,
         disc_reg: RTLReg,
         local_disc_offset: i64,
+        path_lo: Option<i64>,
+        path_hi: Option<i64>,
         stmt_map: &HashMap<Node, &CsharpminorStmt>,
         seq_next_map: &HashMap<Node, Node>,
         reg_derivation: &HashMap<RTLReg, (RTLReg, i64)>,
         resolve_reg: &dyn Fn(RTLReg) -> (RTLReg, i64),
+        cond_break_nodes: &HashSet<Node>,
         cases: &mut Vec<(i64, Node, Node)>,
         visited: &mut HashSet<Node>,
     ) {
         if !visited.insert(node) { return; }
 
+        // Loop-exit compares are not dispatch members (same exclusion the Ascent chain rules apply via !cond_is_break, and the same reason roots skip them): crossing one walks out of the dispatch region, e.g. around a loop back edge into the next iteration's tests.
+        if cond_break_nodes.contains(&node) { return; }
+
         // Track in-place self-updates of the discriminant for subsequent compares on this path: `Sset(disc_reg, disc_reg + N)` updates local_disc_offset by N.
-        if let Some(CsharpminorStmt::Sset(dst, expr)) = stmt_map.get(&node) {
-            if *dst == disc_reg {
-                if let CsharpminorExpr::Ebinop(op, lhs, rhs) = expr {
-                    if let (CsharpminorExpr::Evar(src), CsharpminorExpr::Econst(cst)) =
-                        (lhs.as_ref(), rhs.as_ref())
-                    {
-                        if *src == disc_reg {
-                            if let Some(off) = switch_disc_offset(op, cst) {
-                                if let Some(&next) = seq_next_map.get(&node) {
-                                    walk_tree(next, disc_reg, local_disc_offset + off, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
+        if let Some(s) = stmt_map.get(&node) {
+            if stmt_def_reg(s) == Some(disc_reg) {
+                if let CsharpminorStmt::Sset(_, expr) = s {
+                    if let CsharpminorExpr::Ebinop(op, lhs, rhs) = expr {
+                        if let (CsharpminorExpr::Evar(src), CsharpminorExpr::Econst(cst)) =
+                            (lhs.as_ref(), rhs.as_ref())
+                        {
+                            if *src == disc_reg {
+                                if let Some(off) = switch_disc_offset(op, cst) {
+                                    if let Some(&next) = seq_next_map.get(&node) {
+                                        // The path interval is in root space (compare offsets renormalize), so it passes through unchanged.
+                                        walk_tree(next, disc_reg, local_disc_offset + off, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                                    }
+                                    return;
                                 }
-                                return;
                             }
                         }
                     }
                 }
+                // Any other redefinition of the discriminant (call/builtin result, or an Sset whose RHS is not the modeled in-place +/-const) KILLS the dispatch value: compares beyond this point test an unrelated value, and continuing with the stale offset fabricates case rows (observed: walking through a loop header's `c = f()` call carried a -3 rebase onto the loop-exit compares, minting phantom `case 5`).
+                return;
             }
         }
 
@@ -1130,9 +1527,36 @@ fn detect_comparison_tree_switches(
         let (reg, inline_off, cond, ifso, ifnot) = match cmp {
             Some(c) => c,
             None => {
-                // Follow sequential successor
-                if let Some(&next) = seq_next_map.get(&node) {
-                    walk_tree(next, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
+                // Only pure control (jump/nop/discriminant-rebase) may be walked through: any state change kills row attribution because the head's dispatch jumps over it, binding deeper rows to skipped-state targets (observed: gcc -O1 cmove cascades between compares caused `case 3` to execute case 29's body). Discriminant-rebase Ssets (clang's lea form) are exempted as dispatch plumbing, not body state.
+                match stmt_map.get(&node) {
+                    Some(CsharpminorStmt::Sjump(t)) => {
+                        if *t != node {
+                            walk_tree(*t, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                        }
+                    }
+                    Some(CsharpminorStmt::Snop) => {
+                        if let Some(&next) = seq_next_map.get(&node) {
+                            walk_tree(next, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                        }
+                    }
+                    Some(CsharpminorStmt::Sset(_, expr)) => {
+                        let rebase_copy = match expr {
+                            CsharpminorExpr::Ebinop(op, lhs, rhs) => match (lhs.as_ref(), rhs.as_ref()) {
+                                (CsharpminorExpr::Evar(src), CsharpminorExpr::Econst(cst)) => {
+                                    switch_disc_offset(op, cst).is_some()
+                                        && resolve_reg(*src).0 == disc_reg
+                                }
+                                _ => false,
+                            },
+                            _ => false,
+                        };
+                        if rebase_copy {
+                            if let Some(&next) = seq_next_map.get(&node) {
+                                walk_tree(next, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 return;
             }
@@ -1152,7 +1576,7 @@ fn detect_comparison_tree_switches(
             | Condition::Ccompluimm(Comparison::Ceq, val) if is_disc => {
                 let case_val = val - offset;
                 cases.push((case_val, ifso, node));
-                walk_tree(ifnot, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
+                walk_tree(ifnot, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
             }
 
             // Cne: false branch = case body (inverted), true continues
@@ -1162,24 +1586,24 @@ fn detect_comparison_tree_switches(
             | Condition::Ccompluimm(Comparison::Cne, val) if is_disc => {
                 let case_val = val - offset;
                 cases.push((case_val, ifnot, node));
-                walk_tree(ifso, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
+                walk_tree(ifso, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
             }
 
             // Cmaskzero(M) on disc means `(disc & M) == 0`. When the AND was the prior instruction that bounded disc to [0..M] (mask is 2^n - 1), this is exactly `disc == 0`, i.e., case 0 of `switch (disc) { ... }`. Treat it like Ceq(0). clang -O1 fuses `and $M, %disc; je case0` into a single Cmaskzero(M).
             Condition::Cmaskzero(mask) if is_disc && mask > 0 && (mask & (mask + 1)) == 0 => {
                 let case_val = -offset;
                 cases.push((case_val, ifso, node));
-                walk_tree(ifnot, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
+                walk_tree(ifnot, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
             }
 
             // Cmasknotzero(M) on disc means `(disc & M) != 0`. With M = 2^n - 1, this is the negation of case 0. Treat like Cne(0).
             Condition::Cmasknotzero(mask) if is_disc && mask > 0 && (mask & (mask + 1)) == 0 => {
                 let case_val = -offset;
                 cases.push((case_val, ifnot, node));
-                walk_tree(ifso, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
+                walk_tree(ifso, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
             }
 
-            // Unsigned `disc < bound` with `disc + offset` (offset <= 0) enumerates range [-offset, bound-offset-1] for the true branch; bounded to keep Sswitch table small.
+            // Unsigned `disc < bound` with `disc + offset` (offset <= 0) enumerates range [-offset, bound-offset-1] for the true branch; bounded to keep Sswitch table small. The true branch additionally implies the signed interval [-offset, bound-offset-1] (an unsigned upper bound on a small non-negative range), which narrows the path interval for nested signed guards.
             Condition::Ccompuimm(Comparison::Clt, bound)
             | Condition::Ccompluimm(Comparison::Clt, bound) if is_disc => {
                 let disc_lower = -offset;
@@ -1189,8 +1613,11 @@ fn detect_comparison_tree_switches(
                         cases.push((v, ifso, node));
                     }
                 }
-                walk_tree(ifso, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
-                walk_tree(ifnot, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
+                let (t_lo, t_hi) = if disc_lower >= 0 && disc_upper >= disc_lower {
+                    (clamp_lo(path_lo, disc_lower), clamp_hi(path_hi, disc_upper))
+                } else { (path_lo, path_hi) };
+                walk_tree(ifso, disc_reg, local_disc_offset, t_lo, t_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                walk_tree(ifnot, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
             }
 
             // Unsigned `disc <= bound`: similar but inclusive upper bound.
@@ -1203,8 +1630,11 @@ fn detect_comparison_tree_switches(
                         cases.push((v, ifso, node));
                     }
                 }
-                walk_tree(ifso, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
-                walk_tree(ifnot, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
+                let (t_lo, t_hi) = if disc_lower >= 0 && disc_upper >= disc_lower {
+                    (clamp_lo(path_lo, disc_lower), clamp_hi(path_hi, disc_upper))
+                } else { (path_lo, path_hi) };
+                walk_tree(ifso, disc_reg, local_disc_offset, t_lo, t_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                walk_tree(ifnot, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
             }
 
             // Unsigned (disc + neg_off) > bound with neg_off < 0: false branch represents disc in [-off, -off + bound]. Used by gcc -O1 to test a contiguous case cluster like `case 2: case 3:` via `sub $2,%eax; cmp $1,%eax; ja default`.
@@ -1217,8 +1647,11 @@ fn detect_comparison_tree_switches(
                         cases.push((v, ifnot, node));
                     }
                 }
-                walk_tree(ifso, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
-                walk_tree(ifnot, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
+                let (f_lo, f_hi) = if disc_lower >= 0 && disc_upper >= disc_lower {
+                    (clamp_lo(path_lo, disc_lower), clamp_hi(path_hi, disc_upper))
+                } else { (path_lo, path_hi) };
+                walk_tree(ifso, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                walk_tree(ifnot, disc_reg, local_disc_offset, f_lo, f_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
             }
 
             // Unsigned (disc + neg_off) >= bound: false branch represents disc in [-off, -off + bound - 1].
@@ -1231,31 +1664,71 @@ fn detect_comparison_tree_switches(
                         cases.push((v, ifnot, node));
                     }
                 }
-                walk_tree(ifso, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
-                walk_tree(ifnot, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
+                let (f_lo, f_hi) = if disc_lower >= 0 && disc_upper >= disc_lower {
+                    (clamp_lo(path_lo, disc_lower), clamp_hi(path_hi, disc_upper))
+                } else { (path_lo, path_hi) };
+                walk_tree(ifso, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                walk_tree(ifnot, disc_reg, local_disc_offset, f_lo, f_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
             }
 
-            // Other range guards on the discriminant: partition the disc space without binding case values; cases come only from Ceq/Cne leaves below.
-            Condition::Ccompimm(Comparison::Cgt, _)
-            | Condition::Ccompuimm(Comparison::Cgt, _)
-            | Condition::Ccomplimm(Comparison::Cgt, _)
+            // SIGNED range guards on the discriminant (gcc/clang binary-search partition tests: `jg`/`jle`/`jl`/`jge`). Each branch narrows the path interval; a branch whose interval becomes finite and small is a contiguous case CLUSTER (e.g. `cmp $4; jg ...` then `cmp $2; jg BODY` isolates {3,4}). When that branch lands on a BODY (not further dispatch on the same discriminant), enumerate its values as cases of this guard, making the guard a chain member: the range-dispatch joins the recovered switch instead of surviving as a raw if re-testing the discriminant. Dedup-order soundness: any `!= v` path constraints not representable in the interval correspond to Ceq/Cne cases pushed EARLIER on this DFS path, and the post-walk first-occurrence dedup discards the interval's stale binding of v.
+            Condition::Ccompimm(scmp, val)
+            | Condition::Ccomplimm(scmp, val)
+                if is_disc && matches!(scmp, Comparison::Cgt | Comparison::Cge | Comparison::Clt | Comparison::Cle) => {
+                // Bound in root-disc space; the compare tests (disc_root + offset) OP val, i.e. disc_root OP (val - offset). On overflow (b = None) the branch intervals stay UNNARROWED and must not enumerate: with a degenerate already-finite path interval, enumerating both branches would bind the same values to two targets.
+                let b = val.checked_sub(offset);
+                let (t_lo, t_hi, f_lo, f_hi) = match (scmp, b) {
+                    (Comparison::Cgt, Some(b)) => (
+                        b.checked_add(1).map_or(path_lo, |x| clamp_lo(path_lo, x)), path_hi,
+                        path_lo, clamp_hi(path_hi, b),
+                    ),
+                    (Comparison::Cge, Some(b)) => (
+                        clamp_lo(path_lo, b), path_hi,
+                        path_lo, b.checked_sub(1).map_or(path_hi, |x| clamp_hi(path_hi, x)),
+                    ),
+                    (Comparison::Clt, Some(b)) => (
+                        path_lo, b.checked_sub(1).map_or(path_hi, |x| clamp_hi(path_hi, x)),
+                        clamp_lo(path_lo, b), path_hi,
+                    ),
+                    (Comparison::Cle, Some(b)) => (
+                        path_lo, clamp_hi(path_hi, b),
+                        b.checked_add(1).map_or(path_lo, |x| clamp_lo(path_lo, x)), path_hi,
+                    ),
+                    _ => (path_lo, path_hi, path_lo, path_hi),
+                };
+                if b.is_some() {
+                    if let Some((l, h)) = enumerable_range(t_lo, t_hi) {
+                        if !range_target_is_interior(ifso, disc_reg, stmt_map, seq_next_map, resolve_reg, cond_break_nodes) {
+                            for v in l..=h {
+                                cases.push((v, ifso, node));
+                            }
+                        }
+                    }
+                    if let Some((l, h)) = enumerable_range(f_lo, f_hi) {
+                        if !range_target_is_interior(ifnot, disc_reg, stmt_map, seq_next_map, resolve_reg, cond_break_nodes) {
+                            for v in l..=h {
+                                cases.push((v, ifnot, node));
+                            }
+                        }
+                    }
+                }
+                walk_tree(ifso, disc_reg, local_disc_offset, t_lo, t_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                walk_tree(ifnot, disc_reg, local_disc_offset, f_lo, f_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+            }
+
+            // Other range guards on the discriminant (unsigned Cgt/Cge with offset >= 0): partition the disc space without binding case values; cases come only from Ceq/Cne leaves below.
+            Condition::Ccompuimm(Comparison::Cgt, _)
             | Condition::Ccompluimm(Comparison::Cgt, _)
-            | Condition::Ccompimm(Comparison::Cle, _)
-            | Condition::Ccomplimm(Comparison::Cle, _)
-            | Condition::Ccompimm(Comparison::Clt, _)
-            | Condition::Ccomplimm(Comparison::Clt, _)
-            | Condition::Ccompimm(Comparison::Cge, _)
             | Condition::Ccompuimm(Comparison::Cge, _)
-            | Condition::Ccomplimm(Comparison::Cge, _)
             | Condition::Ccompluimm(Comparison::Cge, _) if is_disc => {
-                walk_tree(ifso, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
-                walk_tree(ifnot, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
+                walk_tree(ifso, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                walk_tree(ifnot, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
             }
 
             // Non-discriminant or mask test: explore both branches
             _ => {
-                walk_tree(ifso, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
-                walk_tree(ifnot, disc_reg, local_disc_offset, stmt_map, seq_next_map, reg_derivation, resolve_reg, cases, visited);
+                walk_tree(ifso, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                walk_tree(ifnot, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
             }
         }
     }
@@ -1299,8 +1772,9 @@ fn detect_comparison_tree_switches(
                 let mut visited = HashSet::new();
                 walk_tree(
                     *node, root_reg, 0i64,
+                    None, None,
                     &stmt_map, &seq_next_map, &reg_derivation,
-                    &resolve_reg,
+                    &resolve_reg, cond_break_nodes,
                     &mut cases, &mut visited,
                 );
 
@@ -1319,18 +1793,35 @@ fn detect_comparison_tree_switches(
     results
 }
 
-// Walk `next` chain from `start` until a node in `stmt_nodes` is reached; returns None if the chain terminates or cycles without hitting a statement node.
+// Walk the execution-order chain from `start` until a stmt_nodes member is reached. Splices synthetic chain members (A|1<<62, A|1<<63) in at their real-address position; without this they become unreachable islands and statements they carry (e.g. a fused `global = CONST`) are torn out of their branch and re-emitted at the function bottom.
 fn walk_next_to_stmt(
     start: Node,
     next_map: &HashMap<Node, Node>,
     stmt_nodes: &HashSet<Node>,
 ) -> Option<Node> {
-    let mut cur = start;
+    const S1: u64 = crate::util::SYNTH_NODE_BIT; // executes 1st after its real address
+    const S2: u64 = 1u64 << 63; // executes 2nd (two-step chains, e.g. arith_store_*)
+    let base = start & !(S1 | S2);
+    // Remaining members of start's own synthetic chain execute before next(base).
+    if start & (S1 | S2) == 0 && stmt_nodes.contains(&(base | S1)) {
+        return Some(base | S1);
+    }
+    if start & S2 == 0 && stmt_nodes.contains(&(base | S2)) {
+        return Some(base | S2);
+    }
+    let mut cur = base;
     let mut visited: HashSet<Node> = HashSet::new();
     while visited.insert(cur) {
         let nxt = *next_map.get(&cur)?;
         if stmt_nodes.contains(&nxt) {
             return Some(nxt);
+        }
+        // A statement-less successor may still head a synthetic chain (e.g. its Sset folded away, leaving the fused store at nxt | 1<<62).
+        if stmt_nodes.contains(&(nxt | S1)) {
+            return Some(nxt | S1);
+        }
+        if stmt_nodes.contains(&(nxt | S2)) {
+            return Some(nxt | S2);
         }
         cur = nxt;
     }
@@ -1694,6 +2185,13 @@ fn propagate_copies(working: &mut HashMap<Node, CsharpminorStmt>, db: &mut Decom
             prog.in_block.push((node, blk));
         }
     }
+    // VR-2: cminor_succ covers synthetic bit-62 nodes via rtl_succ bridge rules, making their kills visible to the cross-block available-copies lattice.
+    for &(a, b) in db.rel_iter::<(Node, Node)>("cminor_succ") {
+        prog.edge.push((a, b));
+    }
+    for &(_, entry) in db.rel_iter::<(Address, Node)>("func_entry_node") {
+        prog.entry.push((entry,));
+    }
 
     prog.run();
 
@@ -1901,12 +2399,48 @@ fn subst_var_in_stmt(
     }
 }
 
+// VR-2 helpers: available-copies dataflow over the statement-level CFG.
+
+// Transfer one statement through the avail-copies lattice: kill entries whose dst or src is redefined, then gen the statement's own copy.
+fn copy_transfer(
+    avail: &Set<(Node, RTLReg, RTLReg)>,
+    node: Node,
+    stmt: &CsharpminorStmt,
+) -> Set<(Node, RTLReg, RTLReg)> {
+    let def = stmt_def_reg(stmt);
+    let mut out: std::collections::BTreeSet<(Node, RTLReg, RTLReg)> = avail
+        .0
+        .iter()
+        .filter(|(_, dst, src)| def.map_or(true, |d| d != *dst && d != *src))
+        .copied()
+        .collect();
+    if let CsharpminorStmt::Sset(dst, CsharpminorExpr::Evar(src)) = stmt {
+        if dst != src {
+            out.insert((node, *dst, *src));
+        }
+    }
+    Set(out)
+}
+
+// Entries of the avail set that copy into `dst`, as (intro, src) pairs.
+fn avail_copies_of(avail: &Set<(Node, RTLReg, RTLReg)>, dst: RTLReg) -> Vec<(Node, RTLReg)> {
+    avail
+        .0
+        .iter()
+        .filter(|(_, d, _)| *d == dst)
+        .map(|(i, _, s)| (*i, *s))
+        .collect()
+}
+
 // CopyPropagationProgram: Ascent copy propagation. Outputs applicable_subst, dead_copy_v2, copy_intro.
 ascent_par! {
     pub struct CopyPropagationProgram;
 
     relation stmt(Node, CsharpminorStmt);
     relation in_block(Node, Node);
+    // VR-2 inputs: statement-level CFG edges (cminor_succ) and function entry nodes.
+    relation edge(Node, Node);
+    relation entry(Node);
 
     // Both in same block AND a strictly precedes b. Synthetic nodes (bit 62 set) execute immediately after their base address, so naive numeric comparison reorders them past all real-address nodes. exec_order_key folds the address into a 2x+1 form so a synth at base X sits between real X and the next real address.
     relation before_in_block(Node, Node);
@@ -1949,6 +2483,30 @@ ascent_par! {
         copy_intro(intro, dst, src),
         before_in_block(intro, u),
         !copy_killed_between(intro, dst, src, u);
+
+    // VR-2: avail_in is a Dual<Set> intersection lattice -- keeps only path-invariant copies. Loop safety falls out of the meet: at a loop header the entry path (no intro yet) intersects back-edge state, so loop-interior copies never appear available at first-iteration reads, and in-loop redefinitions of dst or src drop the entry on the back edge.
+    lattice avail_in(Node, Dual<Set<(Node, RTLReg, RTLReg)>>);
+
+    // Function entries start with no available copies.
+    avail_in(*e, Dual(Set::default())) <-- entry(e);
+
+    // Propagate along CFG edges through the pred's transfer (kill defs, then gen intro).
+    avail_in(*n, Dual(copy_transfer(&pin.0, *p, s))) <--
+        edge(p, n),
+        avail_in(p, pin),
+        stmt(p, s);
+
+    // Pred without a statement in this program's view has unknown effects: kill everything.
+    avail_in(*n, Dual(Set::default())) <--
+        edge(p, n),
+        avail_in(p, _),
+        !stmt(p, _);
+
+    // Cross-block coverage feeds the same active/covered/dead pipeline; tuples materialize only at use sites.
+    copy_active_at(*u, *dst, src, intro) <--
+        stmt_uses(u, dst),
+        avail_in(u, av),
+        for (intro, src) in avail_copies_of(&av.0, *dst);
 
     // The copy at `intro` has a use of `dst` it does NOT cover (dst read where the copy is inactive: another block, or before `intro` via a back-edge, the loop-carried read); such uses cannot be rewritten to `src`, so killing/substituting the copy would strip dst's def and collapse the loop-carried value to its pre-loop definition (a frozen counter/accumulator).
     relation copy_use_uncovered(Node);

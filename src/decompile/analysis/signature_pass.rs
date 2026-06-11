@@ -415,10 +415,22 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         .rel_iter::<(Address,)>("is_cpp_method_fn")
         .map(|&(a,)| a)
         .collect();
-    let reconciled_return_type_map: HashMap<Address, XType> = db
-        .rel_iter::<(Address, XType)>("reconciled_return_type")
-        .map(|&(a, ref t)| (a, t.clone()))
-        .collect();
+    // reconciled_return_type can have multiple facts per address (cases 2/4 fire once per xtype candidate), so reduce with (refine-priority, ty) to stay deterministic across parallel runs.
+    let reconciled_return_type_map: HashMap<Address, XType> = {
+        let mut groups: HashMap<Address, Vec<XType>> = HashMap::new();
+        for &(a, ref t) in db.rel_iter::<(Address, XType)>("reconciled_return_type") {
+            groups.entry(a).or_default().push(t.clone());
+        }
+        groups
+            .into_iter()
+            .map(|(addr, mut tys)| {
+                tys.sort_by_key(|ty| {
+                    (crate::decompile::passes::clight_pass::xtype_refine_priority(ty), *ty)
+                });
+                (addr, *tys.last().unwrap())
+            })
+            .collect()
+    };
 
     let extern_sigs: HashMap<Symbol, (usize, XType, Arc<Vec<XType>>)> = db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
         .map(|&(name, count, ref ret, ref params)| (name, (count, ret.clone(), params.clone())))
@@ -430,10 +442,21 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         *entry = (*entry).max(count);
     }
 
-    let mut def_param_types: HashMap<Address, HashMap<RTLReg, XType>> = HashMap::new();
-    for &(addr, reg, ref xtype) in db.rel_iter::<(Address, RTLReg, XType)>("emit_function_param_type_candidate") {
-        def_param_types.entry(addr).or_default().insert(reg, xtype.clone());
-    }
+    // Multiple param-type candidates per (addr, reg) are possible; reduce with (refine-priority, ty) for determinism under parallel Ascent.
+    let def_param_types: HashMap<Address, HashMap<RTLReg, XType>> = {
+        let mut cands: HashMap<(Address, RTLReg), Vec<XType>> = HashMap::new();
+        for &(addr, reg, ref xtype) in db.rel_iter::<(Address, RTLReg, XType)>("emit_function_param_type_candidate") {
+            cands.entry((addr, reg)).or_default().push(xtype.clone());
+        }
+        let mut map: HashMap<Address, HashMap<RTLReg, XType>> = HashMap::new();
+        for ((addr, reg), mut tys) in cands {
+            tys.sort_by_key(|ty| {
+                (crate::decompile::passes::clight_pass::xtype_refine_priority(ty), *ty)
+            });
+            map.entry(addr).or_default().insert(reg, *tys.last().unwrap());
+        }
+        map
+    };
 
     let mut rtl_to_mreg: HashMap<(Address, RTLReg), Mreg> = HashMap::new();
     for &(node, ref mreg, rtl_reg) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl") {
@@ -620,14 +643,20 @@ fn reconcile_signatures(db: &mut DecompileDB) {
             // Varargs known but no extern sig: fall through, remember is_va so call sites keep extra args.
         }
 
-        // Hardcode int main(int argc, char **argv) when is_main_fn fires.
+        // main's signature: the classic `int main(int argc, char **argv)`, upgraded to the 3-arg `int main(int, char **argv, char **envp)` when the body's own recovered evidence shows a third register parameter (ABI-4: the hardcoded 2-arg form could not reconcile envp-using mains).
         if is_main_fn_set.contains(&func_addr) {
             if let Some((param_count, ret_type, param_types)) = known_internal_sigs.get(func_name) {
+                let detected_int = reconciled_int_count_map.get(&func_addr).copied().unwrap_or(0);
+                let (main_count, main_types) = if detected_int >= 3 {
+                    (3, vec![XType::Xint, XType::Xcharptrptr, XType::Xcharptrptr])
+                } else {
+                    (*param_count, param_types.clone())
+                };
                 prototypes.push(FunctionPrototype {
                     address: func_addr,
                     name: func_name,
-                    param_count: *param_count,
-                    param_types: param_types.clone(),
+                    param_count: main_count,
+                    param_types: main_types,
                     return_type: *ret_type,
                     confidence: SignatureConfidence::HighConfidence,
                     is_varargs: is_va,
@@ -690,17 +719,26 @@ fn reconcile_signatures(db: &mut DecompileDB) {
 
         let existing_types = def_param_types.get(&func_addr);
         let existing_params = def_params.get(&func_addr);
+        // TR-5: stack params are keyed by fresh_stack_param_reg, not by register webs, so positions >= stack_base must be looked up via fresh_stack_param_reg rather than existing_params.get(i).
+        let stack_base = reconciled_int + float_count;
+        let pos_reg = |i: usize| -> Option<RTLReg> {
+            if i >= stack_base && i < stack_base + stack_count {
+                return Some(crate::decompile::passes::rtl_pass::fresh_stack_param_reg(
+                    func_addr,
+                    i - stack_base,
+                ));
+            }
+            existing_params.and_then(|params| params.get(i).copied())
+        };
         let mut param_types = Vec::with_capacity(reconciled_count);
         for i in 0..reconciled_count {
             let mut resolved_type: Option<XType> = None;
 
             // Priority 1: Definition type from emit_function_param_type
-            if let Some(params) = existing_params {
-                if let Some(&reg) = params.get(i) {
-                    if let Some(types) = existing_types {
-                        if let Some(xtype) = types.get(&reg) {
-                            resolved_type = Some(xtype.clone());
-                        }
+            if let Some(reg) = pos_reg(i) {
+                if let Some(types) = existing_types {
+                    if let Some(xtype) = types.get(&reg) {
+                        resolved_type = Some(xtype.clone());
                     }
                 }
             }
@@ -718,40 +756,39 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                         | XType::Xptr
                 )
             ) {
-                if let Some(params) = existing_params {
-                    if let Some(&reg) = params.get(i) {
-                        if let Some(xtypes) = emit_var_types.get(&reg) {
-                            // Pick the most specific type from candidates (prefer struct ptr > ptr > specific int > generic int)
-                            let best = xtypes.iter().max_by_key(|t| match t {
-                                XType::XstructPtr(_) => 5,
-                                XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr => 4,
-                                XType::Xptr => 3,
-                                XType::Xint8signed | XType::Xint8unsigned | XType::Xint16signed | XType::Xint16unsigned => 2,
-                                XType::Xfloat | XType::Xsingle => 2,
-                                _ => 1,
-                            });
-                            if let Some(best_type) = best {
-                                resolved_type = Some(best_type.clone());
-                            }
-                        } else if param_is_ptr.contains(&reg) {
-                            // Check if it's a struct pointer (multiple offsets)
-                            if let Some(offsets) = param_struct_offsets.get(&reg) {
-                                if offsets.len() > 1 {
-                                    // Look up struct ID from struct_recovery
-                                    let struct_id = db.rel_iter::<(Address, RTLReg, usize)>("emit_var_is_struct_candidate")
-                                        .find(|&&(_, r, _)| r == reg)
-                                        .map(|&(_, _, sid)| sid);
-                                    if let Some(sid) = struct_id {
-                                        resolved_type = Some(XType::XstructPtr(sid));
-                                    } else {
-                                        resolved_type = Some(XType::Xintptr);
-                                    }
+                if let Some(reg) = pos_reg(i) {
+                    if let Some(xtypes) = emit_var_types.get(&reg) {
+                        // Pick the most specific type from candidates (prefer struct ptr > ptr > specific int > generic int)
+                        let best = xtypes.iter().max_by_key(|t| match t {
+                            XType::XstructPtr(_) => 5,
+                            XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr => 4,
+                            XType::Xptr => 3,
+                            XType::Xint8signed | XType::Xint8unsigned | XType::Xint16signed | XType::Xint16unsigned => 2,
+                            XType::Xfloat | XType::Xsingle => 2,
+                            _ => 1,
+                        });
+                        if let Some(best_type) = best {
+                            resolved_type = Some(best_type.clone());
+                        }
+                    } else if param_is_ptr.contains(&reg) {
+                        // Check if it's a struct pointer (multiple offsets)
+                        if let Some(offsets) = param_struct_offsets.get(&reg) {
+                            if offsets.len() > 1 {
+                                // Multiple emit_var_is_struct_candidate facts may match; take min sid for determinism under parallel Ascent.
+                                let struct_id = db.rel_iter::<(Address, RTLReg, usize)>("emit_var_is_struct_candidate")
+                                    .filter(|&&(_, r, _)| r == reg)
+                                    .map(|&(_, _, sid)| sid)
+                                    .min();
+                                if let Some(sid) = struct_id {
+                                    resolved_type = Some(XType::XstructPtr(sid));
                                 } else {
                                     resolved_type = Some(XType::Xintptr);
                                 }
                             } else {
-                                resolved_type = Some(XType::Xptr);
+                                resolved_type = Some(XType::Xintptr);
                             }
+                        } else {
+                            resolved_type = Some(XType::Xptr);
                         }
                     }
                 }

@@ -4,8 +4,8 @@ use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::c_pass::types::{
     AssignOp, BinaryOp, CBlockItem, CExpr, CStmt, CType, ExprTransform, FloatLiteral,
     FloatLiteralSuffix, FuncDef, FuncParam, IntLiteral, IntLiteralBase,
-    IntLiteralSuffix, Label, SourceLoc, StorageClass, StmtTransform, StringLiteral,
-    TypeQualifiers, UnaryOp, VarDecl,
+    IntLiteralSuffix, Label, Signedness, SourceLoc, StorageClass, StmtTransform,
+    StringLiteral, TypeQualifiers, UnaryOp, VarDecl,
 };
 use crate::decompile::passes::c_pass::TranslationUnit;
 use crate::decompile::passes::clight_select::query::GlobalData;
@@ -353,8 +353,8 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 chunk_list.retain(|c|
                     !matches!(c, MemoryChunk::MFloat32 | MemoryChunk::MFloat64));
             }
-            // Among remaining, prefer the largest integer type
-            let best = chunk_list.iter().max_by_key(|c| match c {
+            // Among remaining, prefer the largest integer type; use the chunk itself as a tiebreak so signed/unsigned pairs of the same width don't flip across parallel-Ascent runs.
+            let best = chunk_list.iter().max_by_key(|c| (match c {
                 MemoryChunk::MBool => 0,
                 MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned => 1,
                 MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => 2,
@@ -365,7 +365,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 MemoryChunk::MAny32 => 7,
                 MemoryChunk::MAny64 => 8,
                 MemoryChunk::Unknown => 9,
-            }).copied().unwrap_or(MemoryChunk::Unknown);
+            }, **c)).copied().unwrap_or(MemoryChunk::Unknown);
             (id, best)
         }).collect()
     };
@@ -378,6 +378,89 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         .map(|(id,)| *id)
         .collect();
 
+    // SR-1: type global declarations from recovered layouts so emit_global_struct_fields keeps the struct definition alive through clight_emit's referenced-filter; catalog guard prevents naming a struct that extract_struct_definitions won't emit (incomplete type at TU end).
+    let global_struct_decl_ids: HashMap<usize, usize> = {
+        let catalog_ids: HashSet<usize> = db
+            .rel_iter::<(u64, usize, usize, usize)>("global_struct_catalog")
+            .map(|(_, id, _, _)| *id)
+            .collect();
+        let mut m: HashMap<usize, usize> = HashMap::new();
+        for (ident, sid, _fields) in
+            db.rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_global_struct_fields")
+        {
+            if !catalog_ids.contains(sid) {
+                continue;
+            }
+            // Min-sid per ident: relation is set-semantics and may carry several rows; arrival order must not pick the winner.
+            m.entry(*ident)
+                .and_modify(|e| {
+                    if *sid < *e {
+                        *e = *sid;
+                    }
+                })
+                .or_insert(*sid);
+        }
+        m
+    };
+    // Same for recovered global arrays: smallest (elem_size, count) per ident -- weakest claim, deterministic across the multi-valued relation.
+    let global_array_decl: HashMap<usize, (usize, usize)> = {
+        let mut m: HashMap<usize, (usize, usize)> = HashMap::new();
+        for (ident, elem_size, count) in db.rel_iter::<(Ident, usize, usize)>("is_global_array") {
+            if *elem_size == 0 || *count == 0 {
+                continue;
+            }
+            let cand = (*elem_size, *count);
+            m.entry(*ident)
+                .and_modify(|e| {
+                    if cand < *e {
+                        *e = cand;
+                    }
+                })
+                .or_insert(cand);
+        }
+        m
+    };
+    let ctype_of_chunk = |chunk: &MemoryChunk| -> CType {
+        match chunk {
+            MemoryChunk::MBool | MemoryChunk::MInt32 | MemoryChunk::MAny32 => CType::Int(
+                crate::decompile::passes::c_pass::types::IntSize::Int,
+                crate::decompile::passes::c_pass::types::Signedness::Signed,
+            ),
+            MemoryChunk::MInt8Signed => CType::Int(
+                crate::decompile::passes::c_pass::types::IntSize::Char,
+                crate::decompile::passes::c_pass::types::Signedness::Signed,
+            ),
+            MemoryChunk::MInt8Unsigned => CType::Int(
+                crate::decompile::passes::c_pass::types::IntSize::Char,
+                crate::decompile::passes::c_pass::types::Signedness::Unsigned,
+            ),
+            MemoryChunk::MInt16Signed => CType::Int(
+                crate::decompile::passes::c_pass::types::IntSize::Short,
+                crate::decompile::passes::c_pass::types::Signedness::Signed,
+            ),
+            MemoryChunk::MInt16Unsigned => CType::Int(
+                crate::decompile::passes::c_pass::types::IntSize::Short,
+                crate::decompile::passes::c_pass::types::Signedness::Unsigned,
+            ),
+            MemoryChunk::MFloat32 => CType::Float(
+                crate::decompile::passes::c_pass::types::FloatSize::Float,
+            ),
+            MemoryChunk::MFloat64 => CType::Float(
+                crate::decompile::passes::c_pass::types::FloatSize::Double,
+            ),
+            _ => CType::long(),
+        }
+    };
+    let chunk_byte_size = |chunk: &MemoryChunk| -> usize {
+        match chunk {
+            MemoryChunk::MBool | MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned => 1,
+            MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => 2,
+            MemoryChunk::MInt32 | MemoryChunk::MFloat32 | MemoryChunk::MAny32 => 4,
+            MemoryChunk::MInt64 | MemoryChunk::MFloat64 | MemoryChunk::MAny64 => 8,
+            MemoryChunk::Unknown => 0,
+        }
+    };
+
     for global in globals {
         if global.is_string || global.scalar_value.is_some() {
             continue;
@@ -385,6 +468,41 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         let sanitized_name = sanitize_c_symbol_name(&global.name);
         let (ty, init) = if let Some(known_ty) = known_global_types.get(&sanitized_name) {
             (known_ty.clone(), None)
+        } else if let Some(&sid) = global_struct_decl_ids.get(&global.id) {
+            // SR-1: naming the struct on the declaration keeps the definition alive through the referenced/needs_layout filter; use-site compatibility is handled by clight_emit's recovered-global rewrite.
+            (CType::Struct(format!("struct_{:x}", sid)), None)
+        } else if let Some(&(elem_size, count)) = global_array_decl.get(&global.id) {
+            // SR-1: non-scalar strides (e.g. 12-byte struct elements) have no honest scalar element type, so declare the full extent as a byte array rather than an undersized `int name[count]` that would let a recompile overlap the following symbol.
+            let (elem_ty, decl_count) = match elem_size {
+                1 | 2 | 4 | 8 => {
+                    let elem_ty = match global_chunks.get(&global.id) {
+                        Some(chunk) if chunk_byte_size(chunk) == elem_size => {
+                            ctype_of_chunk(chunk)
+                        }
+                        _ => match elem_size {
+                            1 => CType::Int(
+                                crate::decompile::passes::c_pass::types::IntSize::Char,
+                                crate::decompile::passes::c_pass::types::Signedness::Unsigned,
+                            ),
+                            2 => CType::Int(
+                                crate::decompile::passes::c_pass::types::IntSize::Short,
+                                crate::decompile::passes::c_pass::types::Signedness::Signed,
+                            ),
+                            8 => CType::long(),
+                            _ => CType::int(),
+                        },
+                    };
+                    (elem_ty, count)
+                }
+                _ => (
+                    CType::Int(
+                        crate::decompile::passes::c_pass::types::IntSize::Char,
+                        crate::decompile::passes::c_pass::types::Signedness::Unsigned,
+                    ),
+                    elem_size * count,
+                ),
+            };
+            (CType::Array(Box::new(elem_ty), Some(decl_count)), None)
         } else if global_char_ptr_ids.contains(&global.id) {
             (CType::Pointer(
                 Box::new(CType::Int(
@@ -396,36 +514,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         } else if global.is_pointer || global_ptr_ids.contains(&global.id) {
             (CType::ptr(CType::Void), None)
         } else if let Some(chunk) = global_chunks.get(&global.id) {
-            let chunk_ty = match chunk {
-                MemoryChunk::MBool | MemoryChunk::MInt32 | MemoryChunk::MAny32 => CType::Int(
-                    crate::decompile::passes::c_pass::types::IntSize::Int,
-                    crate::decompile::passes::c_pass::types::Signedness::Signed,
-                ),
-                MemoryChunk::MInt8Signed => CType::Int(
-                    crate::decompile::passes::c_pass::types::IntSize::Char,
-                    crate::decompile::passes::c_pass::types::Signedness::Signed,
-                ),
-                MemoryChunk::MInt8Unsigned => CType::Int(
-                    crate::decompile::passes::c_pass::types::IntSize::Char,
-                    crate::decompile::passes::c_pass::types::Signedness::Unsigned,
-                ),
-                MemoryChunk::MInt16Signed => CType::Int(
-                    crate::decompile::passes::c_pass::types::IntSize::Short,
-                    crate::decompile::passes::c_pass::types::Signedness::Signed,
-                ),
-                MemoryChunk::MInt16Unsigned => CType::Int(
-                    crate::decompile::passes::c_pass::types::IntSize::Short,
-                    crate::decompile::passes::c_pass::types::Signedness::Unsigned,
-                ),
-                MemoryChunk::MFloat32 => CType::Float(
-                    crate::decompile::passes::c_pass::types::FloatSize::Float,
-                ),
-                MemoryChunk::MFloat64 => CType::Float(
-                    crate::decompile::passes::c_pass::types::FloatSize::Double,
-                ),
-                _ => CType::long(),
-            };
-            (chunk_ty, None)
+            (ctype_of_chunk(chunk), None)
         } else {
             (CType::long(), None)
         };
@@ -527,7 +616,9 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             .collect();
 
         let entry_node = func.address as crate::x86::types::Node;
-        let nodes = order_nodes_dfs(entry_node, &nodes_set, &remapped_edges);
+        let nodes = order_nodes_dfs(entry_node, &nodes_set, &remapped_edges, |n| {
+            stmt_map.get(&n).map_or(false, is_unconditional_exit)
+        });
 
         let mut body_items = Vec::new();
         let mut body_terminated = false;
@@ -829,6 +920,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         }
         // Deterministic pick: prefer the row whose XType vector compares smallest.
         sigs.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)).then_with(|| a.0.cmp(&b.0)));
+        // RB-1: each Vec holds >= 1 row by construction (.or_default().push(...)); no input shape produces an empty group.
         let (_param_count, ret_type, param_types) = sigs.into_iter().next().unwrap();
         let ret_ctype = convert_xtype(&ret_type);
         let params: Vec<FuncParam> = param_types
@@ -843,13 +935,65 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         tu.add_func_decl(decl);
     }
 
-    // Per-callee argument types from observed call sites in the emitted bodies, used below to give called-but-not-emitted functions a prototype matching their calls instead of a bare (void).
-    let mut call_sigs: HashMap<String, Vec<CType>> = HashMap::new();
-    for decl in tu.decls.iter() {
-        if let crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDef(fdef) = decl {
-            collect_call_sigs_in_stmt(&fdef.body, &mut call_sigs);
+    // IL-1: join per-call-site argument type evidence (width+class lattice, see ArgEvidence) to produce typed prototypes for called-but-not-emitted functions when every call site agrees; K&R fallback covers the rest.
+    let joined_call_sigs: HashMap<String, Vec<CType>> = {
+        // Callee return types and global variable types visible to the compiler (definitions first, then resolved externs/globals already in the TU).
+        let mut callee_ret: HashMap<String, CType> = HashMap::new();
+        let mut global_types: HashMap<String, CType> = HashMap::new();
+        for decl in tu.decls.iter() {
+            match decl {
+                crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDef(f) => {
+                    callee_ret.insert(f.name.clone(), f.return_type.clone());
+                }
+                crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(d) => {
+                    callee_ret.entry(d.name.clone()).or_insert_with(|| d.return_type.clone());
+                }
+                crate::decompile::passes::c_pass::types::TopLevelDecl::VarDecl(v) => {
+                    global_types.insert(v.name.clone(), v.ty.clone());
+                }
+                _ => {}
+            }
         }
-    }
+        let mut call_evidence: HashMap<String, Vec<Vec<ArgEvidence>>> = HashMap::new();
+        for decl in tu.decls.iter() {
+            if let crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDef(fdef) = decl {
+                let mut local_types: HashMap<String, CType> = HashMap::new();
+                for p in &fdef.params {
+                    if let Some(n) = &p.name {
+                        local_types.insert(n.clone(), p.ty.clone());
+                    }
+                }
+                for v in &fdef.local_vars {
+                    local_types.insert(v.name.clone(), v.ty.clone());
+                }
+                let env = ArgEvidenceEnv {
+                    local_types,
+                    global_types: &global_types,
+                    callee_ret: &callee_ret,
+                };
+                collect_call_arg_evidence_in_stmt(&fdef.body, &env, &mut call_evidence);
+            }
+        }
+        join_call_site_evidence(&call_evidence)
+    };
+    // Typed prototype from joined call-site evidence; None when evidence is missing, arity disagrees, any position is Poison, or the callee is a known variadic.
+    let evidence_decl = |name: &str| -> Option<crate::decompile::passes::c_pass::types::FuncDecl> {
+        if is_known_variadic_fn(name) {
+            return None;
+        }
+        let param_tys = joined_call_sigs.get(name)?;
+        let params: Vec<FuncParam> = param_tys
+            .iter()
+            .enumerate()
+            .map(|(i, t)| FuncParam::named(format!("arg{}", i), t.clone()))
+            .collect();
+        // Return type stays `int` (no return-type evidence collected); int<->pointer misuse at the call site is coerced by the downstream cast-insertion pass.
+        Some(crate::decompile::passes::c_pass::types::FuncDecl::new(
+            name.to_string(),
+            CType::Int(crate::decompile::passes::c_pass::types::IntSize::Int, Signedness::Signed),
+            params,
+        ))
+    };
 
     let resolved_extern_names: HashSet<String> = db
         .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature")
@@ -869,11 +1013,13 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             continue;
         }
 
-        // Unknown-signature extern: emit a K&R `int name();` (unspecified, unchecked args) so calls with any argument count compile, instead of guessing a fixed arity from one call site that breaks every call that disagrees.
-        let decl = crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
-            sanitized_name,
-            CType::Int(crate::decompile::passes::c_pass::types::IntSize::Int, crate::decompile::passes::c_pass::types::Signedness::Signed),
-        );
+        // Unknown-signature extern: prefer a typed prototype from call-site evidence; K&R `int name();` fallback avoids guessing a fixed arity from one call site that breaks all others.
+        let decl = evidence_decl(&sanitized_name).unwrap_or_else(|| {
+            crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
+                sanitized_name,
+                CType::Int(crate::decompile::passes::c_pass::types::IntSize::Int, Signedness::Signed),
+            )
+        });
         tu.add_func_decl(decl);
     }
 
@@ -895,11 +1041,13 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 || (name.starts_with('L') && name.len() > 1 && name[1..].chars().all(|c| c.is_ascii_hexdigit()));
             if !declared.contains(name) && !is_label && !is_compiler_provided(name)
                 && !emitted_func_names.contains(name) {
-                // Called-but-undeclared external of unknown signature: emit a K&R `int name();` (unspecified, unchecked args). Guarded to externals (not emitted internal funcs) to avoid the documented internal-forward-decl regression.
-                let decl = crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
-                    name.clone(),
-                    CType::Int(crate::decompile::passes::c_pass::types::IntSize::Int, crate::decompile::passes::c_pass::types::Signedness::Signed),
-                );
+                // Called-but-undeclared external: prefer typed prototype from evidence; K&R `int name();` fallback; guarded to externals to avoid the internal-forward-decl regression.
+                let decl = evidence_decl(name).unwrap_or_else(|| {
+                    crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
+                        name.clone(),
+                        CType::Int(crate::decompile::passes::c_pass::types::IntSize::Int, Signedness::Signed),
+                    )
+                });
                 forward_decls.push(crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(decl));
             }
         }
@@ -3102,9 +3250,10 @@ pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> C
                 }
             }
             if converted.len() == 1 {
+                // RB-1: len()==1 guard makes next() infallible; both arms push CBlockItem::Stmt so the non-Stmt arm is unreachable.
                 match converted.into_iter().next().unwrap() {
                     CBlockItem::Stmt(s) => s,
-                    _ => unreachable!(),
+                    _ => unreachable!("Ssequence conversion pushes only CBlockItem::Stmt"),
                 }
             } else {
                 CStmt::Block(converted)
@@ -3217,6 +3366,7 @@ fn extract_loop_condition(body: &CStmt) -> Option<(CExpr, CStmt, bool)> {
         return Some((cond, rest_stmt, true));
     }
 
+    // RB-1: last() is infallible -- is_empty() and len()==1 returns above guarantee >= 2 elements here.
     if let Some(cond) = extract_condition_break(stmts.last().unwrap()) {
         let rest: Vec<CStmt> = stmts[..stmts.len() - 1].iter().map(|s| (*s).clone()).collect();
         let rest_stmt = if rest.len() == 1 {
@@ -3282,6 +3432,7 @@ fn extract_loop_update(stmt: &CStmt) -> Option<CExpr> {
                     exprs
                         .into_iter()
                         .reduce(|acc, e| CExpr::Binary(BinaryOp::Comma, Box::new(acc), Box::new(e)))
+                        // RB-1: reduce(None) only on empty iterator; excluded by the !exprs.is_empty() guard above.
                         .unwrap(),
                 )
             } else {
@@ -3350,17 +3501,7 @@ fn switch_body_exits(stmt: &CStmt) -> bool {
 /// Number of disjoint value ranges above which a single-target switch is left as a switch rather than expanded into an `||` chain of range tests (keeps a genuinely sparse set readable as a switch).
 const MAX_RANGE_IF_RUNS: usize = 8;
 
-/// A switch whose explicit cases all branch to one identical, non-fall-through body is semantically a membership test: `switch(e){case lo: ... case hi: goto L;}` == `if (e>=lo && e<=hi) goto L;`. Jump tables and equality-comparison ladders lower to exactly this shape (one `case k: goto L;` per value), which a human writes as a range / `ctype`-style `if`. Recover that form when it is provably equivalent and return None (leaving the switch intact) otherwise.
-///
-/// Equivalence conditions, all required:
-/// - the scrutinee is duplicable (no memory read), since it is evaluated once per range test;
-/// - every explicit case shares one body that cannot fall through (so arm order is irrelevant and
-///   unmatched values still fall past the `if`, matching switch semantics with no `default`);
-/// - an optional `default` body (also non-fall-through) becomes the trailing `else`;
-/// - all case values are non-negative, so the `>=`/`<=` range tests agree with the switch's integer
-///   match regardless of the scrutinee's signedness (equality on the exact case constants is always
-///   sound; only the relational range form is signedness-sensitive). Each emitted range covers a
-///   maximal run of contiguous case labels, so every integer it admits is a real case value.
+/// Converts a single-target switch (all cases share one non-fall-through body) into a range `if` test. Requires: duplicable scrutinee (evaluated multiple times), non-negative case values (so `>=`/`<=` matches the switch's signedness semantics), and every emitted range covers only real case values.
 fn try_switch_to_range_if(
     expr: &clight::ClightExpr,
     cases: &clight::ClightLabeledStatements,
@@ -3492,20 +3633,23 @@ fn external_func_name(ef: &ExternalFunction) -> String {
     }
 }
 
+/// RPO over statement-bearing nodes, walking the FULL `clight_succ` edge set through statement-less nodes (sseq members, dropped fallthroughs) so synthetic nodes upstream of the entry are visited; restricts the OUTPUT to `nodes`. The previous min(nodes) entry fallback was address-order reachability and caused synthetic upstream nodes to land after the final return and be silently dropped.
 fn order_nodes_dfs(
     entry: crate::x86::types::Node,
     nodes: &HashSet<crate::x86::types::Node>,
     edges: &[(crate::x86::types::Node, crate::x86::types::Node)],
+    is_exit: impl Fn(crate::x86::types::Node) -> bool,
 ) -> Vec<crate::x86::types::Node> {
     let mut adjacency: HashMap<crate::x86::types::Node, Vec<crate::x86::types::Node>> = HashMap::new();
     for (src, dst) in edges {
-        if nodes.contains(src) && nodes.contains(dst) {
+        if src != dst {
             adjacency.entry(*src).or_default().push(*dst);
         }
     }
 
     for succs in adjacency.values_mut() {
         succs.sort();
+        succs.dedup();
     }
 
     let mut visited = HashSet::new();
@@ -3517,15 +3661,8 @@ fn order_nodes_dfs(
         PostVisit(crate::x86::types::Node),
     }
 
-    let start_node = if nodes.contains(&entry) {
-        entry
-    } else {
-        *nodes.iter().min().unwrap_or(&entry)
-    };
-
-    if nodes.contains(&start_node) {
-        stack.push(Action::Visit(start_node));
-    }
+    // Always start at the true entry so its successor chain orders every reachable member, even when the entry itself carries no statement.
+    stack.push(Action::Visit(entry));
 
     while let Some(action) = stack.pop() {
         match action {
@@ -3543,18 +3680,25 @@ fn order_nodes_dfs(
                 }
             }
             Action::PostVisit(u) => {
-                post_order.push(u);
+                if nodes.contains(&u) {
+                    post_order.push(u);
+                }
             }
         }
     }
 
     let mut result: Vec<_> = post_order.into_iter().rev().collect();
 
+    // Disconnected members (edges lost to bundling or genuinely dead) are inserted BEFORE the trailing exit run, not after it -- placing them after would let the consumer's dead-statement trim silently drop them. exec_order_key is a last-resort presentation tiebreak, not a reachability decision.
     let result_set: HashSet<_> = result.iter().copied().collect();
     let mut remaining: Vec<_> = nodes.difference(&result_set).copied().collect();
     if !remaining.is_empty() {
         remaining.sort_by_key(|&n| crate::util::exec_order_key(n));
-        result.extend(remaining);
+        let mut insert_at = result.len();
+        while insert_at > 0 && is_exit(result[insert_at - 1]) {
+            insert_at -= 1;
+        }
+        result.splice(insert_at..insert_at, remaining);
     }
 
     result
@@ -4064,6 +4208,7 @@ pub(crate) fn is_valid_c_identifier(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
+    // RB-1: infallible -- the is_empty() return above guarantees a first char.
     let first = s.chars().next().unwrap();
     if !first.is_ascii_alphabetic() && first != '_' {
         return false;
@@ -4247,77 +4392,366 @@ fn collect_called_names_in_expr(expr: &CExpr, names: &mut HashSet<String>) {
     }
 }
 
-/// Infer a forward-declaration parameter type from a call-site argument expression, giving a called-but-not-emitted function (e.g. statically-linked gnulib helpers like version_etc, error) a usable prototype derived from how it is actually called instead of the bare `int f(void)` fallback that rejects every argument; casts (the common decompiler form) give the exact type, otherwise fall back to a width accepting both pointers and integers without truncation.
-fn infer_arg_ctype(expr: &CExpr) -> CType {
-    use crate::decompile::passes::c_pass::types::UnaryOp;
-    match expr {
-        CExpr::Cast(ty, _) => ty.clone(),
-        CExpr::StringLit(_) => CType::ptr(CType::Void),
-        CExpr::Unary(UnaryOp::AddrOf, _) => CType::ptr(CType::Void),
-        _ => CType::long(),
+// IL-1: forward-declaration parameter types from a JOIN over call-site evidence (width+class lattice). Every call site must agree on arity and yield classifiable evidence (from declared C types the compiler will check); otherwise the K&R `int f();` fallback stands. Typed params are compatible-by-construction: int/ptr mismatches are coerced by insert_casts, differing pointer types unify to void*, float+ptr routes to the int/ptr top (inserter refuses to coerce that pair).
+
+/// Per-argument-position evidence: join-semilattice over (type class, width). Bottom = literal 0 (constrains nothing). Int|Int takes max width, prefers Signed on disagreement. Int|Float widens to Float(64) (float sightings are rarer/higher-confidence; double round-trips all ints to 2^53). Ptr|Ptr: equal stays exact, differing unifies to void* except function-ptr mismatches which poison (no implicit fn-ptr->void* in C). Int|Ptr = Float|Ptr = TopIntPtr (emitted as long). Poison forces K&R fallback.
+#[derive(Debug, Clone, PartialEq)]
+enum ArgEvidence {
+    Bottom,
+    Int(u8, Signedness),
+    Float(u8),
+    /// Pointer class; `Some(T)` = exact pointer type evidenced, `None` = unknown pointee (emitted `void *`).
+    Ptr(Option<CType>),
+    TopIntPtr,
+    Poison,
+}
+
+impl ArgEvidence {
+    /// Lattice join: commutative, associative, idempotent -- result is independent of call-site arrival order.
+    fn join(self, other: ArgEvidence) -> ArgEvidence {
+        use ArgEvidence::*;
+        match (self, other) {
+            (Poison, _) | (_, Poison) => Poison,
+            (Bottom, x) | (x, Bottom) => x,
+            (Int(w1, s1), Int(w2, s2)) => {
+                if w1 == w2 {
+                    let s = if s1 == s2 { s1 } else { Signedness::Signed };
+                    Int(w1, s)
+                } else if w1 > w2 {
+                    Int(w1, s1)
+                } else {
+                    Int(w2, s2)
+                }
+            }
+            (Float(w1), Float(w2)) => Float(w1.max(w2)),
+            // Documented: int | float widens to double (see type-level docs).
+            (Int(_, _), Float(_)) | (Float(_), Int(_, _)) => Float(64),
+            (Ptr(a), Ptr(b)) => {
+                if a == b {
+                    Ptr(a)
+                } else if ctype_opt_involves_function(&a) || ctype_opt_involves_function(&b) {
+                    // Differing function-pointer types must not unify to void* (not implicit in strict C).
+                    Poison
+                } else {
+                    Ptr(None)
+                }
+            }
+            // Mixed scalar/pointer classes meet at the int/ptr-safe top.
+            (TopIntPtr, _) | (_, TopIntPtr) => TopIntPtr,
+            (Int(_, _), Ptr(_)) | (Ptr(_), Int(_, _)) => TopIntPtr,
+            (Float(_), Ptr(_)) | (Ptr(_), Float(_)) => TopIntPtr,
+        }
+    }
+
+    /// The C type to emit for a fully-joined position; `None` only for `Poison`, which forces the whole declaration to the K&R fallback.
+    fn to_ctype(&self) -> Option<CType> {
+        use crate::decompile::passes::c_pass::types::{FloatSize, IntSize};
+        match self {
+            // Bottom = no evidence: conservative default (long accepts both ints and pointers untruncated).
+            ArgEvidence::Bottom => Some(CType::long()),
+            ArgEvidence::Int(w, s) => {
+                let sz = match *w {
+                    0..=8 => IntSize::Char,
+                    9..=16 => IntSize::Short,
+                    17..=32 => IntSize::Int,
+                    _ => IntSize::Long,
+                };
+                Some(CType::Int(sz, *s))
+            }
+            ArgEvidence::Float(w) => Some(CType::Float(if *w <= 32 {
+                FloatSize::Float
+            } else {
+                FloatSize::Double
+            })),
+            ArgEvidence::Ptr(Some(ty)) => Some(ty.clone()),
+            ArgEvidence::Ptr(None) => Some(CType::ptr(CType::Void)),
+            ArgEvidence::TopIntPtr => Some(CType::long()),
+            ArgEvidence::Poison => None,
+        }
     }
 }
 
-/// Collect, per called function name, the argument types of its highest-arity call site (so a variadic callee gets a prototype covering all observed arguments); mirrors the traversal of collect_called_names_in_stmt.
-fn collect_call_sigs_in_stmt(stmt: &CStmt, sigs: &mut HashMap<String, Vec<CType>>) {
-    match stmt {
-        CStmt::Expr(expr) => collect_call_sigs_in_expr(expr, sigs),
-        CStmt::Return(Some(expr)) => collect_call_sigs_in_expr(expr, sigs),
-        CStmt::If(cond, then_s, else_s) => {
-            collect_call_sigs_in_expr(cond, sigs);
-            collect_call_sigs_in_stmt(then_s, sigs);
-            if let Some(e) = else_s { collect_call_sigs_in_stmt(e, sigs); }
+fn ctype_involves_function(ty: &CType) -> bool {
+    match ty {
+        CType::Function(_, _, _) => true,
+        CType::Pointer(inner, _) | CType::Array(inner, _) | CType::Qualified(inner, _) => {
+            ctype_involves_function(inner)
         }
-        CStmt::While(cond, body) | CStmt::DoWhile(body, cond) => {
-            collect_call_sigs_in_expr(cond, sigs);
-            collect_call_sigs_in_stmt(body, sigs);
+        _ => false,
+    }
+}
+
+fn ctype_opt_involves_function(ty: &Option<CType>) -> bool {
+    ty.as_ref().map_or(false, ctype_involves_function)
+}
+
+/// Classify a declared C type as argument evidence.
+fn arg_evidence_of_ctype(ty: &CType) -> ArgEvidence {
+    use crate::decompile::passes::c_pass::types::{FloatSize, IntSize};
+    match ty {
+        CType::Int(sz, s) => {
+            let w = match sz {
+                IntSize::Char => 8,
+                IntSize::Short => 16,
+                IntSize::Int => 32,
+                IntSize::Long | IntSize::LongLong => 64,
+            };
+            ArgEvidence::Int(w, *s)
         }
-        CStmt::For(_, cond, update, body) => {
-            if let Some(c) = cond { collect_call_sigs_in_expr(c, sigs); }
-            if let Some(u) = update { collect_call_sigs_in_expr(u, sigs); }
-            collect_call_sigs_in_stmt(body, sigs);
+        CType::Bool => ArgEvidence::Int(8, Signedness::Unsigned),
+        CType::Enum(_) => ArgEvidence::Int(32, Signedness::Signed),
+        CType::Float(FloatSize::Float) => ArgEvidence::Float(32),
+        CType::Float(_) => ArgEvidence::Float(64),
+        CType::Pointer(_, _) => ArgEvidence::Ptr(Some(ty.clone())),
+        // Arrays and function designators decay to pointers in argument position.
+        CType::Array(inner, _) => {
+            ArgEvidence::Ptr(Some(CType::ptr(inner.as_ref().clone())))
         }
-        CStmt::Switch(expr, body) => {
-            collect_call_sigs_in_expr(expr, sigs);
-            collect_call_sigs_in_stmt(body, sigs);
+        CType::Function(_, _, _) => ArgEvidence::Ptr(Some(CType::ptr(ty.clone()))),
+        CType::Qualified(inner, _) => arg_evidence_of_ctype(inner),
+        // void/struct/union/typedef: not a scalar class we can safely type a parameter from.
+        _ => ArgEvidence::Poison,
+    }
+}
+
+/// Type environment for classifying call arguments: exactly the declarations the C compiler sees; locals shadow globals.
+struct ArgEvidenceEnv<'a> {
+    local_types: HashMap<String, CType>,
+    global_types: &'a HashMap<String, CType>,
+    callee_ret: &'a HashMap<String, CType>,
+}
+
+impl ArgEvidenceEnv<'_> {
+    fn var_type(&self, name: &str) -> Option<&CType> {
+        self.local_types.get(name).or_else(|| self.global_types.get(name))
+    }
+}
+
+/// Classify one call-site argument expression; returns `Poison` when the declared type cannot be determined.
+fn arg_evidence_of_expr(expr: &CExpr, env: &ArgEvidenceEnv) -> ArgEvidence {
+    use crate::decompile::passes::c_pass::types::UnaryOp;
+    match expr {
+        CExpr::Cast(ty, _) => arg_evidence_of_ctype(ty),
+        CExpr::StringLit(_) => {
+            ArgEvidence::Ptr(Some(CType::ptr(CType::char_signed())))
         }
-        CStmt::Sequence(stmts) => { for s in stmts { collect_call_sigs_in_stmt(s, sigs); } }
-        CStmt::Block(items) => {
-            for item in items {
-                if let CBlockItem::Stmt(s) = item { collect_call_sigs_in_stmt(s, sigs); }
+        // A literal 0 is a valid int, float, and null pointer constant.
+        CExpr::IntLit(l) if l.value == 0 => ArgEvidence::Bottom,
+        CExpr::IntLit(l) => {
+            use crate::decompile::passes::c_pass::types::IntLiteralSuffix as S;
+            let (suffix_wide, unsigned) = match l.suffix {
+                S::None => (false, false),
+                S::U => (false, true),
+                S::L | S::LL => (true, false),
+                _ => (true, true),
+            };
+            let fits32 = l.value >= i32::MIN as i128 && l.value <= u32::MAX as i128;
+            let w = if suffix_wide || !fits32 { 64 } else { 32 };
+            let s = if unsigned { Signedness::Unsigned } else { Signedness::Signed };
+            ArgEvidence::Int(w, s)
+        }
+        CExpr::FloatLit(l) => {
+            use crate::decompile::passes::c_pass::types::FloatLiteralSuffix as F;
+            ArgEvidence::Float(if matches!(l.suffix, F::F) { 32 } else { 64 })
+        }
+        // A C character literal has type int.
+        CExpr::CharLit(_) => ArgEvidence::Int(32, Signedness::Signed),
+        CExpr::Var(name) => env
+            .var_type(name)
+            .map(arg_evidence_of_ctype)
+            .unwrap_or(ArgEvidence::Poison),
+        CExpr::Paren(inner) => arg_evidence_of_expr(inner, env),
+        CExpr::Unary(UnaryOp::AddrOf, _) => ArgEvidence::Ptr(None),
+        CExpr::Unary(UnaryOp::Deref, inner) => match arg_evidence_of_expr(inner, env) {
+            ArgEvidence::Ptr(Some(CType::Pointer(p, _))) => arg_evidence_of_ctype(&p),
+            _ => ArgEvidence::Poison,
+        },
+        CExpr::Unary(UnaryOp::Not, _) => ArgEvidence::Int(32, Signedness::Signed),
+        CExpr::Unary(UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot, inner) => {
+            match arg_evidence_of_expr(inner, env) {
+                ev @ (ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom) => ev,
+                _ => ArgEvidence::Poison,
             }
         }
-        CStmt::Labeled(_, inner) => collect_call_sigs_in_stmt(inner, sigs),
+        CExpr::Unary(_, _) => ArgEvidence::Poison,
+        CExpr::Binary(op, l, r) => {
+            use crate::decompile::passes::c_pass::types::BinaryOp as B;
+            match op {
+                // Comparisons and logical connectives have type int.
+                B::Eq | B::Ne | B::Lt | B::Le | B::Gt | B::Ge | B::And | B::Or => {
+                    ArgEvidence::Int(32, Signedness::Signed)
+                }
+                B::Shl | B::Shr => match arg_evidence_of_expr(l, env) {
+                    ev @ (ArgEvidence::Int(_, _) | ArgEvidence::Bottom) => ev,
+                    _ => ArgEvidence::Poison,
+                },
+                B::Add | B::Sub => {
+                    let le = arg_evidence_of_expr(l, env);
+                    let re = arg_evidence_of_expr(r, env);
+                    match (le, re) {
+                        // ptr - ptr is ptrdiff_t; ptr +/- int keeps the pointer type.
+                        (ArgEvidence::Ptr(_), ArgEvidence::Ptr(_)) if matches!(op, B::Sub) => {
+                            ArgEvidence::Int(64, Signedness::Signed)
+                        }
+                        (p @ ArgEvidence::Ptr(_), ArgEvidence::Int(_, _) | ArgEvidence::Bottom)
+                        | (ArgEvidence::Int(_, _) | ArgEvidence::Bottom, p @ ArgEvidence::Ptr(_)) => p,
+                        (
+                            le @ (ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom),
+                            re @ (ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom),
+                        ) => le.join(re),
+                        _ => ArgEvidence::Poison,
+                    }
+                }
+                B::Mul | B::Div | B::Mod | B::BitAnd | B::BitOr | B::BitXor => {
+                    let le = arg_evidence_of_expr(l, env);
+                    let re = arg_evidence_of_expr(r, env);
+                    match (&le, &re) {
+                        (
+                            ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom,
+                            ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom,
+                        ) => le.join(re),
+                        _ => ArgEvidence::Poison,
+                    }
+                }
+                _ => ArgEvidence::Poison,
+            }
+        }
+        CExpr::Ternary(_, t, e) => {
+            let te = arg_evidence_of_expr(t, env);
+            let ee = arg_evidence_of_expr(e, env);
+            match (&te, &ee) {
+                // int/ptr-mixed ternary is not valid C; poison so the callee keeps the K&R decl rather than laundering it through TopIntPtr.
+                (ArgEvidence::Ptr(_), ArgEvidence::Int(_, _))
+                | (ArgEvidence::Int(_, _), ArgEvidence::Ptr(_)) => ArgEvidence::Poison,
+                _ => te.join(ee),
+            }
+        }
+        CExpr::Call(callee, _) => match callee.as_ref() {
+            CExpr::Var(name) => env
+                .callee_ret
+                .get(name)
+                .map(arg_evidence_of_ctype)
+                .unwrap_or(ArgEvidence::Poison),
+            _ => ArgEvidence::Poison,
+        },
+        CExpr::SizeofType(_) | CExpr::SizeofExpr(_) | CExpr::AlignofType(_) => {
+            // size_t.
+            ArgEvidence::Int(64, Signedness::Unsigned)
+        }
+        _ => ArgEvidence::Poison,
+    }
+}
+
+/// Collect per-call-site argument evidence vectors keyed by callee name (deterministic TU walk order).
+fn collect_call_arg_evidence_in_stmt(
+    stmt: &CStmt,
+    env: &ArgEvidenceEnv,
+    sites: &mut HashMap<String, Vec<Vec<ArgEvidence>>>,
+) {
+    match stmt {
+        CStmt::Expr(expr) => collect_call_arg_evidence_in_expr(expr, env, sites),
+        CStmt::Return(Some(expr)) => collect_call_arg_evidence_in_expr(expr, env, sites),
+        CStmt::If(cond, then_s, else_s) => {
+            collect_call_arg_evidence_in_expr(cond, env, sites);
+            collect_call_arg_evidence_in_stmt(then_s, env, sites);
+            if let Some(e) = else_s { collect_call_arg_evidence_in_stmt(e, env, sites); }
+        }
+        CStmt::While(cond, body) | CStmt::DoWhile(body, cond) => {
+            collect_call_arg_evidence_in_expr(cond, env, sites);
+            collect_call_arg_evidence_in_stmt(body, env, sites);
+        }
+        CStmt::For(_, cond, update, body) => {
+            if let Some(c) = cond { collect_call_arg_evidence_in_expr(c, env, sites); }
+            if let Some(u) = update { collect_call_arg_evidence_in_expr(u, env, sites); }
+            collect_call_arg_evidence_in_stmt(body, env, sites);
+        }
+        CStmt::Switch(expr, body) => {
+            collect_call_arg_evidence_in_expr(expr, env, sites);
+            collect_call_arg_evidence_in_stmt(body, env, sites);
+        }
+        CStmt::Sequence(stmts) => {
+            for s in stmts { collect_call_arg_evidence_in_stmt(s, env, sites); }
+        }
+        CStmt::Block(items) => {
+            for item in items {
+                if let CBlockItem::Stmt(s) = item { collect_call_arg_evidence_in_stmt(s, env, sites); }
+            }
+        }
+        CStmt::Labeled(_, inner) => collect_call_arg_evidence_in_stmt(inner, env, sites),
         _ => {}
     }
 }
 
-fn collect_call_sigs_in_expr(expr: &CExpr, sigs: &mut HashMap<String, Vec<CType>>) {
+fn collect_call_arg_evidence_in_expr(
+    expr: &CExpr,
+    env: &ArgEvidenceEnv,
+    sites: &mut HashMap<String, Vec<Vec<ArgEvidence>>>,
+) {
     match expr {
         CExpr::Call(callee, args) => {
             if let CExpr::Var(name) = callee.as_ref() {
-                let keep = sigs.get(name).map_or(true, |existing| args.len() > existing.len());
-                if keep {
-                    sigs.insert(name.clone(), args.iter().map(infer_arg_ctype).collect());
-                }
+                let evidence: Vec<ArgEvidence> =
+                    args.iter().map(|a| arg_evidence_of_expr(a, env)).collect();
+                sites.entry(name.clone()).or_default().push(evidence);
             }
-            collect_call_sigs_in_expr(callee, sigs);
-            for arg in args { collect_call_sigs_in_expr(arg, sigs); }
+            collect_call_arg_evidence_in_expr(callee, env, sites);
+            for arg in args { collect_call_arg_evidence_in_expr(arg, env, sites); }
         }
         CExpr::Assign(_, lhs, rhs) | CExpr::Binary(_, lhs, rhs) => {
-            collect_call_sigs_in_expr(lhs, sigs);
-            collect_call_sigs_in_expr(rhs, sigs);
+            collect_call_arg_evidence_in_expr(lhs, env, sites);
+            collect_call_arg_evidence_in_expr(rhs, env, sites);
         }
-        CExpr::Unary(_, inner) | CExpr::Cast(_, inner) | CExpr::Member(inner, _) | CExpr::MemberPtr(inner, _) => {
-            collect_call_sigs_in_expr(inner, sigs);
+        CExpr::Unary(_, inner)
+        | CExpr::Cast(_, inner)
+        | CExpr::Member(inner, _)
+        | CExpr::MemberPtr(inner, _)
+        | CExpr::Paren(inner)
+        | CExpr::SizeofExpr(inner) => {
+            collect_call_arg_evidence_in_expr(inner, env, sites);
+        }
+        CExpr::Index(arr, idx) => {
+            collect_call_arg_evidence_in_expr(arr, env, sites);
+            collect_call_arg_evidence_in_expr(idx, env, sites);
         }
         CExpr::Ternary(a, b, c) => {
-            collect_call_sigs_in_expr(a, sigs);
-            collect_call_sigs_in_expr(b, sigs);
-            collect_call_sigs_in_expr(c, sigs);
+            collect_call_arg_evidence_in_expr(a, env, sites);
+            collect_call_arg_evidence_in_expr(b, env, sites);
+            collect_call_arg_evidence_in_expr(c, env, sites);
         }
         _ => {}
     }
+}
+
+/// Join per-site evidence into a parameter type vector per callee; a callee gets a typed prototype only when arity agrees across all sites and no position joins to Poison.
+fn join_call_site_evidence(
+    sites_by_callee: &HashMap<String, Vec<Vec<ArgEvidence>>>,
+) -> HashMap<String, Vec<CType>> {
+    let mut joined: HashMap<String, Vec<CType>> = HashMap::new();
+    for (name, sites) in sites_by_callee {
+        let Some(first) = sites.first() else { continue };
+        let arity = first.len();
+        if sites.iter().any(|s| s.len() != arity) {
+            continue; // arity disagreement: variadic-or-noise, keep K&R
+        }
+        let mut acc: Vec<ArgEvidence> = vec![ArgEvidence::Bottom; arity];
+        for site in sites {
+            for (slot, ev) in acc.iter_mut().zip(site.iter()) {
+                *slot = std::mem::replace(slot, ArgEvidence::Bottom).join(ev.clone());
+            }
+        }
+        let mut param_types = Vec::with_capacity(arity);
+        let mut ok = true;
+        for ev in &acc {
+            match ev.to_ctype() {
+                Some(t) => param_types.push(t),
+                None => { ok = false; break; }
+            }
+        }
+        if ok {
+            joined.insert(name.clone(), param_types);
+        }
+    }
+    joined
 }
 
 /// Rename duplicate labels within a function body so each is unique: first occurrence keeps its name, subsequent get `_2`, `_3`, etc.
@@ -4613,5 +5047,129 @@ fn replace_last_assign_with_return(stmt: &CStmt, var: &str) -> CStmt {
             CStmt::Sequence(new_stmts)
         }
         other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod arg_evidence_tests {
+    use super::*;
+    use crate::decompile::passes::c_pass::types::{FloatSize, IntSize};
+
+    fn i32_() -> ArgEvidence { ArgEvidence::Int(32, Signedness::Signed) }
+    fn i64_() -> ArgEvidence { ArgEvidence::Int(64, Signedness::Signed) }
+    fn u32_() -> ArgEvidence { ArgEvidence::Int(32, Signedness::Unsigned) }
+    fn f64_() -> ArgEvidence { ArgEvidence::Float(64) }
+    fn ptr_char() -> ArgEvidence { ArgEvidence::Ptr(Some(CType::ptr(CType::char_signed()))) }
+    fn ptr_int() -> ArgEvidence { ArgEvidence::Ptr(Some(CType::ptr(CType::int()))) }
+
+    #[test]
+    fn join_int_widths() {
+        // int32 | int64 -> int64 (the FIXPLAN 5.5 example).
+        assert_eq!(i32_().join(i64_()), i64_());
+        // equal width, sign disagreement -> signed.
+        assert_eq!(u32_().join(i32_()), i32_());
+        assert_eq!(
+            i32_().join(i64_()).to_ctype(),
+            Some(CType::Int(IntSize::Long, Signedness::Signed))
+        );
+    }
+
+    #[test]
+    fn join_int_ptr_is_compilable_top() {
+        // int | ptr -> conservative top emitted as long (cast-inserter-safe).
+        assert_eq!(i64_().join(ptr_char()), ArgEvidence::TopIntPtr);
+        assert_eq!(ArgEvidence::TopIntPtr.to_ctype(), Some(CType::long()));
+        // float | ptr must never produce a float param; inserter cannot coerce float<->ptr, so it lands at the int/ptr top.
+        assert_eq!(f64_().join(ptr_char()), ArgEvidence::TopIntPtr);
+    }
+
+    #[test]
+    fn join_float_int_documented_choice() {
+        // float | int -> double (documented in the ArgEvidence docs).
+        assert_eq!(i64_().join(ArgEvidence::Float(32)), ArgEvidence::Float(64));
+        assert_eq!(
+            f64_().join(i32_()).to_ctype(),
+            Some(CType::Float(FloatSize::Double))
+        );
+    }
+
+    #[test]
+    fn join_pointers() {
+        // identical pointer types stay exact; differing ones unify to void*.
+        assert_eq!(ptr_char().join(ptr_char()), ptr_char());
+        assert_eq!(ptr_char().join(ptr_int()), ArgEvidence::Ptr(None));
+        assert_eq!(
+            ArgEvidence::Ptr(None).to_ctype(),
+            Some(CType::ptr(CType::Void))
+        );
+        // differing function-pointer types poison (no implicit conversion).
+        let fp = ArgEvidence::Ptr(Some(CType::ptr(CType::Function(
+            Box::new(CType::Void),
+            vec![],
+            false,
+        ))));
+        assert_eq!(fp.clone().join(ptr_char()), ArgEvidence::Poison);
+        assert_eq!(fp.clone().join(fp.clone()), fp);
+    }
+
+    #[test]
+    fn join_bottom_and_poison() {
+        // literal 0 (Bottom) constrains nothing; Poison absorbs everything.
+        assert_eq!(ArgEvidence::Bottom.join(ptr_char()), ptr_char());
+        assert_eq!(ArgEvidence::Bottom.join(i32_()), i32_());
+        assert_eq!(ArgEvidence::Bottom.to_ctype(), Some(CType::long()));
+        assert_eq!(ArgEvidence::Poison.join(i64_()), ArgEvidence::Poison);
+        assert_eq!(ArgEvidence::Poison.to_ctype(), None);
+    }
+
+    #[test]
+    fn join_is_commutative_associative_idempotent() {
+        let samples = [
+            ArgEvidence::Bottom,
+            i32_(),
+            i64_(),
+            u32_(),
+            ArgEvidence::Float(32),
+            f64_(),
+            ptr_char(),
+            ptr_int(),
+            ArgEvidence::Ptr(None),
+            ArgEvidence::TopIntPtr,
+            ArgEvidence::Poison,
+        ];
+        for a in &samples {
+            assert_eq!(a.clone().join(a.clone()), *a, "idempotence {:?}", a);
+            for b in &samples {
+                assert_eq!(
+                    a.clone().join(b.clone()),
+                    b.clone().join(a.clone()),
+                    "commutativity {:?} {:?}",
+                    a,
+                    b
+                );
+                for c in &samples {
+                    let ab_c = a.clone().join(b.clone()).join(c.clone());
+                    let a_bc = a.clone().join(b.clone().join(c.clone()));
+                    assert_eq!(ab_c, a_bc, "associativity {:?} {:?} {:?}", a, b, c);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn join_sites_requires_arity_agreement() {
+        let mut sites: HashMap<String, Vec<Vec<ArgEvidence>>> = HashMap::new();
+        sites.insert("f".to_string(), vec![vec![i32_()], vec![i64_()]]);
+        sites.insert("g".to_string(), vec![vec![i32_()], vec![i32_(), i32_()]]);
+        sites.insert("h".to_string(), vec![vec![ArgEvidence::Poison]]);
+        sites.insert("z".to_string(), vec![vec![], vec![]]);
+        let joined = join_call_site_evidence(&sites);
+        assert_eq!(
+            joined.get("f"),
+            Some(&vec![CType::Int(IntSize::Long, Signedness::Signed)])
+        );
+        assert!(!joined.contains_key("g"), "arity mismatch must fall back to K&R");
+        assert!(!joined.contains_key("h"), "poison must fall back to K&R");
+        assert_eq!(joined.get("z"), Some(&vec![]), "consistent zero-arity -> (void)");
     }
 }

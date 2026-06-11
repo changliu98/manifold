@@ -89,6 +89,22 @@ use crate::decompile::passes::c_pass::types::{CType, TranslationUnit};
 use crate::decompile::passes::clight_select::select::SelectedFunction;
 use crate::decompile::passes::clight_select::query::GlobalData;
 
+/// Pipeline policy fixed at the 2026-06 corpus optimum; behavior env gates were removed after A/B decisions closed -- the pass list and these constants ARE the configuration; diagnostic env vars (TRACE_NODE etc.) remain but never change output.
+pub mod config {
+    /// var_reduce: above this count, skip O(k^2) pair enumeration and use copy-only coalescing (bitset engine).
+    pub const COALESCE_GREEDY_CAP: usize = 4096;
+    /// var_reduce: liveness work bound (nodes x candidates); bail on coalescing when exceeded -- never unsafe, only forgone.
+    pub const COALESCE_WORK_BOUND: usize = 8_000_000;
+    /// select: ITE compound-assembly node cap (CF-9 backstop; post-CF-1 the dispatch duplication that motivated it is gone -- 0 binds over 30+ runs).
+    pub const ITE_MAX_NODES: usize = 1_000_000;
+    /// solve: z3 Optimize rlimit budget. CAVEAT: z3 4.8.x ignores rlimit via Optimize params (UNRESOLVED O-9) -- wall timeout below is the only effective backstop on such libs.
+    pub const SOLVE_RLIMIT: u32 = 20_000_000;
+    /// solve: z3 wall timeout per function.
+    pub const SOLVE_TIMEOUT_MS: u32 = 120_000;
+    /// forloop: max stmts in a return-tail eligible for EagerReturns/CrossJumpRevert duplication (return-ending blocks, no internal goto/label/decl).
+    pub const FORLOOP_MAX_DUP_TAIL: usize = 8;
+}
+
 use crate::util::leak;
 use crate::x86::mach::Mreg;
 use crate::x86::types::*;
@@ -550,6 +566,8 @@ impl DecompileDB {
             Box::new(clight_pass::ClightFieldPass),
             Box::new(clight_emit_pass::ClightSelectPass),
             Box::new(clight_emit_pass::ClightEmitPass),
+            // PhoenixStructurePass removed 2026-06-10: wave-2 adjudication kept it OFF (-3..-10% gotos at 28:1 line churn, UNRESOLVED O-13); recoverable at c291258.
+            Box::new(forloop::ForLoopPass),
             Box::new(var_reduce::VarReducePass),
         ];
 

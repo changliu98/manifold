@@ -41,7 +41,7 @@ ascent_par! {
         allocation_site(node, result_reg, _),
         let provenance_id = compute_provenance_id(*func, *result_reg);
 
-    // 64KiB window: permits negative offsets (container_of, C++ upcast) without pulling in unrelated arithmetic.
+    // PT-2: 64KiB offset window guards against large immediates (absolute addresses, crypto constants) creating spurious Embed edges into integer registers and mis-typing them as pointers; measured on /bin/ls+/bin/echo, the window dropped zero real chain extensions.
     provenance_edge(func, src, dst, EdgeType::Embed, offset) <--
         instr_in_function(node, func),
         rtl_inst(node, ?RTLInst::Iop(Operation::Olea(Addressing::Aindexed(offset)), args, dst)),
@@ -101,7 +101,7 @@ ascent_par! {
         if args.len() == 1,
         let src = args[0];
 
-    // Depth bound 6: captures most real chains; previously 3 truncated ptr->field->field->field.
+    // PT-3: depth=6 is a termination guarantee, not a precision knob -- RTL regs are reused across loop iterations so provenance_edge contains cycles; without a finite depth bound, loop-carried Embed offsets make acc_ofs diverge and pure-Assign cycles yield infinite tuples; measured on corpus, depth 6 truncated nothing.
     provenance_chain(func, reg, reg, prov_id, 0, 0) <--
         provenance_root(func, reg, prov_id);
 
@@ -133,6 +133,17 @@ ascent_par! {
     emit_var_type_candidate(reg, XType::Xptr) <--
         provenance_chain(func, reg, root, prov_id, _, _),
         chain_has_ptr_evidence(func, root, prov_id);
+
+    // PT-1: an Assign-only copy chain still types as pointer when its ROOT already carries pointer evidence (from the type pass or transitively from another chain): copies of a known pointer are pointers. Forward-only - root evidence flows to chain members, never back - so the bidirectional int/ptr pollution the type pass disabled cannot arise; monotone over finite regs, so the transitive closure terminates.
+    #[local] relation reg_has_ptr_candidate(RTLReg);
+    reg_has_ptr_candidate(reg) <--
+        emit_var_type_candidate(reg, xt),
+        if matches!(xt, XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr
+            | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_));
+
+    emit_var_type_candidate(reg, XType::Xptr) <--
+        provenance_chain(_, reg, root, _, _, _),
+        reg_has_ptr_candidate(root);
 }
 
 // Unique provenance ID from function address and register
@@ -246,18 +257,23 @@ fn emit_provenance_ptr_types(db: &mut DecompileDB) {
         let first = chunks[0];
         let all_same = chunks.iter().all(|c| *c == first);
 
-        // Agreeing chunks pick a specific pointee type; disagreeing chunks fall back to Xptr rather than dropped.
+        // PT-4: mixed chunks mean a struct base (fields of different widths off one pointer), so falling back to Xptr is semantically correct -- guessing an element pointee type here would be wrong; struct identity is struct_recovery's job keyed on offsets, not this pass's.
         let xtype = if all_same {
-            match first {
-                MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned | MemoryChunk::MBool => XType::Xcharptr,
-                MemoryChunk::MInt32 | MemoryChunk::MAny32 => XType::Xintptr,
-                MemoryChunk::MFloat64 => XType::Xfloatptr,
-                MemoryChunk::MFloat32 => XType::Xsingleptr,
-                _ => XType::Xptr,
-            }
+            pointee_xtype_for_chunk(first)
         } else {
             XType::Xptr
         };
         db.rel_push("emit_var_type_candidate", (*reg, xtype));
+    }
+}
+
+// Pointee type implied by a single deref chunk width/class.
+fn pointee_xtype_for_chunk(chunk: MemoryChunk) -> XType {
+    match chunk {
+        MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned | MemoryChunk::MBool => XType::Xcharptr,
+        MemoryChunk::MInt32 | MemoryChunk::MAny32 => XType::Xintptr,
+        MemoryChunk::MFloat64 => XType::Xfloatptr,
+        MemoryChunk::MFloat32 => XType::Xsingleptr,
+        _ => XType::Xptr,
     }
 }

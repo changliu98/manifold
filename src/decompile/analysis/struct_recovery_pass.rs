@@ -23,6 +23,7 @@ pub fn chunk_byte_size(chunk: &MemoryChunk) -> usize {
     }
 }
 
+// SR-4: cap is a false-folding guard -- raising it folds more unrelated locals into fake fields; bound the window by observed deref extent (stack_lea_used_for_access) before raising.
 const MAX_STACK_STRUCT_SIZE: i64 = 1024;
 
 
@@ -80,6 +81,21 @@ ascent_par! {
         let base_reg = args[0],
         is_ptr(&base_reg),
         instr_in_function(node, func);
+
+    // Load-evidence subset of ptr_deref; sub-register store chunks are width-unreliable upstream.
+    relation ptr_deref_load(RTLReg, i64, MemoryChunk);
+
+    ptr_deref_load(base_reg, *ofs, *chunk) <--
+        rtl_inst(_, ?RTLInst::Iload(chunk, Addressing::Aindexed(ofs), args, _)),
+        if args.len() >= 1,
+        let base_reg = args[0],
+        is_ptr(&base_reg);
+
+    ptr_deref_load(base_reg, *ofs, *chunk) <--
+        rtl_inst(_, ?RTLInst::Iload(chunk, Addressing::Aindexed2(ofs), args, _)),
+        if args.len() >= 1,
+        let base_reg = args[0],
+        is_ptr(&base_reg);
 
 
     #[local] relation call_site(Node, Symbol);
@@ -274,6 +290,13 @@ ascent_par! {
         stack_struct_field(func, base_ofs, b, chunk_b, _),
         if a != b,
         if chunk_a != chunk_b;
+    // SR-1: two-field uniform-chunk stack struct requires the LEA'd pointer to be used at 2+ distinct inner offsets; bare address-taking (scanf(&x)-style) stays unpromoted.
+    stack_is_struct_candidate(func, base_ofs) <--
+        stack_field_ofs_count(func, base_ofs, count),
+        if *count >= 2,
+        stack_lea_used_for_access(func, base_ofs, o1),
+        stack_lea_used_for_access(func, base_ofs, o2),
+        if o1 != o2;
 
 
     // Global struct detection via constant-offset accesses
@@ -285,24 +308,42 @@ ascent_par! {
     global_deref(*ident, *ofs, *chunk, *src) <--
         rtl_inst(_, ?RTLInst::Istore(chunk, Addressing::Aglobal(ident, ofs), _, src));
 
+    // RIP-relative field accesses resolve to separate SUB_/L_ idents; fold them back via global_array_pass-produced interior_to_base_ident or the same global never shows two offsets on one base.
+    relation interior_to_base_ident(Ident, Ident, i64);
+
+    global_deref(*base, int_ofs + ofs, *chunk, *dst) <--
+        interior_to_base_ident(int_id, base, int_ofs),
+        rtl_inst(_, ?RTLInst::Iload(chunk, Addressing::Aglobal(acc_id, ofs), _, dst)),
+        if acc_id == int_id;
+
+    global_deref(*base, int_ofs + ofs, *chunk, *src) <--
+        interior_to_base_ident(int_id, base, int_ofs),
+        rtl_inst(_, ?RTLInst::Istore(chunk, Addressing::Aglobal(acc_id, ofs), _, src)),
+        if acc_id == int_id;
+
+    // Load-evidence subset: sub-register stores are lifted at full register width upstream, so prefer load chunks per offset to get the real access width.
+    relation global_deref_load(Ident, i64, MemoryChunk);
+
+    global_deref_load(*ident, *ofs, *chunk) <--
+        rtl_inst(_, ?RTLInst::Iload(chunk, Addressing::Aglobal(ident, ofs), _, _));
+
+    global_deref_load(*base, int_ofs + ofs, *chunk) <--
+        interior_to_base_ident(int_id, base, int_ofs),
+        rtl_inst(_, ?RTLInst::Iload(chunk, Addressing::Aglobal(acc_id, ofs), _, _)),
+        if acc_id == int_id;
+
     #[local] relation global_has_offset(Ident, i64);
     global_has_offset(ident, ofs) <-- global_deref(ident, ofs, _, _);
 
-    // Global struct: 3+ offsets OR 2 offsets with differing chunks (pair-like).
+    // Promote on 2+ distinct offsets; constant-only int pairs are layout-identical to two-field structs at binary level so struct is the best reading. Arrays vetoed by !is_global_array + !global_has_variable_index.
     #[local] relation global_has_multiple_offsets(Ident);
-    // 3+ distinct offsets via aggregation (global_has_offset is already distinct per (ident,ofs)); replaces the O(offsets^3) 3-way self-join.
     #[local] relation global_offset_count(Ident, usize);
     global_offset_count(ident, count) <--
         global_has_offset(ident, _),
         agg count = ascent::aggregators::count() in global_has_offset(ident, _);
     global_has_multiple_offsets(ident) <--
         global_offset_count(ident, count),
-        if *count >= 3;
-    global_has_multiple_offsets(ident) <--
-        global_deref(ident, a, chunk_a, _),
-        global_deref(ident, b, chunk_b, _),
-        if a != b,
-        if chunk_a != chunk_b;
+        if *count >= 2;
 
     #[local] relation global_has_variable_index(Ident);
 
@@ -314,6 +355,13 @@ ascent_par! {
         rtl_inst(_, ?RTLInst::Iload(_, Addressing::Abased(ident, _), _, _));
     global_has_variable_index(*ident) <--
         rtl_inst(_, ?RTLInst::Istore(_, Addressing::Abased(ident, _), _, _));
+
+    // PIE `lea sym(%rip),%r` + scaled access through %r: variable indexing vetoes struct even when !is_global_array alone wouldn't fire.
+    relation global_access_ev(Ident, i64, MemoryChunk, bool, bool);
+
+    global_has_variable_index(ident) <--
+        global_access_ev(ident, _, _, _, is_var),
+        if *is_var;
 
     relation global_is_struct_candidate(Ident);
 
@@ -369,6 +417,46 @@ impl IRPass for StructRecoveryPass {
         prog.swap_db_fields(db);
 
         post_process_structs(db);
+
+        // Diagnostic hook (env-gated, like CF4_TRACE) for struct-recovery work.
+        if std::env::var("SR_DUMP").is_ok() {
+            for t in db.rel_iter::<(Ident, Ident, i64)>("interior_to_base_ident") {
+                eprintln!("[SR] interior_to_base_ident {:x?}", t);
+            }
+            for t in db.rel_iter::<(Ident, i64, MemoryChunk, RTLReg)>("global_deref") {
+                eprintln!("[SR] global_deref {:x?}", t);
+            }
+            for t in db.rel_iter::<(Ident,)>("global_is_struct_candidate") {
+                eprintln!("[SR] global_is_struct_candidate {:x?}", t);
+            }
+            for t in db.rel_iter::<(u64, usize, usize, usize)>("global_struct_catalog") {
+                eprintln!("[SR] global_struct_catalog {:x?}", t);
+            }
+            for t in db.rel_iter::<(usize, usize, i64, FieldType, Ident)>("emit_struct_field") {
+                eprintln!("[SR] emit_struct_field {:x?}", t);
+            }
+            // SR-4 incidence probe: how close do stack-struct windows come to the MAX_STACK_STRUCT_SIZE cap?
+            {
+                let mut max_field_ofs: i64 = 0;
+                let mut windows_near_cap: std::collections::HashSet<(Address, i64)> =
+                    std::collections::HashSet::new();
+                let mut total_windows: std::collections::HashSet<(Address, i64)> =
+                    std::collections::HashSet::new();
+                for &(func, base, fofs, _, _) in
+                    db.rel_iter::<(Address, i64, i64, MemoryChunk, RTLReg)>("stack_struct_field")
+                {
+                    total_windows.insert((func, base));
+                    if fofs > max_field_ofs { max_field_ofs = fofs; }
+                    if fofs > MAX_STACK_STRUCT_SIZE - 128 {
+                        windows_near_cap.insert((func, base));
+                    }
+                }
+                eprintln!(
+                    "[SR] stack-window summary: {} windows, max field ofs {}, {} windows within 128B of the {} cap",
+                    total_windows.len(), max_field_ofs, windows_near_cap.len(), MAX_STACK_STRUCT_SIZE
+                );
+            }
+        }
 
         // Post-Datalog: push Xptr for non-param registers used at 2+ offsets (can't add to is_ptr pre-Datalog due to ptr_deref explosion)
         {
@@ -426,7 +514,7 @@ impl IRPass for StructRecoveryPass {
             "emit_function", "known_extern_signature",
             "string_data", "ident_to_symbol",
             "stack_var", "stack_var_chunk",
-            "is_global_array",
+            "is_global_array", "interior_to_base_ident", "global_access_ev",
             "emit_function_param_candidate", "func_has_param_at_position",
             "emit_function_return",
         ]
@@ -440,10 +528,11 @@ impl IRPass for StructRecoveryPass {
             "struct_id_to_canonical", "emit_struct_def",
             "reg_to_struct_id",
             "func_param_struct_type_candidate", "func_return_struct_type",
-            "ptr_deref", "ptr_is_struct_candidate",
+            "ptr_deref", "ptr_deref_load", "ptr_is_struct_candidate",
             "struct_field_type", "refined_ptr_type",
             "stack_struct_field", "stack_is_struct_candidate", "stack_lea_reg",
-            "global_deref", "global_is_struct_candidate",
+            "global_deref", "global_deref_load", "global_is_struct_candidate",
+            "emit_global_struct_fields",
         ]
     }
 }
@@ -462,7 +551,7 @@ struct CandidateStruct {
     access_count: usize,
 }
 
-// Returns None if fields overlap or form a uniform-stride array
+// Returns None on overlap or uniform-stride array. Packed structs accepted (extent-based overlap check); true overlap (union) intentionally rejected -- flat InferredField/build_fields_with_padding can't represent it and a wrong layout poisons downstream type evidence. Bitfields and VLA tails are unrecoverable at byte granularity.
 fn try_build_layout(accesses: &[(i64, MemoryChunk)]) -> Option<Vec<InferredField>> {
     // On conflicting chunks at one offset (union-like), widen to the largest rather than drop evidence.
     let mut per_offset: BTreeMap<i64, Vec<MemoryChunk>> = BTreeMap::new();
@@ -515,6 +604,24 @@ fn try_build_layout(accesses: &[(i64, MemoryChunk)]) -> Option<Vec<InferredField
     Some(fields)
 }
 
+// Prefer load chunks: sub-register stores are lifted at full register width upstream (byte store -> MInt32), faking overlaps and over-widening fields.
+fn prefer_load_chunks(
+    ofs_chunks: Vec<(i64, MemoryChunk)>,
+    loads: Option<&HashMap<i64, HashSet<MemoryChunk>>>,
+) -> Vec<(i64, MemoryChunk)> {
+    let loads = match loads {
+        Some(l) => l,
+        None => return ofs_chunks,
+    };
+    ofs_chunks
+        .into_iter()
+        .filter(|(ofs, chunk)| match loads.get(ofs) {
+            Some(set) if !set.is_empty() => set.contains(chunk),
+            _ => true,
+        })
+        .collect()
+}
+
 fn post_process_structs(db: &mut DecompileDB) {
     let struct_candidates: Vec<RTLReg> = db
         .rel_iter::<(RTLReg,)>("ptr_is_struct_candidate")
@@ -525,6 +632,16 @@ fn post_process_structs(db: &mut DecompileDB) {
         .rel_iter::<(RTLReg, i64, MemoryChunk, RTLReg, Address)>("ptr_deref")
         .cloned()
         .collect();
+
+    let mut ptr_loads_by_base: HashMap<RTLReg, HashMap<i64, HashSet<MemoryChunk>>> = HashMap::new();
+    for &(base, ofs, chunk) in db.rel_iter::<(RTLReg, i64, MemoryChunk)>("ptr_deref_load") {
+        ptr_loads_by_base.entry(base).or_default().entry(ofs).or_default().insert(chunk);
+    }
+
+    let mut global_loads_by_ident: HashMap<Ident, HashMap<i64, HashSet<MemoryChunk>>> = HashMap::new();
+    for &(ident, ofs, chunk) in db.rel_iter::<(Ident, i64, MemoryChunk)>("global_deref_load") {
+        global_loads_by_ident.entry(ident).or_default().entry(ofs).or_default().insert(chunk);
+    }
 
     let struct_field_types: Vec<(RTLReg, i64, MemoryChunk, XType)> = db
         .rel_iter::<(RTLReg, i64, MemoryChunk, XType)>("struct_field_type")
@@ -606,9 +723,12 @@ fn post_process_structs(db: &mut DecompileDB) {
             None => continue,
         };
 
-        let ofs_chunks: Vec<(i64, MemoryChunk)> = accesses.iter()
-            .map(|&(ofs, chunk, _, _)| (ofs, chunk))
-            .collect();
+        let ofs_chunks: Vec<(i64, MemoryChunk)> = prefer_load_chunks(
+            accesses.iter()
+                .map(|&(ofs, chunk, _, _)| (ofs, chunk))
+                .collect(),
+            ptr_loads_by_base.get(&ptr_reg),
+        );
 
         if let Some(fields) = try_build_layout(&ofs_chunks) {
             let func = accesses.first().map(|a| a.3).unwrap_or(0);
@@ -676,15 +796,21 @@ fn post_process_structs(db: &mut DecompileDB) {
     let mut global_candidates_sorted = global_candidates.clone();
     global_candidates_sorted.sort();
 
+    // ident -> recovered layout, for the global-side struct binding below.
+    let mut global_layouts: Vec<(Ident, Vec<InferredField>)> = Vec::new();
+
     for &(ident,) in &global_candidates_sorted {
         let accesses = match global_deref_map.get(&ident) {
             Some(a) => a,
             None => continue,
         };
 
-        let ofs_chunks: Vec<(i64, MemoryChunk)> = accesses.iter()
-            .map(|&(ofs, chunk, _)| (ofs, chunk))
-            .collect();
+        let ofs_chunks: Vec<(i64, MemoryChunk)> = prefer_load_chunks(
+            accesses.iter()
+                .map(|&(ofs, chunk, _)| (ofs, chunk))
+                .collect(),
+            global_loads_by_ident.get(&ident),
+        );
 
         if let Some(fields) = try_build_layout(&ofs_chunks) {
             for &(ofs, _, val_reg) in accesses {
@@ -693,7 +819,8 @@ fn post_process_structs(db: &mut DecompileDB) {
                 }
             }
 
-            *layout_access_count.entry(fields).or_insert(0) += accesses.len();
+            *layout_access_count.entry(fields.clone()).or_insert(0) += accesses.len();
+            global_layouts.push((ident, fields));
         }
     }
 
@@ -813,6 +940,24 @@ fn post_process_structs(db: &mut DecompileDB) {
     // Push reg->canonical struct ID mapping to DB for ClightFieldPass and clight_select bridging
     let rtsi: ascent::boxcar::Vec<_> = var_struct_map.iter().map(|&(addr, reg, sid)| (addr, reg, sid)).collect();
     db.rel_set("reg_to_struct_id", rtsi);
+
+    // Global ident -> struct binding: pure constant-offset globals carry no XstructPtr register, so without emit_global_struct_fields the definition is unreferenced and pruned at emission.
+    {
+        let mut egsf: Vec<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)> = Vec::new();
+        for (ident, fields) in &global_layouts {
+            let layout_hash = compute_layout_hash(fields);
+            if let Some(&sid) = hash_to_canonical.get(&layout_hash) {
+                let field_tuples: Arc<Vec<(i64, Ident, MemoryChunk)>> = Arc::new(
+                    fields.iter()
+                        .map(|f| (f.offset, make_field_ident(f.offset, f.chunk), f.chunk))
+                        .collect(),
+                );
+                egsf.push((*ident, sid, field_tuples));
+            }
+        }
+        let egsf_bv: ascent::boxcar::Vec<_> = egsf.into_iter().collect();
+        db.rel_set("emit_global_struct_fields", egsf_bv);
+    }
 
     let abi_regs = &crate::x86::abi::abi_config().int_arg_regs;
 

@@ -48,7 +48,7 @@ impl LinearVal {
     fn sub(self, other: Self) -> Self {
         Self { coeff: self.coeff.wrapping_sub(other.coeff), constant: self.constant.wrapping_sub(other.constant) }
     }
-    // Only linear-times-constant is supported; two linear-in-disc would be quadratic and silently bail.
+    // Only linear-times-constant is supported: gcc/LLVM switch lowering produces only affine maps (a*disc+b), never disc*disc, so quadratic is impossible from a real switch and must not be rewritten.
     fn mul(self, other: Self) -> Option<Self> {
         if other.coeff == 0 {
             Some(Self { coeff: self.coeff.wrapping_mul(other.constant), constant: self.constant.wrapping_mul(other.constant) })
@@ -251,7 +251,7 @@ fn detect_closed_form_in_func(
         }
     }
 
-    // Pattern A: masked discriminant with sequential closed-form. Strict gate: post-mask body must be only Sset/Sreturn/Snop.
+    // Pattern A: masked discriminant with sequential closed-form. Three safety conditions: (1) straight-line only (no branches), (2) disc_reg never redefined after mask (prevents miscompile where gcc lowers `(x&7)*100+5` by clobbering the masked reg in-place, causing stale discriminant reads), (3) unevaluable RHS poisons dst. Sstore/Scall side effects are skipped rather than bailed to handle the common "compute; store to global; return" shape.
     if let Some((_mask_node, mask_idx, disc_reg, mask)) = stmts.iter().enumerate()
         .find_map(|(i, (n, s))| match s {
             CsharpminorStmt::Sset(dst, expr) => {
@@ -275,20 +275,49 @@ fn detect_closed_form_in_func(
             _ => None,
         })
     {
+        // Path purity: a jump into the walked region lets switch_node be reached without the mask, so bail if any jump target lands inside (exempting the Sreturn itself, which never executes switch_node).
+        let mut jump_targets: HashSet<Node> = HashSet::new();
+        for (_, s) in stmts {
+            match s {
+                CsharpminorStmt::Scond(_, _, t1, t2) => {
+                    jump_targets.insert(*t1);
+                    jump_targets.insert(*t2);
+                }
+                CsharpminorStmt::Sjump(t) => {
+                    jump_targets.insert(*t);
+                }
+                CsharpminorStmt::Sjumptable(_, targets) => {
+                    for t in targets.iter() {
+                        jump_targets.insert(*t);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let mut reg_vals: HashMap<RTLReg, LinearVal> = HashMap::new();
         let mut return_reg: Option<RTLReg> = None;
         let mut return_node: Option<Node> = None;
         let mut last_set_node_for_reg: HashMap<RTLReg, Node> = HashMap::new();
         let mut ok = true;
         for (n, s) in &stmts[mask_idx + 1..] {
+            if jump_targets.contains(n) && !matches!(s, CsharpminorStmt::Sreturn(_)) {
+                ok = false;
+                break;
+            }
             match s {
                 CsharpminorStmt::Sset(d, e) => {
+                    // Discriminant purity: any redefinition makes the emitted Sswitch discriminant stale even when the RHS is affine-evaluable.
+                    if *d == disc_reg {
+                        ok = false;
+                        break;
+                    }
                     if let Some(lv) = eval_csharp_expr(e, disc_reg, &reg_vals) {
                         reg_vals.insert(*d, lv);
                         last_set_node_for_reg.insert(*d, *n);
                     } else {
-                        ok = false;
-                        break;
+                        // (3) unevaluable RHS: poison dst; only bail later if it feeds the formula.
+                        reg_vals.remove(d);
                     }
                 }
                 CsharpminorStmt::Sreturn(e) => {
@@ -299,6 +328,19 @@ fn detect_closed_form_in_func(
                     break;
                 }
                 CsharpminorStmt::Snop => continue,
+                // Memory effects touch no register dataflow and are preserved downstream in order.
+                CsharpminorStmt::Sstore(..) => continue,
+                // Calls/builtins: preserve side effects downstream; poison the result reg (unknown value), bail if it overwrites disc_reg.
+                CsharpminorStmt::Scall(dst, ..) | CsharpminorStmt::Sbuiltin(dst, ..) => {
+                    if let Some(d) = dst {
+                        if *d == disc_reg {
+                            ok = false;
+                            break;
+                        }
+                        reg_vals.remove(d);
+                    }
+                }
+                // (1) any control transfer breaks the straight-line premise.
                 _ => {
                     ok = false;
                     break;

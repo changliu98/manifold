@@ -79,15 +79,15 @@ fn op_output_xtype(op: &Operation) -> Option<XType> {
         Ocast16signed => Some(XType::Xint16signed),
         Ocast16unsigned => Some(XType::Xint16unsigned),
 
-        // Float (double precision)
-        Onegf | Oabsf | Oaddf | Osubf | Omulf |
+        // Float (double precision). Ofloatofsingle is CVTSS2SD (f32->f64) per asm_pass; the previous grouping had single<->double conversions swapped.
+        Onegf | Oabsf | Oaddf | Osubf | Omulf | Odivf | Omaxf | Ominf |
         Ofloatofint | Ofloatoflong |
-        Osingleoffloat => Some(XType::Xfloat),
+        Ofloatofsingle => Some(XType::Xfloat),
 
-        // Float (single precision)
-        Onegfs | Oabsfs | Oaddfs | Osubfs | Omulfs |
+        // Float (single precision). Osingleoffloat is CVTSD2SS (f64 -> f32).
+        Onegfs | Oabsfs | Oaddfs | Osubfs | Omulfs | Odivfs |
         Osingleofint | Osingleoflong |
-        Ofloatofsingle => Some(XType::Xsingle),
+        Osingleoffloat => Some(XType::Xsingle),
 
         // Comparison result (boolean)
         Ocmp(_) => Some(XType::Xbool),
@@ -119,23 +119,18 @@ fn cond_operand_xtype(cond: &Condition) -> Option<XType> {
     }
 }
 
-/// Returns true if the operation consumes floating-point (double) operands.
-fn is_float_op(op: &Operation) -> bool {
+/// Returns true if the operation CONSUMES f64 operands; direction-aware: Ointoffloat/Olongoffloat/Osingleoffloat have f64 args but non-f64 dsts, while int->float and single-precision ops must be excluded.
+fn op_consumes_f64(op: &Operation) -> bool {
     use Operation::*;
     matches!(op,
         Onegf | Oabsf | Oaddf | Osubf | Omulf | Odivf | Omaxf | Ominf |
-        Osingleoffloat | Ointoffloat | Olongoffloat |
-        Onegfs | Oabsfs | Oaddfs | Osubfs | Omulfs | Odivfs |
-        Ofloatofsingle | Ointofsingle | Olongofsingle
+        Ointoffloat | Olongoffloat | Osingleoffloat
     )
 }
 
-/// Returns true if the condition compares floating-point operands.
-fn is_float_cond(cond: &Condition) -> bool {
-    matches!(cond,
-        Condition::Ccompf(_) | Condition::Cnotcompf(_) |
-        Condition::Ccompfs(_) | Condition::Cnotcompfs(_)
-    )
+/// Returns true if the condition compares f64 operands; single-precision compares excluded for the same width reason as op_consumes_f64.
+fn is_f64_cond(cond: &Condition) -> bool {
+    matches!(cond, Condition::Ccompf(_) | Condition::Cnotcompf(_))
 }
 
 
@@ -217,26 +212,44 @@ ascent_par! {
         for mreg in args.iter(),
         reg_rtl(node, *mreg, rtl_reg);
 
-    // 2. MOVSD upgrade: MAny64 -> Xfloat when the register is used in float arithmetic.
-    emit_var_type_candidate(rtl_reg, XType::Xfloat) <--
-        emit_var_type_candidate(rtl_reg, ?XType::Xany64),
+    // 2. MOVSD upgrade (TR-2): MAny64 -> Xfloat only when the value demonstrably flows into an f64-consuming position or is produced by an f64-producing op; direction-blind and flow-blind old rules wrongly floated cvttsd2si dsts and missed values reaching float ops only through copies.
+
+    #[local] relation f64_copy_edge(RTLReg, RTLReg);
+    f64_copy_edge(args[0], *dst) <--
+        rtl_inst(_, ?RTLInst::Iop(Operation::Omove, args, dst)),
+        if args.len() == 1;
+
+    // Operand positions that consume an f64 value.
+    #[local] relation f64_use_reg(RTLReg);
+    f64_use_reg(*arg) <--
         rtl_inst(_, ?RTLInst::Iop(op, args, _)),
-        if is_float_op(op),
-        if args.contains(&rtl_reg);
-
-    // Also upgrade when the register is the destination of a float operation
-    emit_var_type_candidate(rtl_reg, XType::Xfloat) <--
-        emit_var_type_candidate(rtl_reg, ?XType::Xany64),
-        rtl_inst(_, ?RTLInst::Iop(op, _, dst)),
-        if is_float_op(op),
-        if dst == rtl_reg;
-
-    // Also upgrade when the register is used in a float comparison
-    emit_var_type_candidate(rtl_reg, XType::Xfloat) <--
-        emit_var_type_candidate(rtl_reg, ?XType::Xany64),
+        if op_consumes_f64(op),
+        for arg in args.iter();
+    f64_use_reg(*arg) <--
         rtl_inst(_, ?RTLInst::Iop(Operation::Ocmp(cond), args, _)),
-        if is_float_cond(cond),
-        if args.contains(&rtl_reg);
+        if is_f64_cond(cond),
+        for arg in args.iter();
+    f64_use_reg(*arg) <--
+        rtl_inst(_, ?RTLInst::Icond(cond, args, _, _)),
+        if is_f64_cond(cond),
+        for arg in args.iter();
+
+    #[local] relation flows_to_f64_use(RTLReg);
+    flows_to_f64_use(reg) <-- f64_use_reg(reg);
+    flows_to_f64_use(src) <-- f64_copy_edge(src, dst), flows_to_f64_use(dst);
+
+    #[local] relation holds_f64_value(RTLReg);
+    holds_f64_value(dst) <--
+        rtl_inst(_, ?RTLInst::Iop(op, _, dst)),
+        if is_float_operation(op);
+    holds_f64_value(dst) <-- f64_copy_edge(src, dst), holds_f64_value(src);
+
+    emit_var_type_candidate(reg, XType::Xfloat) <--
+        emit_var_type_candidate(reg, ?XType::Xany64),
+        flows_to_f64_use(reg);
+    emit_var_type_candidate(reg, XType::Xfloat) <--
+        emit_var_type_candidate(reg, ?XType::Xany64),
+        holds_f64_value(reg);
 
 
     // 3. Pointer evidence (no is_not_ptr; pointers are a subtype of 8-byte int, no conflict)

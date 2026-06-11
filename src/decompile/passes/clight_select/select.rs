@@ -149,6 +149,38 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
     let loop_info_all = extract_loop_info(db);
     let ite_info_all = extract_ite_info(db);
 
+    // Determinism diagnostic: fingerprint solver-relevant FunctionData fields before z3 solve -- stable fields + flipping selection means variance is inside z3's model; a moving field names the upstream source.
+    if std::env::var("DET_FP").is_ok() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let fh = |s: &str| -> u64 {
+            let mut h = DefaultHasher::new();
+            s.hash(&mut h);
+            h.finish()
+        };
+        let sorted_kv = |it: Vec<String>| -> String {
+            let mut v = it;
+            v.sort();
+            v.join(",")
+        };
+        for f in &functions {
+            // Candidate vectors keep their stored order (position = priority); maps are key-sorted.
+            let vtc = sorted_kv(f.var_type_candidates.iter().map(|(r, cs)| format!("{}:{:?}", r, cs)).collect());
+            let ns = sorted_kv(f.node_statements.iter().map(|(n, ss)| format!("{}:{:?}", n, ss)).collect());
+            let sigs = sorted_kv(f.callee_signatures.iter().map(|(id, s)| {
+                format!("{}:{}/{:?}/{:?}", id, s.param_count, s.return_type, s.param_types)
+            }).collect());
+            let sftc = sorted_kv(f.struct_field_type_candidates.iter().map(|(k, v)| format!("{:?}:{:?}", k, v)).collect());
+            let sfti = sorted_kv(f.struct_field_type_idx.iter().map(|(k, v)| format!("{:?}:{}", k, v)).collect());
+            let rsi = sorted_kv(f.reg_struct_ids.iter().map(|(k, v)| format!("{}:{}", k, v)).collect());
+            eprintln!(
+                "[FP-IN] {:016x} vtc={:016x} ns={:016x} sigs={:016x} ret={:016x} rsi={:016x} sftc={:016x} sfti={:016x}",
+                f.address, fh(&vtc), fh(&ns), fh(&sigs), fh(&format!("{:?}", f.return_type)),
+                fh(&rsi), fh(&sftc), fh(&sfti),
+            );
+        }
+    }
+
     // Statement-form + type selection is done entirely by the Z3/SMT inference model; the clang-in-the-loop greedy search has been removed (full migration to Z3).
     let best_state =
         crate::decompile::passes::clight_select::solve::infer_select_program(&functions, &name_to_ident);
@@ -178,7 +210,17 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
             su.sort();
             let mut sg: Vec<String> = f.sseq_groups.iter().map(|(k, v)| format!("{}:{:?}", k, v)).collect();
             sg.sort();
-            let mut li: Vec<String> = f.loop_info.iter().map(|(n, v)| format!("{}:{:?}", n, v)).collect();
+            // LoopInfo HashMaps have non-deterministic Debug order; key-sort so the fingerprint only moves on real content changes.
+            let mut li: Vec<String> = f.loop_info.iter().map(|(n, v)| {
+                let mut bs: Vec<String> = v.break_stmts.iter().map(|(k, s)| format!("{}:{:?}", k, s)).collect();
+                bs.sort();
+                let mut er: Vec<(Node, (Node, Node))> = v.exit_returns.iter().map(|(k, p)| (*k, *p)).collect();
+                er.sort();
+                format!(
+                    "{}:body={:?} exit={:?} step={:?} primary={:?} breaks=[{}] rets={:?}",
+                    n, v.body_nodes, v.exit_node, v.step_node, v.primary_exit, bs.join(","), er
+                )
+            }).collect();
             li.sort();
             let mut rsi: Vec<String> = f.reg_struct_ids.iter().map(|(k, v)| format!("{}:{}", k, v)).collect();
             rsi.sort();
@@ -194,6 +236,23 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
 }
 
 fn det_fp_stage(addr: Address, stage: &str, statements: &HashMap<Node, ClightStmt>) {
+    if let Ok(want) = std::env::var("CF3_DUMP") {
+        if let Ok(waddr) = u64::from_str_radix(want.trim_start_matches("0x"), 16) {
+            if waddr == addr {
+                let mut keys: Vec<Node> = statements.keys().copied().collect();
+                keys.sort_unstable();
+                let sw: usize = statements.values().map(count_switches).sum();
+                eprintln!("[DUMP-{}] {} keys, {} switches", stage, keys.len(), sw);
+                if let Ok(hdr) = std::env::var("CF3_DUMP_NODE") {
+                    if let Ok(h) = u64::from_str_radix(hdr.trim_start_matches("0x"), 16) {
+                        if let Some(s) = statements.get(&h) {
+                            eprintln!("[DUMP-{}] node {:x}: {:?}", stage, h, s);
+                        }
+                    }
+                }
+            }
+        }
+    }
     if std::env::var("DET_FP").is_err() {
         return;
     }
@@ -259,7 +318,7 @@ fn build_selected_function_from_program_state(
 
     let func_loop_info = loop_info_all.get(&func.address).cloned().unwrap_or_default();
 
-    assemble_loops(&mut statements, &func_loop_info);
+    assemble_loops(&mut statements, &func_loop_info, &func.successors);
     det_fp_stage(func.address, "S2loop", &statements);
 
     let func_ite_info = ite_info_all.get(&func.address).cloned().unwrap_or_default();
@@ -297,6 +356,9 @@ fn build_selected_function_from_program_state(
     det_fp_stage(func.address, "S5inline", &statements);
     flatten_cascading_ifthenelse_all(&mut statements);
     det_fp_stage(func.address, "S6flat", &statements);
+    // CF-3 always on (gate removed 2026-06-10): /bin/ls -2.2% gotos; case bodies that stay multi-referenced until CF-6 deduplication become inlinable afterward.
+    inline_switch_case_bodies(&mut statements);
+    det_fp_stage(func.address, "S6sw", &statements);
     deduplicate_identical_blocks(&mut statements);
     det_fp_stage(func.address, "S7dedup", &statements);
     ensure_goto_labels(&mut statements);
@@ -649,6 +711,7 @@ fn walk_stmt_exprs(stmt: &ClightStmt, pred: &dyn Fn(&ClightExpr) -> bool) -> boo
 fn assemble_loops(
     statements: &mut HashMap<Node, ClightStmt>,
     loop_info: &HashMap<Node, LoopInfo>,
+    successors: &HashMap<Node, Vec<Node>>,
 ) {
     // Process smallest loops first (inner before outer). Break ties by header address.
     let mut headers: Vec<(&Node, &LoopInfo)> = loop_info.iter().collect();
@@ -665,7 +728,14 @@ fn assemble_loops(
             body_iter_nodes.push(header);
         }
         body_iter_nodes.sort_by_key(|&n| crate::util::exec_order_key(n));
+        // Rotate so the HEADER is the first emitted element. Scontinue and the implicit fall-off-the-end loop-back both re-enter at the body's FIRST statement, so they mean "goto header" only when the header is that statement. gcc's rotated layouts place body code below the header address (the entry jumps forward to the condition/call cluster), which would otherwise leave the header mid-sequence and make every continue land on the wrong node. Dominance guarantees every external entry into the loop passes the header, so starting the emitted body there matches the real entry edge.
+        if let Some(pos) = body_iter_nodes.iter().position(|&n| n == header) {
+            body_iter_nodes.rotate_left(pos);
+        }
         let body_node_set: HashSet<Node> = body_iter_nodes.iter().copied().collect();
+
+        // Rotated loops (gcc -O0 `jmp .Lcond; .Lbody: ...; .Lcond: cmp; jg .Lbody`): the dominance header is the COND node, which execution order places LAST in the assembled body, so the latch edge emits as a goto to the exec-FIRST body node rather than to the header. A goto to the body's first statement is exactly `continue` for the while(1) we are building, so it converts like a header goto.
+        let body_top_label: Option<Ident> = body_iter_nodes.first().map(|&n| ident_from_node(n));
 
         // Determine exit target: the node just after the loop.
         let exit_target_label: Option<Ident> = info.primary_exit.as_ref().map(|pe| {
@@ -684,6 +754,10 @@ fn assemble_loops(
         }
 
         let mut body_stmts: Vec<ClightStmt> = Vec::new();
+        // Originating node of each body statement, index-aligned with body_stmts (the CF-4 guard resolves goto targets to body positions through it).
+        let mut body_stmt_nodes: Vec<Node> = Vec::new();
+        // A5 absorptions commit only if the loop itself commits (CF-4 guard below); pushing straight to absorbed_value_nodes would delete the value node even when the Sloop is skipped.
+        let mut loop_absorbed: Vec<Node> = Vec::new();
 
         for &node in &body_iter_nodes {
             // Use pre-built break statement if this is a non-primary loop exit
@@ -692,11 +766,13 @@ fn assemble_loops(
                 if let Some(&(value_node, ret_node)) = info.exit_returns.get(&node) {
                     if let Some(tail) = build_return_tail(statements, value_node, ret_node) {
                         body_stmts.push(replace_break_with(break_stmt, &tail));
-                        absorbed_value_nodes.push(value_node);
+                        body_stmt_nodes.push(node);
+                        loop_absorbed.push(value_node);
                         continue;
                     }
                 }
                 body_stmts.push(break_stmt.clone());
+                body_stmt_nodes.push(node);
                 continue;
             }
 
@@ -706,7 +782,7 @@ fn assemble_loops(
             };
 
             // Convert gotos: header_label->Scontinue, outside loop->Sbreak, recurse into branches.
-            let converted = convert_loop_gotos(&stmt, header_label, &body_node_set, &exit_target_label);
+            let converted = convert_loop_gotos(&stmt, header_label, body_top_label, &body_node_set, &exit_target_label);
             // Check nonempty: peel through Slabel wrappers to see if innermost is Sskip.
             let mut s = &converted;
             let mut outer_label: Option<Ident> = None;
@@ -725,12 +801,23 @@ fn assemble_loops(
                 if is_skip {
                     body_stmts.push(converted);
                 } else {
-                    // Strip one outer label so the body's natural fallthrough threads via the parent Ssequence; downstream label-restoration adds it back when a goto actually targets it.
+                    // Strip one outer label so the body's natural fallthrough threads via the parent Ssequence - UNLESS a goto within this body targets the label: then it must stay on the statement, or ensure_goto_labels re-creates it as an empty top-level Sskip OUTSIDE the loop and every in-loop goto (switch case entries especially) jumps out to nothing, leaving the real body statements unreachable to be dropped downstream (the vanishing-case-body bug).
                     let stripped = match converted {
-                        ClightStmt::Slabel(_, inner) => *inner,
+                        ClightStmt::Slabel(lbl, inner) if !body_goto_targets.contains(&lbl) => *inner,
                         other => other,
                     };
                     body_stmts.push(stripped);
+                }
+                body_stmt_nodes.push(node);
+                // Upstream trimming deletes a body node's `jmp header` back-edge on the assumption that POSITION supplies the loop-back - true only for the exec-LAST body node. For any other node whose sole control successor is the header and whose statement can fall through, materialize the loop-back as Scontinue, or its execution would fall into the NEXT case body (fall-through corruption between reordered case bodies).
+                if let Some(succs) = successors.get(&node) {
+                    if succs.len() == 1
+                        && succs[0] == header
+                        && body_stmts.last().map(stmt_may_fall_through).unwrap_or(false)
+                    {
+                        body_stmts.push(ClightStmt::Scontinue);
+                        body_stmt_nodes.push(node);
+                    }
                 }
             }
         }
@@ -738,7 +825,23 @@ fn assemble_loops(
         // Remove trailing Scontinue (redundant at end of loop body)
         while body_stmts.last() == Some(&ClightStmt::Scontinue) {
             body_stmts.pop();
+            body_stmt_nodes.pop();
         }
+
+        // CF-4 guard: a loop must be re-enterable. If the assembled body has no loop-level continue and no path can fall off its end, every path leaves on iteration 1 - the construct is not a loop (typically the dominance-filtered body excluded the shared hubs that carry the real cycle, CF-2). Wrapping it in while(1) lies about control flow and traps interior labels' back-edges as gotos (a goto cannot become `continue` through a foreign loop level - the quotearg case). Skip assembly and leave the nodes flat; the real cycle, if any, lives at an interior label.
+        if !loop_body_can_reenter(
+            &body_stmts,
+            &body_stmt_nodes,
+            &body_node_set,
+            header,
+            body_iter_nodes.first().copied(),
+        ) {
+            if std::env::var("CF4_TRACE").is_ok() {
+                eprintln!("[cf4] skip header={:#x} label={} body={:#?}", header, header_label, body_stmts);
+            }
+            continue;
+        }
+        absorbed_value_nodes.extend(loop_absorbed);
 
         let body = match body_stmts.len() {
             0 => ClightStmt::Sskip,
@@ -842,8 +945,8 @@ fn assemble_ite(
         a_size.cmp(&b_size).then(b.0.cmp(a.0))
     });
 
-    // Per-branch ceiling on assembled-compound size; bounds the 2^depth shared-node duplication blowup on degenerate control flow. Far above any real function's nesting, so it only trips on pathological structuring (configurable via ITE_MAX_NODES).
-    let node_cap: usize = std::env::var("ITE_MAX_NODES").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
+    // Per-branch cap on assembled-compound size to bound 2^depth shared-node duplication. CF-9 (2026-06-10): 0 binds observed after CF-1 removed the dispatch duplication that caused the original 122-branch blowup; keep as backstop -- smallest-first ensures O(cap) construction even on degenerate inputs.
+    let node_cap: usize = crate::decompile::elevator::config::ITE_MAX_NODES;
 
     for (&branch, info) in &branches {
         // Branch holds Sifthenelse from clight_pass flat Scond rule, possibly wrapped in Slabel.
@@ -873,9 +976,22 @@ fn assemble_ite(
             None => false,
         };
 
+        // CF-1: a node shared by BOTH arms would be duplicated into each structured context, and the duplication compounds across nesting levels - one binary dispatch switch emitted dozens of times (119 copies observed in __strftime_internal). A switch-bearing shared node is therefore NOT embedded: it stays once at top level and each arm reaches it by goto; the compounding stops at the first switch-bearing level. Cheap shared nodes keep duplicating (that genuinely avoids gotos).
+        let shared_preserved: HashSet<Node> = info
+            .true_body_nodes
+            .iter()
+            .filter(|n| info.false_body_nodes.contains(n))
+            .filter(|n| statements.get(n).map(stmt_contains_switch).unwrap_or(false))
+            .copied()
+            .collect();
+
         let collect_body = |body_nodes: &[Node]| -> ClightStmt {
             let mut body_stmts: Vec<ClightStmt> = Vec::new();
             for &node in body_nodes {
+                if shared_preserved.contains(&node) {
+                    body_stmts.push(ClightStmt::Sgoto(ident_from_node(node)));
+                    continue;
+                }
                 if let Some(stmt) = statements.get(&node) {
                     // Strip outer label; the node identity is subsumed by the compound
                     let stripped = match stmt {
@@ -943,13 +1059,43 @@ fn assemble_ite(
         };
         statements.insert(branch, wrapped);
 
-        // Remove consumed body nodes from top-level
+        // Remove consumed body nodes from top-level (preserved shared switch-bearing nodes stay - the arms goto them)
         for &node in &info.true_body_nodes {
-            statements.remove(&node);
+            if !shared_preserved.contains(&node) {
+                statements.remove(&node);
+            }
         }
         for &node in &info.false_body_nodes {
-            statements.remove(&node);
+            if !shared_preserved.contains(&node) {
+                statements.remove(&node);
+            }
         }
+    }
+}
+
+// Total Sswitch count in a statement tree (CF3_DUMP diagnostics).
+fn count_switches(s: &ClightStmt) -> usize {
+    match s {
+        ClightStmt::Sswitch(_, cases) => {
+            1 + cases.iter().map(|(_, cs)| count_switches(cs)).sum::<usize>()
+        }
+        ClightStmt::Ssequence(ss) => ss.iter().map(count_switches).sum(),
+        ClightStmt::Sifthenelse(_, a, b) => count_switches(a) + count_switches(b),
+        ClightStmt::Sloop(a, b) => count_switches(a) + count_switches(b),
+        ClightStmt::Slabel(_, inner) => count_switches(inner),
+        _ => 0,
+    }
+}
+
+// Whether a statement (sub)tree contains an Sswitch - the CF-1 "heavy dispatch" criterion.
+fn stmt_contains_switch(s: &ClightStmt) -> bool {
+    match s {
+        ClightStmt::Sswitch(..) => true,
+        ClightStmt::Ssequence(ss) => ss.iter().any(stmt_contains_switch),
+        ClightStmt::Sifthenelse(_, a, b) => stmt_contains_switch(a) || stmt_contains_switch(b),
+        ClightStmt::Sloop(a, b) => stmt_contains_switch(a) || stmt_contains_switch(b),
+        ClightStmt::Slabel(_, inner) => stmt_contains_switch(inner),
+        _ => false,
     }
 }
 
@@ -957,12 +1103,13 @@ fn assemble_ite(
 fn convert_loop_gotos(
     stmt: &ClightStmt,
     header_label: Ident,
+    body_top_label: Option<Ident>,
     body_node_set: &HashSet<Node>,
     _exit_target_label: &Option<Ident>,
 ) -> ClightStmt {
     match stmt {
         ClightStmt::Sgoto(target) => {
-            if *target == header_label {
+            if *target == header_label || Some(*target) == body_top_label {
                 ClightStmt::Scontinue
             } else {
                 // Check if the target is outside the loop body
@@ -974,26 +1121,493 @@ fn convert_loop_gotos(
                 }
             }
         }
+        // Continue-conversion descends into switch cases: `continue` inside a switch binds to the enclosing LOOP (C semantics), so a case-body goto back to the loop header/body-top is exactly `continue`. Break conversion must NOT descend - Sbreak inside a case would bind to the SWITCH; a goto that leaves the loop from within a case stays a goto.
+        ClightStmt::Sswitch(e, cases) => {
+            let new_cases = cases
+                .iter()
+                .map(|(v, s)| (*v, convert_case_continues(s, header_label, body_top_label)))
+                .collect();
+            ClightStmt::Sswitch(e.clone(), new_cases)
+        }
         ClightStmt::Sifthenelse(cond, then_box, else_box) => {
-            let new_then = convert_loop_gotos(then_box, header_label, body_node_set, _exit_target_label);
-            let new_else = convert_loop_gotos(else_box, header_label, body_node_set, _exit_target_label);
+            let new_then = convert_loop_gotos(then_box, header_label, body_top_label, body_node_set, _exit_target_label);
+            let new_else = convert_loop_gotos(else_box, header_label, body_top_label, body_node_set, _exit_target_label);
             ClightStmt::Sifthenelse(cond.clone(), Box::new(new_then), Box::new(new_else))
         }
         ClightStmt::Ssequence(stmts) => {
             let new_stmts: Vec<ClightStmt> = stmts
                 .iter()
-                .map(|s| convert_loop_gotos(s, header_label, body_node_set, _exit_target_label))
+                .map(|s| convert_loop_gotos(s, header_label, body_top_label, body_node_set, _exit_target_label))
                 .collect();
             ClightStmt::Ssequence(new_stmts)
         }
         ClightStmt::Slabel(lbl, inner) => {
-            let new_inner = convert_loop_gotos(inner, header_label, body_node_set, _exit_target_label);
+            let new_inner = convert_loop_gotos(inner, header_label, body_top_label, body_node_set, _exit_target_label);
             ClightStmt::Slabel(*lbl, Box::new(new_inner))
         }
         _ => stmt.clone(),
     }
 }
 
+// CF-3: inline externalized switch case bodies. Lowering emits `case K: goto L_k` with the body as a separate labeled statement (often shared by several stacked case values); when EVERY goto to that label in the function comes from ONE switch's entries, the body belongs to that switch exclusively: its entries regroup into a contiguous C fall-through run (`case v1: case v2: <body>`) with the body inlined at the run's end and the label dropped. Only bodies that provably DIVERT (return / goto / continue on every path) are moved - a falling-through body at its original position continues into the next sibling statement, which inlining would change.
+fn inline_switch_case_bodies(statements: &mut HashMap<Node, ClightStmt>) {
+    // Reference counts: every goto in the function vs gotos appearing exactly as a switch entry, plus how many distinct switches reference each target.
+    let mut total_gotos: HashMap<Ident, usize> = HashMap::new();
+    for s in statements.values() {
+        for t in collect_goto_targets(s) {
+            *total_gotos.entry(t as Ident).or_default() += 1;
+        }
+    }
+    let mut entry_gotos: HashMap<Ident, usize> = HashMap::new();
+    let mut switch_count: HashMap<Ident, usize> = HashMap::new();
+    fn scan_switches(
+        s: &ClightStmt,
+        entry_gotos: &mut HashMap<Ident, usize>,
+        switch_count: &mut HashMap<Ident, usize>,
+    ) {
+        match s {
+            ClightStmt::Sswitch(_, cases) => {
+                let mut seen_here: HashSet<Ident> = HashSet::new();
+                for (_, cs) in cases {
+                    if let ClightStmt::Sgoto(t) = cs {
+                        *entry_gotos.entry(*t).or_default() += 1;
+                        seen_here.insert(*t);
+                    }
+                    scan_switches(cs, entry_gotos, switch_count);
+                }
+                for t in seen_here {
+                    *switch_count.entry(t).or_default() += 1;
+                }
+            }
+            ClightStmt::Ssequence(ss) => ss.iter().for_each(|x| scan_switches(x, entry_gotos, switch_count)),
+            ClightStmt::Sifthenelse(_, a, b) => {
+                scan_switches(a, entry_gotos, switch_count);
+                scan_switches(b, entry_gotos, switch_count);
+            }
+            ClightStmt::Sloop(a, b) => {
+                scan_switches(a, entry_gotos, switch_count);
+                scan_switches(b, entry_gotos, switch_count);
+            }
+            ClightStmt::Slabel(_, inner) => scan_switches(inner, entry_gotos, switch_count),
+            _ => {}
+        }
+    }
+    for s in statements.values() {
+        scan_switches(s, &mut entry_gotos, &mut switch_count);
+    }
+    let inlinable: HashSet<Ident> = entry_gotos
+        .iter()
+        .filter(|(t, &ec)| {
+            total_gotos.get(t).copied().unwrap_or(0) == ec && switch_count.get(t).copied().unwrap_or(0) == 1
+        })
+        .map(|(&t, _)| t)
+        .collect();
+    if inlinable.is_empty() {
+        return;
+    }
+
+    // Harvest inlinable top-level labeled bodies: the body must divert, its predecessor must divert (else falls into the label), and key must equal label (unclaimed restore uses `lbl as Node`). Bodies with loop-level Sbreak/Scontinue are excluded: Sbreak binds to the claiming switch, Scontinue binds to whatever loop encloses the claim site.
+    let mut harvested: HashMap<Ident, ClightStmt> = HashMap::new();
+    let mut top_keys: Vec<Node> = statements.keys().copied().collect();
+    top_keys.sort_by_key(|&n| crate::util::exec_order_key(n));
+    for (i, &k) in top_keys.iter().enumerate() {
+        if let Some(ClightStmt::Slabel(lbl, inner)) = statements.get(&k) {
+            if inlinable.contains(lbl)
+                && k == *lbl as Node
+                && !stmt_may_fall_through(inner)
+                && !matches!(inner.as_ref(), ClightStmt::Slabel(..))
+                && !contains_escaping_break(inner)
+                && !contains_loop_level_continue(inner)
+            {
+                let prev_diverts = i == 0
+                    || top_keys
+                        .get(i - 1)
+                        .and_then(|p| statements.get(p))
+                        .map(|s| !stmt_may_fall_through(s))
+                        .unwrap_or(false);
+                if i == 0 {
+                    // The function's first statement is fallen into from the prologue: never movable.
+                    continue;
+                }
+                if prev_diverts {
+                    let lbl = *lbl;
+                    let inner = (**inner).clone();
+                    statements.remove(&k);
+                    harvested.insert(lbl, inner);
+                }
+            }
+        }
+    }
+
+    // Rebuild every tree: sequences may also hold the body as a SIBLING of the switch (loop bodies after assemble_loops). Sorted: claims are uncontested (switch_count==1), but the harvested pool is shared mutable state - never let HashMap arrival order decide anything.
+    let mut keys: Vec<Node> = statements.keys().copied().collect();
+    keys.sort_unstable();
+    for k in keys {
+        if let Some(stmt) = statements.remove(&k) {
+            let rebuilt = rebuild_with_inlined_cases(stmt, &inlinable, &mut harvested);
+            statements.insert(k, rebuilt);
+        }
+    }
+
+    // Safety: anything harvested but never claimed goes back untouched (its gotos still exist).
+    for (lbl, body) in harvested {
+        statements.insert(lbl as Node, ClightStmt::Slabel(lbl, Box::new(body)));
+    }
+}
+
+// Claimable entry targets for switches in `s`: excludes uniform-target switches (left for range-if rendering) and does not descend into Ssequence (those pools were already processed). Mirror of inline_into_switches traversal; best-effort -- unclaimed bodies are positionally restored.
+fn collect_claimable_entry_targets(s: &ClightStmt, out: &mut HashSet<Ident>) {
+    match s {
+        ClightStmt::Sswitch(_, cases) => {
+            for (_, cs) in cases {
+                if let ClightStmt::Sgoto(t) = cs {
+                    let uniform = cases
+                        .iter()
+                        .filter(|(v, _)| v.is_some())
+                        .all(|(_, c)| matches!(c, ClightStmt::Sgoto(g) if g == t));
+                    if !uniform {
+                        out.insert(*t);
+                    }
+                }
+                collect_claimable_entry_targets(cs, out);
+            }
+        }
+        ClightStmt::Sifthenelse(_, a, b) | ClightStmt::Sloop(a, b) => {
+            collect_claimable_entry_targets(a, out);
+            collect_claimable_entry_targets(b, out);
+        }
+        ClightStmt::Slabel(_, inner) => collect_claimable_entry_targets(inner, out),
+        _ => {}
+    }
+}
+
+fn rebuild_with_inlined_cases(
+    stmt: ClightStmt,
+    inlinable: &HashSet<Ident>,
+    harvested: &mut HashMap<Ident, ClightStmt>,
+) -> ClightStmt {
+    match stmt {
+        ClightStmt::Ssequence(ss) => {
+            // First recurse, then let switches in this sequence claim diverting labeled SIBLINGS.
+            let mut elems: Vec<ClightStmt> = ss
+                .into_iter()
+                .map(|s| rebuild_with_inlined_cases(s, inlinable, harvested))
+                .collect();
+            // Best-effort filter: exclude siblings claimable only by a switch elsewhere or a uniform-target switch, reducing unnecessary harvest+restore churn; soundness rests on exact positional restoration of unclaimed leftovers.
+            let mut claimable_here: HashSet<Ident> = HashSet::new();
+            for e in &elems {
+                collect_claimable_entry_targets(e, &mut claimable_here);
+            }
+            // Harvest inlinable diverting labeled siblings: predecessor must divert, single-label only, no escaping Sbreak (would rebind to the claiming switch). Scontinue-carrying bodies allowed only at zero Sloop crossings where binding is preserved. Each entry records (kept-position, harvest-seq) for exact positional restore if unclaimed.
+            let mut local: HashMap<Ident, (usize, usize, ClightStmt)> = HashMap::new();
+            let mut harvest_seq = 0usize;
+            let mut kept: Vec<ClightStmt> = Vec::with_capacity(elems.len());
+            for e in elems.drain(..) {
+                let movable = match &e {
+                    ClightStmt::Slabel(l, inner)
+                        if inlinable.contains(l)
+                            && claimable_here.contains(l)
+                            && !matches!(inner.as_ref(), ClightStmt::Slabel(..))
+                            && !stmt_may_fall_through(inner)
+                            && !contains_escaping_break(inner) =>
+                    {
+                        kept.last().map(|p| !stmt_may_fall_through(p)).unwrap_or(false)
+                    }
+                    _ => false,
+                };
+                if movable {
+                    if let ClightStmt::Slabel(l, inner) = e {
+                        local.insert(l, (kept.len(), harvest_seq, *inner));
+                        harvest_seq += 1;
+                    }
+                } else {
+                    kept.push(e);
+                }
+            }
+            for e in kept.iter_mut() {
+                inline_into_switches(e, inlinable, &mut local, harvested, 0);
+            }
+            // Restore unclaimed locals at recorded positions in descending (idx, seq) order to preserve relative order; indices remain valid since claims only mutate in-place.
+            let mut leftovers: Vec<(usize, usize, Ident, ClightStmt)> = local
+                .drain()
+                .map(|(lbl, (idx, seq, body))| (idx, seq, lbl, body))
+                .collect();
+            leftovers.sort_unstable_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+            for (idx, _seq, lbl, body) in leftovers {
+                kept.insert(idx.min(kept.len()), ClightStmt::Slabel(lbl, Box::new(body)));
+            }
+            ClightStmt::Ssequence(kept)
+        }
+        ClightStmt::Sifthenelse(c, a, b) => ClightStmt::Sifthenelse(
+            c,
+            Box::new(rebuild_with_inlined_cases(*a, inlinable, harvested)),
+            Box::new(rebuild_with_inlined_cases(*b, inlinable, harvested)),
+        ),
+        ClightStmt::Sloop(a, b) => ClightStmt::Sloop(
+            Box::new(rebuild_with_inlined_cases(*a, inlinable, harvested)),
+            Box::new(rebuild_with_inlined_cases(*b, inlinable, harvested)),
+        ),
+        ClightStmt::Slabel(l, inner) => {
+            ClightStmt::Slabel(l, Box::new(rebuild_with_inlined_cases(*inner, inlinable, harvested)))
+        }
+        mut other => {
+            let mut empty: HashMap<Ident, (usize, usize, ClightStmt)> = HashMap::new();
+            inline_into_switches(&mut other, inlinable, &mut empty, harvested, 0);
+            other
+        }
+    }
+}
+
+// Mutate every Sswitch within `stmt` (not crossing into nested sequences - those were handled by the recursion): regroup entries whose stmt is `goto t` for an owned target into a stacked fall-through run ending with the inlined body. `loop_crossings` counts Sloop boundaries descended since the pool's home sequence: a body containing loop-level Scontinue may only be claimed at zero crossings, where the continue still binds to the same loop it bound to at the body's original sibling position (a switch does not capture continue; an Sloop does).
+fn inline_into_switches(
+    stmt: &mut ClightStmt,
+    inlinable: &HashSet<Ident>,
+    local: &mut HashMap<Ident, (usize, usize, ClightStmt)>,
+    harvested: &mut HashMap<Ident, ClightStmt>,
+    loop_crossings: usize,
+) {
+    match stmt {
+        ClightStmt::Sswitch(_, cases) => {
+            // Targets claimable for this switch, in first-appearance order.
+            let mut order: Vec<Ident> = Vec::new();
+            for (_, cs) in cases.iter() {
+                if let ClightStmt::Sgoto(t) = cs {
+                    if inlinable.contains(t) && !order.contains(t) && (local.contains_key(t) || harvested.contains_key(t)) {
+                        order.push(*t);
+                    }
+                }
+            }
+            for t in order {
+                // Uniform-dispatch guard: a switch where every valued entry targets the same `t` is degenerate -- leave all-goto so the emitter can render it as a range/equality `if` via try_switch_to_range_if; claiming here would freeze it as a stacked-case switch.
+                let uniform = cases
+                    .iter()
+                    .filter(|(v, _)| v.is_some())
+                    .all(|(_, cs)| matches!(cs, ClightStmt::Sgoto(g) if *g == t));
+                if uniform {
+                    continue;
+                }
+                // Past an Sloop boundary the enclosing loop changed, so a continue-carrying body must not be claimed; check before pool removal so it remains available to a zero-crossing switch.
+                if loop_crossings > 0
+                    && local.get(&t).is_some_and(|(_, _, b)| contains_loop_level_continue(b))
+                {
+                    continue;
+                }
+                // Fall-through-predecessor gate: the run re-insertion keeps the FIRST `goto t` slot but removes later ones, so a falling predecessor of a later slot would be rerouted. Refuse claiming when any non-first `goto t` entry has a falling predecessor; keeping gotos is always safe.
+                let first_goto_idx = cases
+                    .iter()
+                    .position(|(_, cs)| matches!(cs, ClightStmt::Sgoto(g) if *g == t));
+                let falls_into_removed = cases.iter().enumerate().any(|(i, (_, cs))| {
+                    matches!(cs, ClightStmt::Sgoto(g) if *g == t)
+                        && Some(i) != first_goto_idx
+                        && i > 0
+                        && stmt_may_fall_through(&cases[i - 1].1)
+                });
+                if falls_into_removed {
+                    continue;
+                }
+                // Track origin pool so an empty-run can restore the body with position data intact.
+                let (body, local_slot) = match local.remove(&t) {
+                    Some((idx, seq, b)) => (b, Some((idx, seq))),
+                    None => match harvested.remove(&t) {
+                        Some(b) => (b, None),
+                        None => continue,
+                    },
+                };
+                if std::env::var("CF3_INLINE_TRACE").is_ok() {
+                    let bd = format!("{:?}", body);
+                    eprintln!("[cf3-inline] claim target={:#x} body={}", t, &bd[..bd.len().min(300)]);
+                }
+                // Remove all `goto t` entries, re-inserting the stacked run at the FIRST removed position to preserve case order (appending at end drifts cases out of order, e.g. cases 2/4/5 below 10 in cut).
+                let mut run_vals: Vec<Option<Z>> = Vec::new();
+                let mut first_pos: Option<usize> = None;
+                let mut kept_cases: Vec<(Option<Z>, ClightStmt)> = Vec::with_capacity(cases.len());
+                for (v, cs) in cases.drain(..) {
+                    if matches!(&cs, ClightStmt::Sgoto(g) if *g == t) {
+                        if first_pos.is_none() {
+                            first_pos = Some(kept_cases.len());
+                        }
+                        run_vals.push(v);
+                    } else {
+                        kept_cases.push((v, cs));
+                    }
+                }
+                *cases = kept_cases;
+                if run_vals.is_empty() {
+                    // Cannot happen for targets collected above, but silently dropping a claimed body deletes statements; restore to origin pool.
+                    match local_slot {
+                        Some((idx, seq)) => {
+                            local.insert(t, (idx, seq, body));
+                        }
+                        None => {
+                            harvested.insert(t, body);
+                        }
+                    }
+                    continue;
+                }
+                let insert_at = first_pos.unwrap_or(cases.len());
+                let mut run: Vec<(Option<Z>, ClightStmt)> = Vec::new();
+                for (i, v) in run_vals.iter().enumerate() {
+                    if i + 1 == run_vals.len() {
+                        run.push((*v, body.clone()));
+                    } else {
+                        run.push((*v, ClightStmt::Sskip));
+                    }
+                }
+                for (i, entry) in run.into_iter().enumerate() {
+                    cases.insert(insert_at + i, entry);
+                }
+            }
+            for (_, cs) in cases.iter_mut() {
+                inline_into_switches(cs, inlinable, local, harvested, loop_crossings);
+            }
+        }
+        ClightStmt::Sifthenelse(_, a, b) => {
+            inline_into_switches(a, inlinable, local, harvested, loop_crossings);
+            inline_into_switches(b, inlinable, local, harvested, loop_crossings);
+        }
+        ClightStmt::Slabel(_, inner) => {
+            inline_into_switches(inner, inlinable, local, harvested, loop_crossings)
+        }
+        ClightStmt::Sloop(a, b) => {
+            inline_into_switches(a, inlinable, local, harvested, loop_crossings + 1);
+            inline_into_switches(b, inlinable, local, harvested, loop_crossings + 1);
+        }
+        _ => {}
+    }
+}
+
+// Restricted goto conversion inside switch case bodies: ONLY loop-header/body-top gotos become Scontinue (binding through the switch to the enclosing loop); everything else is untouched. A nested Sloop captures continue, so recursion stops there.
+fn convert_case_continues(
+    stmt: &ClightStmt,
+    header_label: Ident,
+    body_top_label: Option<Ident>,
+) -> ClightStmt {
+    match stmt {
+        ClightStmt::Sgoto(target)
+            if *target == header_label || Some(*target) == body_top_label =>
+        {
+            ClightStmt::Scontinue
+        }
+        ClightStmt::Ssequence(ss) => ClightStmt::Ssequence(
+            ss.iter()
+                .map(|s| convert_case_continues(s, header_label, body_top_label))
+                .collect(),
+        ),
+        ClightStmt::Sifthenelse(c, t, e) => ClightStmt::Sifthenelse(
+            c.clone(),
+            Box::new(convert_case_continues(t, header_label, body_top_label)),
+            Box::new(convert_case_continues(e, header_label, body_top_label)),
+        ),
+        ClightStmt::Slabel(lbl, inner) => ClightStmt::Slabel(
+            *lbl,
+            Box::new(convert_case_continues(inner, header_label, body_top_label)),
+        ),
+        ClightStmt::Sswitch(e, cases) => ClightStmt::Sswitch(
+            e.clone(),
+            cases
+                .iter()
+                .map(|(v, s)| (*v, convert_case_continues(s, header_label, body_top_label)))
+                .collect(),
+        ),
+        _ => stmt.clone(),
+    }
+}
+
+// CF-4 (assemble_loops guard): whether an assembled loop body can start a second iteration - a loop-level Scontinue exists, or some execution path can fall off the end of the body (the implicit loop-back). Gotos are resolved against the NODE that produced each body statement (labels are not materialized yet at assembly time, so a goto's target node may carry no Slabel): a goto to an emitted in-body node makes that node's position a secondary entry point; a goto to an in-body node whose statement was absorbed cannot be positioned and conservatively reports re-enterable. Conservative toward `true`: only a provable no-reentry returns false (skipping the Sloop wrapper). Calls are treated as falling through (a body ending in a noreturn call still reports re-enterable; refining that needs ABI noreturn knowledge - ABI-2).
+fn loop_body_can_reenter(
+    body: &[ClightStmt],
+    body_stmt_nodes: &[Node],
+    body_node_set: &HashSet<Node>,
+    header: Node,
+    body_top: Option<Node>,
+) -> bool {
+    if body.iter().any(contains_loop_level_continue) {
+        return true;
+    }
+    let mut targets: HashSet<Node> = HashSet::new();
+    for s in body {
+        for t in collect_goto_targets(s) {
+            targets.insert(t);
+        }
+    }
+    // A goto to the header or to the exec-first body node is a back-edge even when it could not become Scontinue (convert_loop_gotos does not descend into Sswitch, so case-body back-edges stay as gotos).
+    if targets.contains(&header) || body_top.is_some_and(|t| targets.contains(&t)) {
+        return true;
+    }
+    let pos: HashMap<Node, usize> = body_stmt_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| (n, i))
+        .collect();
+    let mut entries: Vec<usize> = vec![0];
+    for t in &targets {
+        if let Some(&i) = pos.get(t) {
+            entries.push(i);
+        } else if body_node_set.contains(t) {
+            // In-body target with no emitted statement of its own (absorbed/merged): position unknown, give up.
+            return true;
+        }
+        // Otherwise the goto leaves the loop (kept only for switch-nested exits): it diverts.
+    }
+    entries.sort_unstable();
+    entries.dedup();
+    // Re-enterable iff some entry's straight-line suffix may fall off the end (gotos divert at their own position; resumption at another emitted node is covered by that node's entry).
+    'entry: for &e in &entries {
+        for s in &body[e..] {
+            if !stmt_may_fall_through(s) {
+                continue 'entry;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+// Scontinue bound to the CURRENT loop level: a nested Sloop captures its own continues; Sswitch does not capture continue (C semantics), so case bodies are searched.
+fn contains_loop_level_continue(s: &ClightStmt) -> bool {
+    match s {
+        ClightStmt::Scontinue => true,
+        ClightStmt::Ssequence(ss) => ss.iter().any(contains_loop_level_continue),
+        ClightStmt::Sifthenelse(_, t, e) => {
+            contains_loop_level_continue(t) || contains_loop_level_continue(e)
+        }
+        ClightStmt::Slabel(_, inner) => contains_loop_level_continue(inner),
+        ClightStmt::Sswitch(_, cases) => cases.iter().any(|(_, st)| contains_loop_level_continue(st)),
+        ClightStmt::Sloop(..) => false,
+        _ => false,
+    }
+}
+
+// Sbreak that escapes the statement OUTWARD (not captured by a nested Sloop or Sswitch).
+fn contains_escaping_break(s: &ClightStmt) -> bool {
+    match s {
+        ClightStmt::Sbreak => true,
+        ClightStmt::Ssequence(ss) => ss.iter().any(contains_escaping_break),
+        ClightStmt::Sifthenelse(_, t, e) => contains_escaping_break(t) || contains_escaping_break(e),
+        ClightStmt::Slabel(_, inner) => contains_escaping_break(inner),
+        ClightStmt::Sloop(..) | ClightStmt::Sswitch(..) => false,
+        _ => false,
+    }
+}
+
+// MAY execution fall off the end of this statement in straight-line position? Gotos divert at this level (cross-label resumption is handled by loop_body_can_reenter's entry-point enumeration). A nested loop only completes forward via a break of its own; a switch completes via an escaping break or its last case falling out.
+fn stmt_may_fall_through(s: &ClightStmt) -> bool {
+    match s {
+        ClightStmt::Sreturn(_)
+        | ClightStmt::Sgoto(_)
+        | ClightStmt::Sbreak
+        | ClightStmt::Scontinue => false,
+        ClightStmt::Slabel(_, inner) => stmt_may_fall_through(inner),
+        ClightStmt::Ssequence(ss) => ss.iter().all(stmt_may_fall_through),
+        ClightStmt::Sifthenelse(_, t, e) => stmt_may_fall_through(t) || stmt_may_fall_through(e),
+        ClightStmt::Sloop(b, _) => contains_escaping_break(b),
+        ClightStmt::Sswitch(_, cases) => {
+            cases.iter().any(|(_, st)| contains_escaping_break(st))
+                || cases.last().map_or(true, |(_, st)| stmt_may_fall_through(st))
+        }
+        _ => true,
+    }
+}
 
 pub(crate) fn callee_ident_from_expr(
     func_expr: &ClightExpr,
@@ -1057,8 +1671,30 @@ fn is_value_stmt(stmt: &ClightStmt) -> bool {
     }
 }
 
-// Recursion/stack-depth bound for goto-chain inlining (inline_body_if_local_track). It caps how deep a single-predecessor goto chain is followed through ALL statement kinds (Ssequence/Sloop/Sswitch/Sifthenelse/Slabel), not just if-then-else. Termination is already guaranteed by the `visiting` set; this cap exists ONLY to bound native stack depth, since the downstream printer (print.rs) recurses with no depth guard and would stack-overflow on a pathologically deep chain. Corpus max observed chain depth is ~81, so 256 admits every real chain while staying safely bounded.
+// Depth bound for goto-chain inlining: admits a splice only while (depth at goto) + (target's assembled tree depth) stays within this limit, preventing unbounded native-stack growth in recursive walks and the downstream printer. RB-2: the old FOLLOW counter didn't bound depth for backward chains -- each root spliced an already-expanded tree compounding linearly until stack overflow; charging the measured target depth closes that. 256 admits all observed real chains (~81 max); deeper chains keep one residual goto per cap window.
 const MAX_GOTO_INLINE_DEPTH: usize = 256;
+
+// Tree depth measured iteratively (not recursively) so it is safe to call on the arbitrarily deep trees this measurement exists to fence.
+fn stmt_depth(root: &ClightStmt) -> usize {
+    let mut max = 0usize;
+    let mut work: Vec<(&ClightStmt, usize)> = vec![(root, 1)];
+    while let Some((s, d)) = work.pop() {
+        if d > max {
+            max = d;
+        }
+        match s {
+            ClightStmt::Ssequence(ss) => work.extend(ss.iter().map(|c| (c, d + 1))),
+            ClightStmt::Sifthenelse(_, a, b) | ClightStmt::Sloop(a, b) => {
+                work.push((a.as_ref(), d + 1));
+                work.push((b.as_ref(), d + 1));
+            }
+            ClightStmt::Slabel(_, inner) => work.push((inner.as_ref(), d + 1)),
+            ClightStmt::Sswitch(_, cases) => work.extend(cases.iter().map(|(_, c)| (c, d + 1))),
+            _ => {}
+        }
+    }
+    max
+}
 
 fn count_predecessors(successors: &HashMap<Node, Vec<Node>>) -> HashMap<Node, usize> {
     let mut preds = HashMap::new();
@@ -1199,21 +1835,39 @@ fn inline_control_flow_bodies(
     let mut nodes_to_process: Vec<Node> = statements.keys().copied().collect();
     nodes_to_process.sort();
 
+    // Lazily-filled assembled-tree depth per node; the splice gate charges the target's full depth so backward-ordered chains cannot compound past MAX_GOTO_INLINE_DEPTH.
+    let mut depth_of: HashMap<Node, usize> = HashMap::new();
+
     for node in nodes_to_process {
         if let Some(stmt) = statements.get(&node).cloned() {
             let mut visiting = HashSet::new();
             visiting.insert(node);
             let (inlined, newly_inlined) =
-                inline_stmt_recursive_track(&stmt, statements, &preds, &mut visiting, 0);
+                inline_stmt_recursive_track(&stmt, statements, &preds, &mut visiting, 0, &mut depth_of);
             // Free absorbed children immediately. Each inlined node has pred_count==1 (its only predecessor is the node we just inlined it into), so it is not referenced elsewhere and its content now lives inside `inlined`. Without this, every node's fully-inlined tree coexists in `statements` until the retain below; O(n^2) memory on long pred==1 chains, which OOMs large functions (e.g. 136803, stuck here at >11G).
             for &n in &newly_inlined {
                 statements.remove(&n);
+                depth_of.remove(&n);
             }
             inlined_nodes.extend(newly_inlined);
             if inlined != stmt {
+                depth_of.insert(node, stmt_depth(&inlined));
                 statements.insert(node, inlined);
             }
         }
+    }
+
+    if std::env::var("RB2_TRACE").is_ok() {
+        let max_d = depth_of.values().copied().max().unwrap_or(0);
+        let max_live = statements
+            .iter()
+            .map(|(n, s)| (stmt_depth(s), *n))
+            .max()
+            .unwrap_or((0, 0));
+        eprintln!(
+            "[rb2] S5 done: max depth_of={} live max stmt_depth={} at node {:x}",
+            max_d, max_live.0, max_live.1
+        );
     }
 
     let referenced: HashSet<Node> = statements
@@ -1348,30 +2002,32 @@ fn extract_trailing_ifthenelse(
     }
 }
 
+// `depth` is structural position depth (not a follow counter): the native stack cost the printer pays at this position.
 fn inline_stmt_recursive_track(
     stmt: &ClightStmt,
     statements: &HashMap<Node, ClightStmt>,
     preds: &HashMap<Node, usize>,
     visiting: &mut HashSet<Node>,
-    inline_count: usize,
+    depth: usize,
+    depth_of: &mut HashMap<Node, usize>,
 ) -> (ClightStmt, Vec<Node>) {
     let mut inlined = Vec::new();
 
     let result = match stmt {
         ClightStmt::Sifthenelse(cond, then_box, else_box) => {
             let (then_stmt, then_inlined) =
-                inline_body_if_local_track(&**then_box, statements, preds, visiting, inline_count);
+                inline_body_if_local_track(&**then_box, statements, preds, visiting, depth + 1, depth_of);
             let (else_stmt, else_inlined) =
-                inline_body_if_local_track(&**else_box, statements, preds, visiting, inline_count);
+                inline_body_if_local_track(&**else_box, statements, preds, visiting, depth + 1, depth_of);
             inlined.extend(then_inlined);
             inlined.extend(else_inlined);
             ClightStmt::Sifthenelse(cond.clone(), Box::new(then_stmt), Box::new(else_stmt))
         }
         ClightStmt::Sloop(body_box, incr_box) => {
             let (body_stmt, body_inlined) =
-                inline_body_if_local_track(&**body_box, statements, preds, visiting, inline_count);
+                inline_body_if_local_track(&**body_box, statements, preds, visiting, depth + 1, depth_of);
             let (incr_stmt, incr_inlined) =
-                inline_body_if_local_track(&**incr_box, statements, preds, visiting, inline_count);
+                inline_body_if_local_track(&**incr_box, statements, preds, visiting, depth + 1, depth_of);
             inlined.extend(body_inlined);
             inlined.extend(incr_inlined);
             ClightStmt::Sloop(Box::new(body_stmt), Box::new(incr_stmt))
@@ -1380,7 +2036,7 @@ fn inline_stmt_recursive_track(
             let mut result_stmts = Vec::new();
             for s in stmts {
                 let (inlined_s, s_inlined) =
-                    inline_stmt_recursive_track(s, statements, preds, visiting, inline_count);
+                    inline_stmt_recursive_track(s, statements, preds, visiting, depth + 1, depth_of);
                 result_stmts.push(inlined_s);
                 inlined.extend(s_inlined);
             }
@@ -1388,7 +2044,7 @@ fn inline_stmt_recursive_track(
         }
         ClightStmt::Slabel(lbl, inner) => {
             let (inner_inlined, inner_nodes) =
-                inline_stmt_recursive_track(&**inner, statements, preds, visiting, inline_count);
+                inline_stmt_recursive_track(&**inner, statements, preds, visiting, depth + 1, depth_of);
             inlined.extend(inner_nodes);
             ClightStmt::Slabel(*lbl, Box::new(inner_inlined))
         }
@@ -1396,7 +2052,7 @@ fn inline_stmt_recursive_track(
             let mut new_cases = Vec::new();
             for (label, case_stmt) in cases {
                 let (inlined_case, case_inlined) =
-                    inline_body_if_local_track(case_stmt, statements, preds, visiting, inline_count);
+                    inline_body_if_local_track(case_stmt, statements, preds, visiting, depth + 1, depth_of);
                 inlined.extend(case_inlined);
                 new_cases.push((label.clone(), inlined_case));
             }
@@ -1413,34 +2069,40 @@ fn inline_body_if_local_track(
     statements: &HashMap<Node, ClightStmt>,
     preds: &HashMap<Node, usize>,
     visiting: &mut HashSet<Node>,
-    inline_count: usize,
+    depth: usize,
+    depth_of: &mut HashMap<Node, usize>,
 ) -> (ClightStmt, Vec<Node>) {
     match stmt {
         ClightStmt::Sgoto(target_ident) => {
             let target_node = *target_ident as u64;
             let pred_count = preds.get(&target_node).copied().unwrap_or(0);
 
-            if pred_count == 1
-                && !visiting.contains(&target_node)
-                && inline_count < MAX_GOTO_INLINE_DEPTH
-            {
+            if pred_count == 1 && !visiting.contains(&target_node) {
                 if let Some(target_stmt) = statements.get(&target_node) {
                     if is_trivial_labeled_goto(target_stmt) {
                         return (stmt.clone(), vec![]);
                     }
-
-                    visiting.insert(target_node);
-                    let (recursed_stmt, mut recursed_nodes) = inline_stmt_recursive_track(
-                        target_stmt, statements, preds, visiting, inline_count + 1,
-                    );
-                    recursed_nodes.push(target_node);
-                    return (recursed_stmt, recursed_nodes);
+                    // Admit only if (depth + target's already-expanded tree depth) stays within MAX_GOTO_INLINE_DEPTH; keeping the goto is always safe.
+                    let target_depth = *depth_of
+                        .entry(target_node)
+                        .or_insert_with(|| stmt_depth(target_stmt));
+                    if depth > 300 && std::env::var("RB2_TRACE").is_ok() {
+                        eprintln!("[rb2] RUNAWAY depth={} target={:x} tdepth={}", depth, target_node, target_depth);
+                    }
+                    if depth + target_depth <= MAX_GOTO_INLINE_DEPTH {
+                        visiting.insert(target_node);
+                        let (recursed_stmt, mut recursed_nodes) = inline_stmt_recursive_track(
+                            target_stmt, statements, preds, visiting, depth + 1, depth_of,
+                        );
+                        recursed_nodes.push(target_node);
+                        return (recursed_stmt, recursed_nodes);
+                    }
                 }
             }
 
             (stmt.clone(), vec![])
         }
-        _ => inline_stmt_recursive_track(stmt, statements, preds, visiting, inline_count),
+        _ => inline_stmt_recursive_track(stmt, statements, preds, visiting, depth, depth_of),
     }
 }
 

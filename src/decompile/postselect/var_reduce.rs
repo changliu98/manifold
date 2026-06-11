@@ -1,5 +1,6 @@
-// Post-emission variable reduction on the final C AST. Two cooperating transformations, run per function as fold -> coalesce -> fold: * single-use temporary folding (`reduce_function`): inline `t = e; use(t)`. * live-range coalescing (`run_coalesce`): merge non-interfering locals into one (identical-type, then relaxed cross-type with cast insertion) and delete identity copies. Interference comes from a backward-liveness lattice over a CFG that models goto/label/break/continue (see CLAUDE.md); every axis is conservative, and an unmodelable CFG bails (no merge).
+// Post-emission variable reduction on the final C AST. Cooperating transformations, run per function as split-init -> fold -> coalesce -> fold -> re-fuse: * initializer splitting (`split_scalar_inits`): turn `T x = const;` into `T x; x = const;` so x is a fold/coalesce candidate; survivors re-fuse afterwards. * single-use temporary folding (`reduce_function`): inline `t = e; use(t)`. * live-range coalescing (`run_coalesce`): merge non-interfering locals into one (identical-type, then relaxed cross-type with cast insertion) and delete identity copies. Interference comes from a bitset-encoded backward-liveness lattice over a CFG that models goto/label/break/continue exactly (see CLAUDE.md); compound assigns / inc-dec are use-then-def; unknown-target jumps (unresolved goto, orphan break/continue) become all-live barrier nodes rather than bailing the function; only the resource bounds still bail (no merge). Always on (behavior gates removed 2026-06-10; resource bounds live in elevator::config). Diagnostic env: MANIFOLD_VR_STATS=1 (per-function stderr stats).
 use std::collections::{HashMap, HashSet};
+use crate::decompile::elevator::config::{COALESCE_GREEDY_CAP, COALESCE_WORK_BOUND};
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::c_pass::helpers::map_expr;
 use crate::decompile::passes::c_pass::types::*;
@@ -403,11 +404,27 @@ fn vars(e: &CExpr) -> Vec<String> {
     v
 }
 
-/// def / uses for a *statement-level* expression. A kill is recorded ONLY for `Var = rhs` (unconditional, whole-variable, plain assignment). Every other shape (compound assign, inc/dec, store through a pointer, conditional assign nested in `?:`/`&&`/`||`) records no kill and treats all operands as uses - over-approximating liveness, which is always safe (it can only block a merge, never enable an unsound one).
+/// Compound assigns and inc/dec are USE-then-DEF (VR-4): the old value is read so the var remains in `uses`, and a new def is recorded so its live range correctly excludes the new value from merging with live-out vars. Non-var LHS and nested assigns are conservatively treated as uses-only (over-approximates liveness; can only block merges, never enable unsound ones).
 fn leaf_def_uses(e: &CExpr) -> (Option<String>, Vec<String>) {
-    if let CExpr::Assign(AssignOp::Assign, lhs, rhs) = e {
+    if let CExpr::Assign(op, lhs, rhs) = e {
         if let CExpr::Var(x) = &**lhs {
-            return (Some(x.clone()), vars(rhs));
+            if *op == AssignOp::Assign {
+                return (Some(x.clone()), vars(rhs));
+            }
+            // compound assign: the var's old value is one of the uses
+            let mut uses = vec![x.clone()];
+            collect_vars(rhs, &mut uses);
+            return (Some(x.clone()), uses);
+        }
+    }
+    if let CExpr::Unary(op, a) = e {
+        if matches!(
+            op,
+            UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::PostInc | UnaryOp::PostDec
+        ) {
+            if let CExpr::Var(x) = &**a {
+                return (Some(x.clone()), vec![x.clone()]);
+            }
         }
     }
     (None, vars(e))
@@ -474,13 +491,14 @@ struct FlowNode {
     uses: Vec<String>,
     copy_src: Option<String>,
     succ: Vec<usize>,
+    /// Unknown-target jump (unresolved goto / orphan break/continue): modeled as all-candidates-live barrier so any possible target is covered without bailing the whole function.
+    barrier: bool,
 }
 
 struct Cfg {
     nodes: Vec<FlowNode>,
     labels: HashMap<String, usize>,
     gotos: Vec<(usize, String)>,
-    ok: bool,
 }
 
 const EXIT: usize = 0;
@@ -489,15 +507,20 @@ impl Cfg {
     fn new() -> Self {
         // node 0 = EXIT sink (no successors).
         Cfg {
-            nodes: vec![FlowNode { def: None, uses: vec![], copy_src: None, succ: vec![] }],
+            nodes: vec![FlowNode {
+                def: None,
+                uses: vec![],
+                copy_src: None,
+                succ: vec![],
+                barrier: false,
+            }],
             labels: HashMap::new(),
             gotos: Vec::new(),
-            ok: true,
         }
     }
 
     fn add(&mut self, def: Option<String>, uses: Vec<String>) -> usize {
-        self.nodes.push(FlowNode { def, uses, copy_src: None, succ: vec![] });
+        self.nodes.push(FlowNode { def, uses, copy_src: None, succ: vec![], barrier: false });
         self.nodes.len() - 1
     }
 
@@ -543,7 +566,7 @@ impl Cfg {
                 let id = self.add(None, vec![]);
                 match brk {
                     Some(t) => self.nodes[id].succ = vec![t],
-                    None => self.ok = false,
+                    None => self.nodes[id].barrier = true, // no enclosing loop/switch: unknown target
                 }
                 id
             }
@@ -551,7 +574,7 @@ impl Cfg {
                 let id = self.add(None, vec![]);
                 match cont {
                     Some(t) => self.nodes[id].succ = vec![t],
-                    None => self.ok = false,
+                    None => self.nodes[id].barrier = true, // no enclosing loop: unknown target
                 }
                 id
             }
@@ -669,13 +692,13 @@ impl Cfg {
         entries
     }
 
-    /// Resolve goto edges; an unresolved target makes the CFG unsafe.
+    /// Resolve goto edges; absent labels become barriers instead of poisoning the whole function.
     fn resolve_gotos(&mut self) {
         let fixups = std::mem::take(&mut self.gotos);
         for (id, label) in fixups {
             match self.labels.get(&label) {
                 Some(&t) => self.nodes[id].succ = vec![t],
-                None => self.ok = false,
+                None => self.nodes[id].barrier = true,
             }
         }
     }
@@ -683,86 +706,147 @@ impl Cfg {
 
 // --------------------------- liveness + interference ---------------------------
 
-/// Build the candidate-only interference relation. Returns `None` if the CFG could not be modeled exactly (caller must not coalesce).
-fn interference(
-    cfg: &Cfg,
-    cand: &HashMap<String, u32>,
-) -> Option<HashSet<(u32, u32)>> {
-    if !cfg.ok {
-        return None;
+#[inline]
+fn bit_set(row: &mut [u64], i: u32) {
+    row[(i / 64) as usize] |= 1u64 << (i % 64);
+}
+
+#[inline]
+fn bit_clear(row: &mut [u64], i: u32) {
+    row[(i / 64) as usize] &= !(1u64 << (i % 64));
+}
+
+/// Symmetric k x k interference bit-matrix over candidate ids (row i = vars interfering with i).
+struct BitMatrix {
+    w: usize, // words per row
+    rows: Vec<u64>,
+}
+
+impl BitMatrix {
+    fn new(k: usize) -> Self {
+        let w = (k + 63) / 64;
+        BitMatrix { w, rows: vec![0u64; k * w] }
     }
+    fn row(&self, i: u32) -> &[u64] {
+        let o = i as usize * self.w;
+        &self.rows[o..o + self.w]
+    }
+    fn set(&mut self, a: u32, b: u32) {
+        let o = a as usize * self.w;
+        bit_set(&mut self.rows[o..o + self.w], b);
+    }
+    fn or_into_row(&mut self, a: u32, bits: &[u64]) {
+        let o = a as usize * self.w;
+        for j in 0..self.w {
+            self.rows[o + j] |= bits[j];
+        }
+    }
+    #[cfg(test)]
+    fn get(&self, a: u32, b: u32) -> bool {
+        self.rows[a as usize * self.w + (b / 64) as usize] >> (b % 64) & 1 == 1
+    }
+}
+
+/// Build the candidate-only interference relation from a backward may-liveness fixpoint. Returns `Err` only on resource bail (work bound / non-convergence); unknown-target jumps use the barrier model instead of bailing.
+fn interference(cfg: &Cfg, cand: &HashMap<String, u32>) -> Result<BitMatrix, &'static str> {
     let n = cfg.nodes.len();
+    let k = cand.len();
     // Work bound: skip liveness on pathologically large functions rather than risk a slow fixpoint. Bailing only forgoes coalescing; it is never unsafe.
-    if n.saturating_mul(cand.len()) > 8_000_000 {
-        return None;
+    if n.saturating_mul(k) > COALESCE_WORK_BOUND {
+        return Err("work-bound");
     }
+    let w = (k + 63) / 64;
     // Pre-filter each node's def/uses/copy_src to candidate ids.
     let id_of = |name: &str| cand.get(name).copied();
     let mut node_def: Vec<Option<u32>> = vec![None; n];
-    let mut node_uses: Vec<Vec<u32>> = vec![Vec::new(); n];
     let mut node_copy: Vec<Option<u32>> = vec![None; n];
+    let mut use_bits: Vec<u64> = vec![0u64; n * w];
+    let all_row: Vec<u64> = {
+        let mut r = vec![0u64; w];
+        for i in 0..k {
+            bit_set(&mut r, i as u32);
+        }
+        r
+    };
     for (i, nd) in cfg.nodes.iter().enumerate() {
+        let row = &mut use_bits[i * w..(i + 1) * w];
+        if nd.barrier {
+            row.copy_from_slice(&all_row); // unknown jump target: everything may be needed
+        } else {
+            for u in &nd.uses {
+                if let Some(id) = id_of(u) {
+                    bit_set(row, id);
+                }
+            }
+        }
         node_def[i] = nd.def.as_ref().and_then(|s| id_of(s));
-        node_uses[i] = nd.uses.iter().filter_map(|u| id_of(u)).collect();
         node_copy[i] = nd.copy_src.as_ref().and_then(|s| id_of(s));
     }
 
     // Backward may-liveness lattice (join = union). Iterate to fixpoint.
-    let mut live_in: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+    let mut live_in: Vec<u64> = vec![0u64; n * w];
+    let mut scratch: Vec<u64> = vec![0u64; w];
     let mut changed = true;
     let mut guard = 0usize;
-    let cap = n.saturating_mul(cand.len()).saturating_add(n).saturating_add(16);
+    let cap = n.saturating_mul(k).saturating_add(n).saturating_add(16);
     while changed {
         changed = false;
         guard += 1;
         if guard > cap + 4 {
-            return None; // non-convergence safety net; never coalesce on doubt
+            return Err("fixpoint"); // non-convergence safety net; never coalesce on doubt
         }
         for i in (0..n).rev() {
             // live_out = union live_in[succ]
-            let mut out: HashSet<u32> = HashSet::new();
+            scratch.fill(0);
             for &s in &cfg.nodes[i].succ {
-                for &v in &live_in[s] {
-                    out.insert(v);
+                let sr = &live_in[s * w..(s + 1) * w];
+                for j in 0..w {
+                    scratch[j] |= sr[j];
                 }
             }
             // live_in = uses union (live_out \ def)
-            let mut new_in = out.clone();
             if let Some(d) = node_def[i] {
-                new_in.remove(&d);
+                bit_clear(&mut scratch, d);
             }
-            for &u in &node_uses[i] {
-                new_in.insert(u);
+            let ur = &use_bits[i * w..(i + 1) * w];
+            for j in 0..w {
+                scratch[j] |= ur[j];
             }
-            if new_in != live_in[i] {
-                live_in[i] = new_in;
+            let cur = &mut live_in[i * w..(i + 1) * w];
+            if scratch[..] != cur[..] {
+                cur.copy_from_slice(&scratch);
                 changed = true;
             }
         }
     }
 
     // Interference: at every def, the defined var conflicts with everything live-out there (except itself and, at a copy `d = src`, the source).
-    let mut interfere: HashSet<(u32, u32)> = HashSet::new();
+    let mut m = BitMatrix::new(k);
     for i in 0..n {
         let Some(d) = node_def[i] else { continue };
-        let copy = node_copy[i];
-        let mut out: HashSet<u32> = HashSet::new();
+        scratch.fill(0);
         for &s in &cfg.nodes[i].succ {
-            for &v in &live_in[s] {
-                out.insert(v);
+            let sr = &live_in[s * w..(s + 1) * w];
+            for j in 0..w {
+                scratch[j] |= sr[j];
             }
         }
-        for &v in &out {
-            if v == d {
-                continue;
+        bit_clear(&mut scratch, d);
+        if let Some(c) = node_copy[i] {
+            bit_clear(&mut scratch, c); // copy-related: d and src may share storage here
+        }
+        m.or_into_row(d, &scratch);
+        // symmetric closure: (v, d) for every v live-out at d's def
+        for j in 0..w {
+            let mut word = scratch[j];
+            while word != 0 {
+                let v = (j as u32) * 64 + word.trailing_zeros();
+                m.set(v, d);
+                word &= word - 1;
             }
-            if copy == Some(v) {
-                continue; // copy-related: d and src may share storage here
-            }
-            interfere.insert(if d < v { (d, v) } else { (v, d) });
         }
     }
-    Some(interfere)
+    Ok(m)
 }
 
 // --------------------------- coalescing ---------------------------
@@ -777,13 +861,24 @@ fn is_scalar(ty: &CType) -> bool {
 struct Uf {
     parent: Vec<u32>,
     members: Vec<Vec<u32>>, // valid only at roots
+    membs: Vec<Vec<u64>>,   // roots: bitset of members
+    neigh: Vec<Vec<u64>>,   // roots: union of the members' interference rows
 }
 
 impl Uf {
-    fn new(k: usize) -> Self {
+    fn new(k: usize, interfere: &BitMatrix) -> Self {
+        let w = (k + 63) / 64;
         Uf {
             parent: (0..k as u32).collect(),
             members: (0..k as u32).map(|i| vec![i]).collect(),
+            membs: (0..k as u32)
+                .map(|i| {
+                    let mut r = vec![0u64; w];
+                    bit_set(&mut r, i);
+                    r
+                })
+                .collect(),
+            neigh: (0..k as u32).map(|i| interfere.row(i).to_vec()).collect(),
         }
     }
     fn find(&mut self, x: u32) -> u32 {
@@ -799,30 +894,33 @@ impl Uf {
         }
         r
     }
-    /// Union iff no member of one class interferes with any member of the other (keeps every class pairwise non-interfering - the soundness invariant). Same-type is guaranteed by the caller.
-    fn try_union(&mut self, a: u32, b: u32, interfere: &HashSet<(u32, u32)>) -> bool {
+    /// Union iff no member of one class interferes with any member of the other. Same-type/eligibility is guaranteed by the caller.
+    fn try_union(&mut self, a: u32, b: u32) -> bool {
         let ra = self.find(a);
         let rb = self.find(b);
         if ra == rb {
             return true;
         }
-        for &x in &self.members[ra as usize] {
-            for &y in &self.members[rb as usize] {
-                let pair = if x < y { (x, y) } else { (y, x) };
-                if interfere.contains(&pair) {
-                    return false;
-                }
-            }
+        let (ru, rv) = (ra as usize, rb as usize);
+        if self.neigh[ru].iter().zip(&self.membs[rv]).any(|(x, y)| x & y != 0) {
+            return false;
         }
-        let moved = std::mem::take(&mut self.members[rb as usize]);
-        self.parent[rb as usize] = ra;
-        self.members[ra as usize].extend(moved);
+        let moved = std::mem::take(&mut self.members[rv]);
+        self.parent[rv] = ra;
+        self.members[ru].extend(moved);
+        let mv = std::mem::take(&mut self.membs[rv]);
+        for (dst, src) in self.membs[ru].iter_mut().zip(&mv) {
+            *dst |= src;
+        }
+        let nv = std::mem::take(&mut self.neigh[rv]);
+        for (dst, src) in self.neigh[ru].iter_mut().zip(&nv) {
+            *dst |= src;
+        }
         true
     }
 }
 
-// Above this candidate count, skip the O(k^2) greedy general merge and keep only copy-related coalescing, to bound cost on pathologically large funcs.
-const GREEDY_CAP: usize = 600;
+// Above COALESCE_GREEDY_CAP, skip O(k^2) greedy pair enumeration and keep only copy-related coalescing; functions this large also tend to hit the COALESCE_WORK_BOUND liveness bail first.
 
 // --------------------------- merge plan + relaxed (cross-type) ---------------------------
 
@@ -868,7 +966,7 @@ impl Plan {
     }
 }
 
-/// Coalesce non-interfering locals (identical-type, then - when `relax` - cross-type with cast insertion) and delete identity copies. Returns the number of locals eliminated.
+/// Coalesce non-interfering locals (identical-type, then relaxed cross-type with cast insertion) and delete identity copies. Returns the number of locals eliminated.
 fn run_coalesce(func: &mut FuncDef) -> usize {
     // Candidates: scalar locals with no initializer whose address is never taken. (Params/globals are not in local_vars; inited locals are skipped so no initialization is ever dropped; address-taken locals are excluded because aliasing breaks the liveness model.)
     let mut addr_taken: HashSet<String> = HashSet::new();
@@ -882,8 +980,6 @@ fn run_coalesce(func: &mut FuncDef) -> usize {
         .collect();
     names.sort();
     names.dedup();
-
-    let relax = std::env::var("MANIFOLD_NO_RELAX_COALESCE").is_err();
 
     let plan: Plan = if names.len() < 2 {
         Plan::empty()
@@ -904,15 +1000,28 @@ fn run_coalesce(func: &mut FuncDef) -> usize {
         let mut cfg = Cfg::new();
         cfg.lower(&norm, EXIT, None, None);
         cfg.resolve_gotos();
-        match interference(&cfg, &cand) {
-            None => Plan::empty(), // unmodelable CFG: never coalesce
-            Some(interfere) => {
+        let (plan, bail) = match interference(&cfg, &cand) {
+            Err(reason) => (Plan::empty(), reason), // resource bail: never coalesce on doubt
+            Ok(interfere) => {
                 // Vars whose every write is a top-level plain `v = rhs` are "simply-defined" - only these may be RELAXED-merged, so the read/write cast rewrite is total and valid.
                 let mut complex: HashSet<String> = HashSet::new();
                 mark_complex_stmt(&func.body, &mut complex);
-                build_plan(&names, &cand, &ty_of, &cfg, &interfere, &complex, relax)
+                (build_plan(&names, &cand, &ty_of, &cfg, &interfere, &complex), "-")
             }
+        };
+        if std::env::var("MANIFOLD_VR_STATS").is_ok() {
+            let barriers = cfg.nodes.iter().filter(|nd| nd.barrier).count();
+            eprintln!(
+                "vr-stats fn={} k={} nodes={} barriers={} bail={} merged={}",
+                func.name,
+                names.len(),
+                cfg.nodes.len(),
+                barriers,
+                bail,
+                plan.rename.len()
+            );
         }
+        plan
     };
 
     // Apply the plan: rename, insert casts for relaxed members, and drop same-class copies (`v = w` where both now share a slot - incl. `x = x;`).
@@ -934,9 +1043,8 @@ fn build_plan(
     cand: &HashMap<String, u32>,
     ty_of: &[CType],
     cfg: &Cfg,
-    interfere: &HashSet<(u32, u32)>,
+    interfere: &BitMatrix,
     complex: &HashSet<String>,
-    relax: bool,
 ) -> Plan {
     // Copy pairs (def, src) get merged first so copies collapse to identity.
     let mut copies: Vec<(u32, u32)> = Vec::new();
@@ -953,42 +1061,69 @@ fn build_plan(
     copies.dedup();
 
     let k = names.len();
-    let mut uf = Uf::new(k);
+    let cap = COALESCE_GREEDY_CAP;
+    let mut uf = Uf::new(k, interfere);
     let same_ty = |a: u32, b: u32| ty_of[a as usize] == ty_of[b as usize];
 
-    // Tier 1: identical-type merges (no casts) - copies first, then greedy.
+    // Tier 1: identical-type merges (no casts) - copies first, then greedy per type bucket.
     for &(d, s) in &copies {
         if same_ty(d, s) {
-            uf.try_union(d, s, interfere);
+            uf.try_union(d, s);
         }
     }
-    if k <= GREEDY_CAP {
-        for a in 0..k as u32 {
-            for b in (a + 1)..k as u32 {
-                if same_ty(a, b) && uf.find(a) != uf.find(b) {
-                    uf.try_union(a, b, interfere);
+    if k <= cap {
+        let mut keys: Vec<&CType> = Vec::new();
+        let mut buckets: Vec<Vec<u32>> = Vec::new();
+        for i in 0..k {
+            match keys.iter().position(|t| **t == ty_of[i]) {
+                Some(p) => buckets[p].push(i as u32),
+                None => {
+                    keys.push(&ty_of[i]);
+                    buckets.push(vec![i as u32]);
+                }
+            }
+        }
+        for bucket in &buckets {
+            for ai in 0..bucket.len() {
+                for bi in (ai + 1)..bucket.len() {
+                    let (a, b) = (bucket[ai], bucket[bi]);
+                    if uf.find(a) != uf.find(b) {
+                        uf.try_union(a, b);
+                    }
                 }
             }
         }
     }
 
     // Tier 2: relaxed cross-type merges (same storage group), only between classes whose every member is simply-defined (so cast insertion is sound).
-    if relax && k <= GREEDY_CAP {
+    if k <= cap {
         let elig: Vec<bool> = names.iter().map(|n| !complex.contains(n)).collect();
+        // Class eligibility is tracked as a per-root AND-over-members flag so a tier-2 union inherits eligibility without rescanning all members.
+        let mut root_elig: Vec<bool> = vec![true; k];
+        for i in 0..k as u32 {
+            let r = uf.find(i);
+            root_elig[r as usize] &= elig[i as usize];
+        }
         let grp: Vec<Grp> = ty_of.iter().map(group_of).collect();
-        for a in 0..k as u32 {
-            for b in (a + 1)..k as u32 {
-                if grp[a as usize] != grp[b as usize] {
-                    continue;
-                }
-                let (ra, rb) = (uf.find(a), uf.find(b));
-                if ra == rb {
-                    continue;
-                }
-                let ea = uf.members[ra as usize].iter().all(|&m| elig[m as usize]);
-                let eb = uf.members[rb as usize].iter().all(|&m| elig[m as usize]);
-                if ea && eb {
-                    uf.try_union(a, b, interfere);
+        let mut gbuckets: [Vec<u32>; 2] = [Vec::new(), Vec::new()];
+        for i in 0..k {
+            let g = match grp[i] {
+                Grp::IntPtr => 0usize,
+                Grp::Float => 1usize,
+            };
+            gbuckets[g].push(i as u32);
+        }
+        for bucket in &gbuckets {
+            for ai in 0..bucket.len() {
+                for bi in (ai + 1)..bucket.len() {
+                    let (a, b) = (bucket[ai], bucket[bi]);
+                    let (ra, rb) = (uf.find(a), uf.find(b));
+                    if ra == rb {
+                        continue;
+                    }
+                    if root_elig[ra as usize] && root_elig[rb as usize] {
+                        uf.try_union(a, b);
+                    }
                 }
             }
         }
@@ -1346,6 +1481,137 @@ fn collect_addr_taken_stmt(s: &CStmt, out: &mut HashSet<String>) {
     });
 }
 
+// --------------------------- initializer splitting (VR-3a) ---------------------------
+
+/// True when the initializer expression is const-pure: no variable reads, no calls/loads/stores/inc-dec; safe to move below other declarations.
+fn const_pure_expr(e: &CExpr) -> bool {
+    let mut ok = true;
+    visit_expr(e, &mut |x| match x {
+        CExpr::Var(_)
+        | CExpr::Call(..)
+        | CExpr::Assign(..)
+        | CExpr::Unary(UnaryOp::Deref, _)
+        | CExpr::Unary(UnaryOp::PreInc, _)
+        | CExpr::Unary(UnaryOp::PreDec, _)
+        | CExpr::Unary(UnaryOp::PostInc, _)
+        | CExpr::Unary(UnaryOp::PostDec, _)
+        | CExpr::MemberPtr(..)
+        | CExpr::Index(..) => ok = false,
+        _ => {}
+    });
+    ok
+}
+
+/// Turn `T x = const;` into `T x;` + a leading body assignment so x becomes a fold/coalesce candidate. Only splits auto, non-const/volatile, scalar, non-address-taken locals whose initializer is const-pure and not read by any remaining (unsplit) initializer. Survivors are re-fused by `refuse_scalar_inits`.
+fn split_scalar_inits(func: &mut FuncDef) -> Vec<String> {
+    let mut addr_taken: HashSet<String> = HashSet::new();
+    collect_addr_taken_stmt(&func.body, &mut addr_taken);
+
+    let splittable = |d: &VarDecl| {
+        d.storage_class == StorageClass::Auto
+            && !d.qualifiers.is_const
+            && !d.qualifiers.is_volatile
+            && is_scalar(&d.ty)
+            && !addr_taken.contains(&d.name)
+            && matches!(&d.init, Some(Initializer::Expr(e)) if const_pure_expr(e))
+    };
+    // A remaining (unsplit) initializer that reads a candidate would observe it before its moved assignment runs, so that candidate must not be split.
+    let mut read_by_remaining: HashSet<String> = HashSet::new();
+    for d in func.local_vars.iter().filter(|d| !splittable(d)) {
+        decl_init_exprs(d, &mut |e| {
+            for v in vars(e) {
+                read_by_remaining.insert(v);
+            }
+        });
+    }
+
+    // A var excluded only by read_by_remaining has a const-pure init (reads nothing), so it cannot extend read_by_remaining; one pass suffices.
+    let mut split: Vec<String> = Vec::new();
+    let mut assigns: Vec<CStmt> = Vec::new();
+    for d in func.local_vars.iter_mut() {
+        if !splittable(d) || read_by_remaining.contains(&d.name) {
+            continue;
+        }
+        let Some(Initializer::Expr(e)) = d.init.clone() else { continue };
+        assigns.push(CStmt::Expr(CExpr::Assign(
+            AssignOp::Assign,
+            Box::new(CExpr::Var(d.name.clone())),
+            Box::new(e),
+        )));
+        split.push(d.name.clone());
+        d.init = None;
+    }
+    if split.is_empty() {
+        return split;
+    }
+    let old = std::mem::replace(&mut func.body, CStmt::Empty);
+    func.body = match old {
+        CStmt::Block(items) => {
+            let mut v: Vec<CBlockItem> = assigns.into_iter().map(CBlockItem::Stmt).collect();
+            v.extend(items);
+            CStmt::Block(v)
+        }
+        CStmt::Sequence(ss) => {
+            let mut v = assigns;
+            v.extend(ss);
+            CStmt::Sequence(v)
+        }
+        other => {
+            let mut v: Vec<CBlockItem> = assigns.into_iter().map(CBlockItem::Stmt).collect();
+            v.push(CBlockItem::Stmt(other));
+            CStmt::Block(v)
+        }
+    };
+    split
+}
+
+/// Re-absorb surviving split assignments back into their declarations (cosmetic inverse of `split_scalar_inits`); only a leading prefix is absorbed in declaration order, so execution order is preserved exactly.
+fn refuse_scalar_inits(func: &mut FuncDef, split: &[String]) {
+    if split.is_empty() {
+        return;
+    }
+    let split_set: HashSet<&str> = split.iter().map(String::as_str).collect();
+    let mut fused: HashSet<String> = HashSet::new();
+    loop {
+        let head_def: Option<(String, CExpr)> = {
+            let head: Option<&CStmt> = match &func.body {
+                CStmt::Block(items) => items.first().and_then(|it| match it {
+                    CBlockItem::Stmt(s) => Some(s),
+                    CBlockItem::Decl(_) => None,
+                }),
+                CStmt::Sequence(ss) => ss.first(),
+                _ => None,
+            };
+            head.and_then(simple_def).and_then(|(v, rhs)| {
+                if split_set.contains(v) && !fused.contains(v) && const_pure_expr(rhs) {
+                    Some((v.to_string(), rhs.clone()))
+                } else {
+                    None
+                }
+            })
+        };
+        let Some((v, rhs)) = head_def else { break };
+        let Some(d) = func
+            .local_vars
+            .iter_mut()
+            .find(|d| d.name == v && d.init.is_none())
+        else {
+            break;
+        };
+        d.init = Some(Initializer::Expr(rhs));
+        fused.insert(v);
+        match &mut func.body {
+            CStmt::Block(items) => {
+                items.remove(0);
+            }
+            CStmt::Sequence(ss) => {
+                ss.remove(0);
+            }
+            _ => unreachable!("head_def only matches Block/Sequence"),
+        }
+    }
+}
+
 pub struct VarReducePass;
 
 impl IRPass for VarReducePass {
@@ -1354,18 +1620,18 @@ impl IRPass for VarReducePass {
     }
 
     fn run(&self, db: &mut DecompileDB) {
-        if std::env::var("MANIFOLD_NO_VARREDUCE").is_ok() {
-            return;
-        }
         let tu = match db.cast_optimized_translation_unit.as_mut() {
             Some(tu) => tu,
             None => return,
         };
-        let coalesce_on = std::env::var("MANIFOLD_NO_COALESCE").is_err();
         let mut total = 0usize;
         let mut merged = 0usize;
+        let mut split_total = 0usize;
         for decl in tu.decls.iter_mut() {
             if let TopLevelDecl::FuncDef(f) = decl {
+                // 0) Split initializers -> fold/coalesce candidates (VR-3a); re-fused at end.
+                let split = split_scalar_inits(f);
+                split_total += split.len();
                 // 1) Fold single-use temporaries first, so coalescing operates on real variables (and its casts don't block any folds). fixpoint so chained temps (t1=*p; t2=t1->f; x=t2) collapse.
                 loop {
                     let n = reduce_function(f);
@@ -1375,9 +1641,7 @@ impl IRPass for VarReducePass {
                     }
                 }
                 // 2) Merge non-interfering locals (live-range coalescing) + drop identity copies.
-                if coalesce_on {
-                    merged += run_coalesce(f);
-                }
+                merged += run_coalesce(f);
                 // 3) Mop up any temporaries coalescing newly made single-use.
                 loop {
                     let n = reduce_function(f);
@@ -1386,12 +1650,15 @@ impl IRPass for VarReducePass {
                         break;
                     }
                 }
+                // 4) Re-fuse surviving split initializers (cosmetic identity inverse of 0).
+                refuse_scalar_inits(f, &split);
             }
         }
         log::info!(
-            "var_reduce: coalesced {} locals, folded {} single-use temporaries",
+            "var_reduce: coalesced {} locals, folded {} single-use temporaries, split {} initializers",
             merged,
-            total
+            total,
+            split_total
         );
     }
 
@@ -1402,5 +1669,291 @@ impl IRPass for VarReducePass {
 
     fn outputs(&self) -> &'static [&'static str] {
         &["cast_optimized_translation_unit"]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lv(n: &str) -> VarDecl {
+        VarDecl::new(n, CType::long())
+    }
+
+    fn assign(v: &str, e: CExpr) -> CStmt {
+        CStmt::Expr(CExpr::Assign(
+            AssignOp::Assign,
+            Box::new(CExpr::var(v)),
+            Box::new(e),
+        ))
+    }
+
+    fn callstmt(f: &str, arg: CExpr) -> CStmt {
+        CStmt::Expr(CExpr::call(CExpr::var(f), vec![arg]))
+    }
+
+    fn add(a: CExpr, b: CExpr) -> CExpr {
+        CExpr::Binary(BinaryOp::Add, Box::new(a), Box::new(b))
+    }
+
+    fn fd(locals: Vec<VarDecl>, body: Vec<CStmt>) -> FuncDef {
+        FuncDef {
+            name: "t".into(),
+            return_type: CType::long(),
+            params: vec![],
+            is_variadic: false,
+            storage_class: StorageClass::Auto,
+            body: CStmt::Block(body.into_iter().map(CBlockItem::Stmt).collect()),
+            local_vars: locals,
+            loc: SourceLoc::unknown(),
+        }
+    }
+
+    /// Mirror of VarReducePass::run for a single function.
+    fn run_all(f: &mut FuncDef) -> usize {
+        let split = split_scalar_inits(f);
+        while reduce_function(f) > 0 {}
+        let merged = run_coalesce(f);
+        while reduce_function(f) > 0 {}
+        refuse_scalar_inits(f, &split);
+        merged
+    }
+
+    // ---- VR-4: compound assign / inc-dec are USE-then-DEF ----
+
+    #[test]
+    fn vr4_leaf_def_uses_shapes() {
+        // x += 1  -> def x, uses contain x
+        let (d, u) = leaf_def_uses(&CExpr::Assign(
+            AssignOp::AddAssign,
+            Box::new(CExpr::var("x")),
+            Box::new(CExpr::int(1)),
+        ));
+        assert_eq!(d.as_deref(), Some("x"));
+        assert!(u.iter().any(|v| v == "x"));
+        // x++  -> def x, uses [x]
+        let (d, u) = leaf_def_uses(&CExpr::Unary(UnaryOp::PostInc, Box::new(CExpr::var("x"))));
+        assert_eq!(d.as_deref(), Some("x"));
+        assert_eq!(u, vec!["x".to_string()]);
+        // *p += 1  -> no var def, p used
+        let (d, u) = leaf_def_uses(&CExpr::Assign(
+            AssignOp::AddAssign,
+            Box::new(CExpr::deref(CExpr::var("p"))),
+            Box::new(CExpr::int(1)),
+        ));
+        assert_eq!(d, None);
+        assert!(u.iter().any(|v| v == "p"));
+    }
+
+    #[test]
+    fn vr4_incdec_def_blocks_uninit_merge() {
+        // a++; b++: each ++ is a USE-then-DEF so the other var is live-out at each def -> a/b interfere and must not merge.
+        let mut f = fd(
+            vec![lv("a"), lv("b")],
+            vec![
+                CStmt::Expr(CExpr::Unary(UnaryOp::PostInc, Box::new(CExpr::var("a")))),
+                CStmt::Expr(CExpr::Unary(UnaryOp::PostInc, Box::new(CExpr::var("b")))),
+                CStmt::Return(Some(add(CExpr::var("a"), CExpr::var("b")))),
+            ],
+        );
+        let merged = run_all(&mut f);
+        assert_eq!(merged, 0);
+        assert_eq!(f.local_vars.len(), 2);
+    }
+
+    // ---- VR-3b: unknown-target jumps are barriers, not whole-function bails ----
+
+    #[test]
+    fn orphan_continue_is_barrier_not_bail() {
+        // Orphan continue is a barrier; a and b defs are downstream so they still coalesce (old code bailed the whole function).
+        let mut f = fd(
+            vec![lv("a"), lv("b")],
+            vec![
+                CStmt::If(
+                    CExpr::int(1),
+                    Box::new(CStmt::Continue),
+                    None,
+                ),
+                assign("a", CExpr::int(1)),
+                callstmt("f", CExpr::var("a")),
+                callstmt("f", CExpr::var("a")),
+                assign("b", CExpr::int(2)),
+                callstmt("g", CExpr::var("b")),
+                CStmt::Return(Some(CExpr::var("b"))),
+            ],
+        );
+        let merged = run_all(&mut f);
+        assert_eq!(merged, 1);
+        assert_eq!(f.local_vars.len(), 1);
+    }
+
+    #[test]
+    fn unresolved_goto_is_barrier_not_bail() {
+        let mut f = fd(
+            vec![lv("a"), lv("b")],
+            vec![
+                CStmt::If(
+                    CExpr::int(1),
+                    Box::new(CStmt::Goto("L_nowhere".into())),
+                    None,
+                ),
+                assign("a", CExpr::int(1)),
+                callstmt("f", CExpr::var("a")),
+                callstmt("f", CExpr::var("a")),
+                assign("b", CExpr::int(2)),
+                callstmt("g", CExpr::var("b")),
+                CStmt::Return(Some(CExpr::var("b"))),
+            ],
+        );
+        let merged = run_all(&mut f);
+        assert_eq!(merged, 1);
+        assert_eq!(f.local_vars.len(), 1);
+    }
+
+    #[test]
+    fn barrier_keeps_upstream_defs_apart() {
+        // a's def is upstream of the barrier; barrier makes b live-out at a's def, so they interfere and must not merge.
+        let mut f = fd(
+            vec![lv("a"), lv("b")],
+            vec![
+                assign("a", CExpr::int(1)),
+                callstmt("f", CExpr::var("a")),
+                callstmt("f", CExpr::var("a")),
+                CStmt::If(CExpr::int(1), Box::new(CStmt::Continue), None),
+                assign("b", CExpr::int(2)),
+                callstmt("g", CExpr::var("b")),
+                CStmt::Return(Some(CExpr::var("b"))),
+            ],
+        );
+        let merged = run_all(&mut f);
+        assert_eq!(merged, 0);
+        assert_eq!(f.local_vars.len(), 2);
+    }
+
+    // ---- goto-cycle (post-CF-4 flat loop): loop-carried vars must not merge ----
+
+    #[test]
+    fn goto_cycle_loop_carried_not_merged() {
+        // b is live around the back edge at a's def -> (a,b) interfere; the b=a copy exemption applies only at the copy node and must not unlock the merge.
+        let mut f = fd(
+            vec![lv("a"), lv("b")],
+            vec![
+                CStmt::Labeled(
+                    Label::Named("top".into()),
+                    Box::new(assign("b", CExpr::var("a"))),
+                ),
+                assign("a", add(CExpr::var("a"), CExpr::int(1))),
+                CStmt::If(
+                    CExpr::Binary(
+                        BinaryOp::Lt,
+                        Box::new(CExpr::var("a")),
+                        Box::new(CExpr::int(10)),
+                    ),
+                    Box::new(CStmt::Goto("top".into())),
+                    None,
+                ),
+                CStmt::Return(Some(CExpr::var("b"))),
+            ],
+        );
+        let merged = run_all(&mut f);
+        assert_eq!(merged, 0);
+        assert_eq!(f.local_vars.len(), 2);
+    }
+
+    #[test]
+    fn interference_is_symmetric() {
+        // a = 1; b = 2; return a + b;  -> exactly the pair (a,b), set both ways.
+        let body = CStmt::Block(
+            vec![
+                assign("a", CExpr::int(1)),
+                assign("b", CExpr::int(2)),
+                CStmt::Return(Some(add(CExpr::var("a"), CExpr::var("b")))),
+            ]
+            .into_iter()
+            .map(CBlockItem::Stmt)
+            .collect(),
+        );
+        let mut cfg = Cfg::new();
+        cfg.lower(&normalize(&body), EXIT, None, None);
+        cfg.resolve_gotos();
+        let mut cand = HashMap::new();
+        cand.insert("a".to_string(), 0u32);
+        cand.insert("b".to_string(), 1u32);
+        let m = interference(&cfg, &cand).expect("no resource bail");
+        assert!(m.get(0, 1));
+        assert!(m.get(1, 0));
+    }
+
+    // ---- VR-3a: initializer splitting ----
+
+    #[test]
+    fn split_zero_init_coalesces_disjoint() {
+        // a's initializer previously blocked coalescing; after splitting, a and b have disjoint ranges and merge; surviving rep re-fuses `= 0`.
+        let mut f = fd(
+            vec![
+                lv("a").with_init(Initializer::Expr(CExpr::int(0))),
+                lv("b"),
+            ],
+            vec![
+                callstmt("f", CExpr::var("a")),
+                callstmt("f", CExpr::var("a")),
+                assign("b", CExpr::int(2)),
+                callstmt("g", CExpr::var("b")),
+                CStmt::Return(Some(CExpr::var("b"))),
+            ],
+        );
+        let merged = run_all(&mut f);
+        assert_eq!(merged, 1);
+        assert_eq!(f.local_vars.len(), 1);
+        assert_eq!(f.local_vars[0].name, "a");
+        assert!(f.local_vars[0].init.is_some(), "surviving rep re-fuses = 0");
+        // the split assignment was absorbed back into the declaration
+        if let CStmt::Block(items) = &f.body {
+            assert!(matches!(
+                items.first(),
+                Some(CBlockItem::Stmt(CStmt::Expr(CExpr::Call(..))))
+            ));
+        } else {
+            panic!("body should still be a block");
+        }
+    }
+
+    #[test]
+    fn split_refuse_is_identity_when_nothing_merges() {
+        // a and b interfere; nothing folds; split + refuse must be a no-op.
+        let mut f = fd(
+            vec![
+                lv("a").with_init(Initializer::Expr(CExpr::int(0))),
+                lv("b"),
+            ],
+            vec![
+                assign("b", add(CExpr::var("a"), CExpr::int(1))),
+                callstmt("g", CExpr::var("b")),
+                CStmt::Return(Some(add(CExpr::var("a"), CExpr::var("b")))),
+            ],
+        );
+        let orig = f.clone();
+        let merged = run_all(&mut f);
+        assert_eq!(merged, 0);
+        assert_eq!(f, orig, "split followed by refuse must be the identity");
+    }
+
+    #[test]
+    fn static_and_const_inits_not_split() {
+        let mut f = fd(
+            vec![
+                lv("s")
+                    .with_init(Initializer::Expr(CExpr::int(0)))
+                    .with_storage(StorageClass::Static),
+                VarDecl {
+                    qualifiers: TypeQualifiers { is_const: true, ..TypeQualifiers::none() },
+                    ..lv("c").with_init(Initializer::Expr(CExpr::int(0)))
+                },
+            ],
+            vec![CStmt::Return(Some(add(CExpr::var("s"), CExpr::var("c"))))],
+        );
+        let split = split_scalar_inits(&mut f);
+        assert!(split.is_empty());
+        assert!(f.local_vars.iter().all(|d| d.init.is_some()));
     }
 }

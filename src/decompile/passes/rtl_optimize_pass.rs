@@ -730,7 +730,7 @@ pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
     let rebuild_args = |node: Node| -> Option<Arc<Vec<RTLReg>>> {
         let mut pairs = args_by_call.get(&node)?.clone();
         pairs.sort_by_key(|(pos, _)| *pos);
-        // Scatter by position into a dense vector padded with DEFAULT_VAR so a dropped leading arg leaves a sentinel hole rather than left-shifting later args into its slot (Args is purely positional); contiguous positions 0..N overwrite every slot.
+        // Scatter by position (sentinel DEFAULT_VAR for holes so dropped leading args don't left-shift later ones); len = max_pos+1 is safe because pos <= 5 (6-entry ARG_REGS, rtl_pass.rs).
         let len = pairs.last().map(|(pos, _)| *pos + 1).unwrap_or(0);
         let mut args: Vec<RTLReg> = vec![crate::util::DEFAULT_VAR as RTLReg; len];
         for (pos, reg) in pairs {
@@ -928,16 +928,21 @@ impl PassContext {
                 }
             }
         }
+        // Per reg, keep the max-(refine_priority, type) candidate via fold-during-insert (avoids intermediate Vec; key embeds type so equal-key ties are identical values, making the winner iteration-order-independent).
         let var_types: HashMap<RTLReg, XType> = {
-            let mut groups: HashMap<RTLReg, Vec<XType>> = HashMap::new();
+            let key = |ty: &XType| (crate::decompile::passes::clight_pass::xtype_refine_priority(ty), *ty);
+            let mut chosen: HashMap<RTLReg, XType> = HashMap::new();
             for (reg, xty) in db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate") {
-                groups.entry(*reg).or_default().push(*xty);
+                chosen
+                    .entry(*reg)
+                    .and_modify(|cur| {
+                        if key(xty) > key(cur) {
+                            *cur = *xty;
+                        }
+                    })
+                    .or_insert(*xty);
             }
-            groups.into_iter().map(|(reg, mut tys)| {
-                tys.sort_by_key(|ty| (crate::decompile::passes::clight_pass::xtype_refine_priority(ty), *ty));
-                let chosen = *tys.last().unwrap();
-                (reg, chosen)
-            }).collect()
+            chosen
         };
 
         let node_to_func: HashMap<Node, Address> = {
@@ -979,9 +984,14 @@ impl PassContext {
         let mut func_insts: HashMap<Address, BTreeMap<Node, RTLInst>> = HashMap::new();
         for (func, node_candidates) in func_node_candidates {
             let insts = func_insts.entry(func).or_default();
+            // INVARIANT: entries in func_node_candidates are created only via push, so each Vec has >= 1 element; malformed input changes which candidates appear, never empties an existing list.
             for (node, candidates) in node_candidates {
                 if candidates.len() == 1 {
-                    insts.insert(node, candidates.into_iter().next().unwrap());
+                    let only = candidates
+                        .into_iter()
+                        .next()
+                        .expect("len()==1 guard: single candidate present");
+                    insts.insert(node, only);
                 } else {
                     let mut candidates = candidates;
                     candidates.sort_by_cached_key(|inst| format!("{:?}", inst));
@@ -1000,7 +1010,7 @@ impl PassContext {
                         };
                         let is_cond = matches!(inst, RTLInst::Icond(..));
                         (is_cond, score + arg_bonus)
-                    }).unwrap();
+                    }).expect("non-empty by construction: func_node_candidates entries are created by push (see invariant above)");
                     insts.insert(node, best);
                 }
             }
@@ -1436,12 +1446,16 @@ fn const_eq_branch_taken(cond: &Condition) -> Option<bool> {
 
 // Constant-fold a two-register conditional branch whose operands provably hold the SAME value, then drop the now-unreachable nodes: CRT stubs (deregister_tm_clones) compare two LEAs of the same global with `je`, so the statically-taken branch leaves the fall-through tail (and its undefined-return-value load) dead. Operands are equal only when the same register or both the identical 0-arg constant (`single_def_const`, e.g. same Oaddrsymbol), never firing for genuine runtime compares. Returns true if a branch was folded.
 fn fold_static_eq_branches(func: &mut FunctionCFG) -> bool {
+    // single_def_const, enforced: a register counts as a known constant ONLY when that constant op is its sole def in the function. Without the def-count guard, a reg with several defs (constant + runtime value, or two different constants, with map iteration keeping an arbitrary one) satisfies same_value through a def that may not be the one reaching the compare, folding a genuinely runtime branch - whose pruned tail can then e.g. mis-void the function by deleting its only return-value def.
+    let du = DefUseInfo::build(func);
     let mut const_of: HashMap<RTLReg, Constant> = HashMap::new();
     for inst in func.inst.values() {
         if let RTLInst::Iop(op, args, dst) = inst {
             if args.is_empty() {
                 if let Some(cst) = crate::decompile::passes::cminor_pass::constant_from_operation(op) {
-                    const_of.insert(*dst, cst);
+                    if du.defs.get(dst).is_some_and(|d| d.len() == 1) {
+                        const_of.insert(*dst, cst);
+                    }
                 }
             }
         }

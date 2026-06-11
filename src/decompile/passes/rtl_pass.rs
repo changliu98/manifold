@@ -30,6 +30,26 @@ fn dom_set_with_self(strict: &Set<Address>, n: Address) -> Set<Address> {
     Set(s)
 }
 
+// ABI-1 (3.2e): MOVSX/MOVSXD/MOVZX -> MemoryChunk; returns None for non-extending mnemonics so plain MOV (which also covers callee-save reloads) never fires; (unsigned, 4) rejected because 32-bit writes zero-extend implicitly.
+fn extending_load_chunk(mnem: &str, size: usize) -> Option<MemoryChunk> {
+    let m = mnem.to_ascii_uppercase();
+    let signed = if m == "MOVZX" {
+        false
+    } else if m == "MOVSX" || m == "MOVSXD" {
+        true
+    } else {
+        return None;
+    };
+    match (signed, size) {
+        (true, 4) => Some(MemoryChunk::MInt32),
+        (true, 2) => Some(MemoryChunk::MInt16Signed),
+        (true, 1) => Some(MemoryChunk::MInt8Signed),
+        (false, 2) => Some(MemoryChunk::MInt16Unsigned),
+        (false, 1) => Some(MemoryChunk::MInt8Unsigned),
+        _ => None,
+    }
+}
+
 ascent_par! {
     #![measure_rule_times]
 
@@ -37,7 +57,11 @@ ascent_par! {
     pub struct RTLPassProgram;
 
     relation arch_bit(i64);
+    // RSP adjustments from disassembly; drives sp_entry_ofs to anchor raw SP displacements to the function-entry frame (ABI-1/3.2e).
+    relation adjusts_stack(Address, Symbol, i64);
     relation arg_constrained_as_ptr(Node, RTLReg);
+    // RSP<->RBP register moves from disassembly; drives func_sets_frame_pointer for BP-relative stack-param rules.
+    relation stack_base_move(Address, Symbol, Symbol);
     relation block_in_function(Node, Address);
     relation call_arg_struct_ptr(Node, usize, usize);
     relation emit_clight_stmt(Address, Node, ClightStmt);
@@ -108,6 +132,10 @@ ascent_par! {
     relation pjcc(Address, TestCond, Symbol);
     relation plabel(Address, Symbol);
     relation plea(Address, Symbol, Symbol);
+    // 3.8 R3 inputs (asm_pass exports, swapped in by name): MOV operand rows + the asm-side RIP/global resolution, needed to lower the plain RIP-relative immediate global store which has NO mach/ltl route (asm's mach_imm_indirect_store excludes RIP and the Mstore(Aglobal) rules need a register source).
+    relation pmov(Address, Symbol, Symbol);
+    relation rip_target_addr(Address, Address);
+    relation resolved_addr_to_symbol(Address, Ident, i64);
     relation psub(Address, Symbol, Symbol);
     relation reg_def(Address, Mreg);
     relation reg_def_used(Address, Mreg, Address);
@@ -811,7 +839,7 @@ ascent_par! {
     
     rtl_inst_candidate(synthetic_addr, istore_inst) <--
         mach_imm_indirect_store(addr, _imm_val, typ, base_mreg, disp),
-        reg_xtl(addr, *base_mreg, base_rtl),
+        reg_rtl(addr, *base_mreg, base_rtl),
         let fresh_reg = fresh_xtl_reg(*addr, Mreg::DI),
         let synthetic_addr = *addr | (1u64 << 62),
         let mc = match typ {
@@ -837,6 +865,64 @@ ascent_par! {
         instr_in_function(addr, func_start),
         let synthetic_addr = *addr | (1u64 << 62),
         next(addr, next);
+
+    // 3.8 R3: RIP-relative immediate global store had no lifting route (mach_imm_indirect_store excludes RIP; Mstore(Aglobal) needs a register source); detect from asm operand rows + RIP resolution and lower ident-keyed: Ointconst at addr, Istore(Aglobal) at synthetic successor. The absolute-addressed DI-pair form (extinct on modern compilers) should fold here when it resurfaces.
+    #[local] relation mach_imm_global_store(Address, i64, MemoryChunk, Ident, i64);
+    mach_imm_global_store(*addr, imm_int, mc, *ident, *ofs) <--
+        pmov(addr, dst, src),
+        op_immediate(src, imm_sym, _),
+        op_indirect(dst, _, base_str, idx_str, _, _, sz),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if is_rip(base_str),
+        rip_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, ofs),
+        let imm_int = *imm_sym as i64,
+        let mc = match *sz {
+            1 => MemoryChunk::MInt8Unsigned,
+            2 => MemoryChunk::MInt16Unsigned,
+            8 => MemoryChunk::MInt64,
+            _ => MemoryChunk::MInt32,
+        };
+
+    rtl_inst_candidate(addr, iop_inst) <--
+        mach_imm_global_store(addr, imm_val, mc, _ident, _ofs),
+        !has_ltl_op(addr),
+        let fresh_reg = fresh_xtl_reg(*addr, Mreg::DI),
+        let op = if matches!(mc, MemoryChunk::MInt64) {
+            Operation::Olongconst(*imm_val)
+        } else {
+            Operation::Ointconst(*imm_val)
+        },
+        let iop_inst = RTLInst::Iop(op, Arc::new(vec![]), fresh_reg);
+
+    rtl_inst_candidate(synthetic_addr, istore_inst) <--
+        mach_imm_global_store(addr, _imm_val, mc, ident, ofs),
+        !has_ltl_op(addr),
+        let fresh_reg = fresh_xtl_reg(*addr, Mreg::DI),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let istore_inst = RTLInst::Istore(*mc, Addressing::Aglobal(*ident, *ofs), Arc::new(vec![]), fresh_reg);
+
+    rtl_edge_negated(addr, next) <--
+        mach_imm_global_store(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synthetic_addr), instr_in_function(addr, func_start) <--
+        mach_imm_global_store(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synthetic_addr, next), instr_in_function(synthetic_addr, func_start) <--
+        mach_imm_global_store(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62),
+        next(addr, next);
+
+    synth_only_addr(addr) <--
+        mach_imm_global_store(addr, _, _, _, _),
+        !has_ltl_op(addr);
 
     // reg_xtl for arith addresses: chains from the reg_def_used def site when no real ltl op exists. For loads that overwrite their base reg, propagate only def_id; otherwise use_id leaks past, canonicalizer merges I/O into one RTL reg, and copy_propagation/dead_store wipes the whole load chain (including struct field accesses).
     reg_xtl(*addr, *base_mreg, arg_id) <--
@@ -929,11 +1015,41 @@ ascent_par! {
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *src_mreg, arg_id);
 
-    // arith_load_op: memory-source arithmetic (e.g. add [mem], reg); only fires without a real ltl op. BP-relative loads (local-variable arithmetic like `add -12(%rbp), %eax`) bind the load result to the same stack_rtl that Lsetstack/mach_imm_stack_init write to; otherwise the loaded value is a fresh RTEMP that copy-prop/dead-store eliminates while the matching store flows independently, blanking the loop body.
+    // 3.8 R1: reg_xtl chains for FUSED float ops (float_load_op), mirroring the arith chains above. Without these the fused op's register operands never join the def-use web: the addressing regs (float_load_arg) stayed fresh/undefined and a param-fed `addsd k(%rip),%xmm0` read an unbound register. The synthetic entry edge reg_def_used(func_start, Xk, addr) (float_param_reg_used_early) makes a still-live float param's id chain in directly.
+    reg_xtl(*addr, *m, arg_id) <--
+        float_load_arg(addr, _, m),
+        reg_def_used(defaddr, *m, *addr),
+        !load_overwrites_base(defaddr, m),
+        reg_xtl(defaddr, *m, arg_id);
+
+    reg_xtl(*addr, *m, arg_id) <--
+        float_load_arg(addr, _, m),
+        reg_def_used(defaddr, *m, *addr),
+        load_overwrites_base(defaddr, m),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *m, arg_id);
+
+    // Binary (RMW) form only: dst is read+written (`dst = dst OP loaded`); the unary conversion form writes a fresh dst and must not chain prior values in.
+    reg_xtl(*addr, *dst_mreg, arg_id) <--
+        float_load_op(addr, _, _, _, _, dst_mreg, false),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *dst_mreg, *addr),
+        !load_overwrites_base(defaddr, dst_mreg),
+        reg_xtl(defaddr, *dst_mreg, arg_id);
+
+    reg_xtl(*addr, *dst_mreg, arg_id) <--
+        float_load_op(addr, _, _, _, _, dst_mreg, false),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *dst_mreg, *addr),
+        load_overwrites_base(defaddr, dst_mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *dst_mreg, arg_id);
+
+    // arith_load_op: BP-relative memory-source arithmetic binds to stack_rtl so the in-place update threads to later reads; otherwise copy-prop/DSE eliminates the disconnected RTEMP and blanks the loop body. Fused-op builders use reg_rtl (canonicalized), not raw reg_xtl, so entry params (whose alias never is the raw min id) resolve correctly instead of becoming fabricated `var = 0` locals.
     rtl_inst_candidate(addr, load_inst) <--
         arith_load_op(addr, _op, chunk, base_mreg, disp, _dst_mreg),
         !has_ltl_op(addr),
-        reg_xtl(addr, *base_mreg, base_rtl),
+        reg_rtl(addr, *base_mreg, base_rtl),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
         if *base_mreg == Mreg::BP,
@@ -942,14 +1058,81 @@ ascent_par! {
     rtl_inst_candidate(synthetic_addr, op_inst) <--
         arith_load_op(addr, op, _chunk, base_mreg, disp, dst_mreg),
         !has_ltl_op(addr),
-        reg_xtl(addr, *dst_mreg, dst_rtl),
+        reg_rtl(addr, *dst_mreg, dst_rtl),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
         if *base_mreg == Mreg::BP,
         let synthetic_addr = *addr | (1u64 << 62),
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, *stack_rtl]), *dst_rtl);
 
-    // Fallback (non-BP base or BP without matching stack_var): use a fresh RTEMP, same as before.
+    // ABI-1: the per-function rank of an incoming-stack-arg offset (ascending offset = ascending SysV position), matching the index the signature side uses when it allocates fresh_stack_param_reg for positions 6+. Tiny per-function sets, not a pairwise blowup.
+    #[local] relation stack_param_lower(Address, i64, i64);
+    stack_param_lower(func, ofs, o2) <--
+        stack_passed_param(func, ofs),
+        stack_passed_param(func, o2),
+        if *o2 < *ofs;
+    #[local] relation stack_param_idx(Address, i64, usize);
+    stack_param_idx(func, ofs, idx) <--
+        stack_passed_param(func, ofs),
+        agg idx = ascent::aggregators::count() in stack_param_lower(func, ofs, _);
+
+    // ABI-1: memory-source arithmetic reading an INCOMING stack argument binds the loaded value to the function's synthetic stack-param reg - the same reg the signature allocates for position 6+idx - so the body references pN. Previously these fell to the fresh-RTEMP fallback and the 7th+ argument's dataflow disconnected entirely (8-arg test: the +g+h tail of a sum chain became an uninitialized fabricated local).
+    #[local] relation arith_load_uses_stack_param(Node);
+    arith_load_uses_stack_param(addr) <--
+        arith_load_op(addr, _, _, base_mreg, disp, _),
+        !has_ltl_op(addr),
+        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
+        instr_in_function(addr, func_start),
+        stack_param_idx(func_start, disp, _);
+
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        arith_load_op(addr, op, _chunk, base_mreg, disp, dst_mreg),
+        !has_ltl_op(addr),
+        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
+        reg_rtl(addr, *dst_mreg, dst_rtl),
+        instr_in_function(addr, func_start),
+        stack_param_idx(func_start, disp, idx),
+        !arith_load_uses_stack_var(addr),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, param_reg]), *dst_rtl);
+
+    // TR-5: the load's memory chunk supplies TYPE evidence for stack-passed positions, which previously had no evidence path at all and defaulted to Xany64 in prototypes (the int_pos register caps are correct - only 6 int arg regs exist - but positions 6+ never received types).
+    emit_function_param_type_candidate(func_start, param_reg, xt) <--
+        arith_load_op(addr, _, chunk, base_mreg, disp, _),
+        !has_ltl_op(addr),
+        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
+        instr_in_function(addr, func_start),
+        stack_param_idx(func_start, disp, idx),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let xt = match chunk {
+            MemoryChunk::MInt32 => XType::Xint,
+            MemoryChunk::MInt64 => XType::Xlong,
+            MemoryChunk::MFloat64 => XType::Xfloat,
+            MemoryChunk::MFloat32 => XType::Xsingle,
+            MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned
+            | MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => XType::Xint,
+            _ => XType::Xany64,
+        };
+
+    emit_function_param_type_candidate(func_start, param_reg, xt) <--
+        ltl_inst(addr, ?LTLInst::Lload(chunk, Addressing::Aindexed(disp), args, _)),
+        for base in args.iter(),
+        if *base == Mreg::BP || *base == Mreg::SP,
+        instr_in_function(addr, func_start),
+        stack_param_idx(func_start, disp, idx),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let xt = match chunk {
+            MemoryChunk::MInt32 => XType::Xint,
+            MemoryChunk::MInt64 => XType::Xlong,
+            MemoryChunk::MFloat64 => XType::Xfloat,
+            MemoryChunk::MFloat32 => XType::Xsingle,
+            MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned
+            | MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => XType::Xint,
+            _ => XType::Xany64,
+        };
+
+    // Fallback (non-BP base or BP without matching stack_var/stack-param): use a fresh RTEMP, same as before.
     #[local] relation arith_load_uses_stack_var(Node);
     arith_load_uses_stack_var(addr) <--
         arith_load_op(addr, _, _, base_mreg, disp, _),
@@ -961,16 +1144,18 @@ ascent_par! {
     rtl_inst_candidate(addr, load_inst) <--
         arith_load_op(addr, _op, chunk, base_mreg, disp, _dst_mreg),
         !has_ltl_op(addr),
-        reg_xtl(addr, *base_mreg, base_rtl),
+        reg_rtl(addr, *base_mreg, base_rtl),
         !arith_load_uses_stack_var(addr),
+        !arith_load_uses_stack_param(addr),
         let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp);
 
     rtl_inst_candidate(synthetic_addr, op_inst) <--
         arith_load_op(addr, op, _chunk, _base_mreg, _disp, dst_mreg),
         !has_ltl_op(addr),
-        reg_xtl(addr, *dst_mreg, dst_rtl),
+        reg_rtl(addr, *dst_mreg, dst_rtl),
         !arith_load_uses_stack_var(addr),
+        !arith_load_uses_stack_param(addr),
         let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
         let synthetic_addr = *addr | (1u64 << 62),
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, temp]), *dst_rtl);
@@ -1003,7 +1188,7 @@ ascent_par! {
     #[local] relation float_load_arg_rtl(Node, usize, RTLReg);
     float_load_arg_rtl(addr, pos, rtl) <--
         float_load_arg(addr, pos, m),
-        reg_xtl(addr, *m, rtl);
+        reg_rtl(addr, *m, rtl);
 
     #[local] relation float_load_args_collected(Node, Arc<Vec<RTLReg>>);
     float_load_args_collected(addr, args) <--
@@ -1026,7 +1211,7 @@ ascent_par! {
     rtl_inst_candidate(synthetic_addr, op_inst) <--
         float_load_op(addr, op, _, _, _, dst, false),
         !has_ltl_op(addr),
-        reg_xtl(addr, *dst, dst_rtl),
+        reg_rtl(addr, *dst, dst_rtl),
         let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
         let synthetic_addr = *addr | (1u64 << 62),
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, temp]), *dst_rtl);
@@ -1035,7 +1220,7 @@ ascent_par! {
     rtl_inst_candidate(synthetic_addr, op_inst) <--
         float_load_op(addr, op, _, _, _, dst, true),
         !has_ltl_op(addr),
-        reg_xtl(addr, *dst, dst_rtl),
+        reg_rtl(addr, *dst, dst_rtl),
         let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
         let synthetic_addr = *addr | (1u64 << 62),
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![temp]), *dst_rtl);
@@ -1082,7 +1267,7 @@ ascent_par! {
     rtl_inst_candidate(addr, op_inst) <--
         arith_store_reg(addr, op, _chunk, base_mreg, disp, src_mreg),
         !has_ltl_op(addr),
-        reg_xtl(addr, *src_mreg, src_rtl),
+        reg_rtl(addr, *src_mreg, src_rtl),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
         if *base_mreg == Mreg::BP,
@@ -1091,7 +1276,7 @@ ascent_par! {
     rtl_inst_candidate(addr, load_inst) <--
         arith_store_reg(addr, _op, chunk, base_mreg, disp, _src_mreg),
         !has_ltl_op(addr),
-        reg_xtl(addr, *base_mreg, base_rtl),
+        reg_rtl(addr, *base_mreg, base_rtl),
         !arith_store_reg_uses_stack_var(addr),
         let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp);
@@ -1099,7 +1284,7 @@ ascent_par! {
     rtl_inst_candidate(synth1, op_inst) <--
         arith_store_reg(addr, op, _chunk, _base_mreg, _disp, src_mreg),
         !has_ltl_op(addr),
-        reg_xtl(addr, *src_mreg, src_rtl),
+        reg_rtl(addr, *src_mreg, src_rtl),
         !arith_store_reg_uses_stack_var(addr),
         let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
         let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::from("RTEMP")),
@@ -1109,7 +1294,7 @@ ascent_par! {
     rtl_inst_candidate(synth2, store_inst) <--
         arith_store_reg(addr, _op, chunk, base_mreg, disp, _src_mreg),
         !has_ltl_op(addr),
-        reg_xtl(addr, *base_mreg, base_rtl),
+        reg_rtl(addr, *base_mreg, base_rtl),
         !arith_store_reg_uses_stack_var(addr),
         let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::from("RTEMP")),
         let synth2 = *addr | (1u64 << 63),
@@ -1176,7 +1361,7 @@ ascent_par! {
     rtl_inst_candidate(addr, load_inst) <--
         arith_store_imm(addr, _op, chunk, base_mreg, disp),
         !has_ltl_op(addr),
-        reg_xtl(addr, *base_mreg, base_rtl),
+        reg_rtl(addr, *base_mreg, base_rtl),
         !arith_store_imm_uses_stack_var(addr),
         let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp);
@@ -1193,7 +1378,7 @@ ascent_par! {
     rtl_inst_candidate(synth2, store_inst) <--
         arith_store_imm(addr, _op, chunk, base_mreg, disp),
         !has_ltl_op(addr),
-        reg_xtl(addr, *base_mreg, base_rtl),
+        reg_rtl(addr, *base_mreg, base_rtl),
         !arith_store_imm_uses_stack_var(addr),
         let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::from("RTEMP")),
         let synth2 = *addr | (1u64 << 63),
@@ -1249,7 +1434,7 @@ ascent_par! {
     rtl_inst_candidate(synth1, op_inst) <--
         arith_store_abs_reg(addr, op, _chunk, _ident, _offset, src_mreg),
         !has_ltl_op(addr),
-        reg_xtl(addr, *src_mreg, src_rtl),
+        reg_rtl(addr, *src_mreg, src_rtl),
         let temp = fresh_xtl_reg(*addr, Mreg::from("RTEMP")),
         let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::from("RTEMP")),
         let synth1 = *addr | (1u64 << 62),
@@ -2301,6 +2486,14 @@ ascent_par! {
         if *mreg != Mreg::SP,
         !trim_instruction(addr);
 
+    // 3.8 R1: fused float op's register write (e.g. the X0 of `addsd k(%rip),%xmm0`), mirroring the arith legs above so the def exists even when a label/branch ltl_inst coexists at the address.
+    reg_def_site(*addr, *mreg) <--
+        float_load_op(addr, _, _, _, _, _, _),
+        !has_ltl_op(addr),
+        reg_def(addr, mreg),
+        if *mreg != Mreg::SP,
+        !trim_instruction(addr);
+
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
         if let Either::Left(mreg) = callee,
@@ -2549,6 +2742,8 @@ ascent_par! {
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lbranch(target)),
+        // Suppress Ibranch when R3 imm-global-store owns the address: the synth chain already routes to next(addr), and a competing Ibranch orphans the synthetic Istore, breaking every guard arm's return-tail shape.
+        !mach_imm_global_store(addr, _, _, _, _),
         let inst = RTLInst::Ibranch(target.clone());
 
     rtl_inst_candidate(addr, inst) <--
@@ -2700,10 +2895,11 @@ ascent_par! {
         ax_retval_def_base(def_addr),
         !is_call_or_tailcall(def_addr),
         reg_def_used(def_addr, Mreg::AX, ret_addr);
-    // (b) a float/double X0 def reaches a return (mirror of the func_has_ax_return_value X0 rule).
+    // (b) a float/double X0 VALUE def reaches a return (call X0 clobbers are events, not values - see x0_value_write).
     func_produces_retval(func_start) <--
         instr_in_function(ret_addr, func_start),
-        def_reaches_return(ret_addr, _, Mreg::X0);
+        def_reaches_return(ret_addr, def_addr, Mreg::X0),
+        x0_value_write(def_addr);
     // (c) the function forwards a local callee's result and that callee itself produces a value (positive recursion; keeps the SCC negation-free and thus stratifiable).
     func_produces_retval(func_start) <--
         instr_in_function(call_addr, func_start),
@@ -2774,25 +2970,21 @@ ascent_par! {
         reg_def_site(addr, Mreg::AX),
         reg_rtl(addr, Mreg::AX, rtl_reg);
 
-    // Recovery (return def-use broken): no def reaches the return but an AX def-site exists, so bind the return to the last in-function AX def by program order (mirrors arg_reg_used_no_def) instead of a fresh undefined reg.
+    // Recovery (return def-use broken): reg_def_used bound no def to the return, so bind it to an AX def that STRUCTURALLY reaches it (def_reaches_return: intra-block last def, else lattice membership at the return's block). Replaces the "any def with entry-order <= the return's entry-order" magnitude proxy, which freely matched defs on disjoint branches and defs that never flow to this return.
     relation ax_recovered_cand(Address, Address, Address);
     ax_recovered_cand(func_start, ret_addr, def_addr) <--
         ltl_inst(ret_addr, ?LTLInst::Lreturn),
         !ax_value_direct(ret_addr, _),
         instr_in_function(ret_addr, func_start),
-        func_ax_def(func_start, def_addr, _),
-        instr_min_order(func_start, def_addr, def_order),
-        instr_min_order(func_start, ret_addr, ret_order),
-        if *def_order <= *ret_order;
+        def_reaches_return(ret_addr, def_addr, Mreg::AX),
+        func_ax_def(func_start, def_addr, _);
 
-    // Keep only the latest such def (closest to the return).
+    // Several defs can reach one return (may-reach join at a merge): every member is a valid phi input, so keep one deterministic representative (max def address). This address comparison is a tie-break among structurally-proven candidates, NOT a reachability decision (that is def_reaches_return above).
     relation ax_recovered_killed(Address, Address, Address);
     ax_recovered_killed(func_start, ret_addr, def_addr) <--
         ax_recovered_cand(func_start, ret_addr, def_addr),
         ax_recovered_cand(func_start, ret_addr, other_def),
-        instr_min_order(func_start, def_addr, def_order),
-        instr_min_order(func_start, other_def, other_order),
-        if *other_order > *def_order;
+        if *other_def > *def_addr;
 
     relation ax_recovered(Address, Address, Address);
     ax_recovered(func_start, ret_addr, def_addr) <--
@@ -2832,11 +3024,35 @@ ascent_par! {
         let void_reg = crate::decompile::passes::rtl_pass::fresh_xtl_reg(*addr, Mreg::AX),
         let inst = RTLInst::Ireturn(void_reg);
 
+    // (3.2e) Extending load of an incoming stack arg binds its dst to the function's synthetic stack-param reg (position 6+idx), same as arith_load_uses_stack_param; without this, Lgetstack fallbacks fabricate an uninitialized local for the 7th+ int/short parameter.
+    #[local] relation lgetstack_is_stack_param(Node);
+    lgetstack_is_stack_param(addr) <--
+        extending_stack_arg_load(addr, func_start, disp, _),
+        stack_param_idx(func_start, disp, _);
+
+    rtl_inst_candidate(addr, inst) <--
+        extending_stack_arg_load(addr, func_start, disp, _),
+        stack_param_idx(func_start, disp, idx),
+        ltl_inst(addr, ?LTLInst::Lgetstack(_slot, _ofs, _typ, dst)),
+        reg_rtl(addr, *dst, dst_rtl),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![param_reg]), *dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        extending_stack_arg_load(addr, func_start, disp, _),
+        stack_param_idx(func_start, disp, idx),
+        ltl_inst(addr, ?LTLInst::Lgetstack(_slot, _ofs, _typ, dst)),
+        !reg_rtl(addr, dst, _),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let fresh_dst = fresh_xtl_reg(*addr, *dst) | FRESH_NS_REG_DST,
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![param_reg]), fresh_dst);
+
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lgetstack(slot, ofs, typ, dst)),
         reg_rtl(addr, *dst, dst_rtl),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, ofs, rtl_reg),
+        !lgetstack_is_stack_param(addr),
         let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*rtl_reg]), *dst_rtl);
 
     rtl_inst_candidate(addr, inst) <--
@@ -2844,6 +3060,7 @@ ascent_par! {
         reg_rtl(addr, *dst, dst_rtl),
         instr_in_function(addr, func_start),
         !stack_var(func_start, addr, ofs, _),
+        !lgetstack_is_stack_param(addr),
         let fresh_src = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_STACK_SRC,
         let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![fresh_src]), *dst_rtl);
 
@@ -2852,6 +3069,7 @@ ascent_par! {
         !reg_rtl(addr, dst, _),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, ofs, rtl_reg),
+        !lgetstack_is_stack_param(addr),
         let fresh_dst = fresh_xtl_reg(*addr, *dst) | FRESH_NS_REG_DST,
         let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*rtl_reg]), fresh_dst);
 
@@ -2860,6 +3078,7 @@ ascent_par! {
         !reg_rtl(addr, dst, _),
         instr_in_function(addr, func_start),
         !stack_var(func_start, addr, ofs, _),
+        !lgetstack_is_stack_param(addr),
         let fresh_src = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_STACK_SRC,
         let fresh_dst = fresh_xtl_reg(*addr, *dst) | FRESH_NS_REG_DST,
         let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![fresh_src]), fresh_dst);
@@ -3014,7 +3233,6 @@ ascent_par! {
     relation xtl_canonical(RTLReg, RTLReg);
     xtl_canonical(id, canonical.0) <-- xtl_canonical_lat(id, canonical);
 
-    relation is_early_arg_use(Address, Node);
 
     #[local] relation param_reg_used_early(Address, Mreg);
 
@@ -3036,14 +3254,38 @@ ascent_par! {
         ltl_inst(addr, ?LTLInst::Lbuiltin(_, _, BuiltinArg::BA(dst_reg))),
         if *dst_reg != Mreg::Unknown;
 
+    // A def-EVENT: every register write, INCLUDING trimmed instructions (canary spill/reload/check). A trim removes the instruction's VALUE from the program (no gen), but at runtime the register was still overwritten, so older defs must NOT be spliced through the trimmed site - block_last_def chains on these kill events while the value-consuming rules additionally require asm_effective_def. Without the kill, trimming the canary reload `mov slot,%rax` in a `call f; jmp epilogue; <canary check>; ret` shape reconnected f's AX return value to this function's ret, fabricating return-value evidence for void callees (and the same splice leaked param liveness across trimmed defs of arg registers).
+    relation asm_def_kill(Address, Mreg);
+    asm_def_kill(addr, reg) <-- reg_def(addr, reg);
+    asm_def_kill(addr, reg) <-- asm_effective_def(addr, reg);
+
     reg_use(addr, Mreg::AX) <--
         ltl_inst(addr, ?LTLInst::Lreturn);
 
     // Float/double (XMM0) returns. Returns place a double/float result in X0 (XMM0), unseen by the AX-keyed return machinery (the only return reg_use was AX above), so double-returning functions bound no value and fell to the fabricated/void path; a function returns float iff some return is reached by an in-function X0 def AND no AX value reaches any return (an AX-binding function is int/ptr-returning). Add an X0 return reg_use only for those, then mirror the AX direct def-use binding with x0_value_direct / x0_value_addr.
+
+    // X0 VALUE writes (mirror of ax_value_write below): an Lop/Lload/Lgetstack producing an X0 value, or a call whose callee actually returns float (local: positive recursion through func_returns_float; extern: known signature). A bare CALL's caller-saved X0 clobber row in asm_effective_def is an EVENT, not a value - without this filter any void function whose epilogue follows a call classified as float-returning the moment its (correctly severed) AX evidence disappeared, rebinding the ret to the call and fabricating `return f(...)` for void f.
+    #[local] relation x0_value_write(Address);
+    x0_value_write(addr) <-- ltl_inst(addr, ?LTLInst::Lop(_, _, Mreg::X0));
+    x0_value_write(addr) <-- ltl_inst(addr, ?LTLInst::Lload(_, _, _, Mreg::X0));
+    x0_value_write(addr) <-- ltl_inst(addr, ?LTLInst::Lgetstack(_, _, _, Mreg::X0));
+    x0_value_write(addr) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Right(Either::Left(callee)))),
+        func_returns_float(callee);
+    x0_value_write(addr) <--
+        external_call_site(addr, _, name),
+        known_extern_signature(name, _, ret, _),
+        if matches!(ret, XType::Xfloat | XType::Xsingle);
+    // 3.8 R1: a FUSED float op writing X0 (float_load_op lowering, e.g. `addsd k(%rip),%xmm0; ret`) is a genuine X0 VALUE write. It has no Lop/Lload ltl_inst, so the rules above never saw it: func_returns_float stayed false, the X0 ret reg_use was never created, and DCE collapsed the whole body to `return 0`.
+    x0_value_write(addr) <--
+        float_load_op(addr, _, _, _, _, Mreg::X0, _),
+        !has_ltl_op(addr);
+
     relation func_x0_def_reaches_return(Address);
     func_x0_def_reaches_return(func_start) <--
         instr_in_function(ret_addr, func_start),
-        def_reaches_return(ret_addr, _, Mreg::X0);
+        def_reaches_return(ret_addr, def_addr, Mreg::X0),
+        x0_value_write(def_addr);
 
     // AX def-site reaching a return, structural (reg_def_site only) so it stays OUT of the reg_def_used/reg_use SCC (gating on ax_value_direct would put the negation below in the same stratum as the X0 reg_use this drives, unstratifiable); an AX def reaching a return means an int/ptr/bool result in AX, not a float return, correctly excluding e.g. `return p3 < fabs(p1-p2)` (bool in AX, live XMM only as a compare operand).
     #[local] relation ax_value_write(Address);
@@ -3057,17 +3299,44 @@ ascent_par! {
         def_reaches_return(ret_addr, def_addr, Mreg::AX),
         ax_value_write(def_addr);
 
-    // An X0-to-memory store reaching a return: X0 here is a computed temp written out, not the returned value (a genuine double return leaves X0 untouched-by-store before ret).
+    // The X0 def consumed by an X0-to-memory store (intra-block last def, else lattice membership at the store's block) - same def-reaches-point shape as def_reaches_return/def_reaches_call.
+    #[local] relation x0_store_consumed_def(Address, Address);
+    x0_store_consumed_def(*st_addr, *def_addr) <--
+        ltl_inst(st_addr, ?LTLInst::Lstore(_, _, _, st_src)),
+        if *st_src == Mreg::X0,
+        block_last_def(st_addr, def_addr, Mreg::X0),
+        asm_effective_def(def_addr, Mreg::X0);
+    x0_store_consumed_def(*st_addr, *def_addr) <--
+        ltl_inst(st_addr, ?LTLInst::Lstore(_, _, _, st_src)),
+        if *st_src == Mreg::X0,
+        code_in_block(st_addr, blk),
+        instr_in_function(st_addr, func),
+        !block_last_def(st_addr, _, Mreg::X0),
+        reaching_def_in(func, blk, Mreg::X0, s),
+        for def_addr in s.0.iter();
+    // Stack-slot store form: SIMD struct copies lift as Lgetstack(X0)/Lsetstack(X0) pairs, so the Lstore-only match missed them and the X0 temp was misread as a float return value the moment no AX value reached the return.
+    x0_store_consumed_def(*st_addr, *def_addr) <--
+        ltl_inst(st_addr, ?LTLInst::Lsetstack(st_src, _, _, _)),
+        if *st_src == Mreg::X0,
+        block_last_def(st_addr, def_addr, Mreg::X0),
+        asm_effective_def(def_addr, Mreg::X0);
+    x0_store_consumed_def(*st_addr, *def_addr) <--
+        ltl_inst(st_addr, ?LTLInst::Lsetstack(st_src, _, _, _)),
+        if *st_src == Mreg::X0,
+        code_in_block(st_addr, blk),
+        instr_in_function(st_addr, func),
+        !block_last_def(st_addr, _, Mreg::X0),
+        reaching_def_in(func, blk, Mreg::X0, s),
+        for def_addr in s.0.iter();
+
+    // The X0 value arriving at a return was also written to memory: that X0 is a computed temp stored out, not a float return value (a genuine double return leaves the returned X0 unstored). Structural: the SAME def feeds both the store and the return, replacing the "some store earlier than the return by entry-order" magnitude proxy that also matched unrelated stores on disjoint branches (falsely suppressing real float returns).
     relation func_x0_stored_before_return(Address);
     func_x0_stored_before_return(func_start) <--
         instr_in_function(ret_addr, func_start),
         ltl_inst(ret_addr, ?LTLInst::Lreturn),
-        instr_in_function(st_addr, func_start),
-        ltl_inst(st_addr, ?LTLInst::Lstore(_, _, _, st_src)),
-        if *st_src == Mreg::X0,
-        instr_min_order(func_start, st_addr, st_order),
-        instr_min_order(func_start, ret_addr, ret_order),
-        if *st_order <= *ret_order;
+        def_reaches_return(ret_addr, def_addr, Mreg::X0),
+        x0_store_consumed_def(st_addr, def_addr),
+        instr_in_function(st_addr, func_start);
 
     relation func_returns_float(Address);
     func_returns_float(func_start) <--
@@ -3100,17 +3369,18 @@ ascent_par! {
         if *edge_type != "call" && *edge_type != "indirect" && *edge_type != "indirect_call",
         code_in_block(src, src_block);
 
+    // block_last_def(u, e, r): the last def-EVENT for r strictly before u in u's block. Chains on asm_def_kill so a trimmed def stops older defs (negation consumers `!block_last_def(u, _, r)` = "r untouched in block before u" are kill-aware for free); consumers that need the event as a VALUE must additionally check asm_effective_def(e, r) - a trimmed event then yields no def edge at all, which is the sound model (the runtime value at u is canary/junk the trim removed, not some older spliced def).
     relation block_last_def(Address, Address, Mreg);
 
     block_last_def(next_addr, def_addr, reg) <--
-        asm_effective_def(def_addr, reg),
+        asm_def_kill(def_addr, reg),
         next(def_addr, next_addr),
         code_in_block(def_addr, blk),
         code_in_block(next_addr, blk);
 
     block_last_def(next_addr, def_addr, reg) <--
         block_last_def(curr_addr, def_addr, reg),
-        !asm_effective_def(curr_addr, reg),
+        !asm_def_kill(curr_addr, reg),
         next(curr_addr, next_addr),
         code_in_block(curr_addr, blk),
         code_in_block(next_addr, blk);
@@ -3124,11 +3394,12 @@ ascent_par! {
     last_def_in_block(block, def_addr, reg) <--
         block_last_insn(block, last_insn),
         block_last_def(last_insn, def_addr, reg),
-        !asm_effective_def(last_insn, reg);
+        asm_effective_def(def_addr, reg),
+        !asm_def_kill(last_insn, reg);
 
     relation asm_defined_in_block(Address, Mreg);
     asm_defined_in_block(block, reg) <--
-        asm_effective_def(ea, reg),
+        asm_def_kill(ea, reg),
         code_in_block(ea, block);
 
     relation live_var_def(Address, Mreg, Address);
@@ -3156,7 +3427,8 @@ ascent_par! {
     reg_def_used(def_addr, reg, use_addr) <--
         reg_use(use_addr, reg),
         !trim_instruction(use_addr),
-        block_last_def(use_addr, def_addr, reg);
+        block_last_def(use_addr, def_addr, reg),
+        asm_effective_def(def_addr, reg);
 
     reg_def_used(def_addr, reg, use_addr) <--
         live_var_at_block_end(def_block, use_block, reg),
@@ -3176,9 +3448,7 @@ ascent_par! {
         reg_use(use_addr, mreg),
         !trim_instruction(use_addr);
 
-    is_early_arg_use(func_start, addr) <--
-        function_entry_count(func_start, addr, count),
-        if *count < FUNC_ARG_DIST as i64;
+    // (is_early_arg_use deleted: the entry-BFS-distance window is replaced by param_still_live / instr_in_function partitioning in the reg_xtl binding rules; distance must never decide which def binds a use.)
 
     // Float (XMM) parameter early reaching-def, mirroring the integer param_reg_used_early / reg_def_used edge: is_arg_reg holds only int regs, so XMM args (X0-X7) never got the func_start->early-use edge and their mid-function uses stayed fresh/undefined (an XMM compare operand or fabs input). Gated only on is_float_arg_reg (not the validated set) to stay out of the func_float_param_used negation cycle; the func_start synthetic def is excluded from the float param detector (xmm_arg_use_has_internal_def below) so it cannot suppress validation.
     #[local] relation float_param_reg_used_early(Address, Mreg);
@@ -3320,7 +3590,7 @@ ascent_par! {
         code_in_block(dst, blk),
         if *dst <= *src;
 
-    // Reaching-definition lattice Forward MAY-reaching-defs of a register at each block ENTRY, restricted to argument/return registers (reg_of_interest) to bound cost. The Set lattice join is union (may-reach). This is the lattice-maintained replacement for the instr_min_order / function_entry_count magnitude proxies: "def d reaches point u for reg r" becomes block_last_def(u,d,r) intra-block, else d in reaching_def_in(func, block_of_u, r) with no in-block redef: exact at any distance. Seeded ONLY from real def-sites (last_def_in_block), never func_param_validated, so it stays out of the param-validation negation SCC. Inert for now (no consumers); wired into G1/G2/G3 in later steps.
+    // Reaching-definition lattice Forward MAY-reaching-defs of a register at each block ENTRY, restricted to argument/return registers (reg_of_interest) to bound cost. The Set lattice join is union (may-reach). This is the lattice-maintained replacement for the instr_min_order / function_entry_count magnitude proxies: "def d reaches point u for reg r" becomes block_last_def(u,d,r) intra-block, else d in reaching_def_in(func, block_of_u, r) with no in-block redef: exact at any distance. Seeded ONLY from real def-sites (last_def_in_block), never func_param_validated, so it stays out of the param-validation negation SCC. Consumers: def_reaches_return / def_reaches_call below, the return-value recovery (ax_recovered_cand, x0_store_consumed_def / func_x0_stored_before_return), and arg setup (arg_setup_candidate, arg_reg_block_reaching_def).
     #[local] relation reg_of_interest(Mreg);
     reg_of_interest(r) <-- is_arg_reg(r);
     reg_of_interest(r) <-- is_xmm_arg_reg(r);
@@ -3349,7 +3619,8 @@ ascent_par! {
     def_reaches_return(*ret_addr, *def_addr, *r) <--
         ltl_inst(ret_addr, ?LTLInst::Lreturn),
         reg_of_interest(r),
-        block_last_def(ret_addr, def_addr, r);
+        block_last_def(ret_addr, def_addr, r),
+        asm_effective_def(def_addr, r);
     def_reaches_return(*ret_addr, *def_addr, *r) <--
         ltl_inst(ret_addr, ?LTLInst::Lreturn),
         reg_of_interest(r),
@@ -3364,7 +3635,8 @@ ascent_par! {
     def_reaches_call(*call_addr, *def_addr, *r) <--
         is_call_instruction(call_addr),
         reg_of_interest(r),
-        block_last_def(call_addr, def_addr, r);
+        block_last_def(call_addr, def_addr, r),
+        asm_effective_def(def_addr, r);
     def_reaches_call(*call_addr, *def_addr, *r) <--
         is_call_instruction(call_addr),
         reg_of_interest(r),
@@ -3574,6 +3846,17 @@ ascent_par! {
         reg_use(use_addr, mreg),
         !reg_def_site(use_addr, mreg);
 
+    // 3.8 R1: a fused float RMW (float_load_op binary form) both READS and WRITES its dst, so the threading rule above is blocked by its own reg_def_site. Alias the param web onto the op's ids instead: the op reads the still-live param and overwrites the same machine register, so param and result are one variable under the 2-address model (the same I/O merge the canonicalizer performs for real ltl RMW ops). float_param_still_live is MUST-live, so this never fires past a clobber or around a loop back edge.
+    alias_edge(param_id, op_id) <--
+        float_load_op(addr, _, _, _, _, mreg, false),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        func_float_param_validated(func_start, mreg, _),
+        float_param_still_live(func_start, addr, mreg),
+        reg_xtl(func_start, mreg, param_id),
+        reg_xtl(addr, *mreg, op_id),
+        if param_id != op_id;
+
     param_alias_source(useaddr, mreg) <-- arg_reg_has_external_def(useaddr, mreg);
     param_alias_source(useaddr, mreg) <-- arg_reg_used_no_def(useaddr, mreg);
     param_alias_source(useaddr, mreg) <-- arg_reg_used_very_early(useaddr, mreg);
@@ -3591,11 +3874,11 @@ ascent_par! {
         reg_xtl(useaddr, mreg, use_id),
         if def_id != use_id;
 
+    // Param-bind an arg-reg use over an external (caller) def edge whenever the reg still holds the incoming value (param_still_live: MUST-live, exact at any distance). The old additional is_early_arg_use window (entry-BFS distance < FUNC_ARG_DIST) was a magnitude proxy that silently dropped param binding for deep-but-clean uses.
     reg_xtl(*useaddr, *reg, param_id) <--
         reg_def_used(defaddr, reg, useaddr),
         if *reg != Mreg::SP,
         instr_in_function(useaddr, func_start),
-        is_early_arg_use(func_start, useaddr),
         is_arg_reg(reg),
         !instr_in_function(defaddr, func_start),
         func_arg_reg_used(func_start, reg),
@@ -3640,12 +3923,15 @@ ascent_par! {
         ltl_inst(node, ?LTLInst::Lreturn),
         let fresh = fresh_xtl_reg(*node, Mreg::AX);
 
+    // External-def edge whose use is NOT param-bindable (the reg no longer holds the caller value there): fresh id, reconnected to its def by alias_edge downstream. Exact complement of the param-bind rule above, replacing the "use is far from entry" (!is_early_arg_use) distance proxy.
     reg_xtl(*useaddr, *reg, rtl_reg) <--
         reg_def_used(defaddr, reg, useaddr),
         if *reg != Mreg::SP,
         is_arg_reg(reg),
         instr_in_function(useaddr, func_start),
-        !is_early_arg_use(func_start, useaddr),
+        !instr_in_function(defaddr, func_start),
+        func_arg_reg_used(func_start, reg),
+        !param_still_live(func_start, useaddr, reg),
         let rtl_reg = fresh_xtl_reg(*useaddr, *reg);
 
     reg_xtl(*useaddr, *reg, rtl_reg) <--
@@ -3657,12 +3943,12 @@ ascent_par! {
         !func_arg_reg_used(func_start, reg),
         let rtl_reg = fresh_xtl_reg(*useaddr, *reg);
 
+    // Internal-def edge to an arg-reg use: always a fresh id (the def-to-use connection is made by alias_edge / xtl canonicalization). The old is_early_arg_use condition merely split this one semantic case across two window variants.
     reg_xtl(*useaddr, *reg, rtl_reg) <--
         reg_def_used(defaddr, reg, useaddr),
         if *reg != Mreg::SP,
         is_arg_reg(reg),
         instr_in_function(useaddr, func_start),
-        is_early_arg_use(func_start, useaddr),
         instr_in_function(defaddr, func_start),
         let rtl_reg = fresh_xtl_reg(*useaddr, *reg);
 
@@ -4253,31 +4539,75 @@ ascent_par! {
         is_call_instruction(between_call),
         if *call_addr != *between_call;
 
-    arg_setup_candidate(*defaddr, *dst_reg, *call_addr) <--
+    // Split from arg_setup_candidate so corroboration counting doesn't depend on its own gated output.
+    relation arg_setup_candidate_real(Node, Mreg, Node);
+
+    arg_setup_candidate_real(*defaddr, *dst_reg, *call_addr) <--
         ltl_inst(defaddr, ?LTLInst::Lop(_, _, dst_reg)),
         is_arg_reg(dst_reg),
         def_reaches_call(call_addr, defaddr, dst_reg);
 
-    arg_setup_candidate(*defaddr, *dst_reg, *call_addr) <--
+    arg_setup_candidate_real(*defaddr, *dst_reg, *call_addr) <--
         ltl_inst(defaddr, ?LTLInst::Lgetstack(_slot, _ofs, _typ, dst_reg)),
         is_arg_reg(dst_reg),
         def_reaches_call(call_addr, defaddr, dst_reg);
 
-    arg_setup_candidate(*defaddr, *dst_reg, *call_addr) <--
+    arg_setup_candidate_real(*defaddr, *dst_reg, *call_addr) <--
         ltl_inst(defaddr, ?LTLInst::Lload(_, _, _, dst_reg)),
         is_arg_reg(dst_reg),
         def_reaches_call(call_addr, defaddr, dst_reg);
+
+    arg_setup_candidate(defaddr, mreg, call_addr) <--
+        arg_setup_candidate_real(defaddr, mreg, call_addr);
 
     // Fix 1: live-in / pass-through parameter forwarded to a resolved call. An ABI arg register that is a validated parameter and isn't redefined before the call still holds the incoming value, so forward it as a call arg. Gated to resolved callees (known direct target or known-signature extern) so indirect calls (whose target reg may itself be a fn-pointer param) aren't corrupted. Fixes args dropped to literal 0 (e.g. last_component(name)).
     relation call_has_resolved_callee(Node);
     call_has_resolved_callee(call_addr) <-- call_target_func(call_addr, _);
     call_has_resolved_callee(call_addr) <-- call_has_known_signature(call_addr, _, _, _);
 
-    arg_setup_candidate(func_start, mreg, call_addr) <--
+    // param_still_live gates the forward on MUST-liveness: the register holds the caller value with no def-tainted path from entry. Without this, every resolved call received a forwarded copy of every validated param including long-dead registers (sort: zaptemp grew mergefps's nfiles/SI as a 2nd arg many clobbering calls from entry).
+    #[local] relation forwarded_param_candidate(Node, Mreg, Node);
+    forwarded_param_candidate(func_start, mreg, call_addr) <--
         func_param_validated(func_start, mreg),
         is_call_instruction(call_addr),
         instr_in_function(call_addr, func_start),
-        call_has_resolved_callee(call_addr);
+        call_has_resolved_callee(call_addr),
+        param_still_live(func_start, call_addr, mreg);
+
+    // Corroboration gate: a still-live param forwarded to a call materializes only when the callee validates the position (its own body or known signature) or a second call site agrees; prevents fabricating arity from leftover register state (pwd: atexit's single site grew main's SI as a 2nd param). Real setups are never gated.
+    #[local] relation forwarding_corroborated(Node, Mreg);
+
+    // Callee-side, internal: the callee's own body validates the register as one of its params.
+    forwarding_corroborated(call_addr, mreg) <--
+        forwarded_param_candidate(_, mreg, call_addr),
+        call_target_func(call_addr, callee),
+        func_param_validated(callee, mreg);
+
+    // Callee-side, known signature: the signature's fixed param count covers the position.
+    forwarding_corroborated(call_addr, mreg) <--
+        forwarded_param_candidate(_, mreg, call_addr),
+        call_has_known_signature(call_addr, _, sig_count, _),
+        if let Some(pos) = arg_reg_position(mreg),
+        if pos < *sig_count;
+
+    // Cross-site agreement: another distinct call site of the same callee also carries this position.
+    #[local] relation callee_arg_reg_site(Address, Mreg, Node);
+    callee_arg_reg_site(callee, mreg, call_addr) <--
+        call_target_func(call_addr, callee),
+        arg_setup_candidate_real(_, mreg, call_addr);
+    callee_arg_reg_site(callee, mreg, call_addr) <--
+        call_target_func(call_addr, callee),
+        forwarded_param_candidate(_, mreg, call_addr);
+
+    forwarding_corroborated(call_addr, mreg) <--
+        forwarded_param_candidate(_, mreg, call_addr),
+        call_target_func(call_addr, callee),
+        callee_arg_reg_site(callee, mreg, other_site),
+        if *other_site != *call_addr;
+
+    arg_setup_candidate(func_start, mreg, call_addr) <--
+        forwarded_param_candidate(func_start, mreg, call_addr),
+        forwarding_corroborated(call_addr, mreg);
 
     // (The old order-based "between-call clobber" suppression rules are removed: arg_setup_candidate now comes from def_reaches_call / reaching_def_in, which already excludes any def clobbered before the call; an intervening CALL is an asm_effective_def of caller-saved regs, so reaching_def_in's gen/kill drops it. Detecting the clobber by instr_min_order ordering is both redundant and unsound.)
 
@@ -4286,6 +4616,7 @@ ascent_par! {
     arg_reg_block_reaching_def(call_addr, mreg, def_addr) <--
         is_call_instruction(call_addr),
         block_last_def(call_addr, def_addr, mreg),
+        asm_effective_def(def_addr, mreg),
         is_arg_reg(mreg),
         arg_setup_candidate(def_addr, mreg, call_addr);
 
@@ -4293,6 +4624,7 @@ ascent_par! {
     arg_reg_block_reaching_def(call_addr, mreg, def_addr) <--
         is_call_instruction(call_addr),
         block_last_def(call_addr, def_addr, mreg),
+        asm_effective_def(def_addr, mreg),
         is_xmm_arg_reg(mreg),
         float_arg_setup_candidate(def_addr, mreg, call_addr);
 
@@ -4307,24 +4639,18 @@ ascent_par! {
         float_arg_setup_candidate(other_def, mreg, call_addr),
         if *other_def != *in_block_def;
 
-    // Kill arg setup when a closer redefinition of the same register exists; the !arg_reg_block_reaching_def guard keeps this order-based heuristic from killing the true in-block reaching def (instr_min_order is shortest-distance-from-entry, so a later-block def reached via a loop back-edge can outrank the correct in-block def).
+    // Among multiple structurally-reaching arg setups (may-reach join: `if (c) rdi=a; else rdi=b; call f` - every candidate is a valid phi input), keep one deterministic representative: max def address. arg_setup_candidate is already restricted to defs that actually reach the call (def_reaches_call / reaching_def_in), so this address comparison only picks a canonical member of the proven set - it does NOT decide reachability. The !arg_reg_block_reaching_def guard keeps the in-block dominance winner immune.
     call_clobbers_arg_reg(defaddr, mreg, call_addr) <--
         arg_setup_candidate(defaddr, mreg, call_addr),
         !arg_reg_block_reaching_def(call_addr, mreg, defaddr),
         arg_setup_candidate(other_def, mreg, call_addr),
-        instr_in_function(defaddr, func_start),
-        instr_min_order(func_start, defaddr, def_order),
-        instr_min_order(func_start, other_def, other_order),
-        if *other_order > *def_order && *defaddr != *other_def;
+        if *other_def > *defaddr;
 
     call_clobbers_arg_reg(defaddr, mreg, call_addr) <--
         float_arg_setup_candidate(defaddr, mreg, call_addr),
         !arg_reg_block_reaching_def(call_addr, mreg, defaddr),
         float_arg_setup_candidate(other_def, mreg, call_addr),
-        instr_in_function(defaddr, func_start),
-        instr_min_order(func_start, defaddr, def_order),
-        instr_min_order(func_start, other_def, other_order),
-        if *other_order > *def_order && *defaddr != *other_def;
+        if *other_def > *defaddr;
 
     relation call_arg_setup_detected(Node, Mreg, Node);
 
@@ -4474,7 +4800,7 @@ ascent_par! {
     call_has_float_arg_at_position(call_addr, 7) <--
         call_float_arg_max_position(call_addr, max_pos), if *max_pos >= 7;
 
-    // Fix 3: gate XMM/float-arg positions by the callee signature, mirroring call_arg_position_allowed for the integer path. Without it the float-arg collection appends ANY lea/load->XMM within backward reach (including dead branches and other functions' constant setup) as a spurious float argument, e.g. dcgettext (3 pointer/int params, 0 float params) collecting five leaked string arguments. A float position is only valid when the callee actually accepts a float there.
+    // Gate XMM/float-arg positions by the callee signature, mirroring call_arg_position_allowed for the integer path. The candidates above are already structural (def_reaches_call: function-scoped, clobber-aware), so the old backward-reach leak of dead-branch / other-function setups (dcgettext once collected five leaked string args) is gone. The gate's remaining job is class filtering for stray SAME-function XMM defs that genuinely reach the call without being arguments (a parked float temp would otherwise claim every position up to its register's ordinal via call_float_arg_max_position). Precision depends on callee-signature quality (ABI-2); the principled future fix for varargs calls is AL tracking (SysV: %al carries the XMM-arg count).
     relation call_float_arg_position_allowed(Node, usize);
 
     // No known signature, direct internal target whose inferred param count covers this ordinal.
@@ -4532,6 +4858,7 @@ ascent_par! {
         !call_float_arg_mapping(call_addr, _, _);
 
 
+    // function_entry_dist / function_entry_count: entry-BFS distance, capped at FUNC_ARG_DIST. Surviving uses are PROLOGUE-LOCALITY pattern bounds only (stack_passed_param's "arg-area read near entry", is_stack_canary_related's "canary init near entry") - never dataflow or reachability decisions (those use reaching_def_in / def_reaches_* / param_still_live). The locality uses are owned by ABI-1 (stack-param modeling via real SP/BP frame tracking) and ST-1 (canary via FS-source dataflow): replace them there, then delete this.
     function_entry_dist(addr, node, 0) <-- emit_function(addr, _, node);
 
     function_entry_dist(func, next_node, new_dist) <--
@@ -4546,26 +4873,7 @@ ascent_par! {
         function_entry_dist(func, node, _),
         agg min_dist = ascent::aggregators::min(d) in function_entry_dist(func, node, d);
 
-    lattice instr_order_in_func(Address, Node, ascent::Dual<i64>);
-
-    instr_order_in_func(func, node, ascent::Dual(0)) <-- emit_function(func, _, node);
-
-    instr_order_in_func(func, next_node, ascent::Dual(order.0 + 1)) <--
-        instr_order_in_func(func, curr_node, order),
-        next(curr_node, next_node),
-        instr_in_function(next_node, func);
-
-    instr_order_in_func(func, succ_node, ascent::Dual(order.0 + 1)) <--
-        instr_order_in_func(func, curr_node, order),
-        ltl_succ(curr_node, succ_node),
-        instr_in_function(succ_node, func);
-
-    relation instr_min_order(Address, Node, i64);
-
-    instr_min_order(func, node, min_order) <--
-        instr_order_in_func(func, node, order),
-        let min_order = order.0;
-    
+    // (instr_order_in_func / instr_min_order deleted: the BFS-from-entry order proxy is fully replaced by the structural def_reaches_return / def_reaches_call / reaching_def_in relations; order/magnitude must never decide reachability or dataflow. function_entry_count below survives ONLY for prologue-locality pattern bounds - see its comment.)
 
     relation arg_reg_used_early_in_func(Address, Address, Mreg);
     relation func_float_arg_used_undefined(Address, RTLReg);
@@ -4579,18 +4887,25 @@ ascent_par! {
         func_float_arg_used_undefined(func_start, v),
         xtl_canonical(v, canonical);
 
+    // A PUSH's operand read is stack bookkeeping, not a data use: the lifter absorbs pushes into the frame layout (no LTL instruction exists at the push), so its capstone-level reg_use must not turn a live-from-entry arg register into parameter evidence. Observed: a 16-byte-alignment `push %rcx` in coreutils true's main made CX the 4th parameter; the ABI position-fill then validated DX too, the param-forwarding rule materialized DX/CX args at every resolved call (inflating callee arities, e.g. atexit -> 4 params), and the main-upgrade read the polluted count as an envp-style 3-arg main. A push forwarding a 7th+ stack argument never survives lifting either, so it cannot anchor body dataflow; parameter evidence must come from uses that exist in the lifted program (the Lop/Lload/Lstore/Lcond/Lsetstack shapes used by the other arg_reg_* rules and ltl_inst_uses_mreg in arg_reg_used_no_def).
+    #[local] relation push_operand_use(Address);
+    push_operand_use(addr) <--
+        instruction(addr, _, _, "PUSH", _, _, _, _, _, _);
+
     // An arg register used at a point where it still holds the incoming caller value (reaches the use def-free from entry) IS a parameter use, exactly. This single structural rule replaces the six function_entry_count<FUNC_ARG_DIST window variants (Lop/Lload/Lsetstack x external-def/no-def): arg_reg_param_live_at already subsumes the "no internal def" / "external (caller) def" conditions, and is distance-independent so a far param use is recognized too.
     arg_reg_used_early_in_func(func_start, addr, *reg) <--
         arg_reg_param_live_at(func_start, addr, reg),
         is_arg_reg(reg),
-        reg_use(addr, reg);
+        reg_use(addr, reg),
+        !push_operand_use(addr);
 
     relation arg_reg_has_external_def(Address, Mreg);
 
     arg_reg_has_external_def(func_start, *mreg) <--
         is_arg_reg(mreg),
         arg_reg_param_live_at(func_start, use_addr, mreg),
-        reg_use(use_addr, mreg);
+        reg_use(use_addr, mreg),
+        !push_operand_use(use_addr);
 
     relation arg_reg_used_very_early(Address, Mreg);
     // (Dead internal-def helpers removed: arg_reg_used_very_early no longer references them; arg_reg_param_live_at already excludes a register that has an internal def before the use.)
@@ -4598,7 +4913,8 @@ ascent_par! {
     arg_reg_used_very_early(func_start, *mreg) <--
         is_arg_reg(mreg),
         arg_reg_param_live_at(func_start, early_addr, mreg),
-        reg_use(early_addr, mreg);
+        reg_use(early_addr, mreg),
+        !push_operand_use(early_addr);
 
     relation arg_reg_used_no_def(Address, Mreg);
 
@@ -4629,10 +4945,12 @@ ascent_par! {
         arg_reg_param_live_at(func_start, addr, src);
 
     relation arg_reg_copied_early(Address, Mreg, Mreg);
+    // Same copies with the copy site kept, so the consumption check can follow the copy's OWN def-use edge instead of a distance window.
+    relation arg_reg_copy_site(Address, Address, Mreg, Mreg);
     relation arg_reg_used_via_copy(Address, Mreg);
 
     // An arg register move-copied to a non-arg register while it still holds the caller value: the source is a parameter forwarded through the copy. Window + external/no-def variants -> arg_reg_param_live_at.
-    arg_reg_copied_early(func_start, *src, *dst) <--
+    arg_reg_copy_site(func_start, *addr, *src, *dst) <--
         ltl_inst(addr, ?LTLInst::Lop(Operation::Omove, srcs, dst)),
         if srcs.len() == 1,
         for src in srcs.iter(),
@@ -4641,12 +4959,14 @@ ascent_par! {
         if *dst != Mreg::SP && *dst != Mreg::BP,
         arg_reg_param_live_at(func_start, addr, src);
 
+    arg_reg_copied_early(func_start, src, dst) <--
+        arg_reg_copy_site(func_start, _, src, dst);
+
+    // The copied value is actually consumed: the copy's own def reaches a use (reg_def_used edge from the copy site). Replaces the "some use of dst within entry-BFS distance 512" window, which could credit a use of a DIFFERENT, later def of dst (and whose bound was vacuous anyway: function_entry_count rows cap at FUNC_ARG_DIST).
     arg_reg_used_via_copy(func_start, *arg_reg) <--
-        arg_reg_copied_early(func_start, arg_reg, dst_reg),
-        instr_in_function(use_addr, func_start),
-        function_entry_count(func_start, use_addr, count),
-        if *count < 512,   
-        reg_use(use_addr, dst_reg);
+        arg_reg_copy_site(func_start, copy_addr, arg_reg, dst_reg),
+        reg_def_used(copy_addr, dst_reg, use_addr),
+        instr_in_function(use_addr, func_start);
 
     relation func_arg_reg_used(Address, Mreg);
 
@@ -4726,6 +5046,15 @@ ascent_par! {
         ltl_inst_uses_mreg(addr, mreg),
         !func_has_variadic_xmm_prologue(func_start);
 
+    // 3.8 R1: the XMM read of a FUSED float op (float_load_op binary form reads its dst) is float-param evidence too; it has no ltl_inst, so ltl_inst_uses_mreg above never sees it and a function whose ONLY float-param use is fused (`addsd k(%rip),%xmm0; ret`) validated no float params at all.
+    func_float_param_used(func_start, *mreg) <--
+        is_float_arg_reg(mreg),
+        arg_reg_param_live_at(func_start, addr, mreg),
+        float_load_op(addr, _, _, _, _, mreg, false),
+        !has_ltl_op(addr),
+        !func_has_variadic_xmm_prologue(func_start);
+
+    // Positional chain: X_k validates only if X_{k-1} did, so a single stray param-live X_k use cannot fabricate k+1 float params. Known limit (UNRESOLVED DF-3): a float param whose lower-position sibling is completely untouched in the body (an unused arg at -O2 leaves no callee-side trace) cannot validate here; caller-side evidence (call_float_arg_mapping at call sites of this function) is the only recovery route - signature-reconciliation work, tracked under ABI items.
     relation func_float_param_validated(Address, Mreg, usize);
 
     func_float_param_validated(func_start, Mreg::X0, 0) <--
@@ -4772,13 +5101,48 @@ ascent_par! {
 
     relation stack_passed_param(Address, i64);
 
+    // ABI-1: entry-anchored SP offset per instruction (SP_at_addr - SP_at_entry, accumulated over fallthrough `next` edges). The test `disp + sp_ofs >= 8` places a slot above the return-address in the ENTRY frame regardless of prologue depth; a raw `disp >= 8` misclassifies deep locals as incoming args. Chain stops at non-fallthrough instructions (RET/JMP/HLT/etc.) to prevent the post-epilogue offset (0) from reclaiming deep locals in jump-only-reachable blocks.
+    #[local] lattice sp_entry_ofs(Address, Address, Dual<i64>);
+
+    // Flow breakers: instructions whose linear successor is not reachable; breaking too eagerly only under-claims stack params, never fabricates.
+    #[local] relation sp_chain_breaker(Address);
+    sp_chain_breaker(addr) <--
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "RET" | "RETF" | "RETFQ" | "JMP" | "LJMP" | "HLT"
+            | "UD0" | "UD1" | "UD2" | "INT3" | "IRET" | "IRETD" | "IRETQ" | "SYSRET");
+
+    sp_entry_ofs(func_start, func_start, Dual(0)) <--
+        func_span(_, func_start, _);
+
+    sp_entry_ofs(func_start, curaddr, Dual(prev_ofs.0 + *delta)) <--
+        sp_entry_ofs(func_start, prevaddr, prev_ofs),
+        next(prevaddr, curaddr),
+        !sp_chain_breaker(prevaddr),
+        instr_in_function(curaddr, func_start),
+        adjusts_stack(prevaddr, _, delta);
+
+    sp_entry_ofs(func_start, curaddr, prev_ofs) <--
+        sp_entry_ofs(func_start, prevaddr, prev_ofs),
+        next(prevaddr, curaddr),
+        !sp_chain_breaker(prevaddr),
+        instr_in_function(curaddr, func_start),
+        !adjusts_stack(prevaddr, _, _);
+
+    // BP-based arg detection requires an actual frame pointer: in frameless functions RBP is a callee-saved scratch (often a struct pointer), so a positive-offset BP load is a field deref, not an incoming arg. With a frame pointer, caller args start at BP+16 (BP+0=saved RBP, BP+8=return address).
+    #[local] relation func_sets_frame_pointer(Address);
+    func_sets_frame_pointer(func_start) <--
+        stack_base_move(addr, src, dst),
+        if *src == "RSP" && *dst == "RBP",
+        instr_in_function(addr, func_start);
+
     stack_passed_param(func_start, *ofs) <--
         instr_in_function(addr, func_start),
         function_entry_count(func_start, addr, count),
         if *count < 512,
         ltl_inst(addr, ?LTLInst::Lload(_, Addressing::Aindexed(ofs), args, _)),
         for arg in args.iter(),
-        if *arg == Mreg::BP && *ofs > 0;
+        if *arg == Mreg::BP && *ofs >= 16,
+        func_sets_frame_pointer(func_start);
 
     // Detect functions that use BP as an indexed-addressing base (framed functions)
     #[local] relation func_uses_bp_base(Address);
@@ -4793,13 +5157,15 @@ ascent_par! {
         for arg in args.iter(),
         if *arg == Mreg::BP;
 
+    // SP rules use *ofs + sp_ofs.0 >= 8 (ENTRY-frame anchor); a missing sp_entry_ofs row conservatively yields no param claim.
     stack_passed_param(func_start, *ofs) <--
         instr_in_function(addr, func_start),
         function_entry_count(func_start, addr, count),
         if *count < 512,
         ltl_inst(addr, ?LTLInst::Lload(_, Addressing::Aindexed(ofs), args, _)),
+        sp_entry_ofs(func_start, addr, sp_ofs),
         for arg in args.iter(),
-        if *arg == Mreg::SP && *ofs >= 8,
+        if *arg == Mreg::SP && *ofs + sp_ofs.0 >= 8,
         !func_uses_bp_base(func_start);
 
     // Memory-operand arithmetic like `add 0x8(%rsp), %eax` is lifted via arith_load_op
@@ -4808,7 +5174,8 @@ ascent_par! {
         function_entry_count(func_start, addr, count),
         if *count < 512,
         arith_load_op(addr, _, _, base, ofs, _),
-        if *base == Mreg::SP && *ofs >= 8,
+        sp_entry_ofs(func_start, addr, sp_ofs),
+        if *base == Mreg::SP && *ofs + sp_ofs.0 >= 8,
         !func_uses_bp_base(func_start);
 
     stack_passed_param(func_start, *ofs) <--
@@ -4816,7 +5183,74 @@ ascent_par! {
         function_entry_count(func_start, addr, count),
         if *count < 512,
         arith_load_op(addr, _, _, base, ofs, _),
-        if *base == Mreg::BP && *ofs > 0;
+        if *base == Mreg::BP && *ofs >= 16,
+        func_sets_frame_pointer(func_start);
+
+    // (3.2e) Sign/zero-extending stack-arg loads (movslq/movswq/movzbl/...) lift as pmov->Mgetstack->Lgetstack, bypassing Lload/arith_load_op; the capstone operand is used for base-reg, width, and signedness to pin the parameter type exactly. Restricted to extending mnemonics because plain MOV Mgetstacks include callee-save reloads whose displacements can collide with the arg-area window.
+    #[local] relation extending_stack_arg_load(Node, Address, i64, MemoryChunk);
+
+    // SP-relative: disp + sp_entry_ofs >= 8 anchors to the ENTRY frame (raw `disp >= 8` misclassifies deep locals). Framed-function exclusion must be capstone-level (!func_bp_mem_base) because BP accesses lift to Mgetstack/Msetstack invisible to Lload/Lstore-based func_uses_bp_base. !stack_def_used gates out callee-reused arg slots; !stack_var would self-defeat because the asm pass's shadow Olea(Ainstack) manufactures the stack_var entry for this very read.
+    extending_stack_arg_load(addr, *func_start, *disp, mc) <--
+        instr_in_function(addr, func_start),
+        function_entry_count(func_start, addr, count),
+        if *count < 512,
+        ltl_inst(addr, ?LTLInst::Lgetstack(_, ofs, _, _)),
+        instruction(addr, _, _, mnem, src, _, _, _, _, _),
+        op_indirect(src, _, base_str, idx_str, _, disp, msize),
+        if *disp == *ofs,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::from(*base_str) == Mreg::SP,
+        sp_entry_ofs(func_start, addr, sp_ofs),
+        if *disp + sp_ofs.0 >= 8,
+        !func_bp_mem_base(func_start),
+        !stack_def_used(_, _, _, addr, _, disp),
+        if let Some(mc) = extending_load_chunk(mnem, *msize);
+
+    // BP-relative (framed): args at BP+16+; func_sets_frame_pointer is EXPLICIT so the rule cannot silently widen if lifting conditions change (frameless RBP is a callee-saved scratch, not a frame pointer).
+    extending_stack_arg_load(addr, *func_start, *disp, mc) <--
+        instr_in_function(addr, func_start),
+        function_entry_count(func_start, addr, count),
+        if *count < 512,
+        ltl_inst(addr, ?LTLInst::Lgetstack(_, ofs, _, _)),
+        instruction(addr, _, _, mnem, src, _, _, _, _, _),
+        op_indirect(src, _, base_str, idx_str, _, disp, msize),
+        if *disp == *ofs,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::from(*base_str) == Mreg::BP,
+        if *disp >= 16,
+        func_sets_frame_pointer(func_start),
+        !stack_def_used(_, _, _, addr, _, disp),
+        if let Some(mc) = extending_load_chunk(mnem, *msize);
+
+    // Capstone-level framed-ness: subsumes func_uses_bp_base, which cannot see Mgetstack/Msetstack shapes.
+    #[local] relation func_bp_mem_base(Address);
+    func_bp_mem_base(func_start) <--
+        instr_in_function(addr, func_start),
+        instruction(addr, _, _, _, src, _, _, _, _, _),
+        op_indirect(src, _, base_str, _, _, _, _),
+        if Mreg::from(*base_str) == Mreg::BP;
+    func_bp_mem_base(func_start) <--
+        instr_in_function(addr, func_start),
+        instruction(addr, _, _, _, _, dst, _, _, _, _),
+        op_indirect(dst, _, base_str, _, _, _, _),
+        if Mreg::from(*base_str) == Mreg::BP;
+
+    stack_passed_param(func_start, *ofs) <--
+        extending_stack_arg_load(_, func_start, ofs, _);
+
+    // TR-5 companion: extension width/signedness pins the sub-int XType for the synthetic stack-param reg (more precise than the arith/Lload chunk rules).
+    emit_function_param_type_candidate(func_start, param_reg, xt) <--
+        extending_stack_arg_load(_, func_start, disp, chunk),
+        stack_param_idx(func_start, disp, idx),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let xt = match chunk {
+            MemoryChunk::MInt32 => XType::Xint,
+            MemoryChunk::MInt16Signed => XType::Xint16signed,
+            MemoryChunk::MInt16Unsigned => XType::Xint16unsigned,
+            MemoryChunk::MInt8Signed => XType::Xint8signed,
+            MemoryChunk::MInt8Unsigned => XType::Xint8unsigned,
+            _ => XType::Xany64,
+        };
 
     relation emit_function_stack_param_count(Address, usize);
 
@@ -5233,6 +5667,16 @@ ascent_par! {
     emit_function_return_type_xtype_candidate(func_start, xtype) <--
         emit_function_return(func_start, ret_rtl),
         emit_var_type_candidate(ret_rtl, xtype);
+
+    // 3.8 R1: float return type for FUSED-op-fed X0 returns. The fused def has no ltl Lop, so no emit_var_type_candidate exists at rtl time and the signature ladder fell to Case 3 (has_return + no xtype -> Xany64 -> `long` for a double-returning function). Derive the class from the op that structurally reaches the return: *fs / Osingleoffloat results are single, the rest of the float family is double.
+    emit_function_return_type_xtype_candidate(func_start, xt) <--
+        func_returns_float(func_start),
+        instr_in_function(ret_addr, func_start),
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        def_reaches_return(ret_addr, def_addr, Mreg::X0),
+        float_load_op(def_addr, op, _, _, _, Mreg::X0, _),
+        !has_ltl_op(def_addr),
+        let xt = if matches!(op, Operation::Oaddfs | Operation::Osubfs | Operation::Omulfs | Operation::Odivfs | Operation::Osingleoffloat) { XType::Xsingle } else { XType::Xfloat };
 
     emit_function_return_type_xtype_candidate(callee_func, xtype) <--
         ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Left(callee_func)))),

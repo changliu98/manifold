@@ -680,12 +680,34 @@ ascent_par! {
         let stmt = ClightStmt::Sifthenelse(condition, Box::new(then_stmt), Box::new(else_stmt));
 
 
-    clight_stmt_dead_without_field(func, node, stmt) <--
+    // CF-6 duplicate-dispatch suppression, node-keyed and edge-aware. (The old rule negated on the full (addr, node, stmt) tuple, but it recorded the PRE-LABEL statement while clight_stmt_for_func_raw wraps every statement in Slabel - the negation never matched, a total no-op: every recovered switch also emitted its member compares as raw ifs.) A member is subsumed by the head's switch only when every inbound edge comes from the head or another subsumed member; a member reachable from OUTSIDE the chain (interleaved range tests routing into the cascade) keeps its raw compare - suppressing it would dangle the external edge; the remaining double-dispatch is consistent (equality on the same discriminant) and bounded.
+    #[local] relation chain_member_node(Address, Node, Node);
+    chain_member_node(func, head, node) <--
         valid_switch_chain(func, head, _),
         switch_chain_member(func, head, node, _, _, _),
-        clight_stmt_without_field(node, stmt),
-        if *node != *head; 
-        
+        if *node != *head;
+
+    #[local] relation chain_node(Address, Node, Node);
+    chain_node(func, head, head) <-- valid_switch_chain(func, head, _);
+    chain_node(func, head, m) <-- chain_member_node(func, head, m);
+
+    #[local] relation chain_member_tainted(Address, Node, Node);
+    chain_member_tainted(func, head, m) <--
+        chain_member_node(func, head, m),
+        cminor_succ(p, m),
+        !chain_node(func, head, p);
+    chain_member_tainted(func, head, m) <--
+        chain_member_node(func, head, m),
+        cminor_succ(p, m),
+        chain_member_tainted(func, head, p);
+
+    #[local] relation clight_node_dead(Address, Node);
+    clight_node_dead(func, node) <--
+        chain_member_node(func, head, node),
+        !chain_member_tainted(func, head, node);
+    clight_node_dead(addr, node) <--
+        clight_stmt_dead_without_field(addr, node, _);
+
     clight_stmt_without_field(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sjumptable(expr, targets)),
         all_var_types_global(all_var_types),
@@ -844,7 +866,7 @@ ascent_par! {
 
     emit_clight_stmt_without_field(addr, node, stmt) <--
         clight_stmt_for_func_raw(addr, node, stmt),
-        !clight_stmt_dead_without_field(addr, node, stmt);
+        !clight_node_dead(addr, node);
 
 
     eligible_node_for_sseq(node) <--
@@ -905,15 +927,24 @@ ascent_par! {
         valid_next(dst),
         !has_cminor_stmt(src);
 
+    // A trimmed node whose real control flow DIVERTS from address order (its cminor successor is not its address-next, i.e. it is a jump/branch). Forwarding an edge through it by address adjacency (next_clight below) would fabricate a successor the program does not have: a trimmed `jmp back_to_loop` chained address-wise into the function epilogue turns an unconditional in-loop statement into a fake two-successor loop exit, whose statement the break machinery then discards. Control flow through diverting nodes is already forwarded correctly by the cminor_succ-chaining rules above.
+    #[local] relation diverts_from_next(Node);
+    diverts_from_next(mid) <--
+        cminor_succ(mid, t),
+        next(mid, n),
+        if *t != *n;
+
     #[local] relation next_clight(Node, Node);
     next_clight(mid, final_dst) <--
         next(mid, final_dst),
         !valid_next(mid),
+        !diverts_from_next(mid),
         valid_next(final_dst);
 
     next_clight(mid, final_dst) <--
         next(mid, next_mid),
         !valid_next(mid),
+        !diverts_from_next(mid),
         !valid_next(next_mid),
         next_clight(next_mid, final_dst);
 
@@ -937,7 +968,8 @@ ascent_par! {
 
     emit_struct_fields(func_addr, base_offset, fields) <--
         clight_efield_info(func_addr, _, base_offset, _, _, _),
-        agg fields = collect_unique_struct_fields(field_offset, field_name, chunk) in clight_efield_info(func_addr, _, base_offset, field_offset, field_name, chunk);
+        agg fields_raw = collect_unique_struct_fields(field_offset, field_name, chunk) in clight_efield_info(func_addr, _, base_offset, field_offset, field_name, chunk),
+        let fields = segregate_overlapping_fields(&fields_raw);
 
     // NOTE: XstructPtr type candidates are emitted by ClightFieldPass using canonical struct IDs; emitting here would use register-based IDs causing "no member named" errors.
 
@@ -966,11 +998,12 @@ impl IRPass for ClightFieldPass {
     }
 
     fn inputs(&self) -> &'static [&'static str] {
-        &["emit_struct_fields", "instr_in_function", "clight_stmt_without_field", "emit_clight_stmt_without_field", "clight_stmt_dead_without_field", "mach_imm_stack_init", "global_struct_catalog", "emit_function", "reg_rtl", "call_arg_mapping", "call_target_func", "reg_to_struct_id"]
+        &["emit_struct_fields", "emit_struct_field", "instr_in_function", "clight_stmt_without_field", "emit_clight_stmt_without_field", "clight_stmt_dead_without_field", "mach_imm_stack_init", "global_struct_catalog", "emit_function", "reg_rtl", "call_arg_mapping", "call_target_func", "reg_to_struct_id"]
     }
 
     fn outputs(&self) -> &'static [&'static str] {
-        &["clight_stmt", "emit_clight_stmt", "clight_stmt_dead", "reg_to_struct_id"]
+        // emit_struct_fields is read-modify-write: infer_struct_fields_from_stack_inits pushes rows and SR-2 rel_sets the pruned copy; declaring it an output persists both through parallel-stage sub-dbs.
+        &["clight_stmt", "emit_clight_stmt", "clight_stmt_dead", "reg_to_struct_id", "emit_struct_fields"]
     }
 }
 
@@ -1304,6 +1337,40 @@ pub(crate) fn collect_all_field_info<'a>(
     std::iter::once(fi)
 }
 
+/// SR-2: restrict aggregated per-base field evidence to a non-overlapping layout; build_fields_with_padding silently rebases intersecting extents, corrupting `->ofs_N` byte offsets. Same offset: widen to widest chunk (min name tie-break). Distinct intersecting extents: keep lower-offset field, drop intruder (its accesses keep raw deref form, which is layout-correct).
+pub(crate) fn segregate_overlapping_fields(
+    fields: &[(i64, Ident, MemoryChunk)],
+) -> Arc<Vec<(i64, Ident, MemoryChunk)>> {
+    use crate::decompile::analysis::struct_recovery_pass::chunk_byte_size;
+    // Negative offsets indicate a mid-object base register; build_fields_with_padding rebases by shifting all C offsets while Efield rewrites don't bias the pointer, so every `->ofs_N` reads wrong bytes. Until mid-object bases are supported, emit only the 0-based subset; negative-offset accesses keep their raw deref form.
+    let mut sorted: Vec<&(i64, Ident, MemoryChunk)> = fields.iter().filter(|f| f.0 >= 0).collect();
+    sorted.sort();
+    let mut per_offset: Vec<(i64, Ident, MemoryChunk)> = Vec::with_capacity(sorted.len());
+    for f in sorted {
+        match per_offset.last_mut() {
+            Some(prev) if prev.0 == f.0 => {
+                let wider = chunk_byte_size(&f.2) > chunk_byte_size(&prev.2);
+                if wider {
+                    *prev = f.clone();
+                }
+                // Equal width: keep prev (smallest (name, chunk) - sort order above).
+            }
+            _ => per_offset.push(f.clone()),
+        }
+    }
+    // Cross-offset extent overlap: ascending scan, keep-first.
+    let mut kept: Vec<(i64, Ident, MemoryChunk)> = Vec::with_capacity(per_offset.len());
+    let mut prev_end: Option<i64> = None;
+    for f in per_offset {
+        let size = chunk_byte_size(&f.2) as i64;
+        if prev_end.map_or(true, |e| f.0 >= e) {
+            prev_end = Some(f.0 + size);
+            kept.push(f);
+        }
+        // else: starts inside the previous kept field's extent - segregated out.
+    }
+    Arc::new(kept)
+}
 
 pub(crate) fn filter_and_build_var_type_map(
     all_pairs: &[(RTLReg, XType)],
@@ -3372,17 +3439,30 @@ fn rewrite_clight_expr_fields(expr: &ClightExpr, field_info: &FieldInfo, reg_to_
                         }
                     });
                 if let Some((field_offset, (_field_ident, chunk))) = lookup {
-                    let field_ty = deref_ty.clone();
-                    // Use canonical struct ID if available, else fall back to register-based
-                    let struct_id = reg_to_canonical.get(&base_ident)
-                        .copied()
-                        .unwrap_or_else(|| base_key.unsigned_abs() as Ident);
-                    let struct_ty = ClightType::Tstruct(struct_id, default_attr());
-                    let struct_ptr_ty = pointer_to(struct_ty.clone());
-                    let ptr_expr = ClightExpr::Etempvar(base_ident, struct_ptr_ty);
-                    let proper_field_id = make_field_ident(field_offset, chunk.clone());
-                    let deref_expr = ClightExpr::Ederef(Box::new(ptr_expr), struct_ty);
-                    return ClightExpr::Efield(Box::new(deref_expr), proper_field_id, field_ty);
+                    // SR-2 width gate: rewriting a deref whose scalar width disagrees with the declared field width would silently change bytes read at recompile; keep raw deref form instead. Unknown/non-scalar deref types always rewrite.
+                    let width_ok = match deref_ty {
+                        ClightType::Tint(..)
+                        | ClightType::Tlong(..)
+                        | ClightType::Tfloat(..)
+                        | ClightType::Tpointer(..) => {
+                            use crate::decompile::analysis::struct_recovery_pass::chunk_byte_size;
+                            get_inner_type_size(deref_ty) == Some(chunk_byte_size(chunk) as i64)
+                        }
+                        _ => true,
+                    };
+                    if width_ok {
+                        let field_ty = deref_ty.clone();
+                        // Use canonical struct ID if available, else fall back to register-based
+                        let struct_id = reg_to_canonical.get(&base_ident)
+                            .copied()
+                            .unwrap_or_else(|| base_key.unsigned_abs() as Ident);
+                        let struct_ty = ClightType::Tstruct(struct_id, default_attr());
+                        let struct_ptr_ty = pointer_to(struct_ty.clone());
+                        let ptr_expr = ClightExpr::Etempvar(base_ident, struct_ptr_ty);
+                        let proper_field_id = make_field_ident(field_offset, chunk.clone());
+                        let deref_expr = ClightExpr::Ederef(Box::new(ptr_expr), struct_ty);
+                        return ClightExpr::Efield(Box::new(deref_expr), proper_field_id, field_ty);
+                    }
                 }
             }
             ClightExpr::Ederef(
@@ -3603,7 +3683,19 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
     {
         let fi = func_field_info.entry(*func_addr).or_default();
         for (field_off, field_name, chunk) in fields.iter() {
-            fi.insert((*base_off, *field_off), (*field_name, chunk.clone()));
+            // emit_struct_fields is multi-valued per (func, base); keep widest chunk (tie-break min name) to avoid relation-order flicker.
+            use crate::decompile::analysis::struct_recovery_pass::chunk_byte_size;
+            fi.entry((*base_off, *field_off))
+                .and_modify(|cur| {
+                    let (cur_name, cur_chunk) = cur.clone();
+                    let better = chunk_byte_size(chunk) > chunk_byte_size(&cur_chunk)
+                        || (chunk_byte_size(chunk) == chunk_byte_size(&cur_chunk)
+                            && *field_name < cur_name);
+                    if better {
+                        *cur = (*field_name, chunk.clone());
+                    }
+                })
+                .or_insert((*field_name, chunk.clone()));
         }
     }
 
@@ -3642,14 +3734,22 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
         // Callsite linkage via ABI: a register passed as the N-th argument is the same abstract pointer as the callee's N-th parameter register. Union them so disjoint per-function field-sets merge into one canonical struct.
         let abi_regs = &crate::x86::abi::abi_config().int_arg_regs;
         // Invert emit_function to lookup the function owning a given entry node.
-        let entry_node_to_func: HashMap<Node, Address> = db
-            .rel_iter::<(Address, Symbol, Node)>("emit_function")
-            .map(|(a, _, n)| (*n, *a))
-            .collect();
+        let mut entry_node_to_func: HashMap<Node, Address> = HashMap::new();
+        for (a, _, n) in db.rel_iter::<(Address, Symbol, Node)>("emit_function") {
+            // Aliased symbols can share one entry node; min addr wins to keep callsite union edges stable.
+            entry_node_to_func
+                .entry(*n)
+                .and_modify(|cur| if *a < *cur { *cur = *a })
+                .or_insert(*a);
+        }
         let mut entry_mreg_to_rtl: HashMap<(Address, Mreg), RTLReg> = HashMap::new();
         for &(node, mreg, rtl) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl") {
             if let Some(&func) = entry_node_to_func.get(&node) {
-                entry_mreg_to_rtl.insert((func, mreg), rtl);
+                // reg_rtl is multi-valued per (node, mreg); pick MIN RTLReg so the callee-param representative is stable across parallel-Ascent runs (last-wins flickered union-find classes and efield canonical struct ids).
+                entry_mreg_to_rtl
+                    .entry((func, mreg))
+                    .and_modify(|cur| if rtl < *cur { *cur = rtl })
+                    .or_insert(rtl);
             }
         }
 
@@ -3670,10 +3770,14 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
             .collect();
         call_args.sort();
 
-        let call_targets: HashMap<Node, Address> = db
-            .rel_iter::<(Node, Address)>("call_target_func")
-            .map(|(n, a)| (*n, *a))
-            .collect();
+        let mut call_targets: HashMap<Node, Address> = HashMap::new();
+        for (n, a) in db.rel_iter::<(Node, Address)>("call_target_func") {
+            // Min-wins for indirect calls that map a call node to multiple targets.
+            call_targets
+                .entry(*n)
+                .and_modify(|cur| if *a < *cur { *cur = *a })
+                .or_insert(*a);
+        }
 
         // Union-Find over RTLReg, lazily created as we walk the linkages.
         let mut parent: HashMap<RTLReg, RTLReg> = HashMap::new();
@@ -3711,7 +3815,7 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
         let mut root_fields: HashMap<RTLReg, std::collections::BTreeMap<i64, MemoryChunk>> = HashMap::new();
         for key in &sorted_keys {
             let (_func_addr, base_off) = *key;
-            // emit_struct_fields.base_off is i64 and can encode RTLRegs (high bit set per fresh_xtl_reg), constants, or stack-offset buckets. Only RTLReg-encoded keys belong in the union-find; gating on the high bit avoids polluting equivalence classes with unrelated integer values.
+            // base_off encodes RTLRegs (high bit set), constants, or stack-offset buckets; only RTLReg-encoded keys belong in the union-find.
             if (base_off as u64) & (1u64 << 63) == 0 { continue; }
             let reg = base_off as RTLReg;
             let root = ufind(&mut parent, reg);
@@ -3728,9 +3832,8 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
             }
         }
 
-        // Assign canonical IDs per root. Try to match an existing canonical struct by exact-shape hash; otherwise allocate a new ID.
+        // Assign canonical IDs per root: prefer existing reg_to_canonical entries (min id) so union with struct_recovery's IDs is preserved; otherwise match by exact-shape hash or allocate a new ID.
         let mut root_to_id: HashMap<RTLReg, Ident> = HashMap::new();
-        // For each root, check if any member is already in reg_to_canonical and pick the smallest such id as the root's id (so the union with struct_recovery's canonical IDs is preserved).
         for (root, members) in &root_members {
             let mut existing_ids: Vec<Ident> = members.iter()
                 .filter_map(|(_, base_off)| reg_to_canonical.get(&(*base_off as Ident)).copied())
@@ -3765,13 +3868,17 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
             root_to_id.insert(*root, id);
         }
 
-        // Push new reg_to_struct_id entries; extract_struct_definitions takes min sid so smaller shape-derived IDs win. No subset-redirect: merging shapes that share offsets but are semantically unrelated needs inter-procedural points-to.
+        // Push new reg_to_struct_id entries (min sid wins). Iterate sorted roots with min-merge: aliased functions can share a reg-Ident across two roots (fresh regs encode node<<6|mreg), and HashMap-order overwrites flickered canonical ids.
         let mut new_rtsi: Vec<(Address, RTLReg, usize)> = Vec::new();
-        for (root, members) in &root_members {
+        for root in &sorted_roots {
+            let Some(members) = root_members.get(root) else { continue };
             if let Some(&id) = root_to_id.get(root) {
                 for &(func_addr, base_off) in members {
                     let reg = base_off as Ident;
-                    reg_to_canonical.insert(reg, id);
+                    reg_to_canonical
+                        .entry(reg)
+                        .and_modify(|cur| *cur = (*cur).min(id))
+                        .or_insert(id);
                     new_rtsi.push((func_addr, base_off as RTLReg, id as usize));
                 }
             }
@@ -3780,6 +3887,163 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
         new_rtsi.dedup();
         for tuple in new_rtsi {
             db.rel_push("reg_to_struct_id", tuple);
+        }
+    }
+
+    // SR-2 cross-row closure: per-row segregation cannot stop re-introduced overlap, because extract_struct_definitions unions efield rows across (func, base) per canonical id and then merges with struct_recovery rows. Re-segregate the per-canonical-id union here at the producer and prune both emit_struct_fields and the per-function FieldInfo so no rewrite references a member the def won't carry. Recovery-owned extents are immovable: efield at an exact recovery offset is kept only if names and widths agree; landing inside a recovery extent at a different offset is dropped (raw deref is layout-correct).
+    {
+        use crate::decompile::analysis::struct_recovery_pass::chunk_byte_size;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let cid_of = |base_off: i64, canon: &HashMap<Ident, Ident>| -> Ident {
+            canon
+                .get(&(base_off as Ident))
+                .copied()
+                .unwrap_or(base_off.unsigned_abs() as Ident)
+        };
+
+        // Recovery-owned extents per canonical id: offset -> (end_of_widest_field, min_name). Name is required at exact-alias offsets because a rewrite is only valid when the efield name matches recovery's member (e.g. ofs_9 aliasing _pad_9 would name a non-existent member).
+        let mut recovery_extents: HashMap<Ident, BTreeMap<i64, (i64, Ident)>> = HashMap::new();
+        for (sid, _, off, ftype, fname) in
+            db.rel_iter::<(usize, usize, i64, FieldType, Ident)>("emit_struct_field")
+        {
+            let end = *off + ftype.size(8) as i64;
+            recovery_extents
+                .entry(*sid as Ident)
+                .or_default()
+                .entry(*off)
+                .and_modify(|(e, n)| {
+                    *e = (*e).max(end);
+                    *n = (*n).min(*fname);
+                })
+                .or_insert((end, *fname));
+        }
+
+        let rows: Vec<(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)> = db
+            .rel_iter::<(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_struct_fields")
+            .map(|(a, b, f)| (*a, *b, f.clone()))
+            .collect();
+        let mut union_fields: HashMap<Ident, BTreeSet<(i64, Ident, MemoryChunk)>> = HashMap::new();
+        for (_, base_off, fields) in &rows {
+            let entry = union_fields.entry(cid_of(*base_off, &reg_to_canonical)).or_default();
+            for f in fields.iter() {
+                entry.insert(f.clone());
+            }
+        }
+
+        // Segregated union per canonical id: offset -> the one kept (name, chunk).
+        let mut kept: HashMap<Ident, BTreeMap<i64, (Ident, MemoryChunk)>> = HashMap::new();
+        for (cid, fields) in &union_fields {
+            // Rebase guard: if struct_recovery has negative-offset fields for this canonical id, build_fields_with_padding shifts the whole layout to 0-based C offsets while Efield rewrites don't bias the pointer, so every member reads shifted bytes. Refuse all efield members for such ids; raw derefs are layout-correct.
+            if recovery_extents
+                .get(cid)
+                .is_some_and(|r| r.keys().next().is_some_and(|&o| o < 0))
+            {
+                kept.entry(*cid).or_default();
+                continue;
+            }
+            let mut by_offset: Vec<(i64, Ident, MemoryChunk)> = fields.iter().cloned().collect();
+            by_offset.sort_by_key(|(off, name, chunk)| {
+                (*off, std::cmp::Reverse(chunk_byte_size(chunk)), *name, *chunk)
+            });
+            by_offset.dedup_by_key(|f| f.0);
+            let recov = recovery_extents.get(cid);
+            let mut taken: BTreeMap<i64, i64> = recov
+                .map(|r| r.iter().map(|(&o, &(e, _))| (o, e)).collect())
+                .unwrap_or_default();
+            let k = kept.entry(*cid).or_default();
+            for (off, name, chunk) in by_offset {
+                if let Some(&(rec_end, rec_name)) = recov.and_then(|r| r.get(&off)) {
+                    // Exact alias of a recovery field: only valid if name AND width agree (the emitted member access reads the DEF field's width; a wider efield chunk would silently narrow reads at recompile and break pad math for all following fields).
+                    if name == rec_name && chunk_byte_size(&chunk) as i64 == rec_end - off {
+                        k.insert(off, (name, chunk));
+                    }
+                    continue;
+                }
+                let end = off + chunk_byte_size(&chunk) as i64;
+                let prev_overlaps = taken
+                    .range(..=off)
+                    .next_back()
+                    .is_some_and(|(_, &pe)| pe > off);
+                let next_overlaps = taken.range(off..).next().is_some_and(|(&ns, _)| ns < end);
+                if !prev_overlaps && !next_overlaps {
+                    taken.insert(off, end);
+                    k.insert(off, (name, chunk));
+                }
+            }
+        }
+
+        // Prune relation rows: a union of subsets of a non-overlapping set is non-overlapping, and the kept (name, chunk) winner always survives in its contributing row.
+        let mut dropped = 0usize;
+        let pruned: ascent::boxcar::Vec<(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)> =
+            rows.iter()
+                .map(|(fa, base, fields)| {
+                    let k = &kept[&cid_of(*base, &reg_to_canonical)];
+                    let nf: Vec<(i64, Ident, MemoryChunk)> = fields
+                        .iter()
+                        .filter(|(off, name, chunk)| {
+                            k.get(off).is_some_and(|(kn, kc)| kn == name && kc == chunk)
+                        })
+                        .cloned()
+                        .collect();
+                    if nf.len() != fields.len() {
+                        dropped += fields.len() - nf.len();
+                        (*fa, *base, Arc::new(nf))
+                    } else {
+                        (*fa, *base, fields.clone())
+                    }
+                })
+                .collect();
+        if std::env::var("SR2_TRACE").is_ok() {
+            let total_in: usize = rows.iter().map(|(_, _, f)| f.len()).sum();
+            eprintln!(
+                "[sr2] cross-row segregation: {} canonical ids, {} row fields, {} dropped",
+                kept.len(),
+                total_in,
+                dropped
+            );
+            let mut srows: Vec<_> = rows
+                .iter()
+                .map(|(fa, b, f)| (*fa, *b, f.as_ref().clone()))
+                .collect();
+            srows.sort();
+            for (fa, b, f) in &srows {
+                eprintln!(
+                    "[sr2]   row func={:#x} base={:#x} cid={:#x} fields={:?}",
+                    fa,
+                    b,
+                    cid_of(*b, &reg_to_canonical),
+                    f
+                );
+            }
+            let mut scids: Vec<_> = kept.iter().collect();
+            scids.sort_by_key(|(cid, _)| **cid);
+            for (cid, k) in scids {
+                eprintln!(
+                    "[sr2]   kept cid={:#x} {:?} recovery_extents={:?}",
+                    cid,
+                    k,
+                    recovery_extents.get(cid)
+                );
+            }
+        }
+        if dropped > 0 {
+            db.rel_set("emit_struct_fields", pruned);
+        }
+
+        for fi in func_field_info.values_mut() {
+            fi.retain(|(base, off), nc| {
+                match kept
+                    .get(&cid_of(*base, &reg_to_canonical))
+                    .and_then(|k| k.get(off))
+                {
+                    Some(kept_nc) => {
+                        *nc = *kept_nc;
+                        true
+                    }
+                    None => false,
+                }
+            });
         }
     }
 
@@ -3949,12 +4213,24 @@ fn synthesize_struct_construction(
     for (_func_addr, base_off, fields) in
         db.rel_iter::<(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_struct_fields")
     {
+        // Single-field layouts cause false positives in the fallback matcher (every uniform init run "matches" as 1-field instances); require >=2 fields of evidence.
+        if fields.len() < 2 {
+            continue;
+        }
         let mut layout: Vec<(i64, MemoryChunk)> = fields.iter()
             .map(|(off, _, chunk)| (*off, chunk.clone()))
             .collect();
         layout.sort_by_key(|(off, _)| *off);
         let struct_id = base_off.unsigned_abs() as Ident;
-        known_layouts.entry(layout).or_insert((struct_id, fields.to_vec()));
+        // Min-id wins: or_insert alone flickered the representative id across parallel-Ascent runs, flickering every synthesized field assign.
+        known_layouts
+            .entry(layout)
+            .and_modify(|cur| {
+                if struct_id < cur.0 {
+                    *cur = (struct_id, fields.to_vec());
+                }
+            })
+            .or_insert((struct_id, fields.to_vec()));
     }
 
     if known_layouts.is_empty() {
@@ -4058,7 +4334,27 @@ fn synthesize_struct_construction(
             offsets.sort();
             offsets.dedup();
 
-            for (layout, (struct_id, fields)) in &known_layouts {
+            // Pick the widest chunk seen at each offset.
+            let chunk_at: std::collections::BTreeMap<i64, MemoryChunk> = {
+                use crate::decompile::analysis::struct_recovery_pass::chunk_byte_size;
+                let mut m: std::collections::BTreeMap<i64, MemoryChunk> = std::collections::BTreeMap::new();
+                for (_, ofs, _, typ) in &sorted {
+                    let c = typ_to_chunk(typ);
+                    m.entry(*ofs)
+                        .and_modify(|cur| {
+                            if chunk_byte_size(&c) > chunk_byte_size(cur) {
+                                *cur = c.clone();
+                            }
+                        })
+                        .or_insert(c);
+                }
+                m
+            };
+
+            // Sort candidates (min struct_id, then layout) for determinism: this loop breaks on first match and HashMap order let different layouts claim the cluster each run.
+            let mut layout_candidates: Vec<_> = known_layouts.iter().collect();
+            layout_candidates.sort_by(|a, b| (a.1 .0, a.0).cmp(&(b.1 .0, b.0)));
+            for (layout, (struct_id, fields)) in layout_candidates {
                 let struct_size: i64 = layout.iter().map(|(off, chunk)| {
                     off + match chunk {
                         MemoryChunk::MInt32 => 4,
@@ -4078,7 +4374,8 @@ fn synthesize_struct_construction(
 
                 for &ofs in &offsets {
                     let expected_ofs = min_ofs + (instance_idx as i64) * struct_size + layout[field_idx].0;
-                    if ofs == expected_ofs {
+                    // Offset AND chunk must match: offset-only let int inits satisfy long fields, synthesizing field assigns for unrelated locals.
+                    if ofs == expected_ofs && chunk_at.get(&ofs) == Some(&layout[field_idx].1) {
                         matched_count += 1;
                         field_idx += 1;
                         if field_idx >= field_count {

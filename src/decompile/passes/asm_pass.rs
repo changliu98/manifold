@@ -46,12 +46,32 @@ fn refine_chunk_with_size(mc: MemoryChunk, size: usize) -> MemoryChunk {
     match size {
         1 => if signed { MemoryChunk::MInt8Signed } else { MemoryChunk::MInt8Unsigned },
         2 => if signed { MemoryChunk::MInt16Signed } else { MemoryChunk::MInt16Unsigned },
-        4 => if mc == MemoryChunk::MFloat32 { MemoryChunk::MFloat32 } else { MemoryChunk::MInt32 },
+        // A 4-byte access through a float register is a single (movss); MFloat64 narrows to MFloat32, never to an int chunk.
+        4 => if mc == MemoryChunk::MFloat32 || mc == MemoryChunk::MFloat64 { MemoryChunk::MFloat32 } else { MemoryChunk::MInt32 },
         _ => mc,
     }
 }
 
-/// Recover signed divisor d from magic-multiply constant: d = round(2^total_shift / magic).
+/// Maps SETcc TestCond (CF/ZF unsigned-style) to the float Condition it materializes (A->Cgt, AE->Cge, B->Clt, BE->Cle, E->Ceq, NE->Cnotcompf(Ceq)); returns None for parity/signed conditions a bare float setcc cannot express.
+fn fcmp_setcc_condition(tc: TestCond, is_double: bool) -> Option<Condition> {
+    let cmp = match tc {
+        TestCond::CondA => Comparison::Cgt,
+        TestCond::CondAe => Comparison::Cge,
+        TestCond::CondB => Comparison::Clt,
+        TestCond::CondBe => Comparison::Cle,
+        TestCond::CondE => Comparison::Ceq,
+        TestCond::CondNe => {
+            return Some(if is_double {
+                Condition::Cnotcompf(Comparison::Ceq)
+            } else {
+                Condition::Cnotcompfs(Comparison::Ceq)
+            })
+        }
+        _ => return None,
+    };
+    Some(if is_double { Condition::Ccompf(cmp) } else { Condition::Ccompfs(cmp) })
+}
+
 fn recover_signed_divisor(magic: i64, total_shift: i64) -> Option<i64> {
     if magic <= 0 || total_shift < 32 {
         return None;
@@ -71,7 +91,6 @@ fn recover_signed_divisor(magic: i64, total_shift: i64) -> Option<i64> {
     }
 }
 
-/// Recover signed divisor d from a compensating magic (effective_magic = magic_low32 + 2^32; compiler emits `add result, input` for the wrap).
 fn recover_signed_divisor_compensating(magic_signed_i32: i64, total_shift: i64) -> Option<i64> {
     if total_shift < 32 || total_shift > 63 {
         return None;
@@ -101,7 +120,6 @@ fn recover_signed_divisor_compensating(magic_signed_i32: i64, total_shift: i64) 
     }
 }
 
-/// Recover unsigned divisor d from magic-multiply constant: d = round(2^total_shift / magic).
 fn recover_unsigned_divisor(magic: i64, total_shift: i64) -> Option<i64> {
     if total_shift < 32 {
         return None;
@@ -1207,6 +1225,56 @@ ascent_par! {
         if *disp > 0,
         let target = *disp as Address;
 
+    // Absolute addressing for padd/psub memory-SOURCE direction (`add 0x404024,%eax`, 3.8c)
+    abs_target_addr(addr, target) <--
+        padd(addr, _, src),
+        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
+    abs_target_addr(addr, target) <--
+        psub(addr, _, src),
+        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
+    abs_target_addr(addr, target) <--
+        pand(addr, _, src),
+        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
+    abs_target_addr(addr, target) <--
+        por(addr, _, src),
+        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
+    abs_target_addr(addr, target) <--
+        pxor(addr, _, src),
+        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
+    // Absolute addressing for the float/SSE memory-source op family (addsd/mulss/... 0x..., 3.8a)
+    abs_target_addr(addr, target) <--
+        float_mem_op_raw(addr, _, _, src, _, _),
+        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
     // Scaled-index absolute addressing (clang -fno-pie const-table load): base=NONE, idx=non-NONE scaled, disp>0 is the rodata table base. The displacement must land in a real data section; a small arithmetic displacement (e.g. `lea 0x8(,%rsi,8)`) is an index computation, not a table base, and must stay numeric.
     abs_target_addr(addr, target) <--
         pmov(addr, _, am),
@@ -1535,11 +1603,12 @@ ascent_par! {
         !stack_delta(prevaddr, _);
 
 
-    transl_store_inferred(addr, *chunk, addrmode, regs.clone(), src) <--
+    // ireg_hold_type maps sub-registers to Tint (MInt32), so chunk must come from the capstone operand size (msize), not the register family; refine_chunk_with_size narrows and never widens.
+    transl_store_inferred(addr, mc, addrmode, regs.clone(), src) <--
         pmov(addr, dst, src_sym),
         op_register(src_sym, src_str),
         let src = Mreg::from(src_str),
-        op_indirect(dst, _, r2, idx_str, _scale, disp, _),
+        op_indirect(dst, _, r2, idx_str, _scale, disp, msize),
         if Mreg::from(r2) != Mreg::BP && Mreg::from(r2) != Mreg::SP,
         if *idx_str == "NONE" || idx_str.is_empty(),
         let addrmode = Addrmode{
@@ -1551,14 +1620,15 @@ ascent_par! {
         preg_of(arg, preg_of_r2),
         let regs = Arc::new(vec![*arg]),
         ireg_hold_type(src_str.to_string(), typ),
-        type_to_memchunk(typ, chunk);
+        type_to_memchunk(typ, chunk),
+        let mc = refine_chunk_with_size(*chunk, *msize);
 
     // Indexed store (non-SP/non-BP base with index register)
-    transl_store_inferred(addr, *chunk, addrmode, regs.clone(), src) <--
+    transl_store_inferred(addr, mc, addrmode, regs.clone(), src) <--
         pmov(addr, dst, src_sym),
         op_register(src_sym, src_str),
         let src = Mreg::from(src_str),
-        op_indirect(dst, _, r2, idx_str, scale, disp, _),
+        op_indirect(dst, _, r2, idx_str, scale, disp, msize),
         if Mreg::from(r2) != Mreg::BP && Mreg::from(r2) != Mreg::SP,
         if *idx_str != "NONE" && !idx_str.is_empty(),
         let addrmode = Addrmode{
@@ -1572,14 +1642,15 @@ ascent_par! {
         preg_of(idx_arg, preg_of_idx),
         let regs = Arc::new(vec![*arg, *idx_arg]),
         ireg_hold_type(src_str.to_string(), typ),
-        type_to_memchunk(typ, chunk);
+        type_to_memchunk(typ, chunk),
+        let mc = refine_chunk_with_size(*chunk, *msize);
 
     // Scaled-index store with no base register: mov src, disp(,%idx,scale)
-    transl_store_inferred(addr, *chunk, addrmode, regs.clone(), src) <--
+    transl_store_inferred(addr, mc, addrmode, regs.clone(), src) <--
         pmov(addr, dst, src_sym),
         op_register(src_sym, src_str),
         let src = Mreg::from(src_str),
-        op_indirect(dst, _, base_str, idx_str, scale, disp, _),
+        op_indirect(dst, _, base_str, idx_str, scale, disp, msize),
         if *base_str == "NONE" || base_str.is_empty(),
         if *idx_str != "NONE" && !idx_str.is_empty(),
         let addrmode = Addrmode{
@@ -1591,7 +1662,8 @@ ascent_par! {
         preg_of(idx_arg, preg_of_idx),
         let regs = Arc::new(vec![*idx_arg]),
         ireg_hold_type(src_str.to_string(), typ),
-        type_to_memchunk(typ, chunk);
+        type_to_memchunk(typ, chunk),
+        let mc = refine_chunk_with_size(*chunk, *msize);
 
     transl_store(addr, mc, addrmode, regs, src) <--
         transl_store_inferred(addr, mc, addrmode, regs, src);
@@ -1692,9 +1764,10 @@ ascent_par! {
         pmov(addr, dst, src),
         op_register(src, srcstr),
         let src_reg = Mreg::from(srcstr),
-        op_indirect(dst, _, r2, idx, _, disp, _),
+        op_indirect(dst, _, r2, idx, _, disp, msize),
         if Mreg::from(r2) == Mreg::SP,
         if *idx == "NONE",
+        if *msize != 1 && *msize != 2,
         stack_offset(_, addr, rsp_ofs),
         let ofs_adjusted = *disp + rsp_ofs.0,
         ireg_hold_type(srcstr.to_string(), typ);
@@ -1703,12 +1776,39 @@ ascent_par! {
         pmov(addr, dst, src),
         op_register(src, srcstr),
         let src_reg = Mreg::from(srcstr),
-        op_indirect(dst, _, r2, idx, _, disp, _),
+        op_indirect(dst, _, r2, idx, _, disp, msize),
         if Mreg::from(r2) == Mreg::BP,
         if *idx == "NONE",
+        if *msize != 1 && *msize != 2,
         instr_in_function(addr, func),
         func_has_frame_pointer(func),
         ireg_hold_type(srcstr.to_string(), typ);
+
+    // Typ has no 8/16-bit member, so sub-register frame-slot stores use Ainstack Mstore with the true byte width; rtl re-derives the Lsetstack row from Lstore(Ainstack,[]) so slot dataflow is unchanged.
+    mach_inst(addr, MachInst::Mstore(mc, Addressing::Ainstack(*disp), Arc::new(vec![]), src_reg)) <--
+        pmov(addr, dst, src),
+        op_register(src, srcstr),
+        let src_reg = Mreg::from(srcstr),
+        op_indirect(dst, _, r2, idx, _, disp, msize),
+        if Mreg::from(r2) == Mreg::SP,
+        if *idx == "NONE",
+        if *msize == 1 || *msize == 2,
+        stack_offset(_, addr, _rsp_ofs),
+        ireg_hold_type(srcstr.to_string(), _),
+        let mc = if *msize == 1 { MemoryChunk::MInt8Unsigned } else { MemoryChunk::MInt16Unsigned };
+
+    mach_inst(addr, MachInst::Mstore(mc, Addressing::Ainstack(*disp), Arc::new(vec![]), src_reg)) <--
+        pmov(addr, dst, src),
+        op_register(src, srcstr),
+        let src_reg = Mreg::from(srcstr),
+        op_indirect(dst, _, r2, idx, _, disp, msize),
+        if Mreg::from(r2) == Mreg::BP,
+        if *idx == "NONE",
+        if *msize == 1 || *msize == 2,
+        instr_in_function(addr, func),
+        func_has_frame_pointer(func),
+        ireg_hold_type(srcstr.to_string(), _),
+        let mc = if *msize == 1 { MemoryChunk::MInt8Unsigned } else { MemoryChunk::MInt16Unsigned };
 
     mach_imm_stack_init(addr, disp, imm_int, ty) <--
         pmov(addr, dst, src),
@@ -1732,12 +1832,14 @@ ascent_par! {
         let ty = if *sz <= 4 { Typ::Tint } else { Typ::Tany64 },
         let imm_int = *imm_sym as i64;
 
+    // RIP base excluded: Mreg::from("RIP") is Unknown so the row could never lower; RIP-relative immediate global stores have no lifting route and are silently dropped (FIXPLAN 3.8c).
     mach_imm_indirect_store(addr, imm_int, ty, base_mreg, *disp) <--
         pmov(addr, dst, src),
         op_immediate(src, imm_sym, _),
         op_indirect(dst, _, r2, _, _scale, disp, sz),
         if Mreg::from(r2) != Mreg::BP && Mreg::from(r2) != Mreg::SP,
         if *r2 != "NONE" && !r2.is_empty(),
+        !reg_ip(r2),
         let base_mreg = Mreg::from(r2),
         let ty = if *sz <= 4 { Typ::Tint } else { Typ::Tany64 },
         let imm_int = *imm_sym as i64;
@@ -1822,16 +1924,17 @@ ascent_par! {
         let mc = refine_chunk_with_size(chunk_from_mnem_ext(mnem), *msize);
 
     // BP-relative store when BP is NOT the frame pointer
-    mach_inst(addr, MachInst::Mstore(*mc, Addressing::Aindexed(*disp), Arc::new(vec![Mreg::BP]), src_reg)) <--
+    mach_inst(addr, MachInst::Mstore(mc, Addressing::Aindexed(*disp), Arc::new(vec![Mreg::BP]), src_reg)) <--
         pmov(addr, dst, src),
         op_register(src, srcstr),
         let src_reg = Mreg::from(srcstr),
-        op_indirect(dst, _, r2, _, _, disp, _),
+        op_indirect(dst, _, r2, _, _, disp, msize),
         if Mreg::from(r2) == Mreg::BP,
         instr_in_function(addr, func),
         !func_has_frame_pointer(func),
         ireg_hold_type(srcstr.to_string(), typ),
-        type_to_memchunk(typ, mc);
+        type_to_memchunk(typ, chunk),
+        let mc = refine_chunk_with_size(*chunk, *msize);
 
     // BP-relative store (mnemonic-based chunk) when BP is NOT the frame pointer
     mach_inst(addr, MachInst::Mstore(mc, Addressing::Aindexed(*disp), Arc::new(vec![Mreg::BP]), src_reg)) <--
@@ -1875,6 +1978,83 @@ ascent_par! {
     test_jcc_link(addr0, addr1) <--
         flags_and_jump_pair(addr0, addr1, _),
         ptest(addr0, _, _);
+
+    // Secondary flags consumer: several conditional jumps consume ONE compare's flags (`cmp; je A; jle B` - the backward pairing walks through the je because a jcc does not clobber flags). The established design keys the Mcond at the COMPARE's address and leaves the jcc node empty (bridged by linear's branch-to-next default); with several consumers every condition collides at the one compare node, a single row wins the downstream candidate pick, and each losing jcc node degrades to an UNCONDITIONAL branch-to-fallthrough - silently deleting its taken edge from the CFG (observed: `cmp $2,%eax; je ..; jle ..` lifting the jle as Lbranch, disconnecting a loop's compare spine). Each safe secondary therefore carries its own Mcond at its OWN address; mcond_at_jcc tells linear to compute that Lcond's fall-through as next(jcc) instead of the skip-one-paired-jcc form.
+    #[local] relation secondary_flags_consumer(Address, Address);
+    secondary_flags_consumer(addr0, addr1) <--
+        cmp_jcc_link(addr0, addr1),
+        cmp_jcc_link(addr0, mid),
+        if *mid < *addr1;
+    secondary_flags_consumer(addr0, addr1) <--
+        test_jcc_link(addr0, addr1),
+        test_jcc_link(addr0, mid),
+        if *mid < *addr1;
+
+    // A compared register is redefined between the compare and a secondary jcc (a mov between the jccs is legal - it does not touch flags): re-reading the register at the jcc would test the WRONG value, so such a secondary keeps the legacy (lossy, edge-eating) cmp-keyed behavior rather than emit a mis-valued condition. The addr0 < d < addr1 window is the straight-line flags region between the paired instructions, not a reachability judgment.
+    #[local] relation flags_args_redefined_between(Address, Address);
+    flags_args_redefined_between(addr0, addr1) <--
+        secondary_flags_consumer(addr0, addr1),
+        pcmp(addr0, r1, _),
+        op_register(r1, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r),
+        reg_def(d, mreg),
+        if *addr0 < *d && *d < *addr1;
+    flags_args_redefined_between(addr0, addr1) <--
+        secondary_flags_consumer(addr0, addr1),
+        pcmp(addr0, _, r2),
+        op_register(r2, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r),
+        reg_def(d, mreg),
+        if *addr0 < *d && *d < *addr1;
+    flags_args_redefined_between(addr0, addr1) <--
+        secondary_flags_consumer(addr0, addr1),
+        ptest(addr0, r1, _),
+        op_register(r1, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r),
+        reg_def(d, mreg),
+        if *addr0 < *d && *d < *addr1;
+
+    #[local] relation secondary_safe(Address, Address);
+    secondary_safe(addr0, addr1) <--
+        secondary_flags_consumer(addr0, addr1),
+        !flags_args_redefined_between(addr0, addr1);
+
+    // Where each (compare, jcc) pair's Mcond is keyed: primary (and unsafe secondary) -> the compare's address; safe secondary -> the jcc's own address.
+    #[local] relation mcond_emit_addr(Address, Address, Address);
+    mcond_emit_addr(addr0, addr1, addr0) <--
+        cmp_jcc_link(addr0, addr1),
+        !secondary_safe(addr0, addr1);
+    mcond_emit_addr(addr0, addr1, addr0) <--
+        test_jcc_link(addr0, addr1),
+        !secondary_safe(addr0, addr1);
+    mcond_emit_addr(addr0, addr1, addr1) <--
+        secondary_safe(addr0, addr1);
+
+    relation mcond_at_jcc(Address);
+    mcond_at_jcc(addr1) <-- secondary_safe(_, addr1);
+
+    // A secondary-consumer Mcond reads its compare's registers at the JCC's address, but the raw jcc instruction has no register operands, so the operand-based reg_use derivation sees nothing there; without these rows liveness never connects the compare operand's def to the relocated condition and RTL fabricates an undefined operand.
+    reg_use(addr1, mreg) <--
+        secondary_safe(addr0, addr1),
+        pcmp(addr0, r, _),
+        op_register(r, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r);
+    reg_use(addr1, mreg) <--
+        secondary_safe(addr0, addr1),
+        pcmp(addr0, _, r),
+        op_register(r, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r);
+    reg_use(addr1, mreg) <--
+        secondary_safe(addr0, addr1),
+        ptest(addr0, r, _),
+        op_register(r, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r);
 
     #[local] relation cmp_cmov_link(Address, Address);
     cmp_cmov_link(addr0, addr1) <--
@@ -1991,14 +2171,14 @@ ascent_par! {
         pjcc(_, test_cond, _), if let TestCond::CondNe = test_cond;
 
 
-    mach_inst(addr0, MachInst::Mcond(condition, Arc::new(vec![*arg1]), lbl)) <--
+    mach_inst(emit_addr, MachInst::Mcond(condition, Arc::new(vec![*arg1]), lbl)) <--
         pcmp(addr0, r1, r2),
         op_register(r1, reg_str1),
         op_immediate(r2, imm_val, _),
         reg_64(reg_str1),
         ireg_of(preg_of_r1, Ireg::from(reg_str1)),
         preg_of(arg1, preg_of_r1),
-        cmp_jcc_link(addr0, addr1),
+        mcond_emit_addr(addr0, addr1, emit_addr),
         pjcc(addr1, test_cond, lbl),
         testcond_to_cond_64(*test_cond, base_cond),
         let condition = match base_cond {
@@ -2007,14 +2187,14 @@ ascent_par! {
             other => other.clone(),
         };
 
-    mach_inst(addr0, MachInst::Mcond(condition, Arc::new(vec![*arg1]), lbl)) <--
+    mach_inst(emit_addr, MachInst::Mcond(condition, Arc::new(vec![*arg1]), lbl)) <--
         pcmp(addr0, r1, r2),
         op_register(r1, reg_str1),
         op_immediate(r2, imm_val, _),
         !reg_64(reg_str1),
         ireg_of(preg_of_r1, Ireg::from(reg_str1)),
         preg_of(arg1, preg_of_r1),
-        cmp_jcc_link(addr0, addr1),
+        mcond_emit_addr(addr0, addr1, emit_addr),
         pjcc(addr1, test_cond, lbl),
         testcond_to_cond(*test_cond, base_cond),
         let condition = match base_cond {
@@ -2023,7 +2203,7 @@ ascent_par! {
             other => other.clone(),
         };
 
-    mach_inst(addr0, MachInst::Mcond(condition.clone(), Arc::new(vec![*arg1, *arg2]), lbl)) <--
+    mach_inst(emit_addr, MachInst::Mcond(condition.clone(), Arc::new(vec![*arg1, *arg2]), lbl)) <--
         pcmp(addr0, r1, r2),
         op_register(r1, reg_str1),
         op_register(r2, reg_str2),
@@ -2032,11 +2212,11 @@ ascent_par! {
         ireg_of(preg_of_r2, Ireg::from(reg_str2)),
         preg_of(arg1, preg_of_r1),
         preg_of(arg2, preg_of_r2),
-        cmp_jcc_link(addr0, addr1),
+        mcond_emit_addr(addr0, addr1, emit_addr),
         pjcc(addr1, test_cond, lbl),
         testcond_to_cond_64(*test_cond, condition);
 
-    mach_inst(addr0, MachInst::Mcond(condition.clone(), Arc::new(vec![*arg1, *arg2]), lbl)) <--
+    mach_inst(emit_addr, MachInst::Mcond(condition.clone(), Arc::new(vec![*arg1, *arg2]), lbl)) <--
         pcmp(addr0, r1, r2),
         op_register(r1, reg_str1),
         op_register(r2, reg_str2),
@@ -2045,12 +2225,12 @@ ascent_par! {
         ireg_of(preg_of_r2, Ireg::from(reg_str2)),
         preg_of(arg1, preg_of_r1),
         preg_of(arg2, preg_of_r2),
-        cmp_jcc_link(addr0, addr1),
+        mcond_emit_addr(addr0, addr1, emit_addr),
         pjcc(addr1, test_cond, lbl),
         testcond_to_cond(*test_cond, condition);
 
 
-    mach_inst(addr0, MachInst::Mcond(condition, Arc::new(vec![*arg1]), lbl)) <--
+    mach_inst(emit_addr, MachInst::Mcond(condition, Arc::new(vec![*arg1]), lbl)) <--
         ptest(addr0, r1, r2),
         op_register(r1, reg_str1),
         op_register(r2, reg_str2),
@@ -2058,7 +2238,7 @@ ascent_par! {
         reg_64(reg_str1),
         ireg_of(preg_of_r1, Ireg::from(reg_str1)),
         preg_of(arg1, preg_of_r1),
-        test_jcc_link(addr0, addr1),
+        mcond_emit_addr(addr0, addr1, emit_addr),
         pjcc(addr1, test_cond, lbl),
         let base_cond = condition_for_testcond_sized(*test_cond, true),
         let condition = match base_cond {
@@ -2067,7 +2247,7 @@ ascent_par! {
             other => other,
         };
 
-    mach_inst(addr0, MachInst::Mcond(condition, Arc::new(vec![*arg1]), lbl)) <--
+    mach_inst(emit_addr, MachInst::Mcond(condition, Arc::new(vec![*arg1]), lbl)) <--
         ptest(addr0, r1, r2),
         op_register(r1, reg_str1),
         op_register(r2, reg_str2),
@@ -2075,7 +2255,7 @@ ascent_par! {
         !reg_64(reg_str1),
         ireg_of(preg_of_r1, Ireg::from(reg_str1)),
         preg_of(arg1, preg_of_r1),
-        test_jcc_link(addr0, addr1),
+        mcond_emit_addr(addr0, addr1, emit_addr),
         pjcc(addr1, test_cond, lbl),
         let base_cond = condition_for_testcond_sized(*test_cond, false),
         let condition = match base_cond {
@@ -2185,22 +2365,22 @@ ascent_par! {
         let typ = if *dst_is_64 { Typ::Tany64 } else { Typ::Tint };
 
 
-    mach_inst(addr0, MachInst::Mcond(Condition::Cmaskzero(*mask_val), Arc::new(vec![*arg1]), lbl)) <--
+    mach_inst(emit_addr, MachInst::Mcond(Condition::Cmaskzero(*mask_val), Arc::new(vec![*arg1]), lbl)) <--
         ptest(addr0, r1, r2),
         op_register(r1, reg_str1),
         op_immediate(r2, mask_val, _),
         ireg_of(preg_of_r1, Ireg::from(reg_str1)),
         preg_of(arg1, preg_of_r1),
-        test_jcc_link(addr0, addr1),
+        mcond_emit_addr(addr0, addr1, emit_addr),
         pjcc(addr1, TestCond::CondE, lbl);
 
-    mach_inst(addr0, MachInst::Mcond(Condition::Cmasknotzero(*mask_val), Arc::new(vec![*arg1]), lbl)) <--
+    mach_inst(emit_addr, MachInst::Mcond(Condition::Cmasknotzero(*mask_val), Arc::new(vec![*arg1]), lbl)) <--
         ptest(addr0, r1, r2),
         op_register(r1, reg_str1),
         op_immediate(r2, mask_val, _),
         ireg_of(preg_of_r1, Ireg::from(reg_str1)),
         preg_of(arg1, preg_of_r1),
-        test_jcc_link(addr0, addr1),
+        mcond_emit_addr(addr0, addr1, emit_addr),
         pjcc(addr1, TestCond::CondNe, lbl);
 
 
@@ -3609,16 +3789,17 @@ ascent_par! {
         ireg_hold_type(dst_str.to_string(), typ),
         type_to_memchunk(typ, mc);
 
-    mach_inst(addr, MachInst::Mstore(*mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), src)) <--
+    mach_inst(addr, MachInst::Mstore(mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), src)) <--
         pmov(addr, dst, src_sym),
         op_register(src_sym, src_str),
         let src = Mreg::from(src_str),
-        op_indirect(dst, _, base_str, _, _, disp, _),
+        op_indirect(dst, _, base_str, _, _, disp, msize),
         reg_ip(*base_str),
         rip_target_addr(addr, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
         ireg_hold_type(src_str.to_string(), typ),
-        type_to_memchunk(typ, mc);
+        type_to_memchunk(typ, chunk),
+        let mc = refine_chunk_with_size(*chunk, *msize);
 
     // Absolute addressing load: mov 0x40402c, %eax (base="NONE", disp is the address)
     mach_inst(addr, MachInst::Mload(*mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), dst)) <--
@@ -3680,18 +3861,19 @@ ascent_par! {
         let mc = refine_chunk_with_size(chunk_from_mnem_ext(mnem), *msize);
 
     // Absolute addressing store: mov %eax, 0x40402c (base="NONE", disp is the address)
-    mach_inst(addr, MachInst::Mstore(*mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), src)) <--
+    mach_inst(addr, MachInst::Mstore(mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), src)) <--
         pmov(addr, dst, src_sym),
         op_register(src_sym, src_str),
         let src = Mreg::from(src_str),
-        op_indirect(dst, _, base_str, idx_str, _, disp, _),
+        op_indirect(dst, _, base_str, idx_str, _, disp, msize),
         if *base_str == "NONE" || base_str.is_empty(),
         if *idx_str == "NONE" || idx_str.is_empty(),
         if *disp > 0,
         abs_target_addr(addr, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
         ireg_hold_type(src_str.to_string(), typ),
-        type_to_memchunk(typ, mc);
+        type_to_memchunk(typ, chunk),
+        let mc = refine_chunk_with_size(*chunk, *msize);
 
     // Absolute addressing store (mnemonic-based fallback)
     mach_inst(addr, MachInst::Mstore(mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), src)) <--
@@ -3729,7 +3911,8 @@ ascent_par! {
         if *disp > 0,
         abs_target_addr(addr, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let mc = if *sz <= 4 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+        // 3.8d: carry the operand's true width; refine_chunk_with_size narrows 1/2-byte sizes and keeps 4/8 as int chunks.
+        let mc = refine_chunk_with_size(if *sz <= 4 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 }, *sz);
 
 
     mach_inst(address, MachInst::Mop(Operation::Omove, Arc::new(args), *res)) <--
@@ -4146,13 +4329,14 @@ ascent_par! {
         reg_is_64(dst_str, is_64),
         let op = if *is_64 { Operation::Oaddlimm(-1) } else { Operation::Oaddimm(-1) };
 
-    // ADD/SUB with memory source, register destination: add reg, [mem].
+    // base="NONE" excluded: Mreg::from("NONE") is Unknown so the load leg cannot lower and would conflict with the Aglobal float_load_op route.
     arith_load_op(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(dst_str)) <--
         padd(address, dst, src),
         op_register(dst, dst_str),
         reg_is_64(dst_str, dst_is_64),
         op_indirect(src, _, base_str, idx, _, disp, _),
         if *idx == "NONE" || idx.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
         !reg_sp(base_str),
         !reg_ip(base_str),
         let op = if *dst_is_64 { Operation::Oaddl } else { Operation::Oadd },
@@ -4164,6 +4348,7 @@ ascent_par! {
         reg_is_64(dst_str, dst_is_64),
         op_indirect(src, _, base_str, idx, _, disp, _),
         if *idx == "NONE" || idx.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
         !reg_sp(base_str),
         !reg_ip(base_str),
         let op = if *dst_is_64 { Operation::Osubl } else { Operation::Osub },
@@ -4215,7 +4400,8 @@ ascent_par! {
         let op = if *src_is_64 { Operation::Oaddl } else { Operation::Oadd },
         let chunk = if *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
 
-    arith_load_op(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(src_str)) <--
+    // AND/OR/XOR with memory destination: previously emitted arith_load_op (wrong direction), clobbering the source register and silently dropping the memory store (3.8c direction bug).
+    arith_store_reg(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(src_str)) <--
         pand(address, dst, src),
         op_register(src, src_str),
         reg_is_64(src_str, src_is_64),
@@ -4227,7 +4413,7 @@ ascent_par! {
         let op = if *src_is_64 { Operation::Oandl } else { Operation::Oand },
         let chunk = if *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
 
-    arith_load_op(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(src_str)) <--
+    arith_store_reg(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(src_str)) <--
         por(address, dst, src),
         op_register(src, src_str),
         reg_is_64(src_str, src_is_64),
@@ -4239,7 +4425,7 @@ ascent_par! {
         let op = if *src_is_64 { Operation::Oorl } else { Operation::Oor },
         let chunk = if *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
 
-    arith_load_op(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(src_str)) <--
+    arith_store_reg(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(src_str)) <--
         pxor(address, dst, src),
         op_register(src, src_str),
         reg_is_64(src_str, src_is_64),
@@ -4251,7 +4437,171 @@ ascent_par! {
         let op = if *src_is_64 { Operation::Oxorl } else { Operation::Oxor },
         let chunk = if *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
 
-    // ADD/SUB with immediate source, memory destination: addl $imm, [mem]
+    // AND/OR/XOR with memory source: previously no rule matched so the instruction vanished (3.8c); mirrors padd/psub arith_load_op, SP/RIP excluded.
+    arith_load_op(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(dst_str)) <--
+        pand(address, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_sp(base_str),
+        !reg_ip(base_str),
+        let op = if *dst_is_64 { Operation::Oandl } else { Operation::Oand },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_load_op(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(dst_str)) <--
+        por(address, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_sp(base_str),
+        !reg_ip(base_str),
+        let op = if *dst_is_64 { Operation::Oorl } else { Operation::Oor },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_load_op(*address, op, chunk, Mreg::from(base_str), *disp, Mreg::from(dst_str)) <--
+        pxor(address, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_sp(base_str),
+        !reg_ip(base_str),
+        let op = if *dst_is_64 { Operation::Oxorl } else { Operation::Oxor },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    // RIP-relative integer memory-source arithmetic (3.8c): arith_load_op cannot express a global ident and excludes RIP, so routed through float_load_op whose rtl lowering is operation-agnostic.
+    float_load_op(*addr, op, chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::from(dst_str), false) <--
+        padd(addr, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx, _, _, _),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_ip(*base_str),
+        rip_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *dst_is_64 { Operation::Oaddl } else { Operation::Oadd },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    float_load_op(*addr, op, chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::from(dst_str), false) <--
+        psub(addr, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx, _, _, _),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_ip(*base_str),
+        rip_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *dst_is_64 { Operation::Osubl } else { Operation::Osub },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    float_load_op(*addr, op, chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::from(dst_str), false) <--
+        pand(addr, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx, _, _, _),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_ip(*base_str),
+        rip_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *dst_is_64 { Operation::Oandl } else { Operation::Oand },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    float_load_op(*addr, op, chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::from(dst_str), false) <--
+        por(addr, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx, _, _, _),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_ip(*base_str),
+        rip_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *dst_is_64 { Operation::Oorl } else { Operation::Oor },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    float_load_op(*addr, op, chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::from(dst_str), false) <--
+        pxor(addr, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx, _, _, _),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_ip(*base_str),
+        rip_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *dst_is_64 { Operation::Oxorl } else { Operation::Oxor },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    // Absolute-addressed (clang -fno-pie) memory-source arith: base="NONE" with the address in disp; abs_target_addr rows exist for padd/psub/pand/por/pxor.
+    float_load_op(*addr, op, chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::from(dst_str), false) <--
+        padd(addr, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *dst_is_64 { Operation::Oaddl } else { Operation::Oadd },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    float_load_op(*addr, op, chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::from(dst_str), false) <--
+        psub(addr, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *dst_is_64 { Operation::Osubl } else { Operation::Osub },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    float_load_op(*addr, op, chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::from(dst_str), false) <--
+        pand(addr, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *dst_is_64 { Operation::Oandl } else { Operation::Oand },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    float_load_op(*addr, op, chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::from(dst_str), false) <--
+        por(addr, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *dst_is_64 { Operation::Oorl } else { Operation::Oor },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    float_load_op(*addr, op, chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::from(dst_str), false) <--
+        pxor(addr, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx, _, disp, _),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *dst_is_64 { Operation::Oxorl } else { Operation::Oxor },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    // ADD/SUB immediate to memory: RIP excluded because Mreg::from("RIP") is Unknown and would shadow the ident-keyed arith_store_abs_imm RIP route.
     arith_store_imm(*address, op, chunk, Mreg::from(base_str), *disp) <--
         padd(address, dst, src),
         op_immediate(src, imm_str, _),
@@ -4259,6 +4609,7 @@ ascent_par! {
         op_indirect(dst, _, base_str, idx, _, disp, sz),
         if *idx == "NONE" || idx.is_empty(),
         if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_ip(base_str),
         let is_32 = *sz <= 4,
         let op = if is_32 { Operation::Oaddimm(imm_int) } else { Operation::Oaddlimm(imm_int) },
         let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
@@ -4270,8 +4621,46 @@ ascent_par! {
         op_indirect(dst, _, base_str, idx, _, disp, sz),
         if *idx == "NONE" || idx.is_empty(),
         if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_ip(base_str),
         let is_32 = *sz <= 4,
         let op = if is_32 { Operation::Oaddimm(-imm_int) } else { Operation::Oaddlimm(-imm_int) },
+        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+
+    // AND/OR/XOR immediate to memory: previously no rule matched (reg-dest Oandimm requires op_register on dst) so the instruction vanished (3.8c family).
+    arith_store_imm(*address, op, chunk, Mreg::from(base_str), *disp) <--
+        pand(address, dst, src),
+        op_immediate(src, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_indirect(dst, _, base_str, idx, _, disp, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_ip(base_str),
+        let is_32 = *sz <= 4,
+        let op = if is_32 { Operation::Oandimm(imm_int) } else { Operation::Oandlimm(imm_int) },
+        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+
+    arith_store_imm(*address, op, chunk, Mreg::from(base_str), *disp) <--
+        por(address, dst, src),
+        op_immediate(src, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_indirect(dst, _, base_str, idx, _, disp, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_ip(base_str),
+        let is_32 = *sz <= 4,
+        let op = if is_32 { Operation::Oorimm(imm_int) } else { Operation::Oorlimm(imm_int) },
+        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+
+    arith_store_imm(*address, op, chunk, Mreg::from(base_str), *disp) <--
+        pxor(address, dst, src),
+        op_immediate(src, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_indirect(dst, _, base_str, idx, _, disp, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_ip(base_str),
+        let is_32 = *sz <= 4,
+        let op = if is_32 { Operation::Oxorimm(imm_int) } else { Operation::Oxorlimm(imm_int) },
         let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
 
     // Absolute addressing arith: add reg, 0x40402c (read-modify-write at global)
@@ -4329,6 +4718,239 @@ ascent_par! {
         let is_32 = *sz <= 4,
         let op = if is_32 { Operation::Oaddimm(-imm_int) } else { Operation::Oaddlimm(-imm_int) },
         let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+
+    // RIP-relative memory-dest arithmetic (3.8c): absolute-addressing rules require base="NONE"; the RIP form resolved nothing and the whole RMW vanished; arith_store_abs_* is ident-keyed so applies unchanged.
+    arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::from(src_str)) <--
+        padd(address, dst, src),
+        op_register(src, src_str),
+        reg_is_64(src_str, src_is_64),
+        op_indirect(dst, _, base_str, idx, _, _, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_ip(*base_str),
+        rip_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *src_is_64 { Operation::Oaddl } else { Operation::Oadd },
+        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::from(src_str)) <--
+        psub(address, dst, src),
+        op_register(src, src_str),
+        reg_is_64(src_str, src_is_64),
+        op_indirect(dst, _, base_str, idx, _, _, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_ip(*base_str),
+        rip_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *src_is_64 { Operation::Osubl } else { Operation::Osub },
+        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
+        padd(address, dst, src),
+        op_immediate(src, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_indirect(dst, _, base_str, idx, _, _, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_ip(*base_str),
+        rip_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let is_32 = *sz <= 4,
+        let op = if is_32 { Operation::Oaddimm(imm_int) } else { Operation::Oaddlimm(imm_int) },
+        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+
+    arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
+        psub(address, dst, src),
+        op_immediate(src, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_indirect(dst, _, base_str, idx, _, _, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_ip(*base_str),
+        rip_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let is_32 = *sz <= 4,
+        let op = if is_32 { Operation::Oaddimm(-imm_int) } else { Operation::Oaddlimm(-imm_int) },
+        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+
+    // AND/OR/XOR global RMW (RIP-relative and -fno-pie absolute): previously no rule matched and the whole RMW vanished (3.8c); arith_store_abs_* is op-agnostic.
+    arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::from(src_str)) <--
+        pand(address, dst, src),
+        op_register(src, src_str),
+        reg_is_64(src_str, src_is_64),
+        op_indirect(dst, _, base_str, idx, _, disp, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *src_is_64 { Operation::Oandl } else { Operation::Oand },
+        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::from(src_str)) <--
+        por(address, dst, src),
+        op_register(src, src_str),
+        reg_is_64(src_str, src_is_64),
+        op_indirect(dst, _, base_str, idx, _, disp, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *src_is_64 { Operation::Oorl } else { Operation::Oor },
+        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::from(src_str)) <--
+        pxor(address, dst, src),
+        op_register(src, src_str),
+        reg_is_64(src_str, src_is_64),
+        op_indirect(dst, _, base_str, idx, _, disp, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *src_is_64 { Operation::Oxorl } else { Operation::Oxor },
+        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::from(src_str)) <--
+        pand(address, dst, src),
+        op_register(src, src_str),
+        reg_is_64(src_str, src_is_64),
+        op_indirect(dst, _, base_str, idx, _, _, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_ip(*base_str),
+        rip_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *src_is_64 { Operation::Oandl } else { Operation::Oand },
+        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::from(src_str)) <--
+        por(address, dst, src),
+        op_register(src, src_str),
+        reg_is_64(src_str, src_is_64),
+        op_indirect(dst, _, base_str, idx, _, _, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_ip(*base_str),
+        rip_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *src_is_64 { Operation::Oorl } else { Operation::Oor },
+        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::from(src_str)) <--
+        pxor(address, dst, src),
+        op_register(src, src_str),
+        reg_is_64(src_str, src_is_64),
+        op_indirect(dst, _, base_str, idx, _, _, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_ip(*base_str),
+        rip_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let op = if *src_is_64 { Operation::Oxorl } else { Operation::Oxor },
+        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
+        pand(address, dst, src),
+        op_immediate(src, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_indirect(dst, _, base_str, idx, _, disp, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let is_32 = *sz <= 4,
+        let op = if is_32 { Operation::Oandimm(imm_int) } else { Operation::Oandlimm(imm_int) },
+        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+
+    arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
+        por(address, dst, src),
+        op_immediate(src, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_indirect(dst, _, base_str, idx, _, disp, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let is_32 = *sz <= 4,
+        let op = if is_32 { Operation::Oorimm(imm_int) } else { Operation::Oorlimm(imm_int) },
+        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+
+    arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
+        pxor(address, dst, src),
+        op_immediate(src, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_indirect(dst, _, base_str, idx, _, disp, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let is_32 = *sz <= 4,
+        let op = if is_32 { Operation::Oxorimm(imm_int) } else { Operation::Oxorlimm(imm_int) },
+        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+
+    arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
+        pand(address, dst, src),
+        op_immediate(src, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_indirect(dst, _, base_str, idx, _, _, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_ip(*base_str),
+        rip_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let is_32 = *sz <= 4,
+        let op = if is_32 { Operation::Oandimm(imm_int) } else { Operation::Oandlimm(imm_int) },
+        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+
+    arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
+        por(address, dst, src),
+        op_immediate(src, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_indirect(dst, _, base_str, idx, _, _, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_ip(*base_str),
+        rip_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let is_32 = *sz <= 4,
+        let op = if is_32 { Operation::Oorimm(imm_int) } else { Operation::Oorlimm(imm_int) },
+        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+
+    arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
+        pxor(address, dst, src),
+        op_immediate(src, imm_str, _),
+        let imm_int = *imm_str as i64,
+        op_indirect(dst, _, base_str, idx, _, _, sz),
+        if *idx == "NONE" || idx.is_empty(),
+        reg_ip(*base_str),
+        rip_target_addr(address, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset),
+        let is_32 = *sz <= 4,
+        let op = if is_32 { Operation::Oxorimm(imm_int) } else { Operation::Oxorlimm(imm_int) },
+        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+
+    // abs_target_addr for and/or/xor RMW destinations so they resolve to synthesized idents; mirrors the padd/psub dst-side rows (the src-side rows cover only the memory-source direction).
+    abs_target_addr(addr, target) <--
+        pand(addr, dst, _),
+        op_indirect(dst, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
+    abs_target_addr(addr, target) <--
+        por(addr, dst, _),
+        op_indirect(dst, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
+    abs_target_addr(addr, target) <--
+        pxor(addr, dst, _),
+        op_indirect(dst, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
 
     mach_inst(address, MachInst::Mop(Operation::Omul, Arc::new(args), *res)) <--
         pimul(address, r, r2),
@@ -5588,6 +6210,25 @@ ascent_par! {
         },
         if let Ok((addressing, args)) = transl_addressing_rev(addrmode, None);
 
+    // RIP-relative float source (3.8a): dominant PIE shape for float constants; previously excluded so the op vanished entirely (function collapsed to `return 0`); resolved to synthesized global symbol via Aglobal.
+    float_load_op(*addr, op.clone(), *chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), *dst, *is_unary) <--
+        float_mem_op_raw(addr, op, chunk, src, dst, is_unary),
+        op_indirect(src, _, base_str, idx_str, _, _, _),
+        reg_ip(*base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        rip_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset);
+
+    // Absolute-addressed source (clang -fno-pie constant pool): base="NONE", disp is the address.
+    float_load_op(*addr, op.clone(), *chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), *dst, *is_unary) <--
+        float_mem_op_raw(addr, op, chunk, src, dst, is_unary),
+        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        abs_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset);
+
 
     mach_inst(address, MachInst::Mop(Operation::Osingleofint, Arc::new(args), res)) <--
         pcvtsi2ss(address, rd, rs),
@@ -5802,15 +6443,21 @@ ascent_par! {
         fcmp_jcc_link(addr0, addr1),
         pjcc(addr1, TestCond::CondNe, lbl);
 
-    // comiss/ucomiss with RIP-relative memory operand: load float constant into FP0 (x87 ST0, safe scratch since SSE never uses it); Mcond rules below use FP0 as second operand.
-    mach_inst(addr0, MachInst::Mload(MemoryChunk::MFloat32, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::FP0)) <--
+    // comiss/ucomiss with RIP-relative memory operand: load float constant into FP0 (x87 ST0, safe scratch since SSE never uses it); the relocated Mcond/Ocmp rules below use FP0 as second operand. fp0_loaded_at records the load so a synthetic reg_def(FP0) connects it to the consumer's reg_use (capstone knows nothing about FP0).
+    #[local] relation fp0_loaded_at(Address);
+
+    reg_def(addr0, Mreg::FP0) <-- fp0_loaded_at(addr0);
+
+    mach_inst(addr0, MachInst::Mload(MemoryChunk::MFloat32, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::FP0)),
+    fp0_loaded_at(*addr0) <--
         pucomiss(addr0, _r1, r2),
         op_indirect(r2, _, base_str, _, _, _, _),
         reg_ip(*base_str),
         rip_target_addr(addr0, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset);
 
-    mach_inst(addr0, MachInst::Mload(MemoryChunk::MFloat64, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::FP0)) <--
+    mach_inst(addr0, MachInst::Mload(MemoryChunk::MFloat64, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::FP0)),
+    fp0_loaded_at(*addr0) <--
         pucomisd(addr0, _r1, r2),
         op_indirect(r2, _, base_str, _, _, _, _),
         reg_ip(*base_str),
@@ -5818,7 +6465,8 @@ ascent_par! {
         resolved_addr_to_symbol(target_addr, ident, offset);
 
     // comiss/ucomiss with absolute addressing memory operand
-    mach_inst(addr0, MachInst::Mload(MemoryChunk::MFloat32, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::FP0)) <--
+    mach_inst(addr0, MachInst::Mload(MemoryChunk::MFloat32, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::FP0)),
+    fp0_loaded_at(*addr0) <--
         pucomiss(addr0, _r1, r2),
         op_indirect(r2, _, base_str, idx_str, _, disp, _),
         if *base_str == "NONE" || base_str.is_empty(),
@@ -5827,7 +6475,8 @@ ascent_par! {
         abs_target_addr(addr0, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset);
 
-    mach_inst(addr0, MachInst::Mload(MemoryChunk::MFloat64, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::FP0)) <--
+    mach_inst(addr0, MachInst::Mload(MemoryChunk::MFloat64, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::FP0)),
+    fp0_loaded_at(*addr0) <--
         pucomisd(addr0, _r1, r2),
         op_indirect(r2, _, base_str, idx_str, _, disp, _),
         if *base_str == "NONE" || base_str.is_empty(),
@@ -5836,45 +6485,105 @@ ascent_par! {
         abs_target_addr(addr0, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset);
 
-    // pucomiss with memory operand: Ccompfs variants
-    mach_inst(addr0, MachInst::Mcond(Condition::Ccompfs(Comparison::Cgt), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
-        pucomiss(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
-        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondA, lbl);
-    mach_inst(addr0, MachInst::Mcond(Condition::Ccompfs(Comparison::Cge), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
-        pucomiss(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
-        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondAe, lbl);
-    mach_inst(addr0, MachInst::Mcond(Condition::Ccompfs(Comparison::Clt), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
-        pucomiss(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
-        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondB, lbl);
-    mach_inst(addr0, MachInst::Mcond(Condition::Ccompfs(Comparison::Cle), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
-        pucomiss(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
-        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondBe, lbl);
-    mach_inst(addr0, MachInst::Mcond(Condition::Ccompfs(Comparison::Ceq), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
-        pucomiss(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
-        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondE, lbl);
-    mach_inst(addr0, MachInst::Mcond(Condition::Cnotcompfs(Comparison::Ceq), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
-        pucomiss(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
-        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondNe, lbl);
+    // Register-base memory operand for comisd/ucomiss: loads into FP0, mirroring RIP/absolute paths; BP/SP excluded per slot-variable model.
+    mach_inst(addr0, MachInst::Mload(MemoryChunk::MFloat32, addressing, Arc::new(args), Mreg::FP0)),
+    fp0_loaded_at(*addr0) <--
+        pucomiss(addr0, _r1, r2),
+        op_indirect(r2, _, base_str, idx_str, scale, disp, _),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_ip(base_str),
+        if Mreg::from(base_str) != Mreg::BP && Mreg::from(base_str) != Mreg::SP,
+        let has_idx = *idx_str != "NONE" && !idx_str.is_empty(),
+        let addrmode = Addrmode {
+            base: Some(Ireg::from(base_str)),
+            index: if has_idx { Some((Ireg::from(idx_str), *scale)) } else { None },
+            disp: Displacement::from(*disp),
+        },
+        if let Ok((addressing, args)) = transl_addressing_rev(addrmode, None);
 
-    // pucomisd with memory operand: Ccompf variants
-    mach_inst(addr0, MachInst::Mcond(Condition::Ccompf(Comparison::Cgt), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
-        pucomisd(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
-        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondA, lbl);
-    mach_inst(addr0, MachInst::Mcond(Condition::Ccompf(Comparison::Cge), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
-        pucomisd(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
-        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondAe, lbl);
-    mach_inst(addr0, MachInst::Mcond(Condition::Ccompf(Comparison::Clt), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
-        pucomisd(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
-        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondB, lbl);
-    mach_inst(addr0, MachInst::Mcond(Condition::Ccompf(Comparison::Cle), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
-        pucomisd(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
-        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondBe, lbl);
-    mach_inst(addr0, MachInst::Mcond(Condition::Ccompf(Comparison::Ceq), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
-        pucomisd(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
-        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondE, lbl);
-    mach_inst(addr0, MachInst::Mcond(Condition::Cnotcompf(Comparison::Ceq), Arc::new(vec![arg1, Mreg::FP0]), lbl)) <--
-        pucomisd(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str),
-        let arg1 = Mreg::from(r1_str), fcmp_jcc_link(addr0, addr1), pjcc(addr1, TestCond::CondNe, lbl);
+    mach_inst(addr0, MachInst::Mload(MemoryChunk::MFloat64, addressing, Arc::new(args), Mreg::FP0)),
+    fp0_loaded_at(*addr0) <--
+        pucomisd(addr0, _r1, r2),
+        op_indirect(r2, _, base_str, idx_str, scale, disp, _),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_ip(base_str),
+        if Mreg::from(base_str) != Mreg::BP && Mreg::from(base_str) != Mreg::SP,
+        let has_idx = *idx_str != "NONE" && !idx_str.is_empty(),
+        let addrmode = Addrmode {
+            base: Some(Ireg::from(base_str)),
+            index: if has_idx { Some((Ireg::from(idx_str), *scale)) } else { None },
+            disp: Displacement::from(*disp),
+        },
+        if let Ok((addressing, args)) = transl_addressing_rev(addrmode, None);
+
+    // pucomiss/pucomisd with a memory operand: (compare addr, is_double, register operand).
+    #[local] relation fcmp_mem_arg(Address, bool, Mreg);
+    fcmp_mem_arg(addr0, false, Mreg::from(r1_str)) <--
+        pucomiss(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str);
+    fcmp_mem_arg(addr0, true, Mreg::from(r1_str)) <--
+        pucomisd(addr0, r1, r2), op_register(r1, r1_str), !op_register(r2, _), reg_xmm(r1_str);
+
+    // Mem-operand float compare + jcc relocated to the jcc's address (CF-5c): the FP0 Mload occupies the compare's address and candidate pick drops Mcond keyed there (Icond beats Iload, leaving undefined FP0); relocating to the jcc's otherwise-empty node via mcond_at_jcc fixes fall-through and def-use continuity.
+    mach_inst(addr1, MachInst::Mcond(condition.clone(), Arc::new(vec![*arg1, Mreg::FP0]), lbl)),
+    mcond_at_jcc(*addr1),
+    reg_use(*addr1, *arg1),
+    reg_use(*addr1, Mreg::FP0) <--
+        fcmp_mem_arg(addr0, is_double, arg1),
+        fcmp_jcc_link(addr0, addr1),
+        pjcc(addr1, test_cond, lbl),
+        if let Some(condition) = fcmp_setcc_condition(*test_cond, *is_double);
+
+    // Float compare feeding SETcc (3.8b): had no fcmp->setcc link so neither instruction lifted (function collapsed to `return 0`); mirrors cmp_setcc_link to produce Mop(Ocmp(Ccompf*/Cnotcompf*)) writing the setcc destination.
+    #[local] relation fcmp_setcc_link(Address, Address);
+    fcmp_setcc_link(addr0, addr1) <--
+        pucomisd(addr0, _, _),
+        next(addr0, addr1),
+        psetcc(addr1, _, _);
+    fcmp_setcc_link(addr0, addr1) <--
+        pucomiss(addr0, _, _),
+        next(addr0, addr1),
+        psetcc(addr1, _, _);
+
+    // Reg-reg Ocmp keyed at compare's address: int cmp_setcc design parity; setcc node bridges via linear's branch-to-next default.
+    mach_inst(addr0, MachInst::Mop(Operation::Ocmp(condition.clone()), Arc::new(vec![arg1, arg2]), *dst_mreg)) <--
+        pucomisd(addr0, r1, r2),
+        op_register(r1, r1_str),
+        op_register(r2, r2_str),
+        reg_xmm(r1_str),
+        let arg1 = Mreg::from(r1_str),
+        let arg2 = Mreg::from(r2_str),
+        fcmp_setcc_link(addr0, addr_set),
+        psetcc(addr_set, test_cond, dst_sym),
+        op_register(dst_sym, dst_str),
+        ireg_of(preg_of_dst, Ireg::from(dst_str)),
+        preg_of(dst_mreg, preg_of_dst),
+        if let Some(condition) = fcmp_setcc_condition(*test_cond, true);
+
+    mach_inst(addr0, MachInst::Mop(Operation::Ocmp(condition.clone()), Arc::new(vec![arg1, arg2]), *dst_mreg)) <--
+        pucomiss(addr0, r1, r2),
+        op_register(r1, r1_str),
+        op_register(r2, r2_str),
+        reg_xmm(r1_str),
+        let arg1 = Mreg::from(r1_str),
+        let arg2 = Mreg::from(r2_str),
+        fcmp_setcc_link(addr0, addr_set),
+        psetcc(addr_set, test_cond, dst_sym),
+        op_register(dst_sym, dst_str),
+        ireg_of(preg_of_dst, Ireg::from(dst_str)),
+        preg_of(dst_mreg, preg_of_dst),
+        if let Some(condition) = fcmp_setcc_condition(*test_cond, false);
+
+    // Mem-operand Ocmp keyed at SETcc's address: FP0 Mload occupies compare's address causing the same single-instruction-per-node collision as the relocated Mcond.
+    mach_inst(addr_set, MachInst::Mop(Operation::Ocmp(condition.clone()), Arc::new(vec![*arg1, Mreg::FP0]), *dst_mreg)),
+    reg_use(*addr_set, *arg1),
+    reg_use(*addr_set, Mreg::FP0) <--
+        fcmp_mem_arg(addr0, is_double, arg1),
+        fcmp_setcc_link(addr0, addr_set),
+        psetcc(addr_set, test_cond, dst_sym),
+        op_register(dst_sym, dst_str),
+        ireg_of(preg_of_dst, Ireg::from(dst_str)),
+        preg_of(dst_mreg, preg_of_dst),
+        if let Some(condition) = fcmp_setcc_condition(*test_cond, *is_double);
 
 
     mach_inst(address, MachInst::Mop(Operation::Omove, Arc::new(args), res)) <--

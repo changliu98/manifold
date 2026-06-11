@@ -117,23 +117,39 @@ ascent_par! {
     cminor_succ(*node, resolved) <-- active_cminor_stmt(node, ?CminorStmt::Sifthenelse(_, _, _, ifnot)), !active_cminor_stmt(ifnot, _), next_to_cminor(*ifnot, resolved);
     cminor_succ(*node, resolved) <-- active_cminor_stmt(node, ?CminorStmt::Sjumptable(_, targets)), for target in targets.iter(), !active_cminor_stmt(target, _), next_to_cminor(*target, resolved);
 
-    // Fallthrough as successor
+    // synth_rerouted guards against re-fabricating the rtl_edge_negated-killed fallthrough for synth-carrying nodes (bits 62/63), which would give an unconditional stmt two successors and detach synth stores from their if-arms.
+    #[local] relation synth_rerouted(Node);
+    synth_rerouted(*node) <--
+        rtl_succ(node, dst),
+        if (*dst & (3u64 << 62)) != 0,
+        active_cminor_stmt(dst, _);
+
+    // Fallthrough suppressed when a synth chain carries the real flow; bridge rules below provide node -> synth -> ... -> next instead.
     cminor_succ(node, next) <--
         csh_next(node, next),
+        !synth_rerouted(node),
         active_cminor_stmt(node, _),
         active_cminor_stmt(next, _);
 
-    // Synth-node successor: bit-62 nodes (e.g. SP-indexed-load synth from rtl_pass) lack `next` entries; bridge via rtl_succ so the C emitter's DFS visits them and the synth Sset survives. rtl_succ drives the join (one tuple per CFG edge), binding node+dst so the active_cminor_stmt lookups are indexed; scanning active_cminor_stmt twice with independent unbound vars was an O(active^2) self-join (36s on large binaries). Clause order is semantics-neutral in Datalog.
+    // Synth-node successor: synthetic nodes (bit 62 or 63, e.g. SP-indexed-load synth1/synth2 from rtl_pass) lack `next` entries; bridge via rtl_succ so the C emitter's DFS visits them and the synth Sset survives. rtl_succ drives the join (one tuple per CFG edge), binding node+dst so the active_cminor_stmt lookups are indexed; scanning active_cminor_stmt twice with independent unbound vars was an O(active^2) self-join (36s on large binaries). Clause order is semantics-neutral in Datalog.
     cminor_succ(*node, *dst) <--
         rtl_succ(node, dst),
-        if (*node & (1u64 << 62)) != 0,
+        if (*node & (3u64 << 62)) != 0,
         active_cminor_stmt(node, _),
         active_cminor_stmt(dst, _);
+
+    // Synth chain exiting to a trimmed address resolves via `next`, so suppressing the bypass edge above cannot strand the chain.
+    cminor_succ(*node, resolved) <--
+        rtl_succ(node, dst),
+        if (*node & (3u64 << 62)) != 0,
+        active_cminor_stmt(node, _),
+        !active_cminor_stmt(dst, _),
+        next_to_cminor(*dst, resolved);
 
     // The predecessor of a synth node needs an explicit cminor_succ; `next` skips synth, leaving it unreachable from its real-address predecessor.
     cminor_succ(*node, *dst) <--
         rtl_succ(node, dst),
-        if (*dst & (1u64 << 62)) != 0,
+        if (*dst & (3u64 << 62)) != 0,
         active_cminor_stmt(node, _),
         active_cminor_stmt(dst, _);
 
@@ -370,6 +386,8 @@ ascent_par! {
         pred(func, node, p),
         dom(func, p, header),
         if *p != *header;
+
+    // CF-2/O-6 (removed 2026-06-10): SCC-body-extension was provably empty for recognized loops (any latch-reaching node that avoids H contradicts dom(latch,H)), and headerless-SCC creation was built end-to-end but regressed goto_per_func 4.01->4.46 (+11%) because the strictly-headerless family is tiny while conservative irreducible emission adds gotos faster than back-edge->continue removes them; reviving it requires cutting emission costs first (same-target branch collapse, goto-chain threading, unique-target exit->break).
 
 
     relation loop_nesting_via_idom(Address, Node, Node);
