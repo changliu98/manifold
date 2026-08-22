@@ -1,0 +1,15997 @@
+use crate::decompile::elevator::DecompileDB;
+use crate::run_pass;
+
+use crate::decompile::passes::asm_pass::transl_addressing_rev;
+use crate::decompile::passes::cminor_pass::*;
+use crate::decompile::passes::csh_pass::*;
+use crate::decompile::passes::pass::IRPass;
+use crate::mreg::{Mreg, RegClass};
+use crate::util::DEFAULT_VAR;
+use crate::x86::asm::{Ireg, TestCond};
+use crate::x86::mach::X86Mreg;
+use crate::x86::op::{Addressing, Comparison, Condition, Operation};
+use crate::x86::types::*;
+use ascent::ascent_par;
+use ascent::lattice::set::Set;
+use ascent::Dual;
+use either::Either;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+const ENDBR64_LEN: u64 = 4;
+
+// Strict-dominator set plus the node itself, mirroring structuring_pass's dom_set helper. Used by the block-dominator lattice in RTLPassProgram so dominance is maintained as O(blocks * dom-depth) lattice state rather than an O(blocks^2) pairwise/path-avoiding workspace.
+fn dom_set_with_self(strict: &Set<Address>, n: Address) -> Set<Address> {
+    let mut s = strict.0.clone();
+    s.insert(n);
+    Set(s)
+}
+
+fn shift_sp_offsets(offsets: &Set<i64>, delta: i64) -> Set<i64> {
+    Set(offsets
+        .iter()
+        .filter_map(|offset| offset.checked_add(delta))
+        .collect())
+}
+
+// Stack-address provenance is a MUST property. A register at a CFG join can
+// have both a local-slot address and an unrelated value as may-reaching
+// definitions; treating the first as sufficient turns the unrelated value
+// into a pointer to the caller's frame. Retain the complete finite origin set
+// in a lattice and expose a slot only when that set is exactly one Slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum StackAddrOrigin {
+    Slot(i64),
+    NonStack,
+}
+
+fn sole_stack_slot(origins: &Set<StackAddrOrigin>) -> Option<i64> {
+    if origins.0.len() != 1 {
+        return None;
+    }
+    match origins.0.iter().next() {
+        Some(StackAddrOrigin::Slot(ofs)) => Some(*ofs),
+        _ => None,
+    }
+}
+
+// A store through `base + extent - width` touches the last byte of an object
+// whose capacity is `extent`.  This is data-layout evidence, not a numeric
+// reachability test: the two value operands still have to be traced back to
+// distinct parameters through the RTL value web below.
+fn indexed_store_ends_at_extent(addressing: &Addressing, chunk: &MemoryChunk) -> bool {
+    if matches!(chunk, MemoryChunk::Unknown) {
+        return false;
+    }
+    let displacement = match addressing {
+        Addressing::Aindexed2(displacement) | Addressing::Aindexed2scaled(1, displacement) => {
+            *displacement
+        }
+        _ => return false,
+    };
+    let width = crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk) as i64;
+    displacement.checked_add(width) == Some(0)
+}
+
+fn positive_integral_extent(constant: &Constant) -> Option<i64> {
+    match constant {
+        Constant::Ointconst(value) | Constant::Olongconst(value) if *value > 0 => Some(*value),
+        _ => None,
+    }
+}
+
+// ABI-1 (3.2e): MOVSX/MOVSXD/MOVZX -> MemoryChunk; returns None for non-extending mnemonics so plain MOV (which also covers callee-save reloads) never fires; (unsigned, 4) rejected because 32-bit writes zero-extend implicitly.
+fn extending_load_chunk(mnem: &str, size: usize) -> Option<MemoryChunk> {
+    let m = mnem.to_ascii_uppercase();
+    let signed = if m == "MOVZX" {
+        false
+    } else if m == "MOVSX" || m == "MOVSXD" {
+        true
+    } else {
+        return None;
+    };
+    match (signed, size) {
+        (true, 4) => Some(MemoryChunk::MInt32),
+        (true, 2) => Some(MemoryChunk::MInt16Signed),
+        (true, 1) => Some(MemoryChunk::MInt8Signed),
+        (false, 2) => Some(MemoryChunk::MInt16Unsigned),
+        (false, 1) => Some(MemoryChunk::MInt8Unsigned),
+        _ => None,
+    }
+}
+
+// An x86 stack-indexed LEA cannot remain a single RTL operation: SP is a
+// frame-relative base, not an ordinary RTL value. Split it into an address-of
+// for the stack displacement and a zero-displacement indexed LEA. Keep Olea
+// versus Oleal intact so 32- and 64-bit result semantics do not drift.
+fn split_sp_indexed_lea(op: &Operation) -> Option<(Operation, Operation, i64)> {
+    match op {
+        Operation::Olea(Addressing::Aindexed2(ofs)) => Some((
+            Operation::Olea(Addressing::Ainstack(*ofs)),
+            Operation::Olea(Addressing::Aindexed2(0)),
+            *ofs,
+        )),
+        Operation::Olea(Addressing::Aindexed2scaled(scale, ofs)) => Some((
+            Operation::Olea(Addressing::Ainstack(*ofs)),
+            Operation::Olea(Addressing::Aindexed2scaled(*scale, 0)),
+            *ofs,
+        )),
+        Operation::Oleal(Addressing::Aindexed2(ofs)) => Some((
+            Operation::Oleal(Addressing::Ainstack(*ofs)),
+            Operation::Oleal(Addressing::Aindexed2(0)),
+            *ofs,
+        )),
+        Operation::Oleal(Addressing::Aindexed2scaled(scale, ofs)) => Some((
+            Operation::Oleal(Addressing::Ainstack(*ofs)),
+            Operation::Oleal(Addressing::Aindexed2scaled(*scale, 0)),
+            *ofs,
+        )),
+        _ => None,
+    }
+}
+
+// CompCert RTL has no 128-bit integer store.  A four-dword broadcast therefore
+// occupies the original instruction node plus three private synthetic nodes,
+// connected explicitly below rather than ordered by their numeric values.
+fn simd_broadcast_lane_node(node: Node, lane: usize) -> Node {
+    match lane {
+        0 => node,
+        1 => node | (1u64 << 62),
+        2 => node | (1u64 << 63),
+        3 => node | (1u64 << 62) | (1u64 << 63),
+        _ => unreachable!("a four-dword broadcast has exactly four lanes"),
+    }
+}
+
+// The private node carrying the upper 8 bytes of a 16-byte frame move; the
+// original node keeps the lower half, as CompCert has no 128-bit chunk.
+// A general-base destination needs a second node as well, because its upper
+// half is a real Istore and the value it stores has to be computed first.
+fn xmm_hi_lane_node(node: Node) -> Node {
+    node | (1u64 << 62)
+}
+
+fn xmm_hi_store_node(node: Node) -> Node {
+    node | (1u64 << 63)
+}
+
+fn offset_addressing(addressing: &Addressing, delta: i64) -> Option<Addressing> {
+    let add = |offset: i64| offset.checked_add(delta);
+    match addressing {
+        Addressing::Aindexed(offset) => add(*offset).map(Addressing::Aindexed),
+        Addressing::Aindexed2(offset) => add(*offset).map(Addressing::Aindexed2),
+        Addressing::Ascaled(scale, offset) => {
+            add(*offset).map(|offset| Addressing::Ascaled(*scale, offset))
+        }
+        Addressing::Aindexed2scaled(scale, offset) => {
+            add(*offset).map(|offset| Addressing::Aindexed2scaled(*scale, offset))
+        }
+        Addressing::Aglobal(ident, offset) => {
+            add(*offset).map(|offset| Addressing::Aglobal(*ident, offset))
+        }
+        Addressing::Abased(ident, offset) => {
+            add(*offset).map(|offset| Addressing::Abased(*ident, offset))
+        }
+        Addressing::Abasedscaled(scale, ident, offset) => {
+            add(*offset).map(|offset| Addressing::Abasedscaled(*scale, *ident, offset))
+        }
+        Addressing::Ainstack(offset) => add(*offset).map(Addressing::Ainstack),
+        Addressing::Unknown => None,
+    }
+}
+
+ascent_par! {
+    #![measure_rule_times]
+
+    #[swap_db]
+    pub struct RTLPassProgram;
+
+    relation arch_bit(i64);
+    // RSP adjustments from disassembly; drives sp_entry_ofs to anchor raw SP displacements to the function-entry frame (ABI-1/3.2e).
+    relation adjusts_stack(Address, Symbol, i64);
+    relation arg_constrained_as_ptr(Node, RTLReg);
+    // RSP<->RBP register moves from disassembly; drives func_sets_frame_pointer for BP-relative stack-param rules.
+    relation stack_base_move(Address, Symbol, Symbol);
+    relation block_in_function(Node, Address);
+    relation emit_clight_stmt(Address, Node, ClightStmt);
+    relation emit_goto_target(Address, Node);
+    relation emit_loop_body(Address, Node, Node);
+    relation emit_loop_exit(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node);
+    relation emit_switch_chain(Address, Node, RTLReg);
+    relation func_param_struct_type_candidate(Address, usize, usize);
+    relation func_span(Symbol, Address, Address);
+    relation global_struct_catalog(u64, usize, usize, usize);
+    relation instr_in_function(Node, Address);
+    relation is_external_function(Address);
+    relation known_extern_signature(Symbol, usize, XType, Arc<Vec<XType>>);
+    relation known_varargs_function(Symbol, usize);
+
+    relation known_func_param_is_ptr(Symbol, usize);
+    relation known_func_returns_long(Symbol);
+    relation known_func_returns_ptr(Symbol);
+    relation main_function(Address);
+    relation reg_def_used(Address, Mreg, Address);
+    relation string_data(String, String, usize);
+    relation struct_id_to_canonical(usize, usize);
+    relation symbol_resolved_addr(Symbol, Address);
+
+    relation block(Address);
+    relation block_boundaries(Address, Address, Address);
+    relation block_in_function(Node, Address);
+    relation code_in_block(Address, Address);
+    relation ddisasm_cfg_edge(Address, Address, Symbol);
+    relation jump_table_target(Node, usize, Node);
+    relation emit_var_type_candidate(RTLReg, XType);
+    relation instr_in_function(Node, Address);
+    relation instruction(Address, usize, &'static str, &'static str, Symbol, Symbol, Symbol, Symbol, usize, usize);
+    relation ireg_hold_type(String, Typ);
+    relation is_not_ptr(RTLReg);
+    relation is_ptr(RTLReg);
+    relation is_char_ptr(RTLReg);
+    relation known_extern_signature(Symbol, usize, XType, Arc<Vec<XType>>);
+    relation known_varargs_function(Symbol, usize);
+    // Bytes an external function writes through a pointer parameter, from the ABI
+    // rather than from anything observable in this binary (name, param index, bytes).
+    relation known_func_param_pointee_size(Symbol, usize, usize);
+
+    relation ltl_inst(Node, LTLInst);
+    relation ltl_succ(Node, Node);
+    relation call_targets_noreturn(Node);
+    relation rtl_next(Node, Node);
+    relation mach_imm_indirect_store(Address, i64, MemoryChunk, Mreg, i64);
+    relation mach_imm_stack_init(Address, i64, i64, Typ);
+    relation simd_dword_broadcast_store(Address, Address, &'static str, &'static str, i64, i64, Mreg);
+    relation movhps_hi_load(Address, Mreg, &'static str, &'static str, i64, i64, bool);
+    // The upper 8 bytes of a 16-byte frame move, which has no CompCert chunk:
+    // (store addr, destination cell, source kind, source reg, source cell, defining site).
+    relation xmm_hi_frame_store(Address, i64, i64, Mreg, i64, Address);
+    // The same move through a general register base: the store's own addressing
+    // (base, index, scale, displacement) and, separately, what its high lane
+    // holds -- (store addr, source kind, source reg, source cell, defining site).
+    relation sse_wide_mem_store(Address, Mreg, &'static str, &'static str, i64, i64);
+    // The same move again to a RIP-relative destination, carrying the resolved
+    // absolute target; the +8 addressing is restated through the target's symbol.
+    relation sse_wide_global_store(Address, Mreg, Address);
+    relation xmm_hi_mem_store(Address, i64, Mreg, i64, Address);
+    relation sse_wide_frame_load(Address, Mreg, i64);
+    relation arith_load_op(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
+    relation float_load_op(Address, Operation, MemoryChunk, Addressing, Arc<Vec<Mreg>>, Mreg, bool);
+    // cvtsi2_stack_op: a cvtsi2ss/sd reading a spilled int SCALAR slot, whose unary conversion reads the slot's canonical SSA reg directly, like arith_load_op's BP-slot path.
+    relation cvtsi2_stack_op(Address, Operation, Mreg, i64, Mreg);
+    // float_arith_stack_op: a binary float arith reading a spilled float SCALAR slot in place, with the slot operand read through its canonical SSA reg rather than a raw frame Iload.
+    relation float_arith_stack_op(Address, Operation, Mreg, i64, Mreg);
+    relation arith_store_reg(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
+    relation arith_store_imm(Address, Operation, MemoryChunk, Mreg, i64);
+    relation arith_store_abs_reg(Address, Operation, MemoryChunk, Ident, i64, Mreg);
+    relation arith_store_abs_imm(Address, Operation, MemoryChunk, Ident, i64);
+    // adc_carry_op: a branchless cmp;adc/sbb conditional-accumulate, expanded here into a 0/1 carry compute plus an accumulator update, since the carry flag has no machine register.
+    relation adc_carry_op(Address, Address, Condition, bool, i64, bool, Mreg, Mreg);
+    // sbb_self_carry_op: `sbb %r,%r`, which is -CF rather than a subtraction; expanded here into the same 0/1 carry compute followed by a negation.
+    relation sbb_self_carry_op(Address, Address, Condition, bool, Mreg, Mreg, Mreg);
+    relation flags_and_jump_pair(Address, Address, &'static str);
+    relation setcc_compare_site(Address, Address);
+    relation next(Address, Address);
+    relation op_immediate(Symbol, i64, usize);
+    relation op_produces_data(Node, RTLReg);
+    relation op_produces_ptr(Node, RTLReg);
+    relation padd(Address, Symbol, Symbol);
+    relation pcmp(Address, Symbol, Symbol);
+    relation ptest(Address, Symbol, Symbol);
+    // osel_compare_site(cmov_addr, compare_addr): from asm_pass; the compare whose flags this cmov consumes, so condition operands resolve at the compare site rather than the (possibly register-reusing) cmov site.
+    relation osel_compare_site(Address, Address);
+    // osel_flags_result_site(cmov_addr, arithmetic_addr): from asm_pass; the
+    // condition consumes the arithmetic definition, not a later value placed
+    // in the same architectural register while flags remain live.
+    relation osel_flags_result_site(Address, Address);
+    relation pdiv(Address, Symbol, Symbol);
+    relation pidiv(Address, Symbol, Symbol);
+    relation pudiv(Address, Symbol, Symbol);
+    relation pjcc(Address, TestCond, Symbol);
+    relation plabel(Address, Symbol);
+    relation plea(Address, Symbol, Symbol);
+    // 3.8 R3 inputs: MOV operand rows plus the asm-side RIP/global resolution, needed for the plain RIP-relative immediate global store, which has no mach/ltl route.
+    relation pmov(Address, Symbol, Symbol);
+    relation rip_target_addr(Address, Address);
+    relation resolved_addr_to_symbol(Address, Ident, i64);
+    relation psub(Address, Symbol, Symbol);
+    relation reg_def(Address, Mreg);
+    relation reg_def_used(Address, Mreg, Address);
+    relation reg_use(Address, Mreg);
+    relation trim_instruction(Address);
+    relation stack_def_used(Address, Symbol, i64, Address, Symbol, i64);
+    relation stack_offset_backedge_rescued_access(Address, Address);
+    relation symbols(Address, Symbol, Symbol);
+
+    relation base_addr_usage(Node, RTLReg, i64);
+    relation op_produces_int(Node, RTLReg);
+    relation op_produces_long(Node, RTLReg);
+    relation op_produces_float(Node, RTLReg);
+    relation op_produces_single(Node, RTLReg);
+    relation op_produces_bool(Node, RTLReg);
+    relation op_produces_int8signed(Node, RTLReg);
+    relation op_produces_int8unsigned(Node, RTLReg);
+    relation op_produces_int16signed(Node, RTLReg);
+    relation op_produces_int16unsigned(Node, RTLReg);
+    relation is_int(RTLReg);
+    relation is_long(RTLReg);
+    relation is_float(RTLReg);
+    relation is_single(RTLReg);
+    relation is_bool(RTLReg);
+    relation is_int8signed(RTLReg);
+    relation is_int8unsigned(RTLReg);
+    relation is_int16signed(RTLReg);
+    relation is_int16unsigned(RTLReg);
+    relation is_signed(RTLReg);
+    relation is_unsigned(RTLReg);
+    relation must_be_ptr(RTLReg);
+    relation has_ptr_type(RTLReg);
+    relation has_char_ptr_type(RTLReg);
+    relation has_float_type(RTLReg);
+    relation has_single_type(RTLReg);
+    relation has_long_type(RTLReg);
+    relation has_int_type(RTLReg);
+    relation has_subint_type(RTLReg);
+
+
+    relation plt_block(Address, Symbol);
+    relation plt_entry(Address, Symbol);
+    relation func_stacksz(Address, Address, Symbol, u64);
+    relation call_has_known_signature(Node, Symbol, usize, XType);
+    relation rtl_inst_candidate(Node, RTLInst);
+    relation emit_function(Address, Symbol, Node);
+    relation rtl_succ_candidate(Node, Node);
+
+    relation rtl_edge_negated(Node, Node);
+    // Memory-indirect call (CALL with op_indirect operand that is a true memory load); tuple is (call_addr, base_reg_str, idx_reg_str, scale, disp).
+    relation call_through_memory(Address, &'static str, &'static str, i64, i64);
+    // Addresses with a real LTL operation (not just a label/branch fallback)
+    relation has_ltl_op(Node);
+    // A plain stack reload that Mach/LTL dropped at a CFG join, but whose
+    // memory source is still justified by StackAnalysis reaching-def facts.
+    // Tuple: (function, instruction, point-local displacement, destination).
+    #[local] relation raw_stack_reload(Address, Address, i64, Mreg);
+    relation is_arg_reg(Mreg);
+    relation is_xmm_arg_reg(Mreg);
+    relation is_float_arg_reg(Mreg);
+    relation is_caller_saved(Mreg);
+    relation abi_int_arg_position(Mreg, usize);
+    relation abi_float_arg_position(Mreg, usize);
+    relation abi_shared_arg_slots(bool);
+    // True when abi_int_arg_position lists slots a function may claim rather than slots the whole image uses (Windows x86-32).
+    relation abi_reg_args_per_function(bool);
+    relation abi_first_stack_arg_position(usize);
+    relation abi_outgoing_stack_base(i64);
+    relation abi_incoming_sp_stack_base(i64);
+    relation abi_incoming_bp_stack_base(i64);
+    relation abi_stack_slot_size(i64);
+    relation abi_pointer_size(i64);
+    // The register a returned integer/pointer value arrives in: AX on x86, X0 on AArch64, R0 on ARM32. The return-value chain below used to spell Mreg::AX inline, which is why no non-x86 frontend could recover a return value.
+    relation abi_ret_int_reg(Mreg);
+    relation abi_ret_float_reg(Mreg);
+    relation ltl_inst_uses_mreg(Node, Mreg);
+    relation ltl_inst_reads_addr_base(Node, Mreg);
+    relation ltl_builtin_unconverted(Node, Symbol, Arc<Vec<BuiltinArg<Mreg>>>, BuiltinArg<Mreg>);
+    relation is_call_or_tailcall(Node);
+    relation is_call_clobbered(Node, Mreg);
+    relation call_args_collected_candidate(Node, Args);
+    relation op_arg_mapping(Node, usize, RTLReg);
+    relation op_args_collected(Node, Args);
+    relation load_arg_mapping(Node, usize, RTLReg);
+    relation load_args_collected(Node, Args);
+    relation store_arg_mapping(Node, usize, RTLReg);
+    relation store_args_collected(Node, Args);
+    relation cond_arg_mapping(Node, usize, RTLReg);
+    relation cond_args_collected(Node, Args);
+    relation global_var_ref(usize);
+    relation global_load_chunk(Ident, MemoryChunk);
+    relation emit_global_is_ptr(Ident);
+    relation emit_global_is_char_ptr(Ident);
+    relation global_addr_reg(Ident, RTLReg);
+    relation base_ident_to_symbol(Ident, Symbol);
+    relation ident_to_symbol(Ident, Symbol);
+    relation comparison_operand(Node, Condition, RTLReg);
+    relation rtl_reg_used_in_func(Address, RTLReg);
+    relation func_has_div_instr(Address);
+    relation temp_cmp_reg(Address, RTLReg);
+    relation temp_cmp_mreg_args(Address, usize, Mreg);
+    relation temp_cmp_args_rtl(Address, usize, RTLReg);
+    relation temp_test_mem_reg(Address, RTLReg);
+    relation temp_test_mem_mreg_args(Address, usize, Mreg);
+    relation temp_test_mem_args_rtl(Address, usize, RTLReg);
+    relation call_returns_value(Address, Mreg);
+    relation ax_value_addr(Address, Address);
+    relation func_ax_def(Address, Address, RTLReg);
+    relation stack_mem_add_imm(Address, i64, i64, usize);
+    relation stack_mem_sub_imm(Address, i64, i64, usize);
+
+    // SP-indexed operations with 2 mregs where mregs[0] == SP.
+    #[local] relation sp_indexed_lea(Node);
+    #[local] relation sp_indexed_load(Node);
+    #[local] relation sp_indexed_store(Node);
+
+    // BP-frame-pointer-indexed load/store detection (mregs[0] == BP in a framed function), expanded like the SP-indexed case, or the base collapses to the whole-frame Olea(Ainstack(0)) and walks off the frame.
+    #[local] relation bp_indexed_load(Node);
+    #[local] relation bp_indexed_store(Node);
+
+    // Every stack-indexed expansion has one synthetic tail. Keep the CFG
+    // takeover policy common so adding a new SP/BP form cannot accidentally
+    // inherit Linear's successor past a separately materialized branch.
+    #[local] relation stack_indexed_chain(Node);
+
+    // The synthetic Olea(Ainstack(ofs)) base from an SP/BP-indexed expansion, driving a per-node stack_xtl and same-offset alias so it resolves to the array's named local instead of a bare frame integer.
+    #[local] relation indexed_synth_stack_base(Address, Node, i64, RTLReg);
+
+    // A LEA into the caller-owned incoming stack-argument area, tracked through
+    // exact register def-use edges.  Optimized variadic consumers commonly
+    // walk this tail directly instead of materializing a va_list; treating the
+    // LEA as an ordinary frame-local address makes later field loads read past
+    // a scalar local and also hides those argument positions from signature
+    // reconciliation.
+    #[local] relation incoming_stack_tail_base(Address, Node, i64, Mreg);
+    #[local] relation incoming_stack_tail_load(Node, Address, i64);
+
+    // A SysV variadic prologue's address of the first unnamed stack argument.
+    // Exact def-use into the va_list overflow_arg_area field, paired with the
+    // adjacent register-save-area field, identifies the ABI operation.  The
+    // entry-anchored SP lattice (or a structural frame pointer) then derives
+    // the fixed stack-prefix length from the slot itself.  This is an address
+    // classification, not reachability: no instruction or node ordering is
+    // used.  Signature reconciliation binds the resulting semantic builtin to
+    // the final last-named parameter after its stricter arity solve.
+    relation variadic_next_arg_site(Address, Node, Mreg);
+    #[local] relation variadic_register_save_area_init(Address, i64);
+    #[local] relation variadic_overflow_arg_area_init(Address, Node, Mreg, i64);
+    #[local] relation variadic_next_arg_prefix_candidate(Address, Node, Mreg, usize);
+    relation variadic_fixed_stack_prefix_count(Address, usize);
+
+    // sp_synth_skip_to_ltl(start, func, dst): start has no ltl_inst; walking next within func reaches dst with one. Function-bounded; used ONLY to give a synth chain its exit edge when the raw fallthrough lifted to nothing, so it doesn't affect ltl_fallthrough.
+    #[local] relation sp_synth_skip_to_ltl(Address, Address, Node);
+
+    // synth_only_addr: addr has no ltl_inst (fused into a synth chain upstream) yet exists in rtl as synth, bridging the predecessor-side edge without resurrecting the broken global skip-over.
+    #[local] relation synth_only_addr(Address);
+
+    // The next semantic RTL address reached from a raw instruction, propagated
+    // over the structural instruction CFG.  This is point-keyed lattice state,
+    // not a materialized pairwise reachability relation: joins union the first
+    // semantic successors from each CFG arm and propagation stops at every
+    // semantic node.
+    #[local] relation rtl_raw_cfg_step(Address, Address);
+    #[local] relation rtl_semantic_node(Address);
+    #[local] lattice rtl_next_semantic(Address, Address, Set<Address>);
+
+
+    rtl_next(src, dst) <-- ltl_succ(src, dst);
+
+    // Linear intentionally does not skip arbitrary instructions that lift to
+    // no LTL node: doing so there changes the CFG consumed by loop recovery.
+    // RTL still needs a semantic edge for an ordinary fallthrough, however,
+    // or a live value copied immediately before a dropped prologue/epilogue
+    // instruction appears to end at a false CFG exit and is deleted by DSE.
+    // Fill only a successor that Linear did not publish, walking the raw CFG
+    // to its first semantic node with the function-keyed lattice below.  By
+    // deriving rtl_next (rather than a final rtl_succ_candidate), synthetic
+    // expansions can still negate and redirect this edge through their tails.
+    rtl_next(*src, *dst) <--
+        ltl_inst(src, inst),
+        if crate::decompile::passes::linear_pass::has_fallthrough(inst, *src),
+        !ltl_succ(*src, _),
+        !call_targets_noreturn(*src),
+        instr_in_function(src, func),
+        rtl_next_semantic(func, src, successors),
+        for dst in successors.0.iter();
+
+    ltl_inst_uses_mreg(addr, mreg) <--
+        ltl_inst(addr, ?LTLInst::Lop(_, args, _)),
+        for mreg in args.iter();
+
+    ltl_inst_uses_mreg(addr, mreg) <--
+        ltl_inst(addr, ?LTLInst::Lload(_, _, args, _)),
+        for mreg in args.iter();
+
+    ltl_inst_uses_mreg(addr, mreg) <--
+        ltl_inst(addr, ?LTLInst::Lstore(_, _, args, _)),
+        for mreg in args.iter();
+
+    ltl_inst_uses_mreg(addr, src) <--
+        ltl_inst(addr, ?LTLInst::Lstore(_, _, _, src));
+
+    ltl_inst_uses_mreg(addr, reg) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Left(reg)));
+
+    ltl_inst_uses_mreg(addr, reg) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(Either::Left(reg)));
+
+    ltl_inst_uses_mreg(addr, mreg) <--
+        ltl_inst(addr, ?LTLInst::Lbuiltin(_, args, _)),
+        for arg in args.iter(),
+        if let BuiltinArg::BA(mreg) = arg;
+
+    ltl_inst_uses_mreg(addr, mreg) <--
+        ltl_inst(addr, ?LTLInst::Lbuiltin(_, args, _)),
+        for arg in args.iter(),
+        if matches!(arg, BuiltinArg::BASplitLong(_, _) | BuiltinArg::BAAddPtr(_, _)),
+        let mregs = extract_builtin_arg_regs(arg),
+        for mreg in mregs.iter();
+
+    ltl_inst_uses_mreg(addr, mreg) <--
+        ltl_inst(addr, ?LTLInst::Lcond(_, args, _, _)),
+        for mreg in args.iter();
+
+    ltl_inst_uses_mreg(addr, arg) <--
+        ltl_inst(addr, ?LTLInst::Ljumptable(arg, _));
+
+    ltl_inst_uses_mreg(addr, ret_reg) <--
+        ltl_inst(addr, LTLInst::Lreturn),
+        abi_ret_int_reg(ret_reg);
+
+    ltl_inst_uses_mreg(addr, src) <--
+        ltl_inst(addr, ?LTLInst::Lsetstack(src, _, _, _));
+
+
+    is_call_or_tailcall(*addr) <-- ltl_inst(addr, ?LTLInst::Lcall(_));
+    is_call_or_tailcall(*addr) <-- ltl_inst(addr, ?LTLInst::Ltailcall(_));
+    is_call_or_tailcall(*addr) <--
+        ltl_inst(addr, ?LTLInst::Lbranch(Either::Right(target))),
+        emit_function(_, _, target);
+
+    is_call_clobbered(n, r) <-- is_call_or_tailcall(n), is_caller_saved(r);
+
+
+    call_args_collected_candidate(call_addr, args) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(_)),
+        agg args = build_call_args(pos, reg) in call_arg_mapping(call_addr, pos, reg);
+
+    // Memory-indirect call detection: op_indirect on a CALL means callee is loaded from memory (register-direct CALLs use op_register).
+    call_through_memory(*addr, base_str, idx_str, *scale, *disp) <--
+        instruction(addr, _, _, "CALL", dst, _, _, _, _, _),
+        op_indirect(dst, _, base_str, idx_str, scale, disp, _);
+
+    // The asm layer preserves an unresolved non-table memory JMP as an
+    // Ltailcall through the Unknown placeholder.  Retain its full addressing
+    // mode here exactly like a memory CALL; the placeholder itself is never
+    // interpreted as the loaded function pointer.
+    call_through_memory(*addr, base_str, idx_str, *scale, *disp) <--
+        instruction(addr, _, _, "JMP", dst, _, _, _, _, _),
+        op_indirect(dst, _, base_str, idx_str, scale, disp, _),
+        ltl_inst(addr, ?LTLInst::Ltailcall(Either::Left(_)));
+
+
+    // osel_cond_pos: a cmov condition operand that is the register the cmov writes, where clang's reuse makes the value at the compare differ from the cmov-site shadow; non-reuse cmovs are unmarked.
+    relation osel_cond_pos(Node, usize, RTLReg);
+    osel_cond_pos(addr, pos, cmp_rtl) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Osel(_, _), mregs, dst_reg)),
+        osel_compare_site(addr, cmp_addr),
+        lop_overwrites_input(addr, dst_reg),
+        lop_overwrite_use_id(addr, *dst_reg, src_xtl),
+        xtl_canonical(src_xtl, shadow_rtl),
+        for (pos, arg) in mregs.iter().enumerate(),
+        if pos >= 2,
+        if arg == dst_reg,
+        reg_rtl(cmp_addr, *arg, cmp_rtl),
+        if cmp_rtl != shadow_rtl;
+
+    // cmov_reuse_node(addr): cmov whose flag register was reused as a value holder. The structuring select-to-if lift targets exactly these (dispatch-style selects), leaving other branchless selects for their own recovery passes (jump tables, closed-form switches, plain ternaries).
+    relation cmov_reuse_node(Node);
+    cmov_reuse_node(addr) <-- osel_cond_pos(addr, _, _);
+
+    // A RIP-relative CMP has no address GPR to put in Mach's Osel argument
+    // list.  asm_pass therefore keeps a two-value Osel backstop so the CMOV
+    // definition survives.  Complete that representation here, where the
+    // compare's existing synthetic global load has an RTL name: append the
+    // loaded value and restore the immediate predicate.  Without this fact,
+    // Cminor has no condition operand and can only emit an unconditional
+    // select.
+    #[local] relation osel_rip_condition(Node, Condition, RTLReg);
+    osel_rip_condition(addr, condition, *loaded) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Osel(base_condition, _), _, _)),
+        osel_compare_site(addr, cmp_addr),
+        pcmp(cmp_addr, memory, immediate),
+        op_indirect(memory, _, base, index, _, _, size),
+        if is_rip(base),
+        if *index == "NONE" || index.is_empty(),
+        op_immediate(immediate, value, _),
+        temp_cmp_reg(cmp_addr, loaded),
+        let sized = adjust_condition_size(base_condition.clone(), *size),
+        if let Some(condition) = condition_with_immediate(sized, *value);
+
+    op_arg_mapping(addr, 2, *loaded) <--
+        osel_rip_condition(addr, _, loaded);
+
+    op_arg_mapping(addr, pos, cmp_rtl) <--
+        osel_cond_pos(addr, pos, cmp_rtl);
+
+    // An Osel's condition operand reflects the compared register's value AT THE COMPARE, so resolve it at osel_compare_site; resolving at the cmov invents a never-defined reg and its producer is dropped.
+    #[local] relation osel_cond_at_compare(Node, usize, RTLReg);
+    osel_cond_at_compare(addr, pos, cmp_rtl) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Osel(_, _), mregs, dst_reg)),
+        osel_compare_site(addr, cmp_addr),
+        for (pos, arg) in mregs.iter().enumerate(),
+        if pos >= 2,
+        if arg != dst_reg,
+        reg_rtl(cmp_addr, *arg, cmp_rtl);
+
+    op_arg_mapping(addr, pos, cmp_rtl) <--
+        osel_cond_at_compare(addr, pos, cmp_rtl);
+
+    // A SUB-result CMOV can reuse the SUB destination as a new selected value
+    // before the CMOV without changing flags.  Mark the condition position
+    // independently of whether its result definition resolves: falling back
+    // to the CMOV-time register value would silently compare the replacement.
+    #[local] relation osel_cond_at_flags_result(Node, usize, Node, Mreg);
+    osel_cond_at_flags_result(addr, pos, result_site, *arg) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Osel(_, _), mregs, _)),
+        osel_flags_result_site(addr, result_site),
+        for (pos, arg) in mregs.iter().enumerate(),
+        if pos >= 2;
+
+    op_arg_mapping(addr, pos, result_rtl) <--
+        osel_cond_at_flags_result(addr, pos, result_site, result_mreg),
+        def_value_rtl(result_site, result_mreg, result_rtl);
+
+    op_arg_mapping(addr, pos, arg_rtl) <--
+        ltl_inst(addr, ?LTLInst::Lop(_, mregs, dst_reg)),
+        for (pos, arg) in mregs.iter().enumerate(),
+        if arg != dst_reg,
+        !osel_cond_at_compare(addr, pos, _),
+        !osel_cond_at_flags_result(addr, pos, _, _),
+        reg_rtl(addr, *arg, arg_rtl);
+
+    op_arg_mapping(addr, pos, arg_rtl) <--
+        ltl_inst(addr, ?LTLInst::Lop(_, mregs, dst_reg)),
+        for (pos, arg) in mregs.iter().enumerate(),
+        if arg == dst_reg,
+        !lop_overwrites_input(addr, *dst_reg),
+        !osel_cond_at_flags_result(addr, pos, _, _),
+        reg_rtl(addr, *arg, arg_rtl);
+
+    op_arg_mapping(addr, pos, arg_rtl_use) <--
+        ltl_inst(addr, ?LTLInst::Lop(_, mregs, dst_reg)),
+        for (pos, arg) in mregs.iter().enumerate(),
+        if arg == dst_reg,
+        !osel_cond_pos(addr, pos, _),
+        !osel_cond_at_flags_result(addr, pos, _, _),
+        lop_overwrite_use_id(addr, *dst_reg, src_xtl),
+        xtl_canonical(src_xtl, arg_rtl_use);
+
+
+    op_args_collected(addr, args) <--
+        ltl_inst(addr, ?LTLInst::Lop(_, mregs, _)),
+        if !mregs.is_empty(),
+        agg args = build_call_args(pos, reg) in op_arg_mapping(addr, pos, reg);
+
+    op_args_collected(addr, Arc::new(vec![])) <--
+        ltl_inst(addr, ?LTLInst::Lop(_, mregs, _)),
+        if !mregs.is_empty(),
+        !op_arg_mapping(addr, _, _);
+
+
+    // Detect SP-indexed LEAs, preserving both scaled/unscaled and 32/64-bit
+    // forms. Other two-argument operations with SP remain ordinary Lops.
+    sp_indexed_lea(addr) <--
+        ltl_inst(addr, ?LTLInst::Lop(op, mregs, _)),
+        if mregs.len() == 2,
+        if mregs[0] == Mreg::SP,
+        if split_sp_indexed_lea(op).is_some();
+
+    // Detect SP-indexed loads (2 mregs where mregs[0] is SP)
+    sp_indexed_load(addr) <--
+        ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, _)),
+        if mregs.len() == 2,
+        if mregs[0] == Mreg::SP;
+
+    // Detect SP-indexed stores (2 mregs where mregs[0] is SP)
+    sp_indexed_store(addr) <--
+        ltl_inst(addr, ?LTLInst::Lstore(_, _, mregs, _)),
+        if mregs.len() == 2,
+        if mregs[0] == Mreg::SP;
+
+    // Detect BP-frame-pointer-indexed loads (2 mregs where mregs[0] is BP) in a framed function.
+    bp_indexed_load(addr) <--
+        ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, _)),
+        if mregs.len() == 2,
+        if mregs[0] == Mreg::BP,
+        instr_in_function(addr, func_start),
+        func_sets_frame_pointer(func_start);
+
+    // Detect BP-frame-pointer-indexed stores (2 mregs where mregs[0] is BP) in a framed function.
+    bp_indexed_store(addr) <--
+        ltl_inst(addr, ?LTLInst::Lstore(_, _, mregs, _)),
+        if mregs.len() == 2,
+        if mregs[0] == Mreg::BP,
+        instr_in_function(addr, func_start),
+        func_sets_frame_pointer(func_start);
+
+    stack_indexed_chain(addr) <-- sp_indexed_lea(addr);
+    stack_indexed_chain(addr) <-- sp_indexed_load(addr);
+    stack_indexed_chain(addr) <-- sp_indexed_store(addr);
+    stack_indexed_chain(addr) <-- bp_indexed_load(addr);
+    stack_indexed_chain(addr) <-- bp_indexed_store(addr);
+
+    // A scheduled cmp+jcc may put the Icond at the raw jcc while Linear's
+    // successor still names the instruction after it. The indexed chain owns
+    // its source node, so redirect both pre-existing exits through its tail.
+    rtl_edge_negated(addr, jcc_addr) <--
+        stack_indexed_chain(addr),
+        next_is_materialized_branch(addr, jcc_addr);
+
+    rtl_succ_candidate(synth, jcc_addr) <--
+        stack_indexed_chain(addr),
+        next_is_materialized_branch(addr, jcc_addr),
+        let synth = *addr | (1u64 << 62);
+
+    // Address-arg position whose register is NOT the load's destination: its value is the register's ordinary canonical at this node.
+    load_arg_mapping(addr, pos, arg_rtl) <--
+        ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, dst_reg)),
+        !sp_indexed_load(addr),
+        !bp_indexed_load(addr),
+        for (pos, arg) in mregs.iter().enumerate(),
+        if arg != dst_reg,
+        reg_rtl(addr, *arg, arg_rtl);
+
+    // Address-arg position whose register IS reused as the load's destination: resolve via the load_overwrite_use_id shadow id, the value BEFORE the load writes, or two conflicting arg vectors drop the load.
+    load_arg_mapping(addr, pos, arg_rtl) <--
+        ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, dst_reg)),
+        !sp_indexed_load(addr),
+        !bp_indexed_load(addr),
+        for (pos, arg) in mregs.iter().enumerate(),
+        if arg == dst_reg,
+        load_overwrite_use_id(addr, *dst_reg, src_xtl),
+        xtl_canonical(src_xtl, arg_rtl);
+
+    load_args_collected(addr, args) <--
+        ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, _)),
+        if mregs.len() > 1,
+        !sp_indexed_load(addr),
+        !bp_indexed_load(addr),
+        agg args = build_call_args(pos, reg) in load_arg_mapping(addr, pos, reg);
+
+    load_args_collected(addr, Arc::new(vec![])) <--
+        ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, _)),
+        if mregs.len() > 1,
+        !sp_indexed_load(addr),
+        !bp_indexed_load(addr),
+        !load_arg_mapping(addr, _, _);
+
+
+    store_arg_mapping(addr, pos, arg_rtl) <--
+        ltl_inst(addr, ?LTLInst::Lstore(_, _, mregs, _)),
+        !sp_indexed_store(addr),
+        !bp_indexed_store(addr),
+        for (pos, arg) in mregs.iter().enumerate(),
+        reg_rtl(addr, *arg, arg_rtl);
+
+    store_args_collected(addr, args) <--
+        ltl_inst(addr, ?LTLInst::Lstore(_, _, mregs, _)),
+        if !mregs.is_empty(),
+        !sp_indexed_store(addr),
+        !bp_indexed_store(addr),
+        agg args = build_call_args(pos, reg) in store_arg_mapping(addr, pos, reg);
+
+    store_args_collected(addr, Arc::new(vec![])) <--
+        ltl_inst(addr, ?LTLInst::Lstore(_, _, mregs, _)),
+        if !mregs.is_empty(),
+        !sp_indexed_store(addr),
+        !bp_indexed_store(addr),
+        !store_arg_mapping(addr, _, _);
+
+
+    cond_arg_mapping(addr, pos, arg_rtl) <--
+        ltl_inst(addr, ?LTLInst::Lcond(_, mregs, _, _)),
+        for (pos, arg) in mregs.iter().enumerate(),
+        reg_rtl(addr, *arg, arg_rtl);
+
+    cond_args_collected(addr, args) <--
+        ltl_inst(addr, ?LTLInst::Lcond(_, mregs, _, _)),
+        if !mregs.is_empty(),
+        agg args = build_call_args(pos, reg) in cond_arg_mapping(addr, pos, reg);
+
+    cond_args_collected(addr, Arc::new(vec![])) <--
+        ltl_inst(addr, ?LTLInst::Lcond(_, mregs, _, _)),
+        if !mregs.is_empty(),
+        !cond_arg_mapping(addr, _, _);
+
+    call_args_collected_candidate(call_addr, args) <--
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(_)),
+        agg args = build_call_args(pos, reg) in call_arg_mapping(call_addr, pos, reg);
+
+    call_args_collected_candidate(call_addr, Arc::new(vec![])) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(_)),
+        !call_arg_mapping(call_addr, _, _);
+
+    call_args_collected_candidate(call_addr, Arc::new(vec![])) <--
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(_)),
+        !call_arg_mapping(call_addr, _, _);
+
+
+    ident_to_symbol(ident, *name) <-- base_ident_to_symbol(ident, name);
+
+    base_ident_to_symbol(ident, *name) <--
+        symbols(addr, name, _),
+        !plt_block(addr, _),
+        !plt_entry(addr, _),
+        let ident = *addr as Ident;
+
+    base_ident_to_symbol(ident, clean_name) <--
+        plt_entry(addr, sym),
+        let ident = *addr as Ident,
+        let clean_name = strip_version_suffix(sym);
+
+    base_ident_to_symbol(ident, clean_name) <--
+        plt_block(addr, sym),
+        let ident = *addr as Ident,
+        let clean_name = strip_version_suffix(sym);
+
+    global_var_ref(ident) <--
+        ltl_inst(_, ?LTLInst::Lop(Operation::Oindirectsymbol(ident), _, _));
+
+    global_var_ref(ident) <--
+        ltl_inst(_, ?LTLInst::Lload(_, Addressing::Aglobal(ident, _), _, _));
+
+    global_var_ref(ident) <--
+        ltl_inst(_, ?LTLInst::Lstore(_, Addressing::Aglobal(ident, _), _, _));
+
+    global_var_ref(ident) <--
+        ltl_inst(_, ?LTLInst::Lload(_, Addressing::Abased(ident, _), _, _));
+
+    global_var_ref(ident) <--
+        ltl_inst(_, ?LTLInst::Lstore(_, Addressing::Abased(ident, _), _, _));
+
+    global_var_ref(ident) <--
+        ltl_inst(_, ?LTLInst::Lload(_, Addressing::Abasedscaled(_, ident, _), _, _));
+
+    global_var_ref(ident) <--
+        ltl_inst(_, ?LTLInst::Lstore(_, Addressing::Abasedscaled(_, ident, _), _, _));
+
+    global_var_ref(ident) <--
+        ltl_inst(_, ?LTLInst::Lcall(Either::Right(Either::Right(name_sym)))),
+        ident_to_symbol(ident, name),
+        if name == name_sym;
+
+    global_var_ref(ident) <--
+        ltl_inst(_, ?LTLInst::Ltailcall(Either::Right(Either::Right(name_sym)))),
+        ident_to_symbol(ident, name),
+        if name == name_sym;
+
+    // Track memory chunk type used when loading from each global (for rodata constant inlining)
+    global_load_chunk(*ident, chunk.clone()) <--
+        ltl_inst(_, ?LTLInst::Lload(chunk, Addressing::Aglobal(ident, _), _, _));
+
+    global_load_chunk(*ident, chunk.clone()) <--
+        ltl_inst(_, ?LTLInst::Lload(chunk, Addressing::Abased(ident, _), _, _));
+
+    global_load_chunk(*ident, chunk.clone()) <--
+        ltl_inst(_, ?LTLInst::Lload(chunk, Addressing::Abasedscaled(_, ident, _), _, _));
+
+    // Store chunks via direct addressing (also inform global type inference)
+    global_load_chunk(*ident, chunk.clone()) <--
+        ltl_inst(_, ?LTLInst::Lstore(chunk, Addressing::Aglobal(ident, _), _, _));
+
+    global_load_chunk(*ident, chunk.clone()) <--
+        ltl_inst(_, ?LTLInst::Lstore(chunk, Addressing::Abased(ident, _), _, _));
+
+    global_load_chunk(*ident, chunk.clone()) <--
+        ltl_inst(_, ?LTLInst::Lstore(chunk, Addressing::Abasedscaled(_, ident, _), _, _));
+
+    // Track RTL register holding address of a global (from Oindirectsymbol, used in PIC binaries)
+    global_addr_reg(*ident, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Oindirectsymbol(ident), _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    // Propagate global address register through aliases
+    global_addr_reg(*ident, b) <-- global_addr_reg(ident, a), alias_edge(a, b);
+    global_addr_reg(*ident, a) <-- global_addr_reg(ident, b), alias_edge(a, b);
+
+    // Drive off the load instruction and match global_addr_reg BY the bound base_rtl; leading with global_addr_reg scanned ltl_inst as an O(n*m) cross-product (26s). Clause order is semantics-neutral.
+    global_load_chunk(*ident, chunk.clone()) <--
+        ltl_inst(node, ?LTLInst::Lload(chunk, Addressing::Aindexed(0), args, _)),
+        if !args.is_empty(),
+        reg_rtl(node, args[0], base_rtl),
+        global_addr_reg(ident, base_rtl);
+
+    // When a global address register is used as base for a store at offset 0, track the chunk
+    global_load_chunk(*ident, chunk.clone()) <--
+        ltl_inst(node, ?LTLInst::Lstore(chunk, Addressing::Aindexed(0), args, _)),
+        if !args.is_empty(),
+        reg_rtl(node, args[0], base_rtl),
+        global_addr_reg(ident, base_rtl);
+
+    // Note: emit_global_is_ptr/emit_global_is_char_ptr are computed in type_pass.rs (more precise).
+
+    is_ptr(reg) <--
+        op_produces_ptr(_, reg);
+
+    is_not_ptr(reg) <--
+        op_produces_data(_, reg);
+
+
+    comparison_operand(addr, cond.clone(), rtl_arg) <--
+        ltl_inst(addr, ?LTLInst::Lcond(cond, mregs, _, _)),
+        for mreg in mregs.iter(),
+        reg_rtl(addr, *mreg, rtl_arg);
+
+
+    reg_xtl(head_addr, mreg, arg_id) <--
+        ltl_inst(head_addr, ?LTLInst::Lop(_, mregs, _)),
+        for mreg in mregs.iter(),
+        reg_def_used(defaddr, *mreg, *head_addr),
+        !lop_overwrites_input(head_addr, mreg),
+        !load_overwrites_base(defaddr, mreg),
+        reg_xtl(defaddr, *mreg, arg_id);
+
+    reg_xtl(head_addr, mreg, arg_id) <--
+        ltl_inst(head_addr, ?LTLInst::Lop(_, mregs, _)),
+        for mreg in mregs.iter(),
+        reg_def_used(defaddr, *mreg, *head_addr),
+        !lop_overwrites_input(head_addr, mreg),
+        load_overwrites_base(defaddr, mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *mreg, arg_id);
+
+    reg_xtl(head_addr, mreg, id) <--
+        ltl_inst(head_addr, ?LTLInst::Lbuiltin(_, args, _)),
+        for builtin_arg in args,
+        if let BuiltinArg::BA(mreg) = builtin_arg,
+        reg_def_used(defaddr, *mreg, *head_addr),
+        !load_overwrites_base(defaddr, mreg),
+        reg_xtl(defaddr, *mreg, id);
+
+    reg_xtl(head_addr, mreg, id) <--
+        ltl_inst(head_addr, ?LTLInst::Lbuiltin(_, args, _)),
+        for builtin_arg in args,
+        if let BuiltinArg::BA(mreg) = builtin_arg,
+        reg_def_used(defaddr, *mreg, *head_addr),
+        load_overwrites_base(defaddr, mreg),
+        is_def(defaddr, id),
+        reg_xtl(defaddr, *mreg, id);
+
+    reg_xtl(head_addr, mreg, arg_id) <--
+        ltl_inst(head_addr, ?LTLInst::Lload(_, _, mregs, _)),
+        for mreg in mregs.iter(),
+        reg_def_used(defaddr, *mreg, *head_addr),
+        !load_overwrites_base(head_addr, mreg),
+        !load_overwrites_base(defaddr, mreg),
+        reg_xtl(defaddr, *mreg, arg_id);
+
+    reg_xtl(head_addr, mreg, arg_id) <--
+        ltl_inst(head_addr, ?LTLInst::Lload(_, _, mregs, _)),
+        for mreg in mregs.iter(),
+        reg_def_used(defaddr, *mreg, *head_addr),
+        !load_overwrites_base(head_addr, mreg),
+        load_overwrites_base(defaddr, mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *mreg, arg_id);
+
+    reg_xtl(addr, Mreg::x86(reg_str.to_string()), arg_id) <--
+        pcmp(addr, sym1, sym2),
+        op_register(sym1, reg_str),
+        reg_def_used(addr, Mreg::x86(reg_str.to_string()), *addr),
+        reg_xtl(*addr, Mreg::x86(reg_str.to_string()), arg_id);
+
+    reg_xtl(addr, Mreg::x86(reg_str.to_string()), arg_id) <--
+        pcmp(addr, sym1, sym2),
+        op_register(sym2, reg_str),
+        reg_def_used(addr, Mreg::x86(reg_str.to_string()), *addr),
+        reg_xtl(*addr, Mreg::x86(reg_str.to_string()), arg_id);
+
+    reg_xtl(head_addr, *src, srcid) <--
+        ltl_inst(head_addr, ?LTLInst::Lstore(mc, adrs, args, src)),
+        reg_def_used(defaddr, *src, *head_addr),
+        !load_overwrites_base(defaddr, src),
+        reg_xtl(defaddr, *src, srcid);
+
+    reg_xtl(head_addr, *src, srcid) <--
+        ltl_inst(head_addr, ?LTLInst::Lstore(mc, adrs, args, src)),
+        reg_def_used(defaddr, *src, *head_addr),
+        load_overwrites_base(defaddr, src),
+        is_def(defaddr, srcid),
+        reg_xtl(defaddr, *src, srcid);
+
+    reg_xtl(head_addr, *src, srcid) <--
+        ltl_inst(head_addr, ?LTLInst::Lsetstack(src, _, _, _)),
+        reg_def_used(defaddr, *src, *head_addr),
+        !load_overwrites_base(defaddr, src),
+        reg_xtl(defaddr, *src, srcid);
+
+    reg_xtl(head_addr, *src, srcid) <--
+        ltl_inst(head_addr, ?LTLInst::Lsetstack(src, _, _, _)),
+        reg_def_used(defaddr, *src, *head_addr),
+        load_overwrites_base(defaddr, src),
+        is_def(defaddr, srcid),
+        reg_xtl(defaddr, *src, srcid);
+
+
+    reg_xtl(head_addr, mreg, arg_id) <--
+        ltl_inst(head_addr, ?LTLInst::Lcond(_, args, _, _)),
+        for mreg in args.iter(),
+        reg_def_used(defaddr, *mreg, *head_addr),
+        !load_overwrites_base(defaddr, mreg),
+        reg_xtl(defaddr, *mreg, arg_id);
+
+    reg_xtl(head_addr, mreg, arg_id) <--
+        ltl_inst(head_addr, ?LTLInst::Lcond(_, args, _, _)),
+        for mreg in args.iter(),
+        reg_def_used(defaddr, *mreg, *head_addr),
+        load_overwrites_base(defaddr, mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *mreg, arg_id);
+
+    reg_xtl(addr, arg, arg_id) <--
+        ltl_inst(addr, ?LTLInst::Ljumptable(arg, _)),
+        reg_def_used(defaddr, *arg, *addr),
+        !load_overwrites_base(defaddr, arg),
+        reg_xtl(defaddr, *arg, arg_id);
+
+    reg_xtl(addr, arg, arg_id) <--
+        ltl_inst(addr, ?LTLInst::Ljumptable(arg, _)),
+        reg_def_used(defaddr, *arg, *addr),
+        load_overwrites_base(defaddr, arg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *arg, arg_id);
+
+
+    reg_xtl(addr, mreg, callee_id) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Left(mreg))),
+        reg_def_used(defaddr, *mreg, *addr),
+        !load_overwrites_base(defaddr, mreg),
+        reg_xtl(defaddr, *mreg, callee_id);
+
+    reg_xtl(addr, mreg, callee_id) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Left(mreg))),
+        reg_def_used(defaddr, *mreg, *addr),
+        load_overwrites_base(defaddr, mreg),
+        is_def(defaddr, callee_id),
+        reg_xtl(defaddr, *mreg, callee_id);
+
+    reg_xtl(addr, mreg, callee_id) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(Either::Left(mreg))),
+        reg_def_used(defaddr, *mreg, *addr),
+        !load_overwrites_base(defaddr, mreg),
+        reg_xtl(defaddr, *mreg, callee_id);
+
+    reg_xtl(addr, mreg, callee_id) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(Either::Left(mreg))),
+        reg_def_used(defaddr, *mreg, *addr),
+        load_overwrites_base(defaddr, mreg),
+        is_def(defaddr, callee_id),
+        reg_xtl(defaddr, *mreg, callee_id);
+
+
+    rtl_inst_candidate(addr, inst) <--
+        mach_imm_stack_init(addr, ofs, imm_val, typ),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, ofs, rtl_reg),
+        let op = match typ {
+            Typ::Tint => Operation::Ointconst(*imm_val),
+            Typ::Tlong | Typ::Tany64 => Operation::Olongconst(*imm_val),
+            _ => Operation::Ointconst(*imm_val),
+        },
+        let inst = RTLInst::Iop(op, Arc::new(vec![]), *rtl_reg);
+
+    rtl_inst_candidate(addr, inst) <--
+        mach_imm_stack_init(addr, ofs, imm_val, typ),
+        instr_in_function(addr, func_start),
+        !stack_xtl(func_start, addr, ofs, _),
+        let rtl_reg = fresh_stack_slot_reg(*addr),
+        let op = match typ {
+            Typ::Tint => Operation::Ointconst(*imm_val),
+            Typ::Tlong | Typ::Tany64 => Operation::Olongconst(*imm_val),
+            _ => Operation::Ointconst(*imm_val),
+        },
+        let inst = RTLInst::Iop(op, Arc::new(vec![]), rtl_reg);
+
+    reg_xtl(addr, base_mreg, arg_id) <--
+        mach_imm_indirect_store(addr, _, _, base_mreg, _),
+        reg_def_used(defaddr, *base_mreg, *addr),
+        !load_overwrites_base(defaddr, base_mreg),
+        reg_xtl(defaddr, *base_mreg, arg_id);
+
+    reg_xtl(addr, base_mreg, arg_id) <--
+        mach_imm_indirect_store(addr, _, _, base_mreg, _),
+        reg_def_used(defaddr, *base_mreg, *addr),
+        load_overwrites_base(defaddr, base_mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *base_mreg, arg_id);
+
+    rtl_succ_candidate(src, dst) <-- rtl_next(src, dst), !rtl_edge_negated(src, dst);
+
+    // Rewire CMP+JCC only when a complete Icond candidate actually exists at
+    // the CMP.  Classifying an operand as "probably stack" is insufficient:
+    // if stack identity is unavailable, deleting cmp -> jcc turns the remaining
+    // branch placeholder into a false unconditional edge.
+    #[local] relation icond_at_cmp(Node, Node, Node);
+    icond_at_cmp(*addr, *tgt, *fth) <--
+        pcmp(addr, _, _),
+        rtl_inst_candidate(addr, ?RTLInst::Icond(_, _, Either::Right(tgt), Either::Right(fth)));
+
+    rtl_edge_negated(addr, *jcc_addr) <--
+        icond_at_cmp(addr, _, _),
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, _, _);
+    rtl_succ_candidate(*addr, *target_addr) <--
+        icond_at_cmp(addr, target_addr, _),
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, _, _);
+    rtl_succ_candidate(*addr, *fallthrough) <--
+        icond_at_cmp(addr, _, fallthrough),
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, _, _);
+
+    // Dual of the cmp+jcc fold for the non-stack-mem case: rebuild the fused Icond's CFG edges from its embedded targets, or it becomes an island and DSE deletes the live def feeding its use.
+    #[local] relation icond_at_jcc(Node, Node, Node);
+    icond_at_jcc(*jcc_addr, *tgt, *fth) <--
+        pjcc(jcc_addr, _, _),
+        rtl_inst_candidate(jcc_addr, ?RTLInst::Icond(_, _, Either::Right(tgt), Either::Right(fth)));
+    rtl_succ_candidate(*jcc_addr, *tgt) <--
+        icond_at_jcc(jcc_addr, tgt, _),
+        !rtl_edge_negated(*jcc_addr, *tgt);
+    rtl_succ_candidate(*jcc_addr, *fth) <--
+        icond_at_jcc(jcc_addr, _, fth),
+        !rtl_edge_negated(*jcc_addr, *fth);
+    rtl_succ_candidate(*cmp_addr, *jcc_addr) <--
+        icond_at_jcc(jcc_addr, _, _),
+        next(cmp_addr, jcc_addr),
+        !rtl_edge_negated(*cmp_addr, *jcc_addr);
+
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lop(_, _, _));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lload(_, _, _, _));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lstore(_, _, _, _));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lcall(_));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Ltailcall(_));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lcond(_, _, _, _));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lbuiltin(_, _, _));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lgetstack(_, _, _, _));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lsetstack(_, _, _, _));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Ljumptable(_, _));
+    has_ltl_op(addr) <-- ltl_inst(addr, ?LTLInst::Lreturn);
+
+    // The exact SP-offset must-state can become unknown at a join when two
+    // paths reach the same stack cell through different instruction forms
+    // (for example SUB on one arm and PUSH on the other).  StackAnalysis
+    // independently maintains structural reaching definitions and records
+    // the raw base/displacement at each use.  Recover only a missing plain
+    // MOV reload for which that analysis proves at least one reaching store;
+    // indexed memory and ordinary object loads remain on their normal paths.
+    raw_stack_reload(*func_start, *addr, *disp, dst_mreg) <--
+        pmov(addr, dst_sym, src_sym),
+        op_register(dst_sym, dst_str),
+        op_indirect(src_sym, _, base_str, idx_str, _, disp, _),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        let base_mreg = Mreg::x86(*base_str),
+        if matches!(base_mreg, Mreg::SP | Mreg::BP),
+        let dst_mreg = Mreg::x86(*dst_str),
+        if !matches!(dst_mreg, Mreg::SP | Mreg::Unknown),
+        instr_in_function(addr, func_start),
+        stack_def_used(_, _def_base, _, addr, use_base, use_ofs),
+        if Mreg::x86(*use_base) == base_mreg && *use_ofs == *disp,
+        !has_ltl_op(addr);
+
+    rtl_inst_candidate(addr, iop_inst) <--
+        mach_imm_indirect_store(addr, imm_val, mc, _base_mreg, _disp),
+        let fresh_reg = fresh_xtl_reg(*addr, Mreg::DI),
+        let op = match mc {
+            MemoryChunk::MInt64 => Operation::Olongconst(*imm_val),
+            _ => Operation::Ointconst(*imm_val),
+        },
+        let iop_inst = RTLInst::Iop(op, Arc::new(vec![]), fresh_reg);
+
+    // An immediate store carries an index register that mach_imm_indirect_store drops, so detect it from the raw asm operands; this relation gates the base-only Istore off and routes to the indexed path.
+    #[local] relation imm_indirect_store_indexed(Address, i64, MemoryChunk, &'static str, &'static str, i64, i64);
+    imm_indirect_store_indexed(*addr, imm_int, mc, base_str, idx_str, *scale, *disp) <--
+        mach_imm_indirect_store(addr, _, _, _, _),
+        pmov(addr, dst, src),
+        op_immediate(src, imm_sym, _),
+        op_indirect(dst, _, base_str, idx_str, scale, disp, sz),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if !is_rip(base_str),
+        let base_mreg = Mreg::x86(*base_str),
+        // SP stays excluded, but BP is allowed for the INDEXED case: a BP base with an index is a genuine stack-array element write, not the scalar frame-slot init carried by mach_imm_stack_init.
+        if base_mreg != Mreg::SP,
+        let mc = match *sz {
+            1 => MemoryChunk::MInt8Unsigned,
+            2 => MemoryChunk::MInt16Unsigned,
+            8 => MemoryChunk::MInt64,
+            _ => MemoryChunk::MInt32,
+        },
+        let imm_int = *imm_sym as i64;
+
+    #[local] relation imm_indirect_store_has_index(Address);
+    imm_indirect_store_has_index(*addr) <-- imm_indirect_store_indexed(addr, _, _, _, _, _, _);
+
+    // BP-frame-pointer indexed immediate store, replaced below by the Olea(Ainstack(disp))+inner-0 expansion; its membership check uses the stable block_in_function inputs, not the growing instr_in_function.
+    #[local] relation real_addr_in_func(Address, Address);
+    real_addr_in_func(addr, func) <--
+        block_in_function(block, func),
+        code_in_block(addr, block);
+    #[local] relation func_sets_fp_stable(Address);
+    func_sets_fp_stable(func) <--
+        stack_base_move(addr, src, dst),
+        if *src == "RSP" && *dst == "RBP",
+        real_addr_in_func(addr, func);
+    #[local] relation imm_indirect_store_bp_indexed(Address, i64, MemoryChunk, &'static str, i64, i64);
+    imm_indirect_store_bp_indexed(*addr, *imm_val, mc.clone(), *idx_str, *scale, *disp) <--
+        imm_indirect_store_indexed(addr, imm_val, mc, base_str, idx_str, scale, disp),
+        if Mreg::x86(*base_str) == Mreg::BP,
+        real_addr_in_func(addr, func_start),
+        func_sets_fp_stable(func_start);
+
+    // Base-only Istore: only when there is no index to preserve (indexed case handled below).
+    rtl_inst_candidate(synthetic_addr, istore_inst) <--
+        mach_imm_indirect_store(addr, _imm_val, mc, base_mreg, disp),
+        !imm_indirect_store_has_index(*addr),
+        reg_rtl(addr, *base_mreg, base_rtl),
+        let fresh_reg = fresh_xtl_reg(*addr, Mreg::DI),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let addressing = Addressing::Aindexed(*disp),
+        let istore_inst = RTLInst::Istore(mc.clone(), addressing, Arc::new(vec![*base_rtl]), fresh_reg);
+
+    // Indexed immediate store mirroring the indexed-load and SP-indexed-store address shapes so the + idx*scale addend survives; the BP-frame-pointer base is handled by the Olea(Ainstack) chain below.
+    rtl_inst_candidate(synthetic_addr, istore_inst) <--
+        imm_indirect_store_indexed(addr, _imm_val, mc, base_str, idx_str, scale, disp),
+        !imm_indirect_store_bp_indexed(*addr, _, _, _, _, _),
+        let base_mreg = Mreg::x86(*base_str),
+        let idx_mreg = Mreg::x86(*idx_str),
+        reg_rtl(addr, base_mreg, base_rtl),
+        reg_rtl(addr, idx_mreg, idx_rtl),
+        let fresh_reg = fresh_xtl_reg(*addr, Mreg::DI),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let addressing = if *scale > 1 {
+            Addressing::Aindexed2scaled(*scale, *disp)
+        } else {
+            Addressing::Aindexed2(*disp)
+        },
+        let istore_inst = RTLInst::Istore(mc.clone(), addressing, Arc::new(vec![*base_rtl, *idx_rtl]), fresh_reg);
+
+    // BP-frame-pointer indexed immediate store as a 3-node chain (const, Olea(Ainstack(disp)), indexed Istore), with indexed_synth_stack_base resolving the base to the array's named local.
+    rtl_inst_candidate(synth1, lea_inst), op_produces_ptr(synth1, bp_addr_rtl),
+    indexed_synth_stack_base(func_start, synth1, *disp, bp_addr_rtl) <--
+        imm_indirect_store_bp_indexed(addr, _imm_val, _mc, _idx_str, _scale, disp),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62),
+        let bp_addr_rtl = fresh_xtl_reg(synth1, Mreg::BP) | FRESH_NS_SP_BASE,
+        let lea_inst = RTLInst::Iop(Operation::Olea(Addressing::Ainstack(*disp)), Arc::new(vec![]), bp_addr_rtl);
+
+    rtl_inst_candidate(synth2, istore_inst) <--
+        imm_indirect_store_bp_indexed(addr, _imm_val, mc, idx_str, scale, _disp),
+        let idx_mreg = Mreg::x86(*idx_str),
+        reg_rtl(addr, idx_mreg, idx_rtl),
+        let synth1 = *addr | (1u64 << 62),
+        let bp_addr_rtl = fresh_xtl_reg(synth1, Mreg::BP) | FRESH_NS_SP_BASE,
+        let fresh_reg = fresh_xtl_reg(*addr, Mreg::DI),
+        let synth2 = *addr | (1u64 << 63),
+        let addressing = if *scale > 1 {
+            Addressing::Aindexed2scaled(*scale, 0)
+        } else {
+            Addressing::Aindexed2(0)
+        },
+        let istore_inst = RTLInst::Istore(mc.clone(), addressing, Arc::new(vec![bp_addr_rtl, *idx_rtl]), fresh_reg);
+
+    // Thread the index register's value web so the index operand chains to its def site instead of staying a fresh unbound register.
+    reg_xtl(addr, idx_mreg, arg_id) <--
+        imm_indirect_store_indexed(addr, _, _, _, idx_str, _, _),
+        let idx_mreg = Mreg::x86(*idx_str),
+        reg_def_used(defaddr, idx_mreg, *addr),
+        !load_overwrites_base(defaddr, &idx_mreg),
+        reg_xtl(defaddr, idx_mreg, arg_id);
+
+    rtl_edge_negated(addr, next) <--
+        mach_imm_indirect_store(addr, _, _, _, _),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synthetic_addr), instr_in_function(addr, func_start) <--
+        mach_imm_indirect_store(addr, _, _, _, _),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62);
+
+    // synth1 -> next for the non-BP-indexed case; the BP-frame-pointer indexed case inserts synth2 (the real Istore) between synth1 and next instead.
+    rtl_succ_candidate(synthetic_addr, next), instr_in_function(synthetic_addr, func_start) <--
+        mach_imm_indirect_store(addr, _, _, _, _),
+        !imm_indirect_store_bp_indexed(*addr, _, _, _, _, _),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62),
+        next(addr, next);
+
+    // BP-frame-pointer indexed immediate store: chain synth1 (Olea) -> synth2 (Istore) -> next.
+    rtl_succ_candidate(synth1, synth2), instr_in_function(synth1, func_start),
+    instr_in_function(synth2, func_start) <--
+        imm_indirect_store_bp_indexed(addr, _, _, _, _, _),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62),
+        let synth2 = *addr | (1u64 << 63);
+
+    rtl_succ_candidate(synth2, next), instr_in_function(synth2, func_start) <--
+        imm_indirect_store_bp_indexed(addr, _, _, _, _, _),
+        instr_in_function(addr, func_start),
+        let synth2 = *addr | (1u64 << 63),
+        next(addr, next);
+
+    // 3.8 R3: a RIP-relative immediate global store has no lifting route, so detect it from asm operand rows plus RIP resolution and lower ident-keyed as Ointconst then Istore(Aglobal).
+    #[local] relation mach_imm_global_store(Address, i64, MemoryChunk, Ident, i64);
+    mach_imm_global_store(*addr, imm_int, mc, *ident, *ofs) <--
+        pmov(addr, dst, src),
+        op_immediate(src, imm_sym, _),
+        op_indirect(dst, _, base_str, idx_str, _, _, sz),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if is_rip(base_str),
+        rip_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, ofs),
+        let imm_int = *imm_sym as i64,
+        let mc = match *sz {
+            1 => MemoryChunk::MInt8Unsigned,
+            2 => MemoryChunk::MInt16Unsigned,
+            8 => MemoryChunk::MInt64,
+            _ => MemoryChunk::MInt32,
+        };
+
+    rtl_inst_candidate(addr, iop_inst) <--
+        mach_imm_global_store(addr, imm_val, mc, _ident, _ofs),
+        !has_ltl_op(addr),
+        let fresh_reg = fresh_xtl_reg(*addr, Mreg::DI),
+        let op = if matches!(mc, MemoryChunk::MInt64) {
+            Operation::Olongconst(*imm_val)
+        } else {
+            Operation::Ointconst(*imm_val)
+        },
+        let iop_inst = RTLInst::Iop(op, Arc::new(vec![]), fresh_reg);
+
+    rtl_inst_candidate(synthetic_addr, istore_inst) <--
+        mach_imm_global_store(addr, _imm_val, mc, ident, ofs),
+        !has_ltl_op(addr),
+        let fresh_reg = fresh_xtl_reg(*addr, Mreg::DI),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let istore_inst = RTLInst::Istore(*mc, Addressing::Aglobal(*ident, *ofs), Arc::new(vec![]), fresh_reg);
+
+    rtl_edge_negated(addr, next) <--
+        mach_imm_global_store(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synthetic_addr), instr_in_function(addr, func_start) <--
+        mach_imm_global_store(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synthetic_addr, next), instr_in_function(synthetic_addr, func_start) <--
+        mach_imm_global_store(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62),
+        next(addr, next);
+
+    synth_only_addr(addr) <--
+        mach_imm_global_store(addr, _, _, _, _),
+        !has_ltl_op(addr);
+
+    // reg_xtl for arith addresses chains from the reg_def_used def site when no real ltl op exists; for loads overwriting their base propagate only def_id, or use_id leaks and DSE wipes the load chain.
+    reg_xtl(*addr, *base_mreg, arg_id) <--
+        arith_load_op(addr, _, _, base_mreg, _, _),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *base_mreg, *addr),
+        !load_overwrites_base(defaddr, base_mreg),
+        reg_xtl(defaddr, *base_mreg, arg_id);
+
+    reg_xtl(*addr, *base_mreg, arg_id) <--
+        arith_load_op(addr, _, _, base_mreg, _, _),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *base_mreg, *addr),
+        load_overwrites_base(defaddr, base_mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *base_mreg, arg_id);
+
+    reg_xtl(*addr, *dst_mreg, arg_id) <--
+        arith_load_op(addr, _, _, _, _, dst_mreg),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *dst_mreg, *addr),
+        !load_overwrites_base(defaddr, dst_mreg),
+        reg_xtl(defaddr, *dst_mreg, arg_id);
+
+    reg_xtl(*addr, *dst_mreg, arg_id) <--
+        arith_load_op(addr, _, _, _, _, dst_mreg),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *dst_mreg, *addr),
+        load_overwrites_base(defaddr, dst_mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *dst_mreg, arg_id);
+
+    reg_xtl(*addr, *base_mreg, arg_id) <--
+        arith_store_reg(addr, _, _, base_mreg, _, _),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *base_mreg, *addr),
+        !load_overwrites_base(defaddr, base_mreg),
+        reg_xtl(defaddr, *base_mreg, arg_id);
+
+    reg_xtl(*addr, *base_mreg, arg_id) <--
+        arith_store_reg(addr, _, _, base_mreg, _, _),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *base_mreg, *addr),
+        load_overwrites_base(defaddr, base_mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *base_mreg, arg_id);
+
+    reg_xtl(*addr, *src_mreg, arg_id) <--
+        arith_store_reg(addr, _, _, _, _, src_mreg),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *src_mreg, *addr),
+        !load_overwrites_base(defaddr, src_mreg),
+        reg_xtl(defaddr, *src_mreg, arg_id);
+
+    reg_xtl(*addr, *src_mreg, arg_id) <--
+        arith_store_reg(addr, _, _, _, _, src_mreg),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *src_mreg, *addr),
+        load_overwrites_base(defaddr, src_mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *src_mreg, arg_id);
+
+    reg_xtl(*addr, *base_mreg, arg_id) <--
+        arith_store_imm(addr, _, _, base_mreg, _),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *base_mreg, *addr),
+        !load_overwrites_base(defaddr, base_mreg),
+        reg_xtl(defaddr, *base_mreg, arg_id);
+
+    reg_xtl(*addr, *base_mreg, arg_id) <--
+        arith_store_imm(addr, _, _, base_mreg, _),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *base_mreg, *addr),
+        load_overwrites_base(defaddr, base_mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *base_mreg, arg_id);
+
+    reg_xtl(*addr, *src_mreg, arg_id) <--
+        arith_store_abs_reg(addr, _, _, _, _, src_mreg),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *src_mreg, *addr),
+        !load_overwrites_base(defaddr, src_mreg),
+        reg_xtl(defaddr, *src_mreg, arg_id);
+
+    reg_xtl(*addr, *src_mreg, arg_id) <--
+        arith_store_abs_reg(addr, _, _, _, _, src_mreg),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *src_mreg, *addr),
+        load_overwrites_base(defaddr, src_mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *src_mreg, arg_id);
+
+    // 3.8 R1: reg_xtl chains for FUSED float ops, mirroring the arith chains; without them the addressing regs stay fresh and a param-fed addsd reads an unbound register.
+    reg_xtl(*addr, *m, arg_id) <--
+        float_load_arg(addr, _, m),
+        reg_def_used(defaddr, *m, *addr),
+        !load_overwrites_base(defaddr, m),
+        reg_xtl(defaddr, *m, arg_id);
+
+    reg_xtl(*addr, *m, arg_id) <--
+        float_load_arg(addr, _, m),
+        reg_def_used(defaddr, *m, *addr),
+        load_overwrites_base(defaddr, m),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *m, arg_id);
+
+    // Binary (RMW) form only: dst is read+written (`dst = dst OP loaded`); the unary conversion form writes a fresh dst and must not chain prior values in.
+    reg_xtl(*addr, *dst_mreg, arg_id) <--
+        float_load_op(addr, _, _, _, _, dst_mreg, false),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *dst_mreg, *addr),
+        !load_overwrites_base(defaddr, dst_mreg),
+        reg_xtl(defaddr, *dst_mreg, arg_id);
+
+    reg_xtl(*addr, *dst_mreg, arg_id) <--
+        float_load_op(addr, _, _, _, _, dst_mreg, false),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *dst_mreg, *addr),
+        load_overwrites_base(defaddr, dst_mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *dst_mreg, arg_id);
+
+    // The frame slot an arith_load_op reads, whichever register addresses it. Which register holds
+    // the frame base is an encoding choice, not a semantic one: stack_var already names the slot
+    // per address for SP and BP alike, and there is no reg_rtl for SP at all, so an SP base that
+    // stops here reaches no rule below and the whole instruction disappears. An SP displacement
+    // naming an INCOMING stack argument is left out so it keeps the stack-param binding further
+    // down, which is what makes the body reference pN rather than a slot local.
+    #[local] relation arith_load_slot(Node, i64, Address);
+    arith_load_slot(addr, *disp, *func_start) <--
+        arith_load_op(addr, _op, _chunk, base_mreg, disp, _dst_mreg),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, _),
+        if *base_mreg == Mreg::BP;
+    arith_load_slot(addr, *disp, *func_start) <--
+        arith_load_op(addr, _op, _chunk, base_mreg, disp, _dst_mreg),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, _),
+        if *base_mreg == Mreg::SP,
+        !stack_param_idx(func_start, disp, _);
+
+    // arith_load_op on a THREADED spilled slot reads the slot's canonical SSA reg directly: a real frame Iload would re-materialize the slot as *(&var_0 + k) garbage, so the load node carries an Inop.
+    rtl_inst_candidate(addr, nop) <--
+        arith_load_slot(addr, _, _),
+        let nop = RTLInst::Inop;
+
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        arith_load_op(addr, op, _chunk, _base_mreg, disp, dst_mreg),
+        arith_load_slot(addr, disp, func_start),
+        reg_rtl(addr, *dst_mreg, dst_rtl),
+        stack_var(func_start, addr, disp, stack_rtl),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, *stack_rtl]), *dst_rtl);
+
+    // ABI-1: the per-function rank of an incoming-stack-arg offset (ascending offset = ascending SysV position), matching the index the signature side uses when it allocates fresh_stack_param_reg for positions 6+. Tiny per-function sets, not a pairwise blowup.
+    #[local] relation stack_param_lower(Address, i64, i64);
+    stack_param_lower(func, ofs, o2) <--
+        stack_passed_param(func, ofs),
+        stack_passed_param(func, o2),
+        if *o2 < *ofs;
+    #[local] relation stack_param_idx(Address, i64, usize);
+    stack_param_idx(func, ofs, idx) <--
+        stack_passed_param(func, ofs),
+        agg idx = ascent::aggregators::count() in stack_param_lower(func, ofs, _);
+
+    // ABI-1: memory-source arithmetic reading an INCOMING stack argument binds to the function's synthetic stack-param reg, so the body references pN instead of a fresh-RTEMP fallback.
+    #[local] relation arith_load_uses_stack_param(Node);
+    arith_load_uses_stack_param(addr) <--
+        arith_load_op(addr, _, _, base_mreg, disp, _),
+        !has_ltl_op(addr),
+        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
+        instr_in_function(addr, func_start),
+        stack_param_idx(func_start, disp, _);
+
+    // Keep the original node as a transparent Inop anchor while the stack-param arithmetic lives at the synthetic successor, or rtl_optimize's liveness cannot carry the RMW destination across it.
+    rtl_inst_candidate(addr, nop) <--
+        arith_load_uses_stack_param(addr),
+        let nop = RTLInst::Inop;
+
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        arith_load_op(addr, op, _chunk, base_mreg, disp, dst_mreg),
+        !has_ltl_op(addr),
+        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
+        reg_rtl(addr, *dst_mreg, dst_rtl),
+        instr_in_function(addr, func_start),
+        stack_param_idx(func_start, disp, idx),
+        !arith_load_uses_stack_var(addr),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, param_reg]), *dst_rtl);
+
+    // TR-5: the load's memory chunk supplies TYPE evidence for stack-passed positions, which previously had no evidence path at all and defaulted to Xany64 in prototypes (the int_pos register caps are correct - only 6 int arg regs exist - but positions 6+ never received types).
+    emit_function_param_type_candidate(func_start, param_reg, xt) <--
+        arith_load_op(addr, _, chunk, base_mreg, disp, _),
+        !has_ltl_op(addr),
+        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
+        instr_in_function(addr, func_start),
+        stack_param_idx(func_start, disp, idx),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let xt = match chunk {
+            MemoryChunk::MInt32 => XType::Xint,
+            MemoryChunk::MInt64 => XType::Xlong,
+            MemoryChunk::MFloat64 => XType::Xfloat,
+            MemoryChunk::MFloat32 => XType::Xsingle,
+            MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned
+            | MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => XType::Xint,
+            _ => XType::Xany64,
+        };
+
+    emit_function_param_type_candidate(func_start, param_reg, xt) <--
+        ltl_inst(addr, ?LTLInst::Lload(chunk, Addressing::Aindexed(disp), args, _)),
+        for base in args.iter(),
+        if *base == Mreg::BP || *base == Mreg::SP,
+        instr_in_function(addr, func_start),
+        stack_param_idx(func_start, disp, idx),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let xt = match chunk {
+            MemoryChunk::MInt32 => XType::Xint,
+            MemoryChunk::MInt64 => XType::Xlong,
+            MemoryChunk::MFloat64 => XType::Xfloat,
+            MemoryChunk::MFloat32 => XType::Xsingle,
+            MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned
+            | MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => XType::Xint,
+            _ => XType::Xany64,
+        };
+
+    // Fallback (no frame-slot base, or one without a matching stack_var/stack-param): use a fresh RTEMP, same as before.
+    #[local] relation arith_load_uses_stack_var(Node);
+    arith_load_uses_stack_var(addr) <-- arith_load_slot(addr, _, _);
+
+    rtl_inst_candidate(addr, load_inst) <--
+        arith_load_op(addr, _op, chunk, base_mreg, disp, _dst_mreg),
+        !has_ltl_op(addr),
+        reg_rtl(addr, *base_mreg, base_rtl),
+        !arith_load_uses_stack_var(addr),
+        !arith_load_uses_stack_param(addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp);
+
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        arith_load_op(addr, op, _chunk, _base_mreg, _disp, dst_mreg),
+        !has_ltl_op(addr),
+        reg_rtl(addr, *dst_mreg, dst_rtl),
+        !arith_load_uses_stack_var(addr),
+        !arith_load_uses_stack_param(addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, temp]), *dst_rtl);
+
+    rtl_edge_negated(addr, next) <--
+        arith_load_op(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synthetic_addr), instr_in_function(addr, func_start) <--
+        arith_load_op(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synthetic_addr, next), instr_in_function(synthetic_addr, func_start) <--
+        arith_load_op(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62),
+        next(addr, next);
+
+    // cvtsi2_stack_op: the slot value is already live in stack_rtl, so the load node carries an Inop and the conversion at the synthetic address consumes stack_rtl instead of a frame Iload.
+    rtl_inst_candidate(addr, nop) <--
+        cvtsi2_stack_op(addr, _op, _base_mreg, disp, _dst_mreg),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, _),
+        let nop = RTLInst::Inop;
+
+    // Conversion at synth: dst_xmm = convert(slot); the xmm dst is write-only, so handle both an existing canonical SSA reg and the fresh case.
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        cvtsi2_stack_op(addr, op, _base_mreg, disp, dst_mreg),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, stack_rtl),
+        reg_rtl(addr, *dst_mreg, dst_rtl),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl]), *dst_rtl);
+
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        cvtsi2_stack_op(addr, op, _base_mreg, disp, dst_mreg),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, stack_rtl),
+        !reg_xtl(addr, *dst_mreg, _),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let dst_rtl = fresh_xtl_reg(*addr, *dst_mreg),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl]), dst_rtl);
+
+    rtl_edge_negated(addr, next) <--
+        cvtsi2_stack_op(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synthetic_addr), instr_in_function(addr, func_start) <--
+        cvtsi2_stack_op(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synthetic_addr, next), instr_in_function(synthetic_addr, func_start) <--
+        cvtsi2_stack_op(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62),
+        next(addr, next);
+
+    synth_only_addr(addr) <-- cvtsi2_stack_op(addr, _, _, _, _), !has_ltl_op(addr);
+
+    // float_arith_stack_op: the slot value is live in stack_rtl, so the binary op at the synthetic address consumes it as the second operand; the read+written dst threads its incoming value in via reg_xtl.
+    reg_xtl(*addr, *dst_mreg, arg_id) <--
+        float_arith_stack_op(addr, _, _, _, dst_mreg),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *dst_mreg, *addr),
+        !load_overwrites_base(defaddr, dst_mreg),
+        reg_xtl(defaddr, *dst_mreg, arg_id);
+
+    reg_xtl(*addr, *dst_mreg, arg_id) <--
+        float_arith_stack_op(addr, _, _, _, dst_mreg),
+        !has_ltl_op(addr),
+        reg_def_used(defaddr, *dst_mreg, *addr),
+        load_overwrites_base(defaddr, dst_mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *dst_mreg, arg_id);
+
+    // A fused float RMW can read an incoming stack parameter like the integer path; kept distinct from a callee-owned spill, which binds to stack_var's local value web instead.
+    #[local] relation float_arith_uses_stack_param(Node);
+    float_arith_uses_stack_param(addr) <--
+        float_arith_stack_op(addr, _, _, disp, _),
+        instr_in_function(addr, func_start),
+        stack_param_idx(func_start, disp, _),
+        !stack_var(func_start, addr, disp, _);
+
+    rtl_inst_candidate(addr, nop) <--
+        float_arith_stack_op(addr, _op, _base_mreg, disp, _dst_mreg),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, _),
+        !float_arith_uses_stack_param(addr),
+        let nop = RTLInst::Inop;
+
+    // Binary op at synth: dst = dst OP slot, where dst is read+written and already has a canonical SSA reg threaded in by the reg_xtl chain above.
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        float_arith_stack_op(addr, op, _base_mreg, disp, dst_mreg),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, stack_rtl),
+        !float_arith_uses_stack_param(addr),
+        reg_rtl(addr, *dst_mreg, dst_rtl),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, *stack_rtl]), *dst_rtl);
+
+    // Incoming stack-param form: retain the real address as an Inop anchor so optimizer liveness crosses it, then consume the parameter at the same synthetic successor.
+    rtl_inst_candidate(addr, nop) <--
+        float_arith_uses_stack_param(addr),
+        let nop = RTLInst::Inop;
+
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        float_arith_stack_op(addr, op, _base_mreg, disp, dst_mreg),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        stack_param_idx(func_start, disp, idx),
+        !stack_var(func_start, addr, disp, _),
+        reg_rtl(addr, *dst_mreg, dst_rtl),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, param_reg]), *dst_rtl);
+
+    emit_function_param_type_candidate(func_start, param_reg, xt) <--
+        float_arith_stack_op(addr, op, _base_mreg, disp, _dst_mreg),
+        instr_in_function(addr, func_start),
+        stack_param_idx(func_start, disp, idx),
+        !stack_var(func_start, addr, disp, _),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let xt = if crate::x86::types::is_single_operation(op) {
+            XType::Xsingle
+        } else {
+            XType::Xfloat
+        };
+
+    rtl_edge_negated(addr, next) <--
+        float_arith_stack_op(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synthetic_addr), instr_in_function(addr, func_start) <--
+        float_arith_stack_op(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synthetic_addr, next), instr_in_function(synthetic_addr, func_start) <--
+        float_arith_stack_op(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62),
+        next(addr, next);
+
+    synth_only_addr(addr) <-- float_arith_stack_op(addr, _, _, _, _), !has_ltl_op(addr);
+
+    // float_load_op: an SSE op with a memory source produces no mach/ltl op, so lower it as a float load into a fresh temp plus the op at a synthetic address; fires only when nothing else lowered it.
+    #[local] relation float_load_arg(Node, usize, Mreg);
+    float_load_arg(addr, pos, *m) <--
+        float_load_op(addr, _, _, _, args, _, _),
+        !has_ltl_op(addr),
+        for (pos, m) in args.iter().enumerate();
+
+    #[local] relation float_load_arg_rtl(Node, usize, RTLReg);
+    float_load_arg_rtl(addr, pos, rtl) <--
+        float_load_arg(addr, pos, m),
+        reg_rtl(addr, *m, rtl);
+
+    #[local] relation float_load_args_collected(Node, Arc<Vec<RTLReg>>);
+    float_load_args_collected(addr, args) <--
+        float_load_op(addr, _, _, _, _, _, _),
+        !has_ltl_op(addr),
+        agg args = build_call_args(pos, reg) in float_load_arg_rtl(addr, pos, reg);
+    float_load_args_collected(addr, Arc::new(vec![])) <--
+        float_load_op(addr, _, _, _, _, _, _),
+        !has_ltl_op(addr),
+        !float_load_arg(addr, _, _);
+
+    rtl_inst_candidate(addr, load_inst) <--
+        float_load_op(addr, _, chunk, addressing, _, _, _),
+        !has_ltl_op(addr),
+        float_load_args_collected(addr, arg_rtls),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let load_inst = RTLInst::Iload(*chunk, addressing.clone(), arg_rtls.clone(), temp);
+
+    // Binary op (mul/add/sub/div): dst = dst OP loaded; dst is read+written like arith_load_op.
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        float_load_op(addr, op, _, _, _, dst, false),
+        !has_ltl_op(addr),
+        reg_rtl(addr, *dst, dst_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, temp]), *dst_rtl);
+
+    // Unary conversion (cvtss2sd/cvtsd2ss): dst = convert(loaded); dst is write-only so it may be a fresh def; handle both the existing-canonical and fresh-reg cases.
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        float_load_op(addr, op, _, _, _, dst, true),
+        !has_ltl_op(addr),
+        reg_rtl(addr, *dst, dst_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![temp]), *dst_rtl);
+
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        float_load_op(addr, op, _, _, _, dst, true),
+        !has_ltl_op(addr),
+        !reg_xtl(addr, *dst, _),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let dst_rtl = fresh_xtl_reg(*addr, *dst),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![temp]), dst_rtl);
+
+    rtl_edge_negated(addr, next) <--
+        float_load_op(addr, _, _, _, _, _, _),
+        !has_ltl_op(addr),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synthetic_addr), instr_in_function(addr, func_start) <--
+        float_load_op(addr, _, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synthetic_addr, next), instr_in_function(synthetic_addr, func_start) <--
+        float_load_op(addr, _, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62),
+        next(addr, next);
+
+    synth_only_addr(addr) <-- float_load_op(addr, _, _, _, _, _, _), !has_ltl_op(addr);
+
+    // adc_carry_op expansion: materialize the carry as the 0/1 value of the compare's carry condition at addr, then update the accumulator at synthetic addresses, reading the compared reg at cmp_addr.
+    #[local] relation adc_carry_needs_k(Address);
+    adc_carry_needs_k(adc_addr) <-- adc_carry_op(adc_addr, _, _, _, k, _, _, _), if *k != 0;
+
+    // addr: t = Ocmp(cf_cond, compared_reg-at-compare). One register arg (immediate baked into cf_cond).
+    rtl_inst_candidate(adc_addr, cmp_inst) <--
+        adc_carry_op(adc_addr, cmp_addr, cf_cond, _, _, _, _, cmp_mreg),
+        reg_rtl(cmp_addr, *cmp_mreg, cmp_rtl),
+        let temp = fresh_xtl_reg(*adc_addr, Mreg::x86("RTEMP")),
+        let cmp_inst = RTLInst::Iop(Operation::Ocmp(cf_cond.clone()), Arc::new(vec![*cmp_rtl]), temp);
+
+    // synth1: acc = acc (+/-) t  (subtract when sbb, since sbb subtracts the carry).
+    // When a residual constant follows, the sum lands in a private temp that
+    // synth2 reads instead of writing the accumulator here: defining one
+    // register at both synthetic nodes makes it multiply-defined, and the
+    // SSA-shaped consumers downstream treat it as a single definition and drop
+    // the second write, silently losing the residual constant.
+    rtl_inst_candidate(synth1, op_inst) <--
+        adc_carry_op(adc_addr, _, _, is_sub, k, acc_is_64, acc_mreg, _),
+        reg_rtl(adc_addr, *acc_mreg, acc_rtl),
+        let temp = fresh_xtl_reg(*adc_addr, Mreg::x86("RTEMP")),
+        let synth1 = *adc_addr | (1u64 << 62),
+        let combine = match (*is_sub, *acc_is_64) {
+            (false, false) => Operation::Oadd,
+            (false, true)  => Operation::Oaddl,
+            (true, false)  => Operation::Osub,
+            (true, true)   => Operation::Osubl,
+        },
+        let sum_dst = if *k != 0 { fresh_carry_sum_reg(*adc_addr) } else { *acc_rtl },
+        let op_inst = RTLInst::Iop(combine, Arc::new(vec![*acc_rtl, temp]), sum_dst);
+
+    // synth2 (only when a residual constant remains): acc = sum + k.
+    rtl_inst_candidate(synth2, op_inst) <--
+        adc_carry_op(adc_addr, _, _, _, k, acc_is_64, acc_mreg, _),
+        if *k != 0,
+        reg_rtl(adc_addr, *acc_mreg, acc_rtl),
+        let synth2 = *adc_addr | (1u64 << 63),
+        let addk = if *acc_is_64 { Operation::Oaddlimm(*k) } else { Operation::Oaddimm(*k) },
+        let sum_src = fresh_carry_sum_reg(*adc_addr),
+        let op_inst = RTLInst::Iop(addk, Arc::new(vec![sum_src]), *acc_rtl);
+
+    rtl_edge_negated(adc_addr, next) <--
+        adc_carry_op(adc_addr, _, _, _, _, _, _, _),
+        next(adc_addr, next);
+
+    rtl_succ_candidate(adc_addr, synth1), instr_in_function(adc_addr, func_start) <--
+        adc_carry_op(adc_addr, _, _, _, _, _, _, _),
+        instr_in_function(adc_addr, func_start),
+        let synth1 = *adc_addr | (1u64 << 62);
+
+    // K==0: synth1 -> next directly (two-node chain).
+    rtl_succ_candidate(synth1, next), instr_in_function(synth1, func_start) <--
+        adc_carry_op(adc_addr, _, _, _, _, _, _, _),
+        !adc_carry_needs_k(adc_addr),
+        instr_in_function(adc_addr, func_start),
+        let synth1 = *adc_addr | (1u64 << 62),
+        next(adc_addr, next);
+
+    // K!=0: synth1 -> synth2 -> next (three-node chain).
+    rtl_succ_candidate(synth1, synth2), instr_in_function(synth1, func_start) <--
+        adc_carry_op(adc_addr, _, _, _, _, _, _, _),
+        adc_carry_needs_k(adc_addr),
+        instr_in_function(adc_addr, func_start),
+        let synth1 = *adc_addr | (1u64 << 62),
+        let synth2 = *adc_addr | (1u64 << 63);
+
+    rtl_succ_candidate(synth2, next), instr_in_function(synth2, func_start) <--
+        adc_carry_op(adc_addr, _, _, _, _, _, _, _),
+        adc_carry_needs_k(adc_addr),
+        instr_in_function(adc_addr, func_start),
+        let synth2 = *adc_addr | (1u64 << 63),
+        next(adc_addr, next);
+
+    synth_only_addr(addr) <-- adc_carry_op(addr, _, _, _, _, _, _, _);
+
+    // sbb_self_carry_op expansion: `sbb %acc,%acc` is acc = -CF, so materialize
+    // the carry as the 0/1 value of the flag source's carry condition at addr,
+    // then negate it into the accumulator at a synthetic address.  The
+    // accumulator's incoming value is deliberately unread: the instruction
+    // discards it.
+    // addr: t = Ocmp(cf_cond, ...) -- one register arg, the immediate folded in.
+    rtl_inst_candidate(sbb_addr, cmp_inst) <--
+        sbb_self_carry_op(sbb_addr, flag_addr, cf_cond, _, _, cf_arg1, cf_arg2),
+        if *cf_arg2 == Mreg::Unknown,
+        reg_rtl(flag_addr, *cf_arg1, arg1_rtl),
+        let temp = fresh_xtl_reg(*sbb_addr, Mreg::x86("RTEMP")),
+        let cmp_inst = RTLInst::Iop(Operation::Ocmp(cf_cond.clone()), Arc::new(vec![*arg1_rtl]), temp);
+
+    // addr: t = Ocmp(cf_cond, lhs, rhs) -- a register-to-register compare.
+    rtl_inst_candidate(sbb_addr, cmp_inst) <--
+        sbb_self_carry_op(sbb_addr, flag_addr, cf_cond, _, _, cf_arg1, cf_arg2),
+        if *cf_arg2 != Mreg::Unknown,
+        reg_rtl(flag_addr, *cf_arg1, arg1_rtl),
+        reg_rtl(flag_addr, *cf_arg2, arg2_rtl),
+        let temp = fresh_xtl_reg(*sbb_addr, Mreg::x86("RTEMP")),
+        let cmp_inst = RTLInst::Iop(Operation::Ocmp(cf_cond.clone()), Arc::new(vec![*arg1_rtl, *arg2_rtl]), temp);
+
+    // synth1: acc = -t, turning the 0/1 carry into the 0/-1 mask sbb produces.
+    rtl_inst_candidate(synth1, neg_inst) <--
+        sbb_self_carry_op(sbb_addr, _, _, acc_is_64, acc_mreg, _, _),
+        reg_rtl(sbb_addr, *acc_mreg, acc_rtl),
+        let temp = fresh_xtl_reg(*sbb_addr, Mreg::x86("RTEMP")),
+        let synth1 = *sbb_addr | (1u64 << 62),
+        let negop = if *acc_is_64 { Operation::Onegl } else { Operation::Oneg },
+        let neg_inst = RTLInst::Iop(negop, Arc::new(vec![temp]), *acc_rtl);
+
+    rtl_edge_negated(sbb_addr, next) <--
+        sbb_self_carry_op(sbb_addr, _, _, _, _, _, _),
+        next(sbb_addr, next);
+
+    rtl_succ_candidate(sbb_addr, synth1), instr_in_function(sbb_addr, func_start) <--
+        sbb_self_carry_op(sbb_addr, _, _, _, _, _, _),
+        instr_in_function(sbb_addr, func_start),
+        let synth1 = *sbb_addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth1, next), instr_in_function(synth1, func_start) <--
+        sbb_self_carry_op(sbb_addr, _, _, _, _, _, _),
+        instr_in_function(sbb_addr, func_start),
+        let synth1 = *sbb_addr | (1u64 << 62),
+        next(sbb_addr, next);
+
+    synth_only_addr(addr) <-- sbb_self_carry_op(addr, _, _, _, _, _, _);
+
+    // arith_store_reg: memory-dest arithmetic with a register source; an
+    // SP/BP-relative RMW operates IN-PLACE on the structurally identified
+    // stack_var so the update threads to later reads of the same slot.  The
+    // choice of stack base register is an encoding detail once stack_var has
+    // proven the point-local slot identity.
+    #[local] relation arith_store_reg_uses_stack_var(Node);
+    arith_store_reg_uses_stack_var(addr) <--
+        arith_store_reg(addr, _, _, base_mreg, disp, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, _),
+        if matches!(*base_mreg, Mreg::SP | Mreg::BP);
+
+    // Stack-slot in-place RMW: the load/op/store triple collapses to a single in-place `slot = slot op src` writing the slot's stack_rtl (matches the Lsetstack model), no explicit memory load/store; the edge stays addr->next (no synthetic chain), see the guarded succ rules.
+    rtl_inst_candidate(addr, op_inst) <--
+        arith_store_reg(addr, op, _chunk, base_mreg, disp, src_mreg),
+        !has_ltl_op(addr),
+        reg_rtl(addr, *src_mreg, src_rtl),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, stack_rtl),
+        if matches!(*base_mreg, Mreg::SP | Mreg::BP),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl, *src_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(addr, load_inst) <--
+        arith_store_reg(addr, _op, chunk, base_mreg, disp, _src_mreg),
+        !has_ltl_op(addr),
+        reg_rtl(addr, *base_mreg, base_rtl),
+        !arith_store_reg_uses_stack_var(addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp);
+
+    rtl_inst_candidate(synth1, op_inst) <--
+        arith_store_reg(addr, op, _chunk, _base_mreg, _disp, src_mreg),
+        !has_ltl_op(addr),
+        reg_rtl(addr, *src_mreg, src_rtl),
+        !arith_store_reg_uses_stack_var(addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::x86("RTEMP")),
+        let synth1 = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![temp, *src_rtl]), temp2);
+
+    rtl_inst_candidate(synth2, store_inst) <--
+        arith_store_reg(addr, _op, chunk, base_mreg, disp, _src_mreg),
+        !has_ltl_op(addr),
+        reg_rtl(addr, *base_mreg, base_rtl),
+        !arith_store_reg_uses_stack_var(addr),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::x86("RTEMP")),
+        let synth2 = *addr | (1u64 << 63),
+        let store_inst = RTLInst::Istore(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp2);
+
+    // Stack-var case keeps the same addr->synth1->synth2->next chain (CFG must not depend on the value/stack layer); the two synthetic nodes carry Inop since the in-place op at addr does the work.
+    rtl_inst_candidate(synth1, nop) <--
+        arith_store_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        arith_store_reg_uses_stack_var(addr),
+        let synth1 = *addr | (1u64 << 62),
+        let nop = RTLInst::Inop;
+
+    rtl_inst_candidate(synth2, nop) <--
+        arith_store_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        arith_store_reg_uses_stack_var(addr),
+        let synth2 = *addr | (1u64 << 63),
+        let nop = RTLInst::Inop;
+
+    rtl_edge_negated(addr, next) <--
+        arith_store_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synth1), instr_in_function(addr, func_start) <--
+        arith_store_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth1, synth2), instr_in_function(synth1, func_start) <--
+        arith_store_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62),
+        let synth2 = *addr | (1u64 << 63);
+
+    rtl_succ_candidate(synth2, next), instr_in_function(synth2, func_start) <--
+        arith_store_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth2 = *addr | (1u64 << 63),
+        next(addr, next);
+
+    // arith_store_imm: memory-dest arithmetic with immediate; only fires
+    // without a real ltl op.  SP/BP-relative read-modify-write operates
+    // IN-PLACE on the slot's stack_rtl so the updated value threads to later
+    // reads of the same structurally identified slot (see arith_store_reg).
+    #[local] relation arith_store_imm_uses_stack_var(Node);
+    arith_store_imm_uses_stack_var(addr) <--
+        arith_store_imm(addr, _, _, base_mreg, disp),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, _),
+        if matches!(*base_mreg, Mreg::SP | Mreg::BP);
+
+    // Stack-slot in-place RMW: the load/op/store triple collapses to one in-place op writing the slot's stack_rtl, so the edge stays addr->next with no synthetic chain.
+    rtl_inst_candidate(addr, op_inst) <--
+        arith_store_imm(addr, op, _chunk, base_mreg, disp),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, stack_rtl),
+        if matches!(*base_mreg, Mreg::SP | Mreg::BP),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(addr, load_inst) <--
+        arith_store_imm(addr, _op, chunk, base_mreg, disp),
+        !has_ltl_op(addr),
+        reg_rtl(addr, *base_mreg, base_rtl),
+        !arith_store_imm_uses_stack_var(addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp);
+
+    rtl_inst_candidate(synth1, op_inst) <--
+        arith_store_imm(addr, op, _chunk, _base_mreg, _disp),
+        !has_ltl_op(addr),
+        !arith_store_imm_uses_stack_var(addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::x86("RTEMP")),
+        let synth1 = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![temp]), temp2);
+
+    rtl_inst_candidate(synth2, store_inst) <--
+        arith_store_imm(addr, _op, chunk, base_mreg, disp),
+        !has_ltl_op(addr),
+        reg_rtl(addr, *base_mreg, base_rtl),
+        !arith_store_imm_uses_stack_var(addr),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::x86("RTEMP")),
+        let synth2 = *addr | (1u64 << 63),
+        let store_inst = RTLInst::Istore(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp2);
+
+    // Stack-var case keeps the same addr->synth1->synth2->next chain (CFG must not depend on the value/stack layer, else the RTL successor SCC absorbs stack_var and breaks stratification); the two synthetic nodes carry Inop since the in-place op at addr already does the work.
+    rtl_inst_candidate(synth1, nop) <--
+        arith_store_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        arith_store_imm_uses_stack_var(addr),
+        let synth1 = *addr | (1u64 << 62),
+        let nop = RTLInst::Inop;
+
+    rtl_inst_candidate(synth2, nop) <--
+        arith_store_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        arith_store_imm_uses_stack_var(addr),
+        let synth2 = *addr | (1u64 << 63),
+        let nop = RTLInst::Inop;
+
+    rtl_edge_negated(addr, next) <--
+        arith_store_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synth1), instr_in_function(addr, func_start) <--
+        arith_store_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth1, synth2), instr_in_function(synth1, func_start) <--
+        arith_store_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62),
+        let synth2 = *addr | (1u64 << 63);
+
+    rtl_succ_candidate(synth2, next), instr_in_function(synth2, func_start) <--
+        arith_store_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth2 = *addr | (1u64 << 63),
+        next(addr, next);
+
+    // arith_store_abs_reg: read-modify-write at absolute (global) address with register source.
+    rtl_inst_candidate(addr, load_inst) <--
+        arith_store_abs_reg(addr, _op, chunk, ident, offset, _src_mreg),
+        !has_ltl_op(addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), temp);
+
+    rtl_inst_candidate(synth1, op_inst) <--
+        arith_store_abs_reg(addr, op, _chunk, _ident, _offset, src_mreg),
+        !has_ltl_op(addr),
+        reg_rtl(addr, *src_mreg, src_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::x86("RTEMP")),
+        let synth1 = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![temp, *src_rtl]), temp2);
+
+    rtl_inst_candidate(synth2, store_inst) <--
+        arith_store_abs_reg(addr, _op, chunk, ident, offset, _src_mreg),
+        !has_ltl_op(addr),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::x86("RTEMP")),
+        let synth2 = *addr | (1u64 << 63),
+        let store_inst = RTLInst::Istore(*chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), temp2);
+
+    rtl_edge_negated(addr, next) <--
+        arith_store_abs_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synth1), instr_in_function(addr, func_start) <--
+        arith_store_abs_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth1, synth2), instr_in_function(synth1, func_start) <--
+        arith_store_abs_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62),
+        let synth2 = *addr | (1u64 << 63);
+
+    rtl_succ_candidate(synth2, next), instr_in_function(synth2, func_start) <--
+        arith_store_abs_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth2 = *addr | (1u64 << 63),
+        next(addr, next);
+
+    // arith_store_abs_imm: read-modify-write at absolute (global) address with immediate source.
+    rtl_inst_candidate(addr, load_inst) <--
+        arith_store_abs_imm(addr, _op, chunk, ident, offset),
+        !has_ltl_op(addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), temp);
+
+    rtl_inst_candidate(synth1, op_inst) <--
+        arith_store_abs_imm(addr, op, _chunk, _ident, _offset),
+        !has_ltl_op(addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::x86("RTEMP")),
+        let synth1 = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![temp]), temp2);
+
+    rtl_inst_candidate(synth2, store_inst) <--
+        arith_store_abs_imm(addr, _op, chunk, ident, offset),
+        !has_ltl_op(addr),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::x86("RTEMP")),
+        let synth2 = *addr | (1u64 << 63),
+        let store_inst = RTLInst::Istore(*chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), temp2);
+
+    rtl_edge_negated(addr, next) <--
+        arith_store_abs_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synth1), instr_in_function(addr, func_start) <--
+        arith_store_abs_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth1, synth2), instr_in_function(synth1, func_start) <--
+        arith_store_abs_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth1 = *addr | (1u64 << 62),
+        let synth2 = *addr | (1u64 << 63);
+
+    rtl_succ_candidate(synth2, next), instr_in_function(synth2, func_start) <--
+        arith_store_abs_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        let synth2 = *addr | (1u64 << 63),
+        next(addr, next);
+
+    reg_xtl(addr, dst, fresh_dst_id), is_def(addr, fresh_dst_id) <--
+        ltl_inst(addr, ?LTLInst::Lgetstack(_, _ofs, _, dst)),
+        let fresh_dst_id = fresh_xtl_reg(*addr, *dst);
+
+    ltl_inst(addr, LTLInst::Lsetstack(*src, slot, *ofs, *typ)) <--
+        ltl_inst(addr, ?LTLInst::Lstore(mc, Addressing::Ainstack(ofs), args, src)),
+        if args.len() == 0,
+        let slot = Slot::Local,
+        instruction(addr, _, _, _, src_reg, _, _, _, _, _),
+        op_register(src_reg, src_reg_str),
+        ireg_hold_type(src_reg_str.to_string(), typ);
+
+
+    rtl_reg_used_in_func(func_start, *reg_rtl) <--
+        reg_rtl(addr, mreg, reg_rtl),
+        instr_in_function(addr, func_start);
+
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
+        if mregs.is_empty(),
+        !variadic_next_arg_site(_, addr, _),
+        reg_rtl(addr, *dst_reg, dst_rtl),
+        let inst = RTLInst::Iop(op.clone(), Arc::new(vec![]), *dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
+        if mregs.is_empty(),
+        !variadic_next_arg_site(_, addr, _),
+        !reg_xtl(addr, *dst_reg, _),
+        let dst_rtl = fresh_xtl_reg(*addr, *dst_reg),
+        let inst = RTLInst::Iop(op.clone(), Arc::new(vec![]), dst_rtl);
+
+    // `__builtin_next_arg` is the C-level semantic equivalent of this ABI
+    // address.  Leave its argument list empty here: RTL deliberately emits a
+    // high-recall marker before the final function signature exists, and the
+    // signature pass fills in the selected last-named parameter.  Retaining
+    // the machine destination as the builtin result keeps all original
+    // def-use edges intact.
+    rtl_inst_candidate(addr, inst), op_produces_ptr(addr, *dst_rtl) <--
+        variadic_next_arg_site(_, addr, dst_mreg),
+        reg_rtl(addr, dst_mreg, dst_rtl),
+        let inst = RTLInst::Ibuiltin(
+            "__builtin_next_arg".to_string(),
+            vec![],
+            BuiltinArg::BA(*dst_rtl),
+        );
+
+    rtl_inst_candidate(addr, inst), op_produces_ptr(addr, dst_rtl) <--
+        variadic_next_arg_site(_, addr, dst_mreg),
+        !reg_xtl(addr, dst_mreg, _),
+        let dst_rtl = fresh_xtl_reg(*addr, *dst_mreg),
+        let inst = RTLInst::Ibuiltin(
+            "__builtin_next_arg".to_string(),
+            vec![],
+            BuiltinArg::BA(dst_rtl),
+        );
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
+        if !mregs.is_empty(),
+        !sp_indexed_lea(addr),
+        !setcc_compare_site(addr, _),
+        !osel_rip_condition(addr, _, _),
+        !lop_overwrites_input(addr, dst_reg),
+        !div_result_dead(addr, dst_reg),
+        reg_rtl(addr, *dst_reg, dst_rtl),
+        op_args_collected(addr, args),
+        let inst = RTLInst::Iop(op.clone(), args.clone(), *dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
+        if !mregs.is_empty(),
+        !sp_indexed_lea(addr),
+        !setcc_compare_site(addr, _),
+        !osel_rip_condition(addr, _, _),
+        !reg_xtl(addr, *dst_reg, _),
+        let dst_rtl = fresh_xtl_reg(*addr, *dst_reg),
+        op_args_collected(addr, args),
+        let inst = RTLInst::Iop(op.clone(), args.clone(), dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
+        if !mregs.is_empty(),
+        !sp_indexed_lea(addr),
+        !osel_rip_condition(addr, _, _),
+        lop_overwrites_input(addr, dst_reg),
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        op_args_collected(addr, args),
+        let inst = RTLInst::Iop(op.clone(), args.clone(), *dst_rtl);
+
+    // Completed RIP-global selects use the same destination binding as the
+    // generic Osel paths above, but replace the condition embedded in the
+    // operation with the exact immediate form recovered from CMP.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Osel(_, typ), mregs, dst_reg)),
+        if !mregs.is_empty(),
+        osel_rip_condition(addr, condition, _),
+        !lop_overwrites_input(addr, dst_reg),
+        reg_rtl(addr, *dst_reg, dst_rtl),
+        op_args_collected(addr, args),
+        let inst = RTLInst::Iop(Operation::Osel(condition.clone(), *typ), args.clone(), *dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Osel(_, typ), mregs, dst_reg)),
+        if !mregs.is_empty(),
+        osel_rip_condition(addr, condition, _),
+        !lop_overwrites_input(addr, dst_reg),
+        !reg_xtl(addr, *dst_reg, _),
+        let dst_rtl = fresh_xtl_reg(*addr, *dst_reg),
+        op_args_collected(addr, args),
+        let inst = RTLInst::Iop(Operation::Osel(condition.clone(), *typ), args.clone(), dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Osel(_, typ), mregs, dst_reg)),
+        if !mregs.is_empty(),
+        osel_rip_condition(addr, condition, _),
+        lop_overwrites_input(addr, dst_reg),
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        op_args_collected(addr, args),
+        let inst = RTLInst::Iop(Operation::Osel(condition.clone(), *typ), args.clone(), *dst_rtl);
+
+    // SETcc defines its destination at `addr`, but consumes the register
+    // values captured by the earlier compare/test.  Resolve the two sides at
+    // their actual machine-order points instead of pretending CMP performed
+    // the later byte-register write.  Ocmp has at most two explicit register
+    // operands; immediate operands are embedded in the Condition.
+    rtl_inst_candidate(*addr, RTLInst::Iop(op.clone(), Arc::new(vec![*arg0]), *dst_rtl)) <--
+        setcc_compare_site(addr, compare_addr),
+        ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
+        if matches!(op, Operation::Ocmp(_)) && mregs.len() == 1,
+        reg_rtl(compare_addr, mregs[0], arg0),
+        reg_rtl(addr, *dst_reg, dst_rtl);
+
+    rtl_inst_candidate(*addr, RTLInst::Iop(op.clone(), Arc::new(vec![*arg0, *arg1]), *dst_rtl)) <--
+        setcc_compare_site(addr, compare_addr),
+        ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
+        if matches!(op, Operation::Ocmp(_)) && mregs.len() == 2,
+        reg_rtl(compare_addr, mregs[0], arg0),
+        reg_rtl(compare_addr, mregs[1], arg1),
+        reg_rtl(addr, *dst_reg, dst_rtl);
+
+    // Lop with dst shadowing an input mreg. Osel needs this for its preserved
+    // destination value. A flags-producing arithmetic result consumed by a
+    // later CMOV needs the same SSA split: flag-neutral instructions may
+    // overwrite the architectural destination between the arithmetic and the
+    // CMOV, so coalescing the arithmetic input and result lets an unrelated
+    // join of the old value rewrite the still-live predicate. The exported
+    // osel_flags_result_site fact is the structural proof that this result has
+    // the extended lifetime; ordinary self-modifying arithmetic keeps the
+    // established coalesced representation.
+    relation lop_overwrites_input(Node, Mreg);
+    lop_overwrites_input(addr, *dst_reg) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Osel(_, _), mregs, dst_reg)),
+        for src in mregs.iter(),
+        if src == dst_reg;
+
+    lop_overwrites_input(result_site, *dst_reg) <--
+        osel_flags_result_site(_, result_site),
+        ltl_inst(result_site, ?LTLInst::Lop(_, mregs, dst_reg)),
+        for src in mregs.iter(),
+        if src == dst_reg;
+
+    // Indexed LEA also reads its index before writing dst. When the index and
+    // dst are the same machine register, use the incoming shadow value in the
+    // synthetic second operation rather than the new definition.
+    lop_overwrites_input(addr, *dst_reg) <--
+        sp_indexed_lea(addr),
+        ltl_inst(addr, ?LTLInst::Lop(_, mregs, dst_reg)),
+        for src in mregs.iter(),
+        if src == dst_reg;
+
+    // Osel reads dst as the false-branch preserve value; capstone doesn't always mark cmov dst readable, so add the use here to drive reg_def_used for the prior-def site.
+    reg_use(addr, *dst_reg) <--
+        lop_overwrites_input(addr, dst_reg);
+
+    // MOVHPS writes only bits 64..127.  In the scalar XMM abstraction its low
+    // lane is therefore a transparent use, not an Osel-style two-address def:
+    // the explicit high-lane Iload below owns the actual write.  Keeping this
+    // out of lop_overwrites_input also avoids minting a second, definition-side
+    // XMM web for an architectural lane that did not change.
+    reg_use(addr, *dst) <--
+        movhps_hi_load(addr, dst, _, _, _, _, _);
+
+    // Use-side xtl id for shadow position (mirrors load_overwrite_use_id below): Osel dst-position arg uses this canonical, leaving fresh def_id for the dst itself.
+    relation lop_overwrite_use_id(Node, Mreg, RTLReg);
+    lop_overwrite_use_id(addr, *dst_reg, use_id) <--
+        lop_overwrites_input(addr, dst_reg),
+        let use_id = fresh_xtl_reg(*addr, *dst_reg) | (1u64 << 62);
+
+    reg_xtl(addr, *dst_reg, use_id) <--
+        lop_overwrite_use_id(addr, dst_reg, use_id);
+
+    reg_def_site(addr, Mreg::AX) <--
+        pdiv(addr, _, _);
+
+    reg_def_site(addr, Mreg::DX) <--
+        pdiv(addr, _, _);
+
+    // A div defines both AX and DX but the two Mops collide at one address, so mark the never-consumed output dead; only when the OTHER is consumed, so a div with both or neither used keeps both.
+    relation div_result_dead(Node, Mreg);
+    div_result_dead(addr, Mreg::AX) <--
+        pdiv(addr, _, _),
+        !reg_def_used(addr, Mreg::AX, _),
+        reg_def_used(addr, Mreg::DX, _);
+    div_result_dead(addr, Mreg::DX) <--
+        pdiv(addr, _, _),
+        !reg_def_used(addr, Mreg::DX, _),
+        reg_def_used(addr, Mreg::AX, _);
+
+    func_has_div_instr(func_start) <--
+        instr_in_function(addr, func_start),
+        pdiv(addr, _, _);
+
+
+    // Signed division (IDIV): quotient in AX, remainder in DX
+    rtl_inst_candidate(addr, RTLInst::Iop(Operation::Odiv, args.clone(), *quot_rtl)) <--
+        pidiv(addr, _, divisor_sym),
+        op_register(divisor_sym, divisor_reg_str),
+        let divisor_mreg = Mreg::x86(divisor_reg_str.to_string()),
+        reg_def_used(ax_def_addr, Mreg::AX, addr),
+        reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
+        reg_def_used(div_def_addr, divisor_mreg, addr),
+        reg_rtl(div_def_addr, divisor_mreg, divisor_rtl),
+        reg_rtl(addr, Mreg::AX, quot_rtl),
+        let args = Arc::new(vec![*ax_rtl, *divisor_rtl]);
+
+    rtl_inst_candidate(synthetic_addr, RTLInst::Iop(Operation::Omod, args.clone(), *rem_rtl)) <--
+        pidiv(addr, _, divisor_sym),
+        op_register(divisor_sym, divisor_reg_str),
+        let divisor_mreg = Mreg::x86(divisor_reg_str.to_string()),
+        reg_def_used(ax_def_addr, Mreg::AX, addr),
+        reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
+        reg_def_used(div_def_addr, divisor_mreg, addr),
+        reg_rtl(div_def_addr, divisor_mreg, divisor_rtl),
+        reg_rtl(addr, Mreg::DX, rem_rtl),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let args = Arc::new(vec![*ax_rtl, *divisor_rtl]);
+
+    // Unsigned division (DIV): quotient in AX, remainder in DX
+    rtl_inst_candidate(addr, RTLInst::Iop(Operation::Odivu, args.clone(), *quot_rtl)) <--
+        pudiv(addr, _, divisor_sym),
+        op_register(divisor_sym, divisor_reg_str),
+        let divisor_mreg = Mreg::x86(divisor_reg_str.to_string()),
+        reg_def_used(ax_def_addr, Mreg::AX, addr),
+        reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
+        reg_def_used(div_def_addr, divisor_mreg, addr),
+        reg_rtl(div_def_addr, divisor_mreg, divisor_rtl),
+        reg_rtl(addr, Mreg::AX, quot_rtl),
+        let args = Arc::new(vec![*ax_rtl, *divisor_rtl]);
+
+    rtl_inst_candidate(synthetic_addr, RTLInst::Iop(Operation::Omodu, args.clone(), *rem_rtl)) <--
+        pudiv(addr, _, divisor_sym),
+        op_register(divisor_sym, divisor_reg_str),
+        let divisor_mreg = Mreg::x86(divisor_reg_str.to_string()),
+        reg_def_used(ax_def_addr, Mreg::AX, addr),
+        reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
+        reg_def_used(div_def_addr, divisor_mreg, addr),
+        reg_rtl(div_def_addr, divisor_mreg, divisor_rtl),
+        reg_rtl(addr, Mreg::DX, rem_rtl),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let args = Arc::new(vec![*ax_rtl, *divisor_rtl]);
+
+    rtl_edge_negated(addr, next_addr) <--
+        pdiv(addr, _, divisor_sym),
+        op_register(divisor_sym, _),
+        next(addr, next_addr);
+
+    rtl_succ_candidate(addr, synthetic_addr), instr_in_function(synthetic_addr, func_start) <--
+        pdiv(addr, _, divisor_sym),
+        op_register(divisor_sym, _),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synthetic_addr, next_addr), instr_in_function(synthetic_addr, func_start) <--
+        pdiv(addr, _, divisor_sym),
+        op_register(divisor_sym, _),
+        instr_in_function(addr, func_start),
+        let synthetic_addr = *addr | (1u64 << 62),
+        next(addr, next_addr);
+
+    // A memory-divisor div has no ltl_inst and thus no reg_use(AX), so synthesize the AX dividend-use; the divisor is the SRC field of pidiv/pudiv, the same field the mach div rules read.
+    reg_use(addr, Mreg::AX) <--
+        pdiv(addr, divisor_sym, _),
+        op_indirect(divisor_sym, _, reg2, _, _, _, _),
+        if reg2.ends_with("BP");
+
+    // Stack-divisor div emits quotient and remainder as COMPETING candidates at the SAME node, so selection keeps only the used result and a dead quotient cannot overwrite the dividend AX.
+    rtl_inst_candidate(addr, RTLInst::Iop(Operation::Odiv, args.clone(), *quot_rtl)) <--
+        pidiv(addr, divisor_sym, _),
+        op_indirect(divisor_sym, reg1, reg2, reg3, mult, disp, sz),
+        if reg2.ends_with("BP"),
+        instr_in_function(addr, func_start),
+        reg_def_used(ax_def_addr, Mreg::AX, addr),
+        reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
+        stack_var(func_start, addr, disp, divisor_rtl),
+        reg_rtl(addr, Mreg::AX, quot_rtl),
+        let args = Arc::new(vec![*ax_rtl, *divisor_rtl]);
+
+    rtl_inst_candidate(addr, RTLInst::Iop(Operation::Omod, args.clone(), *rem_rtl)) <--
+        pidiv(addr, divisor_sym, _),
+        op_indirect(divisor_sym, reg1, reg2, reg3, mult, disp, sz),
+        if reg2.ends_with("BP"),
+        instr_in_function(addr, func_start),
+        reg_def_used(ax_def_addr, Mreg::AX, addr),
+        reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
+        stack_var(func_start, addr, disp, divisor_rtl),
+        reg_rtl(addr, Mreg::DX, rem_rtl),
+        let args = Arc::new(vec![*ax_rtl, *divisor_rtl]);
+
+    rtl_inst_candidate(addr, RTLInst::Iop(Operation::Odivu, args.clone(), *quot_rtl)) <--
+        pudiv(addr, divisor_sym, _),
+        op_indirect(divisor_sym, reg1, reg2, reg3, mult, disp, sz),
+        if reg2.ends_with("BP"),
+        instr_in_function(addr, func_start),
+        reg_def_used(ax_def_addr, Mreg::AX, addr),
+        reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
+        stack_var(func_start, addr, disp, divisor_rtl),
+        reg_rtl(addr, Mreg::AX, quot_rtl),
+        let args = Arc::new(vec![*ax_rtl, *divisor_rtl]);
+
+    rtl_inst_candidate(addr, RTLInst::Iop(Operation::Omodu, args.clone(), *rem_rtl)) <--
+        pudiv(addr, divisor_sym, _),
+        op_indirect(divisor_sym, reg1, reg2, reg3, mult, disp, sz),
+        if reg2.ends_with("BP"),
+        instr_in_function(addr, func_start),
+        reg_def_used(ax_def_addr, Mreg::AX, addr),
+        reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
+        stack_var(func_start, addr, disp, divisor_rtl),
+        reg_rtl(addr, Mreg::DX, rem_rtl),
+        let args = Arc::new(vec![*ax_rtl, *divisor_rtl]);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
+        if mregs.is_empty(),
+        reg_rtl(addr, *dst_reg, dst_rtl),
+        let inst = RTLInst::Iload(*chunk, addressing.clone(), Arc::new(vec![]), *dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
+        if mregs.len() == 1,
+        let arg_mreg = mregs[0],
+        if arg_mreg != *dst_reg,
+        !incoming_stack_tail_load(addr, _, _),
+        reg_rtl(addr, *dst_reg, dst_rtl),
+        reg_rtl(addr, arg_mreg, arg_rtl),
+        let inst = RTLInst::Iload(*chunk, addressing.clone(), Arc::new(vec![*arg_rtl]), *dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
+        if mregs.len() == 1,
+        let arg_mreg = mregs[0],
+        if arg_mreg == *dst_reg,
+        !incoming_stack_tail_load(addr, _, _),
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        load_overwrite_use_id(addr, dst_reg, src_xtl),
+        xtl_canonical(src_xtl, arg_rtl),
+        let inst = RTLInst::Iload(*chunk, addressing.clone(), Arc::new(vec![*arg_rtl]), *dst_rtl);
+
+    // Loads through an incoming-tail LEA are reads of distinct caller-supplied
+    // argument slots, not dereferences of a callee-local object.  Bind each
+    // load to the position-ranked synthetic stack parameter.  The two rules
+    // mirror the ordinary load lowering's separate destination-overwrite case.
+    rtl_inst_candidate(addr, inst) <--
+        incoming_stack_tail_load(addr, func_start, stack_ofs),
+        stack_param_idx(func_start, stack_ofs, idx),
+        ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, dst_reg)),
+        if mregs.len() == 1 && mregs[0] != *dst_reg,
+        reg_rtl(addr, *dst_reg, dst_rtl),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![param_reg]), *dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        incoming_stack_tail_load(addr, func_start, stack_ofs),
+        stack_param_idx(func_start, stack_ofs, idx),
+        ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, dst_reg)),
+        if mregs.len() == 1 && mregs[0] == *dst_reg,
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![param_reg]), *dst_rtl);
+
+    // dst_rtl binds via the load's def id, not reg_rtl(addr, dst_reg), which is multi-valued when the load reuses its destination as an address operand and previously dropped the load.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
+        if mregs.len() > 1,
+        if *addressing != Addressing::Aindexed(0),
+        !sp_indexed_load(addr),
+        !bp_indexed_load(addr),
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        load_args_collected(addr, args),
+        let inst = RTLInst::Iload(*chunk, addressing.clone(), args.clone(), *dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
+        if mregs.len() > 1,
+        if *addressing == Addressing::Aindexed(0),
+        !sp_indexed_load(addr),
+        !bp_indexed_load(addr),
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        reg_rtl(addr, mregs[0], base_rtl),
+        let inst = RTLInst::Iload(*chunk, addressing.clone(), Arc::new(vec![*base_rtl]), *dst_rtl);
+
+    // SP-indexed LEA: materialize the displaced stack base at the real node,
+    // then perform only the index arithmetic at a synthetic successor. This
+    // is the operation counterpart of the SP-indexed load/store expansions.
+    rtl_inst_candidate(addr, base_inst), op_produces_ptr(addr, sp_addr_rtl),
+    indexed_synth_stack_base(func_start, *addr, ofs, sp_addr_rtl) <--
+        sp_indexed_lea(addr),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lop(op, _, _)),
+        if let Some((base_op, _, ofs)) = split_sp_indexed_lea(op),
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let base_inst = RTLInst::Iop(base_op, Arc::new(vec![]), sp_addr_rtl);
+
+    // No destination/index collision: both values have their ordinary node
+    // canonicals.
+    rtl_inst_candidate(synth, indexed_inst), op_produces_ptr(synth, *dst_rtl) <--
+        sp_indexed_lea(addr),
+        ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
+        if mregs[1] != *dst_reg,
+        reg_rtl(addr, *dst_reg, dst_rtl),
+        reg_rtl(addr, mregs[1], idx_rtl),
+        if let Some((_, indexed_op, _)) = split_sp_indexed_lea(op),
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let indexed_inst = RTLInst::Iop(indexed_op, Arc::new(vec![sp_addr_rtl, *idx_rtl]), *dst_rtl);
+
+    // Destination/index collision: resolve the destination from this node's
+    // def and the index from the incoming shadow use.
+    rtl_inst_candidate(synth, indexed_inst), op_produces_ptr(synth, *dst_rtl) <--
+        sp_indexed_lea(addr),
+        ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
+        if mregs[1] == *dst_reg,
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        lop_overwrite_use_id(addr, *dst_reg, idx_xtl),
+        xtl_canonical(idx_xtl, idx_rtl),
+        if let Some((_, indexed_op, _)) = split_sp_indexed_lea(op),
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let indexed_inst = RTLInst::Iop(indexed_op, Arc::new(vec![sp_addr_rtl, *idx_rtl]), *dst_rtl);
+
+    // Rewire the original structural successors through the synthetic index
+    // operation. No address ordering assumption is involved.
+    rtl_edge_negated(addr, next) <--
+        sp_indexed_lea(addr),
+        ltl_succ(addr, next);
+
+    rtl_succ_candidate(addr, synth) <--
+        sp_indexed_lea(addr),
+        let synth = *addr | (1u64 << 62);
+
+    instr_in_function(synth, func_start) <--
+        sp_indexed_lea(addr),
+        instr_in_function(addr, func_start),
+        let synth = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth, next) <--
+        sp_indexed_lea(addr),
+        ltl_succ(addr, next),
+        !next_is_materialized_branch(addr, _),
+        let synth = *addr | (1u64 << 62);
+
+    // Mirror the existing load/store fallback when the raw fallthrough node
+    // was fused upstream and therefore has no ltl_inst/ltl_succ edge.
+    rtl_succ_candidate(synth, dst) <--
+        sp_indexed_lea(addr),
+        instr_in_function(addr, func_start),
+        next(addr, mid),
+        !ltl_inst(*mid, _),
+        !next_is_materialized_branch(addr, _),
+        instr_in_function(*mid, func_start),
+        sp_synth_skip_to_ltl(*mid, *func_start, dst),
+        let synth = *addr | (1u64 << 62);
+
+    // SP-indexed load: expand [SP, idx] to Olea(Ainstack(ofs)) + Iload(Aindexed2scaled(scale, 0)).
+    rtl_inst_candidate(addr, lea_inst), op_produces_ptr(addr, sp_addr_rtl),
+    indexed_synth_stack_base(func_start, *addr, *ofs, sp_addr_rtl) <--
+        sp_indexed_load(addr),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lload(_, addressing, mregs, _)),
+        if mregs.len() == 2 && mregs[0] == Mreg::SP,
+        if let Addressing::Aindexed2scaled(_, ofs) | Addressing::Aindexed2(ofs) = addressing,
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let lea_inst = RTLInst::Iop(Operation::Olea(Addressing::Ainstack(*ofs)), Arc::new(vec![]), sp_addr_rtl);
+
+    rtl_inst_candidate(synth, load_inst) <--
+        ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
+        if mregs.len() == 2 && mregs[0] == Mreg::SP,
+        if let Addressing::Aindexed2scaled(scale, _) = addressing,
+        reg_rtl(addr, *dst_reg, dst_rtl),
+        reg_rtl(addr, mregs[1], idx_rtl),
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2scaled(*scale, 0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *dst_rtl);
+
+    rtl_inst_candidate(synth, load_inst) <--
+        ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
+        if mregs.len() == 2 && mregs[0] == Mreg::SP,
+        if let Addressing::Aindexed2(ofs) = addressing,
+        reg_rtl(addr, *dst_reg, dst_rtl),
+        reg_rtl(addr, mregs[1], idx_rtl),
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2(0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *dst_rtl);
+
+    // SP-indexed load: edge rewiring; redirect addr's successors through the synthetic node
+    rtl_edge_negated(addr, next) <--
+        sp_indexed_load(addr),
+        ltl_succ(addr, next);
+
+    rtl_succ_candidate(addr, synth) <--
+        sp_indexed_load(addr),
+        let synth = *addr | (1u64 << 62);
+
+    // Place synth Iload's instr_in_function via addr's func membership (not ltl_succ): when raw fallthrough lacks ltl_inst (fused `add mem,reg`), ltl_succ is missing and the synth was being dropped from func.inst.
+    instr_in_function(synth, func_start) <--
+        sp_indexed_load(addr),
+        instr_in_function(addr, func_start),
+        let synth = *addr | (1u64 << 62);
+
+    // Synth -> next via ltl_succ when available (normal case).
+    rtl_succ_candidate(synth, next) <--
+        sp_indexed_load(addr),
+        ltl_succ(addr, next),
+        !next_is_materialized_branch(addr, _),
+        let synth = *addr | (1u64 << 62);
+
+    // Synth -> next via function-bounded skip walk when raw next has no ltl_inst (ltl_succ missing); scoped replacement for the global next_skips_to_ltl, applied only to SP-indexed-load synth nodes.
+    rtl_succ_candidate(synth, dst) <--
+        sp_indexed_load(addr),
+        instr_in_function(addr, func_start),
+        next(addr, mid),
+        !ltl_inst(*mid, _),
+        !next_is_materialized_branch(addr, _),
+        instr_in_function(*mid, func_start),
+        sp_synth_skip_to_ltl(*mid, *func_start, dst),
+        let synth = *addr | (1u64 << 62);
+
+    // SP-indexed store: Aindexed2scaled/Aindexed2 with [SP, idx] -> expand similarly
+    rtl_inst_candidate(addr, lea_inst), op_produces_ptr(addr, sp_addr_rtl),
+    indexed_synth_stack_base(func_start, *addr, *ofs, sp_addr_rtl) <--
+        sp_indexed_store(addr),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lstore(_, addressing, mregs, _)),
+        if mregs.len() == 2 && mregs[0] == Mreg::SP,
+        if let Addressing::Aindexed2scaled(_, ofs) | Addressing::Aindexed2(ofs) = addressing,
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let lea_inst = RTLInst::Iop(Operation::Olea(Addressing::Ainstack(*ofs)), Arc::new(vec![]), sp_addr_rtl);
+
+    rtl_inst_candidate(synth, store_inst) <--
+        ltl_inst(addr, ?LTLInst::Lstore(chunk, addressing, mregs, src_reg)),
+        if mregs.len() == 2 && mregs[0] == Mreg::SP,
+        if let Addressing::Aindexed2scaled(scale, _) = addressing,
+        reg_rtl(addr, *src_reg, src_rtl),
+        reg_rtl(addr, mregs[1], idx_rtl),
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let store_inst = RTLInst::Istore(*chunk, Addressing::Aindexed2scaled(*scale, 0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *src_rtl);
+
+    rtl_inst_candidate(synth, store_inst) <--
+        ltl_inst(addr, ?LTLInst::Lstore(chunk, addressing, mregs, src_reg)),
+        if mregs.len() == 2 && mregs[0] == Mreg::SP,
+        if let Addressing::Aindexed2(ofs) = addressing,
+        reg_rtl(addr, *src_reg, src_rtl),
+        reg_rtl(addr, mregs[1], idx_rtl),
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let store_inst = RTLInst::Istore(*chunk, Addressing::Aindexed2(0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *src_rtl);
+
+    // SP-indexed store: edge rewiring
+    rtl_edge_negated(addr, next) <--
+        sp_indexed_store(addr),
+        ltl_succ(addr, next);
+
+    rtl_succ_candidate(addr, synth) <--
+        sp_indexed_store(addr),
+        let synth = *addr | (1u64 << 62);
+
+    // Place the synthetic Istore's instr_in_function directly off addr's function membership (parallel to the SP-load case above).
+    instr_in_function(synth, func_start) <--
+        sp_indexed_store(addr),
+        instr_in_function(addr, func_start),
+        let synth = *addr | (1u64 << 62);
+
+    // Synth -> next via ltl_succ when available (normal case).
+    rtl_succ_candidate(synth, next) <--
+        sp_indexed_store(addr),
+        ltl_succ(addr, next),
+        !next_is_materialized_branch(addr, _),
+        let synth = *addr | (1u64 << 62);
+
+    // Synth -> next via the function-bounded skip walk when the store's raw next address has no ltl_inst (parallel to the SP-load case).
+    rtl_succ_candidate(synth, dst) <--
+        sp_indexed_store(addr),
+        instr_in_function(addr, func_start),
+        next(addr, mid),
+        !ltl_inst(*mid, _),
+        !next_is_materialized_branch(addr, _),
+        instr_in_function(*mid, func_start),
+        sp_synth_skip_to_ltl(*mid, *func_start, dst),
+        let synth = *addr | (1u64 << 62);
+
+    // BP-frame-pointer-indexed load/store, the structural mirror of the SP-indexed expansion: expand [BP, idx] to Olea(Ainstack(disp)) plus an indexed-at-0 access, gated on func_sets_frame_pointer.
+    rtl_inst_candidate(addr, lea_inst), op_produces_ptr(addr, bp_addr_rtl),
+    indexed_synth_stack_base(func_start, *addr, *ofs, bp_addr_rtl) <--
+        bp_indexed_load(addr),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lload(_, addressing, _, _)),
+        if let Addressing::Aindexed2scaled(_, ofs) | Addressing::Aindexed2(ofs) = addressing,
+        let bp_addr_rtl = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_SP_BASE,
+        let lea_inst = RTLInst::Iop(Operation::Olea(Addressing::Ainstack(*ofs)), Arc::new(vec![]), bp_addr_rtl);
+
+    // No-collision: dst register differs from the index register, so reg_rtl gives both directly.
+    rtl_inst_candidate(synth, load_inst) <--
+        bp_indexed_load(addr),
+        ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
+        if let Addressing::Aindexed2scaled(scale, _) = addressing,
+        if mregs[1] != *dst_reg,
+        reg_rtl(addr, *dst_reg, dst_rtl),
+        reg_rtl(addr, mregs[1], idx_rtl),
+        let bp_addr_rtl = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2scaled(*scale, 0), Arc::new(vec![bp_addr_rtl, *idx_rtl]), *dst_rtl);
+
+    rtl_inst_candidate(synth, load_inst) <--
+        bp_indexed_load(addr),
+        ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
+        if let Addressing::Aindexed2(_) = addressing,
+        if mregs[1] != *dst_reg,
+        reg_rtl(addr, *dst_reg, dst_rtl),
+        reg_rtl(addr, mregs[1], idx_rtl),
+        let bp_addr_rtl = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2(0), Arc::new(vec![bp_addr_rtl, *idx_rtl]), *dst_rtl);
+
+    // Collision where the load overwrites its own index register: the dst is the fresh def and the index must be the INCOMING value from load_overwrite_use_id.
+    rtl_inst_candidate(synth, load_inst) <--
+        bp_indexed_load(addr),
+        ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
+        if let Addressing::Aindexed2scaled(scale, _) = addressing,
+        if mregs[1] == *dst_reg,
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        load_overwrite_use_id(addr, dst_reg, idx_xtl),
+        xtl_canonical(idx_xtl, idx_rtl),
+        let bp_addr_rtl = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2scaled(*scale, 0), Arc::new(vec![bp_addr_rtl, *idx_rtl]), *dst_rtl);
+
+    rtl_inst_candidate(synth, load_inst) <--
+        bp_indexed_load(addr),
+        ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
+        if let Addressing::Aindexed2(_) = addressing,
+        if mregs[1] == *dst_reg,
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        load_overwrite_use_id(addr, dst_reg, idx_xtl),
+        xtl_canonical(idx_xtl, idx_rtl),
+        let bp_addr_rtl = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2(0), Arc::new(vec![bp_addr_rtl, *idx_rtl]), *dst_rtl);
+
+    // BP-indexed load: edge rewiring (mirror SP-indexed load).
+    rtl_edge_negated(addr, next) <--
+        bp_indexed_load(addr),
+        ltl_succ(addr, next);
+
+    rtl_succ_candidate(addr, synth) <--
+        bp_indexed_load(addr),
+        let synth = *addr | (1u64 << 62);
+
+    instr_in_function(synth, func_start) <--
+        bp_indexed_load(addr),
+        instr_in_function(addr, func_start),
+        let synth = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth, next) <--
+        bp_indexed_load(addr),
+        ltl_succ(addr, next),
+        !next_is_materialized_branch(addr, _),
+        let synth = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth, dst) <--
+        bp_indexed_load(addr),
+        instr_in_function(addr, func_start),
+        next(addr, mid),
+        !ltl_inst(*mid, _),
+        !next_is_materialized_branch(addr, _),
+        instr_in_function(*mid, func_start),
+        sp_synth_skip_to_ltl(*mid, *func_start, dst),
+        let synth = *addr | (1u64 << 62);
+
+    // BP-indexed store: expand [BP, idx] to Olea(Ainstack(disp)) + Istore(Aindexed2scaled(scale, 0)).
+    rtl_inst_candidate(addr, lea_inst), op_produces_ptr(addr, bp_addr_rtl),
+    indexed_synth_stack_base(func_start, *addr, *ofs, bp_addr_rtl) <--
+        bp_indexed_store(addr),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lstore(_, addressing, _, _)),
+        if let Addressing::Aindexed2scaled(_, ofs) | Addressing::Aindexed2(ofs) = addressing,
+        let bp_addr_rtl = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_SP_BASE,
+        let lea_inst = RTLInst::Iop(Operation::Olea(Addressing::Ainstack(*ofs)), Arc::new(vec![]), bp_addr_rtl);
+
+    rtl_inst_candidate(synth, store_inst) <--
+        bp_indexed_store(addr),
+        ltl_inst(addr, ?LTLInst::Lstore(chunk, addressing, mregs, src_reg)),
+        if let Addressing::Aindexed2scaled(scale, _) = addressing,
+        reg_rtl(addr, *src_reg, src_rtl),
+        reg_rtl(addr, mregs[1], idx_rtl),
+        let bp_addr_rtl = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let store_inst = RTLInst::Istore(*chunk, Addressing::Aindexed2scaled(*scale, 0), Arc::new(vec![bp_addr_rtl, *idx_rtl]), *src_rtl);
+
+    rtl_inst_candidate(synth, store_inst) <--
+        bp_indexed_store(addr),
+        ltl_inst(addr, ?LTLInst::Lstore(chunk, addressing, mregs, src_reg)),
+        if let Addressing::Aindexed2(_) = addressing,
+        reg_rtl(addr, *src_reg, src_rtl),
+        reg_rtl(addr, mregs[1], idx_rtl),
+        let bp_addr_rtl = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let store_inst = RTLInst::Istore(*chunk, Addressing::Aindexed2(0), Arc::new(vec![bp_addr_rtl, *idx_rtl]), *src_rtl);
+
+    // BP-indexed store: edge rewiring (mirror SP-indexed store).
+    rtl_edge_negated(addr, next) <--
+        bp_indexed_store(addr),
+        ltl_succ(addr, next);
+
+    rtl_succ_candidate(addr, synth) <--
+        bp_indexed_store(addr),
+        let synth = *addr | (1u64 << 62);
+
+    instr_in_function(synth, func_start) <--
+        bp_indexed_store(addr),
+        instr_in_function(addr, func_start),
+        let synth = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth, next) <--
+        bp_indexed_store(addr),
+        ltl_succ(addr, next),
+        !next_is_materialized_branch(addr, _),
+        let synth = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth, dst) <--
+        bp_indexed_store(addr),
+        instr_in_function(addr, func_start),
+        next(addr, mid),
+        !ltl_inst(*mid, _),
+        !next_is_materialized_branch(addr, _),
+        instr_in_function(*mid, func_start),
+        sp_synth_skip_to_ltl(*mid, *func_start, dst),
+        let synth = *addr | (1u64 << 62);
+
+    // Give the BP-indexed synthetic Olea(Ainstack(ofs)) a per-node stack_xtl so cminor resolves it to Eaddrof(&local) instead of leaving it as the bare frame integer.
+    stack_xtl(func_start, addr, ofs, base_reg) <--
+        indexed_synth_stack_base(func_start, addr, ofs, base_reg);
+
+    // Unify the synthetic base with every stack_xtl reg at the SAME frame offset so the indexed access and the address-of resolve to ONE named local; the FRESH_NS_SP_BASE bit makes the real local win the min. A re-based name is excluded for the reason given at stack_xtl_rebased.
+    alias_edge(base_reg, other_reg) <--
+        indexed_synth_stack_base(func_start, _, ofs, base_reg),
+        stack_xtl(func_start, other_addr, ofs, other_reg),
+        !stack_xtl_rebased(func_start, other_addr, *ofs),
+        if base_reg != other_reg;
+
+    // Function-bounded skip walk: from a non-ltl-inst addr, walk `next` within the func until hitting one with ltl_inst. Only consumed by SP-indexed LEA/load/store synth rules above.
+    sp_synth_skip_to_ltl(start, func, dst) <--
+        instr_in_function(start, func),
+        next(start, dst),
+        instr_in_function(dst, func),
+        ltl_inst(*dst, _);
+
+    sp_synth_skip_to_ltl(start, func, dst) <--
+        instr_in_function(start, func),
+        next(start, mid),
+        !ltl_inst(*mid, _),
+        instr_in_function(*mid, func),
+        sp_synth_skip_to_ltl(*mid, *func, dst);
+
+    // synth_only_addr members: addresses with RTL synth chains but no ltl_inst.
+    synth_only_addr(addr) <-- arith_load_op(addr, _, _, _, _, _), !has_ltl_op(addr);
+    synth_only_addr(addr) <-- arith_store_reg(addr, _, _, _, _, _), !has_ltl_op(addr);
+    synth_only_addr(addr) <-- arith_store_imm(addr, _, _, _, _), !has_ltl_op(addr);
+    synth_only_addr(addr) <-- arith_store_abs_reg(addr, _, _, _, _, _), !has_ltl_op(addr);
+    synth_only_addr(addr) <-- arith_store_abs_imm(addr, _, _, _, _), !has_ltl_op(addr);
+    synth_only_addr(addr) <-- mach_imm_indirect_store(addr, _, _, _, _);
+    synth_only_addr(addr) <-- mach_imm_stack_init(addr, _, _, _);
+
+    rtl_semantic_node(addr) <-- ltl_inst(addr, _);
+    rtl_semantic_node(addr) <-- synth_only_addr(addr);
+
+    rtl_raw_cfg_step(src, dst) <--
+        next(src, dst),
+        code_in_block(src, block),
+        code_in_block(dst, block),
+        !call_targets_noreturn(src);
+    rtl_raw_cfg_step(src, dst) <--
+        ddisasm_cfg_edge(src, dst, edge_type),
+        if *edge_type != "call" && *edge_type != "indirect" && *edge_type != "indirect_call",
+        !call_targets_noreturn(src);
+
+    rtl_next_semantic(*func, *src, Set::singleton(*dst)) <--
+        rtl_raw_cfg_step(src, dst),
+        instr_in_function(src, func),
+        instr_in_function(dst, func),
+        rtl_semantic_node(*dst);
+
+    rtl_next_semantic(*func, *src, successors.clone()) <--
+        rtl_raw_cfg_step(src, mid),
+        instr_in_function(src, func),
+        instr_in_function(mid, func),
+        !rtl_semantic_node(*mid),
+        rtl_next_semantic(func, mid, successors);
+
+    // mach_imm_stack_init is a one-node semantic producer.  Unlike the other
+    // synth-only classes it has no synthetic tail with a producer-specific
+    // edge, so connect it to the first semantic node on each structural CFG
+    // arm.  This preserves consecutive initializers and crosses only genuinely
+    // empty raw instructions; it cannot skip another semantic producer.
+    rtl_succ_candidate(*addr, *dst) <--
+        mach_imm_stack_init(addr, _, _, _),
+        // Prefer Linear's canonical successor whenever it exists.  Adding the
+        // raw trampoline as a second edge makes Clight emit `goto raw` before
+        // the initializer and renders the store unreachable.
+        !rtl_next(*addr, _),
+        instr_in_function(addr, func),
+        rtl_next_semantic(func, addr, successors),
+        for dst in successors.0.iter();
+
+    // Bridge real ltl_inst's natural fallthrough into the first synth-only addr in a contiguous synth-only run; without this, ltl_fallthrough (which needs ltl_inst at next) drops the edge and erases the function body. Bounded by instr_in_function on both ends to never cross function boundaries.
+    rtl_succ_candidate(prev, addr) <--
+        ltl_inst(prev, prev_inst),
+        if crate::decompile::passes::linear_pass::has_fallthrough(&prev_inst, *prev),
+        instr_in_function(prev, func),
+        next(prev, addr),
+        !ltl_inst(*addr, _),
+        synth_only_addr(*addr),
+        instr_in_function(*addr, func);
+
+    // Tail-bridge: when a synth-only addr's next() is neither ltl_inst nor synth-only, walk past it to the next live in-func ltl_inst and add a parallel edge to the post-skip target.
+    rtl_succ_candidate(synth_last, dst) <--
+        synth_only_addr(addr),
+        instr_in_function(addr, func),
+        next(addr, mid),
+        !next_is_materialized_branch(addr, _),
+        !ltl_inst(*mid, _),
+        !synth_only_addr(*mid),
+        instr_in_function(*mid, func),
+        sp_synth_skip_to_ltl(*mid, *func, dst),
+        let synth_last = (*addr | (1u64 << 62)) | (1u64 << 63);
+
+    // A synth-only expansion whose chain ENDS at `addr | (1<<63)` instead of the
+    // usual `addr | (1<<62)`: the carry expansion emits synth1 (bit 62) then
+    // synth2 (bit 63) when a residual constant remains.  The tail bridge has to
+    // know which node is last, since attaching it to synth1 gives control a path
+    // around synth2 and the residual add is then dead-store eliminated.
+    #[local] relation synth_tail_is_bit63(Address);
+    synth_tail_is_bit63(adc_addr) <--
+        adc_carry_op(adc_addr, _, _, _, _, _, _, _),
+        adc_carry_needs_k(adc_addr);
+    // Memory read/modify/write expansions are always
+    // addr -> bit62(op) -> bit63(store/nop) -> successor.  Treating them as a
+    // one-synth chain attaches the generic bridge to bit62 and creates a path
+    // around the store (or, for a stack-var collapse, a false side-entry into
+    // the following branch arm).
+    synth_tail_is_bit63(addr) <--
+        arith_store_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr);
+    synth_tail_is_bit63(addr) <--
+        arith_store_imm(addr, _, _, _, _),
+        !has_ltl_op(addr);
+    synth_tail_is_bit63(addr) <--
+        arith_store_abs_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr);
+    synth_tail_is_bit63(addr) <--
+        arith_store_abs_imm(addr, _, _, _, _),
+        !has_ltl_op(addr);
+    synth_tail_is_bit63(addr) <--
+        imm_indirect_store_bp_indexed(addr, _, _, _, _, _);
+
+    // Some synth-only producers emit only a single synth (bit 62), not the double (62+63); tail is `addr | (1<<62)`, emit bridging edge from that synth too.
+    rtl_succ_candidate(synth_last, dst) <--
+        synth_only_addr(addr),
+        !synth_tail_is_bit63(addr),
+        instr_in_function(addr, func),
+        next(addr, mid),
+        !next_is_materialized_branch(addr, _),
+        !ltl_inst(*mid, _),
+        !synth_only_addr(*mid),
+        instr_in_function(*mid, func),
+        sp_synth_skip_to_ltl(*mid, *func, dst),
+        let synth_last = *addr | (1u64 << 62);
+
+    // Same bridge for a chain that ends at bit 63 alone.
+    rtl_succ_candidate(synth_last, dst) <--
+        synth_only_addr(addr),
+        synth_tail_is_bit63(addr),
+        instr_in_function(addr, func),
+        next(addr, mid),
+        !next_is_materialized_branch(addr, _),
+        !ltl_inst(*mid, _),
+        !synth_only_addr(*mid),
+        instr_in_function(*mid, func),
+        sp_synth_skip_to_ltl(*mid, *func, dst),
+        let synth_last = *addr | (1u64 << 63);
+
+    // TEST $mask,[mem] has no Mach/LTL representation: materialize the memory
+    // read at the TEST and the mask predicate at its flag-consuming JCC.  Keep
+    // this on the generic non-stack-memory path, matching CMP below; plain
+    // BP/SP operands may denote scalar frame slots and need stack_var identity.
+    #[local] relation test_mem_jcc_link(Address, Address);
+    test_mem_jcc_link(addr, jcc_addr) <--
+        ptest(addr, mem_sym, mask_sym),
+        op_indirect(mem_sym, _, _, _, _, _, _),
+        op_immediate(mask_sym, _, _),
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, test_cond, _),
+        if matches!(test_cond, TestCond::CondE | TestCond::CondNe);
+    test_mem_jcc_link(addr, jcc_addr) <--
+        ptest(addr, mem_sym, mask_sym),
+        op_indirect(mem_sym, _, _, _, _, _, _),
+        op_immediate(mask_sym, _, _),
+        flags_and_jump_pair(addr, jcc_addr, _),
+        pjcc(jcc_addr, test_cond, _),
+        if matches!(test_cond, TestCond::CondE | TestCond::CondNe);
+
+    // The asm pass leaves TEST-memory + CMOV as a two-value Osel and exports
+    // the exact flag origin.  The condition value itself has no machine
+    // register until the memory read is materialized here.
+    #[local] relation test_mem_cmov_link(Address, Address);
+    test_mem_cmov_link(test_addr, cmov_addr) <--
+        osel_compare_site(cmov_addr, test_addr),
+        ptest(test_addr, mem_sym, mask_sym),
+        op_indirect(mem_sym, _, _, _, _, _, _),
+        op_immediate(mask_sym, _, _),
+        ltl_inst(cmov_addr, ?LTLInst::Lop(Operation::Osel(_, _), args, _)),
+        if args.len() == 2;
+
+    #[local] relation test_mem_consumer_link(Address, Address);
+    test_mem_consumer_link(addr, consumer) <-- test_mem_jcc_link(addr, consumer);
+    test_mem_consumer_link(addr, consumer) <-- test_mem_cmov_link(addr, consumer);
+
+    temp_test_mem_reg(addr, fresh_reg) <--
+        test_mem_consumer_link(addr, _),
+        let fresh_reg = fresh_xtl_reg(*addr, Mreg::x86("RTEMP"));
+
+    // Classify TEST operands that the generic address translator can preserve.
+    // A plain BP-relative operand needs separate contextual handling below:
+    // transl_addressing_rev deliberately maps it to Ainstack, whereas in a
+    // frameless function BP is an ordinary object pointer.
+    #[local] relation test_mem_load_address(Address, &'static str, &'static str, i64, i64, usize);
+    test_mem_load_address(*addr, base_str, idx_str, *scale, *disp, *sz) <--
+        test_mem_consumer_link(addr, _),
+        ptest(addr, mem_sym, _),
+        op_indirect(mem_sym, _, base_str, idx_str, scale, disp, sz),
+        if (!base_str.ends_with("BP") && !base_str.ends_with("SP")) || (*idx_str != "NONE" && !idx_str.is_empty());
+
+    #[local] relation frameless_bp_test_mem(Address, Address, i64, usize);
+    frameless_bp_test_mem(func_start, *addr, *disp, *sz) <--
+        test_mem_consumer_link(addr, _),
+        ptest(addr, mem_sym, _),
+        op_indirect(mem_sym, _, base_str, idx_str, _, disp, sz),
+        if Mreg::x86(*base_str) == Mreg::BP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        instr_in_function(addr, func_start),
+        !func_sets_frame_pointer(func_start);
+
+    temp_test_mem_mreg_args(addr, pos, mreg) <--
+        test_mem_load_address(addr, base_str, idx_str, scale, disp, _),
+        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
+        let res = transl_addressing_rev(addrmode, None),
+        if res.is_ok(),
+        let (_, mreg_vec) = res.unwrap(),
+        for (pos, mreg) in mreg_vec.into_iter().enumerate();
+
+    temp_test_mem_mreg_args(addr, 0, Mreg::BP) <--
+        frameless_bp_test_mem(_, addr, _, _);
+
+    temp_test_mem_args_rtl(addr, pos, rtl_reg) <--
+        temp_test_mem_mreg_args(addr, pos, mreg),
+        reg_rtl(addr, mreg, rtl_reg);
+
+    ltl_inst_uses_mreg(addr, mreg) <--
+        temp_test_mem_mreg_args(addr, _, mreg);
+
+    // TEST itself is selected away before LTL, so carry the structurally
+    // reaching address-register definition to the synthetic load explicitly.
+    reg_xtl(test_addr, mreg, arg_id) <--
+        temp_test_mem_mreg_args(test_addr, _, mreg),
+        reg_def_used(defaddr, mreg, test_addr),
+        !load_overwrites_base(defaddr, mreg),
+        reg_xtl(defaddr, mreg, arg_id);
+
+    reg_xtl(test_addr, mreg, arg_id) <--
+        temp_test_mem_mreg_args(test_addr, _, mreg),
+        reg_def_used(defaddr, mreg, test_addr),
+        load_overwrites_base(defaddr, mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, mreg, arg_id);
+
+    rtl_inst_candidate(addr, RTLInst::Iload(chunk, addressing.clone(), args, *fresh_reg)) <--
+        test_mem_load_address(addr, base_str, idx_str, scale, disp, sz),
+        temp_test_mem_reg(addr, fresh_reg),
+        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
+        let res = transl_addressing_rev(addrmode, None),
+        if res.is_ok(),
+        let (addressing, _) = res.unwrap(),
+        agg args = build_call_args(pos, rtl_reg) in temp_test_mem_args_rtl(addr, pos, rtl_reg),
+        if !args.is_empty(),
+        let chunk = match *sz {
+            1 => MemoryChunk::MInt8Unsigned,
+            2 => MemoryChunk::MInt16Unsigned,
+            8 => MemoryChunk::MInt64,
+            _ => MemoryChunk::MInt32,
+        };
+
+    rtl_inst_candidate(addr, RTLInst::Iload(chunk, Addressing::Aindexed(*disp), args, *fresh_reg)) <--
+        frameless_bp_test_mem(_, addr, disp, sz),
+        temp_test_mem_reg(addr, fresh_reg),
+        agg args = build_call_args(pos, rtl_reg) in temp_test_mem_args_rtl(addr, pos, rtl_reg),
+        if !args.is_empty(),
+        let chunk = match *sz {
+            1 => MemoryChunk::MInt8Unsigned,
+            2 => MemoryChunk::MInt16Unsigned,
+            8 => MemoryChunk::MInt64,
+            _ => MemoryChunk::MInt32,
+        };
+
+    #[local] relation osel_mem_test_condition(Node, Condition, RTLReg);
+    osel_mem_test_condition(*cmov_addr, condition.clone(), *loaded) <--
+        test_mem_cmov_link(test_addr, cmov_addr),
+        ltl_inst(cmov_addr, ?LTLInst::Lop(Operation::Osel(condition, _), _, _)),
+        temp_test_mem_reg(test_addr, loaded);
+
+    op_arg_mapping(cmov_addr, 2, *loaded) <--
+        osel_mem_test_condition(cmov_addr, _, loaded);
+
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*fresh_reg]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
+        test_mem_jcc_link(addr, jcc_addr),
+        ptest(addr, _, mask_sym),
+        op_immediate(mask_sym, mask, _),
+        temp_test_mem_reg(addr, fresh_reg),
+        pjcc(jcc_addr, test_cond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        instr_in_function(addr, func_start),
+        instr_in_function(jcc_addr, func_start),
+        instr_in_function(target_addr, func_start),
+        next(jcc_addr, fallthrough),
+        instr_in_function(fallthrough, func_start),
+        let cond = match test_cond {
+            TestCond::CondE => Condition::Cmaskzero(*mask),
+            TestCond::CondNe => Condition::Cmasknotzero(*mask),
+            _ => unreachable!("test_mem_jcc_link only admits JE/JNE"),
+        };
+
+    // A plain BP-relative compare is a stack access only when the function
+    // structurally establishes RBP as its frame pointer.  Optimized frameless
+    // code commonly keeps an ordinary object pointer in this callee-saved
+    // register; transl_addressing_rev cannot distinguish the two contexts and
+    // otherwise turns fields such as 16(%rbp) into the bare frame offset 16.
+    #[local] relation frameless_bp_cmp_mem(Address, Address, i64, usize);
+    frameless_bp_cmp_mem(func_start, addr, *disp, *sz) <--
+        pcmp(addr, mem_sym, _),
+        op_indirect(mem_sym, _, base_str, idx_str, _, disp, sz),
+        if Mreg::x86(*base_str) == Mreg::BP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        instr_in_function(addr, func_start),
+        !func_sets_frame_pointer(func_start);
+    frameless_bp_cmp_mem(func_start, addr, *disp, *sz) <--
+        pcmp(addr, _, mem_sym),
+        op_indirect(mem_sym, _, base_str, idx_str, _, disp, sz),
+        if Mreg::x86(*base_str) == Mreg::BP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        instr_in_function(addr, func_start),
+        !func_sets_frame_pointer(func_start);
+
+    // Feed the real pointer base through the same use/SSA machinery as other
+    // synthesized compare loads.  The contextual addressing form itself is
+    // emitted below as Aindexed(disp), with RBP as its sole argument.
+    temp_cmp_mreg_args(addr, 0, Mreg::BP) <--
+        frameless_bp_cmp_mem(_, addr, _, _);
+
+    temp_cmp_reg(addr, fresh_reg) <--
+        frameless_bp_cmp_mem(_, addr, _, _),
+        let fresh_reg = fresh_xtl_reg(*addr, Mreg::x86("RTEMP"));
+
+    #[local] relation frameless_bp_cmp_jcc(Address, Address);
+    frameless_bp_cmp_jcc(addr, jcc_addr) <--
+        frameless_bp_cmp_mem(_, addr, _, _),
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, _, _);
+    frameless_bp_cmp_jcc(addr, jcc_addr) <--
+        frameless_bp_cmp_mem(_, addr, _, _),
+        flags_and_jump_pair(addr, jcc_addr, _),
+        pjcc(jcc_addr, _, _);
+
+    // CMP+JCC for [mem]+imm with a non-stack base; stack-based forms are handled by the stack_var rules, and the non-BP/SP restriction avoids competing candidates.
+
+    temp_cmp_reg(addr, fresh_reg) <--
+        instruction(addr, _, _, mnem, dst, src, _, _, _, _),
+        if mnem.starts_with("CMP"),
+        op_immediate(dst, _, _),
+        op_indirect(src, _, base_str, idx_str, _, _, _),
+        if (!base_str.ends_with("BP") && !base_str.ends_with("SP")) || (*idx_str != "NONE" && !idx_str.is_empty()),
+        let fresh_reg = fresh_xtl_reg(*addr, Mreg::x86("RTEMP"));
+
+    temp_cmp_mreg_args(addr, pos, mreg) <--
+        instruction(addr, _, _, mnem, dst, src, _, _, _, _),
+        if mnem.starts_with("CMP"),
+        op_immediate(dst, _, _),
+        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        if (!base_str.ends_with("BP") && !base_str.ends_with("SP")) || (*idx_str != "NONE" && !idx_str.is_empty()),
+        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
+        let res = transl_addressing_rev(addrmode, None),
+        if res.is_ok(),
+        let (_, mreg_vec) = res.unwrap(),
+        for (pos, mreg) in mreg_vec.into_iter().enumerate();
+
+    temp_cmp_args_rtl(addr, pos, rtl_reg) <--
+        temp_cmp_mreg_args(addr, pos, mreg),
+        reg_rtl(addr, mreg, rtl_reg);
+
+    rtl_inst_candidate(addr, RTLInst::Iload(chunk, Addressing::Aindexed(*disp), args, *fresh_reg)) <--
+        frameless_bp_cmp_mem(_, addr, disp, sz),
+        temp_cmp_reg(addr, fresh_reg),
+        agg args = build_call_args(pos, rtl_reg) in temp_cmp_args_rtl(addr, pos, rtl_reg),
+        if !args.is_empty(),
+        let chunk = match *sz {
+            1 => MemoryChunk::MInt8Unsigned,
+            2 => MemoryChunk::MInt16Unsigned,
+            8 => MemoryChunk::MInt64,
+            _ => MemoryChunk::MInt32,
+        };
+
+    ltl_inst_uses_mreg(addr, mreg) <--
+        temp_cmp_mreg_args(addr, _, mreg);
+
+    // Propagate reg_xtl into CMP address from prior def of regs CMP uses; CMP has no LTL/MachInst entry (fused into Icond at RTL synth), so ltl_inst-based propagation doesn't fire and temp_cmp_args_rtl can't resolve base/index regs.
+    reg_xtl(cmp_addr, mreg, arg_id) <--
+        temp_cmp_mreg_args(cmp_addr, _, mreg),
+        reg_def_used(defaddr, mreg, cmp_addr),
+        !load_overwrites_base(defaddr, mreg),
+        reg_xtl(defaddr, mreg, arg_id);
+
+    reg_xtl(cmp_addr, mreg, arg_id) <--
+        temp_cmp_mreg_args(cmp_addr, _, mreg),
+        reg_def_used(defaddr, mreg, cmp_addr),
+        load_overwrites_base(defaddr, mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, mreg, arg_id);
+
+    rtl_inst_candidate(addr, RTLInst::Iload(chunk, addressing.clone(), mreg_args, *fresh_reg)) <--
+        instruction(addr, _, _, mnem, dst, src, _, _, _, _),
+        if mnem.starts_with("CMP"),
+        op_immediate(dst, _, _),
+        op_indirect(src, _, base_str, idx_str, scale, disp, sz),
+        if (!base_str.ends_with("BP") && !base_str.ends_with("SP")) || (*idx_str != "NONE" && !idx_str.is_empty()),
+        temp_cmp_reg(addr, fresh_reg),
+        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
+        let res = transl_addressing_rev(addrmode, None),
+        if res.is_ok(),
+        let (addressing, _) = res.unwrap(),
+        agg mreg_args = build_call_args(pos, rtl_reg) in temp_cmp_args_rtl(addr, pos, rtl_reg),
+        if !mreg_args.is_empty(),
+        let chunk = match *sz {
+            1 => MemoryChunk::MInt8Unsigned,
+            2 => MemoryChunk::MInt16Unsigned,
+            8 => MemoryChunk::MInt64,
+            _ => MemoryChunk::MInt32,
+        };
+
+    // cmp imm, [global] with a RIP-relative operand has no base/index GPR, so the mreg-gated Iload never fires; resolve the RIP target to an Aglobal and define the fresh reg the Icond consumes.
+    rtl_inst_candidate(addr, RTLInst::Iload(chunk, Addressing::Aglobal(target_addr, 0), Arc::new(vec![]), *fresh_reg)) <--
+        instruction(addr, size, _, mnem, dst, src, _, _, _, _),
+        if mnem.starts_with("CMP"),
+        op_immediate(dst, _, _),
+        op_indirect(src, _, base_str, idx_str, _, disp, sz),
+        if is_rip(base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        temp_cmp_reg(addr, fresh_reg),
+        let target_addr = (*addr as i64 + *size as i64 + *disp) as Ident,
+        let chunk = match *sz {
+            1 => MemoryChunk::MInt8Unsigned,
+            2 => MemoryChunk::MInt16Unsigned,
+            8 => MemoryChunk::MInt64,
+            _ => MemoryChunk::MInt32,
+        };
+
+    // Icond from cmp[mem],imm placed at JCC (CMP/JCC sequential); false target is JCC's fallthrough (not next_addr=JCC) to avoid self-loop on false branch. Mirrors patterns at 1766/1782/1834.
+    rtl_inst_candidate(*next_addr, RTLInst::Icond(cond, args.clone(), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
+        instruction(addr, _, _, mnem, dst, src, _, _, _, _),
+        if mnem.starts_with("CMP"),
+        op_immediate(dst, imm_sym, _),
+        op_indirect(src, _, base_str, idx_str, _, _, sz),
+        if (!base_str.ends_with("BP") && !base_str.ends_with("SP")) || (*idx_str != "NONE" && !idx_str.is_empty()),
+        let imm_val = *imm_sym as i64,
+        next(addr, next_addr),
+        pjcc(next_addr, test_cond, lbl),
+        temp_cmp_reg(addr, fresh_reg),
+        symbol_resolved_addr(*lbl, target_addr),
+        instr_in_function(target_addr, target_func_start),
+        instr_in_function(next_addr, my_func_start),
+        if target_func_start == my_func_start,
+        next(next_addr, fallthrough),
+        // jcc-taken branch fires on the identity predicate of the test (not its logical inverse); mirrors asm_pass.rs.
+        let raw_cond = crate::x86::types::condition_for_testcond(*test_cond),
+        let sized_cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz),
+        let cond = match sized_cond {
+             Condition::Ccomp(c)  => Condition::Ccompimm(c, imm_val),
+             Condition::Ccompu(c) => Condition::Ccompuimm(c, imm_val),
+             Condition::Ccompl(c)  => Condition::Ccomplimm(c, imm_val),
+             Condition::Ccomplu(c) => Condition::Ccompluimm(c, imm_val),
+             _ => Condition::Ccomp(Comparison::Unknown),
+        },
+        let args = Arc::new(vec![*fresh_reg]);
+
+    // The immediate form above deliberately excludes plain BP/SP operands.
+    // Re-admit a frameless BP object-field compare with the contextual load,
+    // preserving the memory width in the comparison condition.
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond_with_imm, Arc::new(vec![*fresh_reg]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
+        frameless_bp_cmp_mem(func_start, addr, _, sz),
+        pcmp(addr, mem_sym, imm_sym),
+        op_indirect(mem_sym, _, _, _, _, _, _),
+        op_immediate(imm_sym, imm_val, _),
+        frameless_bp_cmp_jcc(addr, jcc_addr),
+        temp_cmp_reg(addr, fresh_reg),
+        pjcc(jcc_addr, testcond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        instr_in_function(target_addr, func_start),
+        next(jcc_addr, fallthrough),
+        instr_in_function(fallthrough, func_start),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let sized_cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz),
+        let cond_with_imm = match sized_cond {
+            Condition::Ccomp(cmp) => Condition::Ccompimm(cmp, *imm_val),
+            Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, *imm_val),
+            Condition::Ccompl(cmp) => Condition::Ccomplimm(cmp, *imm_val),
+            Condition::Ccomplu(cmp) => Condition::Ccompluimm(cmp, *imm_val),
+            _ => sized_cond.clone(),
+        };
+
+    // Canonical frame slot for an index-free CMP memory operand.  SP-relative
+    // displacements are rebased through the point-keyed CFG stack-offset
+    // lattice below; BP-relative slots are valid only in a real framed
+    // function.  Thus 0(%rsp) after a 280-byte frame allocation denotes -280,
+    // including in branch targets that are not physical fallthroughs.
+    #[local] relation scalar_stack_cmp_slot(Address, Address, i64);
+    scalar_stack_cmp_slot(func_start, addr, slot) <--
+        pcmp(addr, mem_sym, _),
+        op_indirect(mem_sym, _, base_str, idx_str, _, disp, _),
+        if Mreg::x86(*base_str) == Mreg::SP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        instr_in_function(addr, func_start),
+        sp_entry_ofs(func_start, addr, sp_offsets),
+        for sp_ofs in sp_offsets.0.iter(),
+        let slot = *disp + *sp_ofs;
+    scalar_stack_cmp_slot(func_start, addr, slot) <--
+        pcmp(addr, _, mem_sym),
+        op_indirect(mem_sym, _, base_str, idx_str, _, disp, _),
+        if Mreg::x86(*base_str) == Mreg::SP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        instr_in_function(addr, func_start),
+        sp_entry_ofs(func_start, addr, sp_offsets),
+        for sp_ofs in sp_offsets.0.iter(),
+        let slot = *disp + *sp_ofs;
+    scalar_stack_cmp_slot(func_start, addr, *disp) <--
+        pcmp(addr, mem_sym, _),
+        op_indirect(mem_sym, _, base_str, idx_str, _, disp, _),
+        if Mreg::x86(*base_str) == Mreg::BP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        instr_in_function(addr, func_start),
+        func_sets_frame_pointer(func_start);
+    scalar_stack_cmp_slot(func_start, addr, *disp) <--
+        pcmp(addr, _, mem_sym),
+        op_indirect(mem_sym, _, base_str, idx_str, _, disp, _),
+        if Mreg::x86(*base_str) == Mreg::BP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        instr_in_function(addr, func_start),
+        func_sets_frame_pointer(func_start);
+
+    // StackAnalysis keys each use by the displacement/base pair present at
+    // that instruction and records any offset transformation separately in
+    // stack_def_used(def_ofs, use_ofs).  Keep that point-local identity for
+    // scalar SSA lookup.  The entry-relative slot above remains necessary for
+    // classifying accesses inside an escaped whole-frame buffer, but using it
+    // as the stack_var key disconnects an RSP compare from an otherwise exact
+    // spill/reload chain after a frame allocation.
+    #[local] relation scalar_stack_cmp_var_slot(Address, Address, i64);
+    scalar_stack_cmp_var_slot(func_start, addr, *disp) <--
+        pcmp(addr, mem_sym, _),
+        op_indirect(mem_sym, _, base_str, idx_str, _, disp, _),
+        if Mreg::x86(*base_str) == Mreg::SP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        instr_in_function(addr, func_start);
+    scalar_stack_cmp_var_slot(func_start, addr, *disp) <--
+        pcmp(addr, _, mem_sym),
+        op_indirect(mem_sym, _, base_str, idx_str, _, disp, _),
+        if Mreg::x86(*base_str) == Mreg::SP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        instr_in_function(addr, func_start);
+    scalar_stack_cmp_var_slot(func_start, addr, *disp) <--
+        pcmp(addr, mem_sym, _),
+        op_indirect(mem_sym, _, base_str, idx_str, _, disp, _),
+        if Mreg::x86(*base_str) == Mreg::BP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        instr_in_function(addr, func_start),
+        func_sets_frame_pointer(func_start);
+    scalar_stack_cmp_var_slot(func_start, addr, *disp) <--
+        pcmp(addr, _, mem_sym),
+        op_indirect(mem_sym, _, base_str, idx_str, _, disp, _),
+        if Mreg::x86(*base_str) == Mreg::BP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        instr_in_function(addr, func_start),
+        func_sets_frame_pointer(func_start);
+
+    // A compare inside an opaque address-taken whole-frame buffer is a memory
+    // read through the escaped address, not a scalar use of the backing local.
+    // Keep the byte offset explicit so later typing retains the array extent.
+    #[local] relation escaped_frame_cmp_mem(Address, Address, i64, usize, RTLReg, i64, RTLReg);
+    escaped_frame_cmp_mem(func_start, addr, slot, *sz, base_addr_rtl, delta, load_rtl) <--
+        scalar_stack_cmp_slot(func_start, addr, slot),
+        pcmp(addr, mem_sym, _),
+        op_indirect(mem_sym, _, _, _, _, _, sz),
+        slot_addr_escaped(func_start, lea_addr, base_slot),
+        func_stacksz(func_start, _, _, stack_size),
+        if let Ok(frame_size) = i64::try_from(*stack_size),
+        if *base_slot == -frame_size,
+        if *slot >= *base_slot && *slot + *sz as i64 <= 0,
+        ltl_inst(lea_addr, ?LTLInst::Lop(Operation::Olea(Addressing::Ainstack(lea_slot)), _, dst_mreg)),
+        if *lea_slot == *base_slot,
+        code_in_block(lea_addr, lea_block),
+        code_in_block(addr, use_block),
+        block_dom_set(func_start, use_block, doms),
+        if doms.0.contains(lea_block),
+        let base_addr_rtl = fresh_xtl_reg(*lea_addr, *dst_mreg),
+        let delta = *slot - *base_slot,
+        let load_rtl = fresh_xtl_reg(*addr, Mreg::x86("RTEMP"));
+    escaped_frame_cmp_mem(func_start, addr, slot, *sz, base_addr_rtl, delta, load_rtl) <--
+        scalar_stack_cmp_slot(func_start, addr, slot),
+        pcmp(addr, _, mem_sym),
+        op_indirect(mem_sym, _, _, _, _, _, sz),
+        slot_addr_escaped(func_start, lea_addr, base_slot),
+        func_stacksz(func_start, _, _, stack_size),
+        if let Ok(frame_size) = i64::try_from(*stack_size),
+        if *base_slot == -frame_size,
+        if *slot >= *base_slot && *slot + *sz as i64 <= 0,
+        ltl_inst(lea_addr, ?LTLInst::Lop(Operation::Olea(Addressing::Ainstack(lea_slot)), _, dst_mreg)),
+        if *lea_slot == *base_slot,
+        code_in_block(lea_addr, lea_block),
+        code_in_block(addr, use_block),
+        block_dom_set(func_start, use_block, doms),
+        if doms.0.contains(lea_block),
+        let base_addr_rtl = fresh_xtl_reg(*lea_addr, *dst_mreg),
+        let delta = *slot - *base_slot,
+        let load_rtl = fresh_xtl_reg(*addr, Mreg::x86("RTEMP"));
+
+    #[local] relation cmp_reads_escaped_frame_buffer(Address);
+    cmp_reads_escaped_frame_buffer(addr) <--
+        escaped_frame_cmp_mem(_, addr, _, _, _, _, _);
+
+    // An exact address-taken scalar slot is different from an opaque
+    // whole-frame buffer: materialize an Ainstack load so cshminor resolves it
+    // back to the local whose address escaped.  Requiring the escaping LEA's
+    // block to dominate the compare prevents a shared-owner block in another
+    // function from lending an unrelated frame base at the same offset.
+    #[local] relation escaped_scalar_cmp_mem(Address, Address, i64, usize, RTLReg);
+    escaped_scalar_cmp_mem(func_start, addr, slot, *sz, load_rtl) <--
+        scalar_stack_cmp_var_slot(func_start, addr, slot),
+        pcmp(addr, mem_sym, _),
+        op_indirect(mem_sym, _, _, _, _, _, sz),
+        slot_addr_escaped(func_start, lea_addr, slot),
+        code_in_block(lea_addr, lea_block),
+        code_in_block(addr, use_block),
+        block_dom_set(func_start, use_block, doms),
+        if doms.0.contains(lea_block),
+        !cmp_reads_escaped_frame_buffer(addr),
+        let load_rtl = fresh_xtl_reg(*addr, Mreg::x86("RTEMP"));
+    escaped_scalar_cmp_mem(func_start, addr, slot, *sz, load_rtl) <--
+        scalar_stack_cmp_var_slot(func_start, addr, slot),
+        pcmp(addr, _, mem_sym),
+        op_indirect(mem_sym, _, _, _, _, _, sz),
+        slot_addr_escaped(func_start, lea_addr, slot),
+        code_in_block(lea_addr, lea_block),
+        code_in_block(addr, use_block),
+        block_dom_set(func_start, use_block, doms),
+        if doms.0.contains(lea_block),
+        !cmp_reads_escaped_frame_buffer(addr),
+        let load_rtl = fresh_xtl_reg(*addr, Mreg::x86("RTEMP"));
+
+    rtl_inst_candidate(addr, RTLInst::Iload(chunk, Addressing::Ainstack(*slot), Arc::new(vec![]), *load_rtl)) <--
+        escaped_scalar_cmp_mem(_, addr, slot, sz, load_rtl),
+        let chunk = match *sz {
+            1 => MemoryChunk::MInt8Unsigned,
+            2 => MemoryChunk::MInt16Unsigned,
+            8 => MemoryChunk::MInt64,
+            _ => MemoryChunk::MInt32,
+        };
+
+    #[local] relation escaped_cmp_value(Address, Address, RTLReg);
+    escaped_cmp_value(func_start, addr, *load_rtl) <--
+        escaped_frame_cmp_mem(func_start, addr, _, _, _, _, load_rtl);
+    escaped_cmp_value(func_start, addr, *load_rtl) <--
+        escaped_scalar_cmp_mem(func_start, addr, _, _, load_rtl);
+
+    #[local] relation cmp_reads_escaped_stack_storage(Address);
+    cmp_reads_escaped_stack_storage(addr) <--
+        escaped_cmp_value(_, addr, _);
+
+    rtl_inst_candidate(addr, RTLInst::Iload(chunk, Addressing::Aindexed(*delta), Arc::new(vec![*base_addr_rtl]), *load_rtl)) <--
+        escaped_frame_cmp_mem(_, addr, _, sz, base_addr_rtl, delta, load_rtl),
+        let chunk = match *sz {
+            1 => MemoryChunk::MInt8Unsigned,
+            2 => MemoryChunk::MInt16Unsigned,
+            8 => MemoryChunk::MInt64,
+            _ => MemoryChunk::MInt32,
+        };
+
+    // x86 CMP permits at most one memory operand.  Place its consuming Icond
+    // at the paired JCC so the load at the CMP remains sequenced before it.
+    // These four take the same same-block pairing as the scalar stack compares:
+    // adjacency alone deletes the branch whenever flag-transparent work is
+    // scheduled between the compare and its JCC.
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond_with_imm, Arc::new(vec![*load_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
+        escaped_cmp_value(_, addr, load_rtl),
+        pcmp(addr, mem_sym, imm_sym),
+        op_indirect(mem_sym, _, _, _, _, _, sz),
+        op_immediate(imm_sym, imm_val, _),
+        stack_cmp_cond_site(addr, jcc_addr, _),
+        pjcc(jcc_addr, testcond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        next(jcc_addr, fallthrough),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let sized_cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz),
+        let cond_with_imm = match sized_cond {
+            Condition::Ccomp(cmp) => Condition::Ccompimm(cmp, *imm_val),
+            Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, *imm_val),
+            Condition::Ccompl(cmp) => Condition::Ccomplimm(cmp, *imm_val),
+            Condition::Ccomplu(cmp) => Condition::Ccompluimm(cmp, *imm_val),
+            _ => sized_cond.clone(),
+        };
+
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond_with_imm, Arc::new(vec![*load_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
+        escaped_cmp_value(_, addr, load_rtl),
+        pcmp(addr, imm_sym, mem_sym),
+        op_immediate(imm_sym, imm_val, _),
+        op_indirect(mem_sym, _, _, _, _, _, sz),
+        stack_cmp_cond_site(addr, jcc_addr, _),
+        pjcc(jcc_addr, testcond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        next(jcc_addr, fallthrough),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let sized_cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz),
+        let cond_with_imm = match sized_cond {
+            Condition::Ccomp(cmp) => Condition::Ccompimm(cmp, *imm_val),
+            Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, *imm_val),
+            Condition::Ccompl(cmp) => Condition::Ccomplimm(cmp, *imm_val),
+            Condition::Ccomplu(cmp) => Condition::Ccompluimm(cmp, *imm_val),
+            _ => sized_cond.clone(),
+        };
+
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*load_rtl, *reg_rtl2]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
+        escaped_cmp_value(_, addr, load_rtl),
+        pcmp(addr, mem_sym, reg_sym),
+        op_indirect(mem_sym, _, _, _, _, _, sz),
+        op_register(reg_sym, reg_str),
+        reg_rtl(addr, Mreg::x86(reg_str.to_string()), reg_rtl2),
+        stack_cmp_cond_site(addr, jcc_addr, _),
+        pjcc(jcc_addr, testcond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        next(jcc_addr, fallthrough),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz);
+
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*reg_rtl2, *load_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
+        escaped_cmp_value(_, addr, load_rtl),
+        pcmp(addr, reg_sym, mem_sym),
+        op_register(reg_sym, reg_str),
+        op_indirect(mem_sym, _, _, _, _, _, sz),
+        reg_rtl(addr, Mreg::x86(reg_str.to_string()), reg_rtl2),
+        stack_cmp_cond_site(addr, jcc_addr, _),
+        pjcc(jcc_addr, testcond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        next(jcc_addr, fallthrough),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz);
+
+    // Compare-only stack reads have no Mach/LTL load from which to seed an SSA
+    // stack identity, so seed it at the point-local slot used by stack def-use.
+    stack_xtl(func_start, addr, slot, rtl_reg) <--
+        scalar_stack_cmp_var_slot(func_start, addr, slot),
+        !cmp_reads_escaped_stack_storage(addr),
+        let rtl_reg = fresh_stack_slot_reg(*addr);
+
+    #[local] relation cmp_uses_scalar_stack_slot(Address);
+    cmp_uses_scalar_stack_slot(addr) <--
+        scalar_stack_cmp_var_slot(func_start, addr, slot),
+        stack_var(func_start, addr, slot, _);
+    cmp_uses_scalar_stack_slot(addr) <--
+        cmp_reads_escaped_stack_storage(addr);
+
+    temp_cmp_reg(addr, fresh_reg) <--
+        pcmp(addr, r1, r2),
+        op_register(r1, _),
+        op_indirect(r2, _, _, _, _, _, _),
+        let fresh_reg = fresh_xtl_reg(*addr, Mreg::x86("RTEMP"));
+
+    temp_cmp_mreg_args(addr, pos, mreg) <--
+        pcmp(addr, r1, r2),
+        op_register(r1, _),
+        op_indirect(r2, _, base_str, idx_str, scale, disp, _),
+        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
+        let res = transl_addressing_rev(addrmode, None),
+        if res.is_ok(),
+        let (_, mreg_vec) = res.unwrap(),
+        for (pos, mreg) in mreg_vec.into_iter().enumerate();
+
+    // A RIP-relative memory operand has no address GPR, so the generic
+    // transl_addressing_rev path below cannot materialize its load.  Resolve
+    // the PC-relative target explicitly for both operand orders; the loaded
+    // temporary is then consumed by the existing Icond-at-JCC rules.
+    rtl_inst_candidate(addr, RTLInst::Iload(chunk, Addressing::Aglobal(target_addr, 0), Arc::new(vec![]), *fresh_reg)) <--
+        pcmp(addr, r1, r2),
+        op_register(r1, _),
+        op_indirect(r2, _, base_str, idx_str, _, disp, sz),
+        if is_rip(base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        instruction(addr, insn_size, _, _, _, _, _, _, _, _),
+        temp_cmp_reg(addr, fresh_reg),
+        let target_addr = (*addr as i64 + *insn_size as i64 + *disp) as Ident,
+        let chunk = match *sz { 1 => MemoryChunk::MInt8Unsigned, 2 => MemoryChunk::MInt16Unsigned, 8 => MemoryChunk::MInt64, _ => MemoryChunk::MInt32 };
+
+    rtl_inst_candidate(addr, RTLInst::Iload(chunk, addressing.clone(), mreg_args, *fresh_reg)) <--
+        pcmp(addr, r1, r2),
+        op_register(r1, _),
+        op_indirect(r2, _, base_str, idx_str, scale, disp, sz),
+        instr_in_function(addr, cmp_func),
+        !cmp_uses_scalar_stack_slot(addr),
+        !frameless_bp_cmp_mem(_, addr, _, _),
+        temp_cmp_reg(addr, fresh_reg),
+        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
+        let res = transl_addressing_rev(addrmode, None),
+        if res.is_ok(),
+        let (addressing, _) = res.unwrap(),
+        agg mreg_args = build_call_args(pos, rtl_reg) in temp_cmp_args_rtl(addr, pos, rtl_reg),
+        let chunk = match *sz { 1 => MemoryChunk::MInt8Unsigned, 2 => MemoryChunk::MInt16Unsigned, 8 => MemoryChunk::MInt64, _ => MemoryChunk::MInt32 };
+
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*reg_rtl, *fresh_reg]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
+        pcmp(addr, r1, r2),
+        op_register(r1, reg_str),
+        op_indirect(r2, _, _, _, _, _, sz),
+        instr_in_function(addr, cmp_func),
+        !cmp_uses_scalar_stack_slot(addr),
+        temp_cmp_reg(addr, fresh_reg),
+        let mreg = Mreg::x86(reg_str),
+        reg_rtl(addr, mreg, reg_rtl),
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, test_cond, lbl),
+        symbol_resolved_addr(*lbl, target_addr),
+        instr_in_function(target_addr, target_func_start),
+        instr_in_function(jcc_addr, my_func_start),
+        if target_func_start == my_func_start,
+        next(jcc_addr, fallthrough),
+        let raw_cond = condition_for_testcond(*test_cond),
+        let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz);
+
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*reg_rtl, *fresh_reg]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
+        pcmp(addr, r1, r2),
+        op_register(r1, reg_str),
+        op_indirect(r2, _, _, _, _, _, sz),
+        instr_in_function(addr, cmp_func),
+        !cmp_uses_scalar_stack_slot(addr),
+        temp_cmp_reg(addr, fresh_reg),
+        let mreg = Mreg::x86(reg_str),
+        reg_rtl(addr, mreg, reg_rtl),
+        flags_and_jump_pair(addr, jcc_addr, _),
+        pjcc(jcc_addr, test_cond, lbl),
+        symbol_resolved_addr(*lbl, target_addr),
+        instr_in_function(target_addr, target_func_start),
+        instr_in_function(jcc_addr, my_func_start),
+        if target_func_start == my_func_start,
+        next(jcc_addr, fallthrough),
+        let raw_cond = condition_for_testcond(*test_cond),
+        let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz);
+
+    temp_cmp_reg(addr, fresh_reg) <--
+        pcmp(addr, r1, r2),
+        op_indirect(r1, _, _, _, _, _, _),
+        op_register(r2, _),
+        let fresh_reg = fresh_xtl_reg(*addr, Mreg::x86("RTEMP"));
+
+    temp_cmp_mreg_args(addr, pos, mreg) <--
+        pcmp(addr, r1, r2),
+        op_indirect(r1, _, base_str, idx_str, scale, disp, _),
+        op_register(r2, _),
+        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
+        let res = transl_addressing_rev(addrmode, None),
+        if res.is_ok(),
+        let (_, mreg_vec) = res.unwrap(),
+        for (pos, mreg) in mreg_vec.into_iter().enumerate();
+
+    rtl_inst_candidate(addr, RTLInst::Iload(chunk, Addressing::Aglobal(target_addr, 0), Arc::new(vec![]), *fresh_reg)) <--
+        pcmp(addr, r1, r2),
+        op_indirect(r1, _, base_str, idx_str, _, disp, sz),
+        op_register(r2, _),
+        if is_rip(base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        instruction(addr, insn_size, _, _, _, _, _, _, _, _),
+        temp_cmp_reg(addr, fresh_reg),
+        let target_addr = (*addr as i64 + *insn_size as i64 + *disp) as Ident,
+        let chunk = match *sz { 1 => MemoryChunk::MInt8Unsigned, 2 => MemoryChunk::MInt16Unsigned, 8 => MemoryChunk::MInt64, _ => MemoryChunk::MInt32 };
+
+    rtl_inst_candidate(addr, RTLInst::Iload(chunk, addressing.clone(), mreg_args, *fresh_reg)) <--
+        pcmp(addr, r1, r2),
+        op_indirect(r1, _, base_str, idx_str, scale, disp, sz),
+        op_register(r2, _),
+        instr_in_function(addr, cmp_func),
+        !cmp_uses_scalar_stack_slot(addr),
+        !frameless_bp_cmp_mem(_, addr, _, _),
+        temp_cmp_reg(addr, fresh_reg),
+        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
+        let res = transl_addressing_rev(addrmode, None),
+        if res.is_ok(),
+        let (addressing, _) = res.unwrap(),
+        agg mreg_args = build_call_args(pos, rtl_reg) in temp_cmp_args_rtl(addr, pos, rtl_reg),
+        let chunk = match *sz { 1 => MemoryChunk::MInt8Unsigned, 2 => MemoryChunk::MInt16Unsigned, 8 => MemoryChunk::MInt64, _ => MemoryChunk::MInt32 };
+
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*fresh_reg, *reg_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
+        pcmp(addr, r1, r2),
+        op_indirect(r1, _, _, _, _, _, sz),
+        op_register(r2, reg_str),
+        instr_in_function(addr, cmp_func),
+        !cmp_uses_scalar_stack_slot(addr),
+        temp_cmp_reg(addr, fresh_reg),
+        let mreg = Mreg::x86(reg_str),
+        reg_rtl(addr, mreg, reg_rtl),
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, test_cond, lbl),
+        symbol_resolved_addr(*lbl, target_addr),
+        instr_in_function(target_addr, target_func_start),
+        instr_in_function(jcc_addr, my_func_start),
+        if target_func_start == my_func_start,
+        next(jcc_addr, fallthrough),
+        let raw_cond = condition_for_testcond(*test_cond),
+        let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz);
+
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, Arc::new(vec![*fresh_reg, *reg_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
+        pcmp(addr, r1, r2),
+        op_indirect(r1, _, _, _, _, _, sz),
+        op_register(r2, reg_str),
+        instr_in_function(addr, cmp_func),
+        !cmp_uses_scalar_stack_slot(addr),
+        temp_cmp_reg(addr, fresh_reg),
+        let mreg = Mreg::x86(reg_str),
+        reg_rtl(addr, mreg, reg_rtl),
+        flags_and_jump_pair(addr, jcc_addr, _),
+        pjcc(jcc_addr, test_cond, lbl),
+        symbol_resolved_addr(*lbl, target_addr),
+        instr_in_function(target_addr, target_func_start),
+        instr_in_function(jcc_addr, my_func_start),
+        if target_func_start == my_func_start,
+        next(jcc_addr, fallthrough),
+        let raw_cond = condition_for_testcond(*test_cond),
+        let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz);
+
+    // The instruction relation is source-first.  Preserve a CMP's flag use
+    // across intervening flag-neutral instructions (for example `mov`) by
+    // pairing it structurally with its JCC rather than requiring adjacency.
+    rtl_inst_candidate(*jcc_addr, RTLInst::Icond(cond, args.clone(), Either::Right(*target_addr), Either::Right(*fallthrough))) <--
+        instruction(addr, _, _, mnem, imm_sym, mem_sym, _, _, _, _),
+        if mnem.starts_with("CMP"),
+        op_immediate(imm_sym, imm_val, _),
+        op_indirect(mem_sym, _, base_str, idx_str, _, _, sz),
+        if (!base_str.ends_with("BP") && !base_str.ends_with("SP")) || (*idx_str != "NONE" && !idx_str.is_empty()),
+        flags_and_jump_pair(addr, jcc_addr, _),
+        pjcc(jcc_addr, test_cond, lbl),
+        temp_cmp_reg(addr, fresh_reg),
+        symbol_resolved_addr(*lbl, target_addr),
+        instr_in_function(target_addr, target_func_start),
+        instr_in_function(jcc_addr, my_func_start),
+        if target_func_start == my_func_start,
+        next(jcc_addr, fallthrough),
+        let raw_cond = condition_for_testcond(*test_cond),
+        let sized_cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz),
+        let cond = match sized_cond {
+             Condition::Ccomp(c)  => Condition::Ccompimm(c, *imm_val),
+             Condition::Ccompu(c) => Condition::Ccompuimm(c, *imm_val),
+             Condition::Ccompl(c)  => Condition::Ccomplimm(c, *imm_val),
+             Condition::Ccomplu(c) => Condition::Ccompluimm(c, *imm_val),
+             _ => Condition::Ccomp(Comparison::Unknown),
+        },
+        let args = Arc::new(vec![*fresh_reg]);
+
+    // CMP+SETcc fusion where one CMP operand is genuine memory: emit the boolean as an Ocmp into the SETcc's destination consuming the already-loaded fresh_reg; gated !stack_var so named slots stay on the stack path.
+    relation setcc_testcond(Address, TestCond);
+    setcc_testcond(addr, tc) <--
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if let Some(tc) = setcc_mnem_testcond(mnem);
+
+    // pcmp(r1=indirect mem, r2=register): Ocmp([loaded_mem, reg], cond).
+    // Use asm's structural flags-origin link rather than raw adjacency so a
+    // flag-neutral scheduled instruction between CMP and SETcc does not sever
+    // the value definition.
+    rtl_inst_candidate(*setcc_addr, RTLInst::Iop(Operation::Ocmp(cond), Arc::new(vec![*fresh_reg, *reg_rtl]), *dst_rtl)) <--
+        pcmp(addr, r1, r2),
+        op_indirect(r1, _, _, _, _, _, sz),
+        op_register(r2, reg_str),
+        instr_in_function(addr, cmp_func),
+        !cmp_uses_scalar_stack_slot(addr),
+        temp_cmp_reg(addr, fresh_reg),
+        let cmp_mreg = Mreg::x86(reg_str),
+        reg_rtl(addr, cmp_mreg, reg_rtl),
+        setcc_compare_site(setcc_addr, addr),
+        setcc_testcond(setcc_addr, test_cond),
+        instruction(setcc_addr, _, _, _, dst_sym, _, _, _, _, _),
+        op_register(dst_sym, dst_str),
+        reg_rtl(setcc_addr, Mreg::x86(dst_str), dst_rtl),
+        let raw_cond = condition_for_testcond(*test_cond),
+        let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz);
+
+    // pcmp(r1=register, r2=indirect mem): Ocmp([reg, loaded_mem], cond).
+    rtl_inst_candidate(*setcc_addr, RTLInst::Iop(Operation::Ocmp(cond), Arc::new(vec![*reg_rtl, *fresh_reg]), *dst_rtl)) <--
+        pcmp(addr, r1, r2),
+        op_register(r1, reg_str),
+        op_indirect(r2, _, _, _, _, _, sz),
+        instr_in_function(addr, cmp_func),
+        !cmp_uses_scalar_stack_slot(addr),
+        temp_cmp_reg(addr, fresh_reg),
+        let cmp_mreg = Mreg::x86(reg_str),
+        reg_rtl(addr, cmp_mreg, reg_rtl),
+        setcc_compare_site(setcc_addr, addr),
+        setcc_testcond(setcc_addr, test_cond),
+        instruction(setcc_addr, _, _, _, dst_sym, _, _, _, _, _),
+        op_register(dst_sym, dst_str),
+        reg_rtl(setcc_addr, Mreg::x86(dst_str), dst_rtl),
+        let raw_cond = condition_for_testcond(*test_cond),
+        let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz);
+
+    // cmp [mem],imm with a non-stack base feeding SETcc: Ocmp([loaded_mem],
+    // Ccompimm), with the Iload produced by the CMP-mem-imm rules above and
+    // the immediate baked into the condition.  pcmp has already normalized
+    // the decoder's source-first instruction operands to destination-first;
+    // matching the raw instruction tuple here reverses memory and immediate.
+    rtl_inst_candidate(*setcc_addr, RTLInst::Iop(Operation::Ocmp(cond), Arc::new(vec![*fresh_reg]), *dst_rtl)) <--
+        pcmp(addr, mem_sym, imm_sym),
+        op_indirect(mem_sym, _, base_str, idx_str, _, _, _),
+        op_immediate(imm_sym, imm_val, _),
+        if (!base_str.ends_with("BP") && !base_str.ends_with("SP")) || (*idx_str != "NONE" && !idx_str.is_empty()),
+        temp_cmp_reg(addr, fresh_reg),
+        setcc_compare_site(setcc_addr, addr),
+        setcc_testcond(setcc_addr, test_cond),
+        instruction(setcc_addr, _, _, _, dst_sym, _, _, _, _, _),
+        op_register(dst_sym, dst_str),
+        reg_rtl(setcc_addr, Mreg::x86(dst_str), dst_rtl),
+        let cond = match condition_for_testcond(*test_cond) {
+             Condition::Ccomp(c)  => Condition::Ccompimm(c, *imm_val),
+             Condition::Ccompu(c) => Condition::Ccompuimm(c, *imm_val),
+             other => other,
+        };
+
+    // Lower a 128-bit PSHUFD broadcast store into four scalar dword stores.
+    // Address operands and the scalar source are resolved through their normal
+    // SSA identities; the generic undefined-XMM store is suppressed only when
+    // this complete replacement is ready.
+    #[local] relation simd_dword_broadcast_ready(Address, Addressing, Args, RTLReg);
+    simd_dword_broadcast_ready(store_addr, addressing.clone(), Arc::new(vec![*base_rtl]), *value_rtl) <--
+        simd_dword_broadcast_store(store_addr, value_addr, base_str, idx_str, scale, disp, value_mreg),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
+        let translated = transl_addressing_rev(addrmode, None),
+        if translated.is_ok(),
+        let (addressing, _) = translated.unwrap(),
+        let base_mreg = Mreg::x86(base_str),
+        reg_rtl(store_addr, base_mreg, base_rtl),
+        reg_rtl(value_addr, *value_mreg, value_rtl);
+
+    simd_dword_broadcast_ready(store_addr, addressing.clone(), Arc::new(vec![*base_rtl, *idx_rtl]), *value_rtl) <--
+        simd_dword_broadcast_store(store_addr, value_addr, base_str, idx_str, scale, disp, value_mreg),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
+        let translated = transl_addressing_rev(addrmode, None),
+        if translated.is_ok(),
+        let (addressing, _) = translated.unwrap(),
+        let base_mreg = Mreg::x86(base_str),
+        let idx_mreg = Mreg::x86(idx_str),
+        reg_rtl(store_addr, base_mreg, base_rtl),
+        reg_rtl(store_addr, idx_mreg, idx_rtl),
+        reg_rtl(value_addr, *value_mreg, value_rtl);
+
+    #[local] relation simd_broadcast_lane(Address, i64, Node);
+    simd_broadcast_lane(addr, 0, *addr) <-- simd_dword_broadcast_store(addr, _, _, _, _, _, _);
+    simd_broadcast_lane(addr, 4, lane) <--
+        simd_dword_broadcast_store(addr, _, _, _, _, _, _),
+        let lane = simd_broadcast_lane_node(*addr, 1);
+    simd_broadcast_lane(addr, 8, lane) <--
+        simd_dword_broadcast_store(addr, _, _, _, _, _, _),
+        let lane = simd_broadcast_lane_node(*addr, 2);
+    simd_broadcast_lane(addr, 12, lane) <--
+        simd_dword_broadcast_store(addr, _, _, _, _, _, _),
+        let lane = simd_broadcast_lane_node(*addr, 3);
+
+    rtl_inst_candidate(lane_node, RTLInst::Istore(MemoryChunk::MInt32, lane_addressing, args.clone(), *value_rtl)) <--
+        simd_dword_broadcast_ready(addr, addressing, args, value_rtl),
+        simd_broadcast_lane(addr, delta, lane_node),
+        if let Some(lane_addressing) = offset_addressing(addressing, *delta);
+
+    rtl_edge_negated(addr, next_node) <--
+        simd_dword_broadcast_store(addr, _, _, _, _, _, _),
+        rtl_next(addr, next_node);
+
+    rtl_edge_negated(addr, jcc_addr) <--
+        simd_dword_broadcast_store(addr, _, _, _, _, _, _),
+        next_is_materialized_branch(addr, jcc_addr);
+
+    rtl_succ_candidate(addr, lane1), instr_in_function(lane1, *func_start) <--
+        simd_dword_broadcast_store(addr, _, _, _, _, _, _),
+        instr_in_function(addr, func_start),
+        let lane1 = simd_broadcast_lane_node(*addr, 1);
+    rtl_succ_candidate(lane1, lane2), instr_in_function(lane2, *func_start) <--
+        simd_dword_broadcast_store(addr, _, _, _, _, _, _),
+        instr_in_function(addr, func_start),
+        let lane1 = simd_broadcast_lane_node(*addr, 1),
+        let lane2 = simd_broadcast_lane_node(*addr, 2);
+    rtl_succ_candidate(lane2, lane3), instr_in_function(lane3, *func_start) <--
+        simd_dword_broadcast_store(addr, _, _, _, _, _, _),
+        instr_in_function(addr, func_start),
+        let lane2 = simd_broadcast_lane_node(*addr, 2),
+        let lane3 = simd_broadcast_lane_node(*addr, 3);
+    rtl_succ_candidate(lane3, next_node) <--
+        simd_dword_broadcast_store(addr, _, _, _, _, _, _),
+        rtl_next(addr, next_node),
+        !next_is_materialized_branch(addr, _),
+        let lane3 = simd_broadcast_lane_node(*addr, 3);
+
+    rtl_succ_candidate(lane3, jcc_addr) <--
+        simd_dword_broadcast_store(addr, _, _, _, _, _, _),
+        next_is_materialized_branch(addr, jcc_addr),
+        let lane3 = simd_broadcast_lane_node(*addr, 3);
+
+    // A store whose next address lifted to nothing -- alignment padding before a
+    // loop header, or a SIMD interleave that is folded into its consumer -- has
+    // no ltl_fallthrough at all, since that rule demands the next address carry
+    // an instruction.  The lane chain then has no exit while still displacing
+    // the textual fallthrough downstream, so the rest of the function becomes
+    // unreachable.  Walk forward to the next lifted instruction instead, the
+    // same scoped skip the SP-indexed synths use.
+    rtl_succ_candidate(lane3, dst) <--
+        simd_dword_broadcast_store(addr, _, _, _, _, _, _),
+        instr_in_function(addr, func_start),
+        next(addr, mid),
+        !ltl_inst(*mid, _),
+        !next_is_materialized_branch(addr, _),
+        instr_in_function(*mid, func_start),
+        sp_synth_skip_to_ltl(*mid, *func_start, dst),
+        let lane3 = simd_broadcast_lane_node(*addr, 3);
+
+    // Legacy MOVHPS has two simultaneous effects: preserve the low XMM lane
+    // (the ordinary LTL Omove at addr) and load a memory quadword into the high
+    // lane. Materialize that load on a private node. A frame-plus-index source
+    // needs the same explicit Ainstack base split as the other SP/BP-indexed
+    // operations, so it uses two private nodes; all other forms use one.
+    #[local] relation movhps_hi_direct_ready(Address, Addressing, Args, Mreg);
+    #[local] relation movhps_hi_stack_ready(Address, i64, i64, RTLReg, Mreg);
+    // Addressability is deliberately independent of SSA resolution. Using a
+    // reg_rtl-backed readiness fact to decide CFG takeover puts function
+    // ownership in the same fixpoint as value numbering and breaks the
+    // stratified call-target aggregations (the same boundary as wide stores).
+    #[local] relation movhps_hi_addressable(Address, bool);
+    #[local] relation movhps_hi_chain_tail(Address, Node);
+
+    movhps_hi_addressable(*addr, false) <--
+        movhps_hi_load(addr, _, _, idx, _, _, true),
+        if *idx == "NONE" || idx.is_empty();
+    movhps_hi_addressable(*addr, true) <--
+        movhps_hi_load(addr, _, _, idx, _, _, true),
+        if *idx != "NONE" && !idx.is_empty();
+    movhps_hi_addressable(*addr, false) <--
+        movhps_hi_load(addr, _, base, idx, _, _, false),
+        if is_rip(base),
+        if *idx == "NONE" || idx.is_empty(),
+        rip_target_addr(addr, target),
+        resolved_addr_to_symbol(target, _, _);
+    movhps_hi_addressable(*addr, false) <--
+        movhps_hi_load(addr, _, base, idx, _, disp, false),
+        if (*base == "NONE" || base.is_empty()) && (*idx == "NONE" || idx.is_empty()),
+        resolved_addr_to_symbol(*disp as Address, _, _);
+    movhps_hi_addressable(*addr, false) <--
+        movhps_hi_load(addr, _, base, _, _, _, false),
+        if *base != "NONE" && !base.is_empty(),
+        if !is_rip(base);
+    movhps_hi_addressable(*addr, false) <--
+        movhps_hi_load(addr, _, base, idx, _, _, false),
+        if *base == "NONE" || base.is_empty(),
+        if *idx != "NONE" && !idx.is_empty();
+
+    movhps_hi_direct_ready(*addr, Addressing::Ainstack(*disp), Arc::new(vec![]), *dst) <--
+        movhps_hi_load(addr, dst, _, idx, _, disp, true),
+        if *idx == "NONE" || idx.is_empty();
+
+    movhps_hi_direct_ready(*addr, Addressing::Aglobal(*ident, *ofs), Arc::new(vec![]), *dst) <--
+        movhps_hi_load(addr, dst, base, idx, _, _, false),
+        if is_rip(base),
+        if *idx == "NONE" || idx.is_empty(),
+        rip_target_addr(addr, target),
+        resolved_addr_to_symbol(target, ident, ofs);
+
+    movhps_hi_direct_ready(*addr, Addressing::Aglobal(*ident, *ofs), Arc::new(vec![]), *dst) <--
+        movhps_hi_load(addr, dst, base, idx, _, disp, false),
+        if (*base == "NONE" || base.is_empty()) && (*idx == "NONE" || idx.is_empty()),
+        resolved_addr_to_symbol(*disp as Address, ident, ofs);
+
+    movhps_hi_direct_ready(*addr, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), *dst) <--
+        movhps_hi_load(addr, dst, base, idx, _, disp, false),
+        if *base != "NONE" && !base.is_empty(),
+        if !is_rip(base),
+        if *idx == "NONE" || idx.is_empty(),
+        let base_mreg = Mreg::x86(base),
+        reg_rtl(addr, base_mreg, base_rtl);
+
+    movhps_hi_direct_ready(*addr, addressing, Arc::new(vec![*base_rtl, *idx_rtl]), *dst) <--
+        movhps_hi_load(addr, dst, base, idx, scale, disp, false),
+        if *base != "NONE" && !base.is_empty(),
+        if !is_rip(base),
+        if *idx != "NONE" && !idx.is_empty(),
+        let base_mreg = Mreg::x86(base),
+        let idx_mreg = Mreg::x86(idx),
+        reg_rtl(addr, base_mreg, base_rtl),
+        reg_rtl(addr, idx_mreg, idx_rtl),
+        let addressing = if *scale > 1 {
+            Addressing::Aindexed2scaled(*scale, *disp)
+        } else {
+            Addressing::Aindexed2(*disp)
+        };
+
+    movhps_hi_direct_ready(*addr, Addressing::Ascaled(*scale, *disp), Arc::new(vec![*idx_rtl]), *dst) <--
+        movhps_hi_load(addr, dst, base, idx, scale, disp, false),
+        if *base == "NONE" || base.is_empty(),
+        if *idx != "NONE" && !idx.is_empty(),
+        let idx_mreg = Mreg::x86(idx),
+        reg_rtl(addr, idx_mreg, idx_rtl);
+
+    movhps_hi_stack_ready(*addr, *scale, *disp, *idx_rtl, *dst) <--
+        movhps_hi_load(addr, dst, _, idx, scale, disp, true),
+        if *idx != "NONE" && !idx.is_empty(),
+        let idx_mreg = Mreg::x86(idx),
+        reg_rtl(addr, idx_mreg, idx_rtl);
+
+    rtl_inst_candidate(synth, inst) <--
+        movhps_hi_direct_ready(addr, addressing, args, _),
+        let synth = *addr | (1u64 << 62),
+        let high_rtl = fresh_xmm_hi_value_reg(*addr),
+        let inst = RTLInst::Iload(MemoryChunk::MAny64, addressing.clone(), args.clone(), high_rtl);
+
+    rtl_inst_candidate(base_node, inst) <--
+        movhps_hi_stack_ready(addr, _, disp, _, _),
+        instr_in_function(addr, func_start),
+        let base_node = *addr | (1u64 << 62),
+        let base_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let inst = RTLInst::Iop(Operation::Olea(Addressing::Ainstack(*disp)), Arc::new(vec![]), base_rtl);
+
+    // The frame-base identity is structural and does not depend on resolving
+    // the index value.  Keeping it on movhps_hi_stack_ready feeds reg_rtl back
+    // into stack alias construction, which prevents the canonical-value
+    // lattice from being cleanly finalized before its consumers run.
+    indexed_synth_stack_base(func_start, base_node, *disp, base_rtl) <--
+        movhps_hi_load(addr, _, _, idx, _, disp, true),
+        if *idx != "NONE" && !idx.is_empty(),
+        instr_in_function(addr, func_start),
+        let base_node = *addr | (1u64 << 62),
+        let base_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE;
+
+    rtl_inst_candidate(load_node, inst) <--
+        movhps_hi_stack_ready(addr, scale, _, idx_rtl, _),
+        let load_node = *addr | (1u64 << 63),
+        let base_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let addressing = if *scale > 1 {
+            Addressing::Aindexed2scaled(*scale, 0)
+        } else {
+            Addressing::Aindexed2(0)
+        },
+        let high_rtl = fresh_xmm_hi_value_reg(*addr),
+        let inst = RTLInst::Iload(MemoryChunk::MAny64, addressing, Arc::new(vec![base_rtl, *idx_rtl]), high_rtl);
+
+    movhps_hi_chain_tail(addr, synth) <--
+        movhps_hi_addressable(addr, false),
+        let synth = *addr | (1u64 << 62);
+    movhps_hi_chain_tail(addr, synth) <--
+        movhps_hi_addressable(addr, true),
+        let synth = *addr | (1u64 << 63);
+
+    rtl_edge_negated(addr, next_node) <--
+        movhps_hi_chain_tail(addr, _),
+        rtl_next(addr, next_node);
+    rtl_edge_negated(addr, jcc_addr) <--
+        movhps_hi_chain_tail(addr, _),
+        next_is_materialized_branch(addr, jcc_addr);
+
+    rtl_succ_candidate(addr, synth), instr_in_function(synth, *func_start) <--
+        movhps_hi_addressable(addr, false),
+        instr_in_function(addr, func_start),
+        let synth = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(addr, base_node), instr_in_function(base_node, *func_start) <--
+        movhps_hi_addressable(addr, true),
+        instr_in_function(addr, func_start),
+        let base_node = *addr | (1u64 << 62);
+    rtl_succ_candidate(base_node, load_node), instr_in_function(load_node, *func_start) <--
+        movhps_hi_addressable(addr, true),
+        instr_in_function(addr, func_start),
+        let base_node = *addr | (1u64 << 62),
+        let load_node = *addr | (1u64 << 63);
+
+    rtl_succ_candidate(tail, next_node) <--
+        movhps_hi_chain_tail(addr, tail),
+        rtl_next(addr, next_node),
+        !next_is_materialized_branch(addr, _);
+    rtl_succ_candidate(tail, jcc_addr) <--
+        movhps_hi_chain_tail(addr, tail),
+        next_is_materialized_branch(addr, jcc_addr);
+    rtl_succ_candidate(tail, dst) <--
+        movhps_hi_chain_tail(addr, tail),
+        instr_in_function(addr, func_start),
+        next(addr, mid),
+        !ltl_inst(*mid, _),
+        !next_is_materialized_branch(addr, _),
+        instr_in_function(*mid, func_start),
+        sp_synth_skip_to_ltl(*mid, *func_start, dst);
+
+    // Upper half of a 16-byte frame move.  asm_pass resolved what the XMM's
+    // high lane holds; here it becomes a second frame-cell move, on a private
+    // synthetic node because one node carries one RTL instruction.  Without it
+    // the odd frame cells of every SSE-initialized stack aggregate stay unwritten,
+    // which both loses their contents and breaks the object into scalars.
+    stack_xtl(func_start, *addr, *hi_ofs, rtl) <--
+        xmm_hi_frame_store(addr, hi_ofs, _, _, _, _),
+        instr_in_function(addr, func_start),
+        let rtl = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_XMM_HI;
+
+    stack_xtl(func_start, *addr, hi_ofs, rtl) <--
+        sse_wide_frame_load(addr, _, ofs),
+        instr_in_function(addr, func_start),
+        let hi_ofs = *ofs + 8,
+        !stack_def_used(_, _, _, addr, _, hi_ofs),
+        let rtl = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_XMM_HI;
+
+    rtl_inst_candidate(synth, inst) <--
+        xmm_hi_frame_store(addr, hi_ofs, 0, _, _, _),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, hi_ofs, dst_rtl),
+        let synth = xmm_hi_lane_node(*addr),
+        let inst = RTLInst::Iop(Operation::Ointconst(0), Arc::new(vec![]), *dst_rtl);
+
+    rtl_inst_candidate(synth, inst) <--
+        xmm_hi_frame_store(addr, hi_ofs, 1, src_mreg, _, site),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, hi_ofs, dst_rtl),
+        reg_def_used(def_addr, *src_mreg, *site),
+        def_value_rtl(def_addr, *src_mreg, src_rtl),
+        let synth = xmm_hi_lane_node(*addr),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*src_rtl]), *dst_rtl);
+
+    rtl_inst_candidate(synth, inst) <--
+        xmm_hi_frame_store(addr, hi_ofs, 2, _, src_ofs, load_addr),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, hi_ofs, dst_rtl),
+        let src_hi_ofs = *src_ofs + 8,
+        stack_var(func_start, load_addr, src_hi_ofs, src_rtl),
+        let synth = xmm_hi_lane_node(*addr),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*src_rtl]), *dst_rtl);
+
+    // Kind 3: the aggregate's initializer is a 16-byte constant in .rodata, so the high
+    // cell is the quadword 8 bytes past it -- the SAME symbol the low lane loads, at
+    // offset+8.  Naming it by its raw address instead would reference an object no
+    // declaration covers, and the load is then dropped and the cell written with a
+    // default 0 rather than the constant that belongs there.
+    rtl_inst_candidate(synth, inst) <--
+        xmm_hi_frame_store(addr, hi_ofs, 3, _, const_addr, _),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, hi_ofs, dst_rtl),
+        resolved_addr_to_symbol(*const_addr as Address, ident, offset),
+        let synth = xmm_hi_lane_node(*addr),
+        let inst = RTLInst::Iload(MemoryChunk::MInt64, Addressing::Aglobal(*ident, *offset + 8), Arc::new(vec![]), *dst_rtl);
+
+    // Kind 4 is already loaded at its MOVHPS site. Copy that explicit high-lane
+    // pseudo into the destination cell; the readiness guard prevents a source
+    // whose addressing could not be materialized from becoming an undefined
+    // value at the later wide store.
+    rtl_inst_candidate(synth, inst) <--
+        xmm_hi_frame_store(addr, hi_ofs, 4, _, _, load_addr),
+        movhps_hi_addressable(load_addr, _),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, hi_ofs, dst_rtl),
+        let src_rtl = fresh_xmm_hi_value_reg(*load_addr),
+        let synth = xmm_hi_lane_node(*addr),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![src_rtl]), *dst_rtl);
+
+    // Kind 5 is the upper quadword of a self PCMPEQx all-ones idiom.  It is a
+    // 64-bit bit-pattern constant, matching the MAny64 cell written here.
+    rtl_inst_candidate(synth, inst) <--
+        xmm_hi_frame_store(addr, hi_ofs, 5, _, _, _),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, hi_ofs, dst_rtl),
+        let synth = xmm_hi_lane_node(*addr),
+        let inst = RTLInst::Iop(Operation::Olongconst(-1), Arc::new(vec![]), *dst_rtl);
+
+    // A cmp+jcc pair with instructions scheduled between them materializes its
+    // Icond AT the jcc, and the pairing wires the jcc's textual predecessor to
+    // it; rtl_next still names the LTL fallthrough PAST the branch.  A chain
+    // that takes over such a predecessor must exit INTO the branch: exiting to
+    // rtl_next would skip the condition, and the surviving direct edge would
+    // fork the store -- touch's -r path lost its `flex_date == 0` guard
+    // exactly that way and called parse_datetime on a null date.
+    #[local] relation next_is_materialized_branch(Address, Node);
+    next_is_materialized_branch(addr, *jcc_addr) <--
+        next(addr, jcc_addr),
+        icond_at_jcc(jcc_addr, _, _);
+    // The Icond fact itself is sufficient. Some relocated/fused condition
+    // paths no longer retain the raw pjcc row that icond_at_jcc uses, but a
+    // synthetic predecessor must still hand control to that condition rather
+    // than skip to either arm.
+    next_is_materialized_branch(addr, *jcc_addr) <--
+        next(addr, jcc_addr),
+        rtl_inst_candidate(jcc_addr, ?RTLInst::Icond(_, _, _, _));
+
+    rtl_edge_negated(addr, next_node) <--
+        xmm_hi_frame_store(addr, _, _, _, _, _),
+        rtl_next(addr, next_node);
+
+    rtl_edge_negated(addr, jcc_addr) <--
+        xmm_hi_frame_store(addr, _, _, _, _, _),
+        next_is_materialized_branch(addr, jcc_addr);
+
+    rtl_succ_candidate(addr, synth), instr_in_function(synth, *func_start) <--
+        xmm_hi_frame_store(addr, _, _, _, _, _),
+        instr_in_function(addr, func_start),
+        let synth = xmm_hi_lane_node(*addr);
+
+    rtl_succ_candidate(synth, next_node) <--
+        xmm_hi_frame_store(addr, _, _, _, _, _),
+        rtl_next(addr, next_node),
+        !next_is_materialized_branch(addr, _),
+        let synth = xmm_hi_lane_node(*addr);
+
+    rtl_succ_candidate(synth, jcc_addr) <--
+        xmm_hi_frame_store(addr, _, _, _, _, _),
+        next_is_materialized_branch(addr, jcc_addr),
+        let synth = xmm_hi_lane_node(*addr);
+
+    // The last store of an SSE-initialized aggregate is regularly followed by
+    // alignment padding, which lifts to nothing and so leaves the store without
+    // an ltl_fallthrough.  Taking over the textual fallthrough with a chain that
+    // then dead-ends would strand every instruction after the aggregate; walk to
+    // the next lifted instruction so the chain rejoins the function.
+    rtl_succ_candidate(synth, dst) <--
+        xmm_hi_frame_store(addr, _, _, _, _, _),
+        instr_in_function(addr, func_start),
+        next(addr, mid),
+        !ltl_inst(*mid, _),
+        // A materialized branch has no ltl_inst either, but it is not padding:
+        // the branch-exit rule above owns that case, and skipping past it
+        // would hand the chain a second, condition-free successor.
+        !next_is_materialized_branch(addr, _),
+        instr_in_function(*mid, func_start),
+        sp_synth_skip_to_ltl(*mid, *func_start, dst),
+        let synth = xmm_hi_lane_node(*addr);
+
+    // Upper half of a 16-byte store through a general register base.  The frame
+    // form above can write its cell directly, because a frame cell IS an RTL
+    // pseudo; a memory destination needs a real Istore, so the lane is built in
+    // two steps on two private nodes: compute the value, then store it at
+    // displacement+8.  Without it the odd quadword of every SSE-initialized
+    // heap record stays whatever the allocator left -- du's argv iterator reads
+    // its own +0x28 field back as a null pointer and dereferences it.
+    #[local] relation xmm_hi_mem_ready(Address, Addressing, Args);
+    xmm_hi_mem_ready(store_addr, hi_addressing.clone(), Arc::new(vec![*base_rtl])) <--
+        sse_wide_mem_store(store_addr, _, base_str, idx_str, scale, disp),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
+        let translated = transl_addressing_rev(addrmode, None),
+        if translated.is_ok(),
+        let (addressing, _) = translated.unwrap(),
+        if let Some(hi_addressing) = offset_addressing(&addressing, 8),
+        let base_mreg = Mreg::x86(base_str),
+        reg_rtl(store_addr, base_mreg, base_rtl);
+
+    xmm_hi_mem_ready(store_addr, hi_addressing.clone(), Arc::new(vec![*base_rtl, *idx_rtl])) <--
+        sse_wide_mem_store(store_addr, _, base_str, idx_str, scale, disp),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
+        let translated = transl_addressing_rev(addrmode, None),
+        if translated.is_ok(),
+        let (addressing, _) = translated.unwrap(),
+        if let Some(hi_addressing) = offset_addressing(&addressing, 8),
+        let base_mreg = Mreg::x86(base_str),
+        let idx_mreg = Mreg::x86(idx_str),
+        reg_rtl(store_addr, base_mreg, base_rtl),
+        reg_rtl(store_addr, idx_mreg, idx_rtl);
+
+    // A RIP-relative destination: the upper half lives at the destination
+    // symbol plus 8, with no register arguments at all.  Restating the target
+    // through its symbol is exactly what the low half's own Mstore lifting
+    // did, so the two halves land in one object.
+    xmm_hi_mem_ready(store_addr, hi_addressing.clone(), Arc::new(vec![])) <--
+        sse_wide_global_store(store_addr, _, target),
+        resolved_addr_to_symbol(target, ident, ofs),
+        let addressing = Addressing::Aglobal(*ident, *ofs),
+        if let Some(hi_addressing) = offset_addressing(&addressing, 8);
+
+    // One value rule per seed kind, exactly the six the frame form recovers,
+    // each defining the same fresh pseudo; the store below is written once and
+    // stays kind-agnostic, so a new seed kind needs one rule here and nothing else.
+    #[local] relation xmm_hi_mem_value(Address, RTLReg);
+    rtl_inst_candidate(value_node, inst), xmm_hi_mem_value(addr, value_rtl) <--
+        xmm_hi_mem_store(addr, 0, _, _, _),
+        let value_node = xmm_hi_lane_node(*addr),
+        let value_rtl = fresh_xmm_hi_value_reg(*addr),
+        let inst = RTLInst::Iop(Operation::Ointconst(0), Arc::new(vec![]), value_rtl);
+
+    rtl_inst_candidate(value_node, inst), xmm_hi_mem_value(addr, value_rtl) <--
+        xmm_hi_mem_store(addr, 1, src_mreg, _, site),
+        reg_def_used(def_addr, *src_mreg, *site),
+        def_value_rtl(def_addr, *src_mreg, src_rtl),
+        let value_node = xmm_hi_lane_node(*addr),
+        let value_rtl = fresh_xmm_hi_value_reg(*addr),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*src_rtl]), value_rtl);
+
+    rtl_inst_candidate(value_node, inst), xmm_hi_mem_value(addr, value_rtl) <--
+        xmm_hi_mem_store(addr, 2, _, src_ofs, load_addr),
+        instr_in_function(addr, func_start),
+        let src_hi_ofs = *src_ofs + 8,
+        stack_var(func_start, load_addr, src_hi_ofs, src_rtl),
+        let value_node = xmm_hi_lane_node(*addr),
+        let value_rtl = fresh_xmm_hi_value_reg(*addr),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*src_rtl]), value_rtl);
+
+    rtl_inst_candidate(value_node, inst), xmm_hi_mem_value(addr, value_rtl) <--
+        xmm_hi_mem_store(addr, 3, _, const_addr, _),
+        resolved_addr_to_symbol(*const_addr as Address, ident, offset),
+        let value_node = xmm_hi_lane_node(*addr),
+        let value_rtl = fresh_xmm_hi_value_reg(*addr),
+        let inst = RTLInst::Iload(MemoryChunk::MInt64, Addressing::Aglobal(*ident, *offset + 8), Arc::new(vec![]), value_rtl);
+
+    rtl_inst_candidate(value_node, inst), xmm_hi_mem_value(addr, value_rtl) <--
+        xmm_hi_mem_store(addr, 4, _, _, load_addr),
+        movhps_hi_addressable(load_addr, _),
+        let src_rtl = fresh_xmm_hi_value_reg(*load_addr),
+        let value_node = xmm_hi_lane_node(*addr),
+        let value_rtl = fresh_xmm_hi_value_reg(*addr),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![src_rtl]), value_rtl);
+
+    rtl_inst_candidate(value_node, inst), xmm_hi_mem_value(addr, value_rtl) <--
+        xmm_hi_mem_store(addr, 5, _, _, _),
+        let value_node = xmm_hi_lane_node(*addr),
+        let value_rtl = fresh_xmm_hi_value_reg(*addr),
+        let inst = RTLInst::Iop(Operation::Olongconst(-1), Arc::new(vec![]), value_rtl);
+
+    rtl_inst_candidate(store_node, inst) <--
+        xmm_hi_mem_ready(addr, hi_addressing, args),
+        xmm_hi_mem_value(addr, value_rtl),
+        let store_node = xmm_hi_store_node(*addr),
+        let inst = RTLInst::Istore(MemoryChunk::MAny64, hi_addressing.clone(), args.clone(), *value_rtl);
+
+    // The chain takes over the fallthrough, so its condition has to be decided
+    // from the store's own facts alone: an SSA-resolved condition would put
+    // instr_in_function in the same fixpoint as the value numbering it feeds.
+    // Both halves of the high lane are recoverable exactly when the store's
+    // addressing translates and its lane has a resolved source.
+    #[local] relation xmm_hi_mem_addressable(Address);
+    xmm_hi_mem_addressable(addr) <--
+        sse_wide_mem_store(addr, _, base_str, idx_str, scale, disp),
+        xmm_hi_mem_store(addr, _, _, _, _),
+        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
+        let translated = transl_addressing_rev(addrmode, None),
+        if translated.is_ok(),
+        let (addressing, _) = translated.unwrap(),
+        if offset_addressing(&addressing, 8).is_some();
+
+    // The RIP-relative form is buildable exactly when its target resolves to a
+    // symbol -- the same condition under which asm_pass lifted the low half at
+    // all -- and the +8 stays representable.
+    xmm_hi_mem_addressable(addr) <--
+        sse_wide_global_store(addr, _, target),
+        xmm_hi_mem_store(addr, _, _, _, _),
+        resolved_addr_to_symbol(target, ident, ofs),
+        let addressing = Addressing::Aglobal(*ident, *ofs),
+        if offset_addressing(&addressing, 8).is_some();
+
+    rtl_edge_negated(addr, next_node) <--
+        xmm_hi_mem_addressable(addr),
+        rtl_next(addr, next_node);
+
+    // The direct edge into a materialized branch is re-pointed through the
+    // chain, exactly like the rtl_next fallthrough above.
+    rtl_edge_negated(addr, jcc_addr) <--
+        xmm_hi_mem_addressable(addr),
+        next_is_materialized_branch(addr, jcc_addr);
+
+    rtl_succ_candidate(addr, value_node), instr_in_function(value_node, *func_start) <--
+        xmm_hi_mem_addressable(addr),
+        instr_in_function(addr, func_start),
+        let value_node = xmm_hi_lane_node(*addr);
+
+    rtl_succ_candidate(value_node, store_node), instr_in_function(store_node, *func_start) <--
+        xmm_hi_mem_addressable(addr),
+        instr_in_function(addr, func_start),
+        let value_node = xmm_hi_lane_node(*addr),
+        let store_node = xmm_hi_store_node(*addr);
+
+    rtl_succ_candidate(store_node, next_node) <--
+        xmm_hi_mem_addressable(addr),
+        rtl_next(addr, next_node),
+        !next_is_materialized_branch(addr, _),
+        let store_node = xmm_hi_store_node(*addr);
+
+    rtl_succ_candidate(store_node, jcc_addr) <--
+        xmm_hi_mem_addressable(addr),
+        next_is_materialized_branch(addr, jcc_addr),
+        let store_node = xmm_hi_store_node(*addr);
+
+    rtl_succ_candidate(store_node, dst) <--
+        xmm_hi_mem_addressable(addr),
+        instr_in_function(addr, func_start),
+        next(addr, mid),
+        !ltl_inst(*mid, _),
+        !next_is_materialized_branch(addr, _),
+        instr_in_function(*mid, func_start),
+        sp_synth_skip_to_ltl(*mid, *func_start, dst),
+        let store_node = xmm_hi_store_node(*addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lstore(chunk, addressing, mregs, src_reg)),
+        if !mregs.is_empty(),
+        !sp_indexed_store(addr),
+        !bp_indexed_store(addr),
+        !simd_dword_broadcast_store(addr, _, _, _, _, _, _),
+        reg_rtl(addr, *src_reg, src_rtl),
+        store_args_collected(addr, args),
+        let inst = RTLInst::Istore(*chunk, addressing.clone(), args.clone(), *src_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lstore(chunk, addressing, mregs, src_reg)),
+        if mregs.is_empty(),
+        !simd_dword_broadcast_store(addr, _, _, _, _, _, _),
+        reg_rtl(addr, *src_reg, src_rtl),
+        let inst = RTLInst::Istore(*chunk, addressing.clone(), Arc::new(vec![]), *src_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Left(mreg) = callee,
+        !call_through_memory(addr, _, _, _, _),
+        call_input_rtl(addr, *mreg, callee_rtl),
+        call_args_collected_candidate(addr, args),
+        call_result_rtl(addr, final_ret),
+        next(addr, next_addr),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Left(*callee_rtl), args.clone(), Some(*final_ret), *next_addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Left(mreg) = callee,
+        !call_through_memory(addr, _, _, _, _),
+        call_input_rtl(addr, *mreg, callee_rtl),
+        call_args_collected_candidate(addr, args),
+        !call_result_rtl(addr, _),
+        next(addr, next_addr),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Left(*callee_rtl), args.clone(), None, *next_addr);
+
+    // Fallback: an indirect Lcall with no structurally reaching input value
+    // still needs a target pseudo.  Do not key this on reg_rtl: a call also
+    // owns post-call caller-saved definitions at the same node.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Left(mreg) = callee,
+        !call_through_memory(addr, _, _, _, _),
+        !call_input_rtl(addr, *mreg, _),
+        call_args_collected_candidate(addr, args),
+        call_result_rtl(addr, final_ret),
+        next(addr, next_addr),
+        let fresh_callee = fresh_call_input_reg(*addr, *mreg),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Left(fresh_callee), args.clone(), Some(*final_ret), *next_addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Left(mreg) = callee,
+        !call_through_memory(addr, _, _, _, _),
+        !call_input_rtl(addr, *mreg, _),
+        call_args_collected_candidate(addr, args),
+        !call_result_rtl(addr, _),
+        next(addr, next_addr),
+        let fresh_callee = fresh_call_input_reg(*addr, *mreg),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Left(fresh_callee), args.clone(), None, *next_addr);
+
+    // Memory-indirect call: Mcall(Left(base_mreg)) loses disp/idx; re-emit Icall with a fresh RTL reg callee. The fresh reg is inlined as Eload by cshminor so the C renders as `(*(disp(base)))(args)`, not a direct call to base.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Left(_))),
+        call_through_memory(addr, _, _, _, _),
+        call_args_collected_candidate(addr, args),
+        call_result_rtl(addr, final_ret),
+        next(addr, next_addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT")),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Left(temp), args.clone(), Some(*final_ret), *next_addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Left(_))),
+        call_through_memory(addr, _, _, _, _),
+        call_args_collected_candidate(addr, args),
+        !call_result_rtl(addr, _),
+        next(addr, next_addr),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT")),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Left(temp), args.clone(), None, *next_addr);
+
+    // Memory-indirect tail transfer: the same explicit load feeds Itailcall,
+    // with no successor/result because the current frame never resumes.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(Either::Left(_))),
+        call_through_memory(addr, _, _, _, _),
+        call_args_collected_candidate(addr, args),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT")),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Itailcall(Some(inferred_sig), Either::Left(temp), args.clone());
+
+    // Surface a memory-indirect transfer's load addressing for cshminor Eload
+    // rendering: base->Aindexed(disp); base+idx->Aindexed2(disp);
+    // base+idx*scale->Aindexed2scaled(scale,disp). The temp matches the
+    // Icall/Itailcall callee above.
+    relation call_through_memory_load(Node, RTLReg, MemoryChunk, Addressing, Args);
+
+    #[local] relation memory_transfer_site(Node);
+    memory_transfer_site(addr) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Left(_))),
+        call_through_memory(addr, _, _, _, _);
+    memory_transfer_site(addr) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(Either::Left(_))),
+        call_through_memory(addr, _, _, _, _);
+
+    call_through_memory_load(*addr, temp, ptr_chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl])) <--
+        memory_transfer_site(addr),
+        call_through_memory(addr, base_str, idx_str, _scale, disp),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        if !is_rip(base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        abi_pointer_size(pointer_size),
+        let ptr_chunk = if *pointer_size == 4 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 },
+        let base_mreg = Mreg::x86(*base_str),
+        call_input_rtl(addr, base_mreg, base_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT"));
+
+    call_through_memory_load(*addr, temp, ptr_chunk, Addressing::Aindexed2(*disp), Arc::new(vec![*base_rtl, *idx_rtl])) <--
+        memory_transfer_site(addr),
+        call_through_memory(addr, base_str, idx_str, scale, disp),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        if !is_rip(base_str),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *scale <= 1,
+        abi_pointer_size(pointer_size),
+        let ptr_chunk = if *pointer_size == 4 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 },
+        let base_mreg = Mreg::x86(*base_str),
+        let idx_mreg = Mreg::x86(*idx_str),
+        call_input_rtl(addr, base_mreg, base_rtl),
+        call_input_rtl(addr, idx_mreg, idx_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT"));
+
+    call_through_memory_load(*addr, temp, ptr_chunk, Addressing::Aindexed2scaled(*scale, *disp), Arc::new(vec![*base_rtl, *idx_rtl])) <--
+        memory_transfer_site(addr),
+        call_through_memory(addr, base_str, idx_str, scale, disp),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        if !is_rip(base_str),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *scale > 1,
+        abi_pointer_size(pointer_size),
+        let ptr_chunk = if *pointer_size == 4 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 },
+        let base_mreg = Mreg::x86(*base_str),
+        let idx_mreg = Mreg::x86(*idx_str),
+        call_input_rtl(addr, base_mreg, base_rtl),
+        call_input_rtl(addr, idx_mreg, idx_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT"));
+
+    // RIP-relative and absolute memory-call operands already name a global
+    // slot/table base.  Their address has no GP base input at the call node.
+    call_through_memory_load(*addr, temp, ptr_chunk, Addressing::Aglobal(*ident, *ofs), Arc::new(vec![])) <--
+        memory_transfer_site(addr),
+        call_through_memory(addr, base_str, idx_str, _, _),
+        if is_rip(base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        rip_target_addr(addr, target),
+        resolved_addr_to_symbol(target, ident, ofs),
+        abi_pointer_size(pointer_size),
+        let ptr_chunk = if *pointer_size == 4 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 },
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT"));
+
+    call_through_memory_load(*addr, temp, ptr_chunk, Addressing::Aglobal(*ident, *ofs), Arc::new(vec![])) <--
+        memory_transfer_site(addr),
+        call_through_memory(addr, base_str, idx_str, _, disp),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        resolved_addr_to_symbol(*disp as Address, ident, ofs),
+        abi_pointer_size(pointer_size),
+        let ptr_chunk = if *pointer_size == 4 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 },
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT"));
+
+    call_through_memory_load(*addr, temp, ptr_chunk, Addressing::Abasedscaled(*scale, *ident, *ofs), Arc::new(vec![*idx_rtl])) <--
+        memory_transfer_site(addr),
+        call_through_memory(addr, base_str, idx_str, scale, disp),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *disp > 0,
+        resolved_addr_to_symbol(*disp as Address, ident, ofs),
+        abi_pointer_size(pointer_size),
+        let ptr_chunk = if *pointer_size == 4 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 },
+        let idx_mreg = Mreg::x86(*idx_str),
+        call_input_rtl(addr, idx_mreg, idx_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT"));
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Left(target_addr) = target,
+        call_args_collected_candidate(addr, args),
+        call_result_rtl(addr, final_ret),
+        next(addr, next_addr),
+        emit_function_signature_candidate(target_addr, sig),
+        let inst = RTLInst::Icall(Some(sig.clone()), Either::Right(target.clone()), args.clone(), Some(*final_ret), *next_addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Left(target_addr) = target,
+        call_args_collected_candidate(addr, args),
+        !call_result_rtl(addr, _),
+        next(addr, next_addr),
+        emit_function_signature_candidate(target_addr, sig),
+        let inst = RTLInst::Icall(Some(sig.clone()), Either::Right(target.clone()), args.clone(), None, *next_addr);
+
+
+    // Select exactly one architectural result class for each call.  A known
+    // signature is authoritative.  For an unknown call, prefer a structurally
+    // used integer result; only otherwise accept FP evidence.  Caller-saved
+    // definitions in every other register remain real output events, but they
+    // are not mistaken for the semantic Icall result.
+    #[local] relation call_known_float_result(Node);
+    #[local] relation call_known_nonvoid_result(Node);
+    #[local] relation call_float_result_evidence(Node);
+    #[local] relation call_selected_result_mreg(Node, Mreg);
+
+    call_known_float_result(call_addr) <--
+        call_has_known_signature(call_addr, _, _, ret_type),
+        if matches!(ret_type, XType::Xfloat | XType::Xsingle);
+    call_known_nonvoid_result(call_addr) <--
+        call_has_known_signature(call_addr, _, _, ret_type),
+        if *ret_type != XType::Xvoid;
+
+    call_float_result_evidence(call_addr) <--
+        call_returns_value(call_addr, float_ret),
+        abi_ret_float_reg(float_ret);
+    call_float_result_evidence(call_addr) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(_)),
+        next(call_addr, next_addr),
+        abi_ret_float_reg(float_ret),
+        ltl_inst_uses_mreg(next_addr, float_ret);
+
+    call_selected_result_mreg(call_addr, float_ret) <--
+        call_known_float_result(call_addr),
+        abi_ret_float_reg(float_ret);
+    call_selected_result_mreg(call_addr, int_ret) <--
+        call_known_nonvoid_result(call_addr),
+        !call_known_float_result(call_addr),
+        abi_ret_int_reg(int_ret);
+    call_selected_result_mreg(call_addr, int_ret) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(_)),
+        !call_has_known_signature(call_addr, _, _, _),
+        abi_ret_int_reg(int_ret),
+        call_returns_value(call_addr, int_ret);
+    call_selected_result_mreg(call_addr, float_ret) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(_)),
+        !call_has_known_signature(call_addr, _, _, _),
+        abi_ret_int_reg(int_ret),
+        !call_returns_value(call_addr, int_ret),
+        abi_ret_float_reg(float_ret),
+        call_float_result_evidence(call_addr);
+
+    reg_xtl(call_addr, mreg, ret_rtl), call_return_mreg(call_addr, mreg, ret_rtl) <--
+        call_selected_result_mreg(call_addr, mreg),
+        let ret_rtl = fresh_xtl_reg(*call_addr, *mreg);
+
+    reg_def_site(addr, *dst) <--
+        ltl_inst(addr, ?LTLInst::Lload(_, _, _, dst));
+
+    reg_def_site(addr, *dst) <--
+        ltl_inst(addr, ?LTLInst::Lgetstack(_, _, _, dst));
+
+    reg_def_site(addr, *dst) <--
+        ltl_inst(addr, ?LTLInst::Lop(_, _, dst)),
+        !movhps_hi_load(addr, dst, _, _, _, _, _);
+
+    // A recovered raw reload may coexist with an Lbranch fallback at the same
+    // address, so the generic "no ltl_inst" raw-def rule cannot see it.
+    reg_def_site(addr, dst) <-- raw_stack_reload(_, addr, _, dst);
+
+    reg_def_site(*addr, *mreg) <--
+        reg_def(addr, mreg),
+        if *mreg != Mreg::SP,
+        !ltl_inst(addr, _),
+        !trim_instruction(addr);
+
+
+    reg_def_site(*call_addr, *reg) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(_)),
+        is_caller_saved(reg),
+        reg_def_used(*call_addr, *reg, _);
+
+
+    return_val_used(*call_addr, 0u64, *ret_reg, *use_addr, 0i64) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(_)),
+        abi_ret_int_reg(ret_reg),
+        reg_def_used(*call_addr, *ret_reg, use_addr),
+        instr_in_function(call_addr, func_start),
+        instr_in_function(use_addr, func_start);
+
+    call_returns_value(*call_addr, *ret_reg) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(_)),
+        abi_ret_int_reg(ret_reg),
+        reg_def_used(*call_addr, *ret_reg, use_addr),
+        instr_in_function(call_addr, func_start),
+        instr_in_function(use_addr, func_start);
+
+    // FP return detection is gated on the callee actually returning float, or
+    // a bare call's caller-saved FP clobber mints a spurious result.
+    call_returns_value(*call_addr, *ret_reg) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(_)),
+        abi_ret_float_reg(ret_reg),
+        reg_def_used(*call_addr, *ret_reg, use_addr),
+        instr_in_function(call_addr, func_start),
+        instr_in_function(use_addr, func_start),
+        x0_value_write(call_addr);
+
+    reg_xtl(addr, mreg, id), is_def(addr, id) <--
+        reg_def_site(addr, mreg),
+        let id = fresh_xtl_reg(*addr, *mreg);
+
+    // Lbranch addresses reg_def butno ltl op
+    reg_def_site(*addr, *mreg) <--
+        arith_load_op(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        reg_def(addr, mreg),
+        if *mreg != Mreg::SP,
+        !trim_instruction(addr);
+
+    reg_def_site(*addr, *mreg) <--
+        arith_store_reg(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        reg_def(addr, mreg),
+        if *mreg != Mreg::SP,
+        !trim_instruction(addr);
+
+    reg_def_site(*addr, *mreg) <--
+        arith_store_imm(addr, _, _, _, _),
+        !has_ltl_op(addr),
+        reg_def(addr, mreg),
+        if *mreg != Mreg::SP,
+        !trim_instruction(addr);
+
+    // 3.8 R1: fused float op's register write (e.g. the X0 of `addsd k(%rip),%xmm0`), mirroring the arith legs above so the def exists even when a label/branch ltl_inst coexists at the address.
+    reg_def_site(*addr, *mreg) <--
+        float_load_op(addr, _, _, _, _, _, _),
+        !has_ltl_op(addr),
+        reg_def(addr, mreg),
+        if *mreg != Mreg::SP,
+        !trim_instruction(addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Left(mreg) = callee,
+        !call_through_memory(addr, _, _, _, _),
+        call_input_rtl(addr, *mreg, callee_rtl),
+        call_args_collected_candidate(addr, args),
+        let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
+        let inst = RTLInst::Itailcall(Some(default_sig), Either::Left(*callee_rtl), args.clone());
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Left(mreg) = callee,
+        !call_through_memory(addr, _, _, _, _),
+        call_input_rtl(addr, *mreg, callee_rtl),
+        !call_args_collected_candidate(addr, _),
+        let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
+        let inst = RTLInst::Itailcall(Some(default_sig), Either::Left(*callee_rtl), Arc::new(vec![]));
+
+    // Fallback: indirect Ltailcall with no structurally reaching input value
+    // (mirrors Lcall above without confusing an output-side definition for an
+    // input).
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Left(mreg) = callee,
+        !call_through_memory(addr, _, _, _, _),
+        !call_input_rtl(addr, *mreg, _),
+        call_args_collected_candidate(addr, args),
+        let fresh_callee = fresh_call_input_reg(*addr, *mreg),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Itailcall(Some(inferred_sig), Either::Left(fresh_callee), args.clone());
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Left(mreg) = callee,
+        !call_through_memory(addr, _, _, _, _),
+        !call_input_rtl(addr, *mreg, _),
+        !call_args_collected_candidate(addr, _),
+        let fresh_callee = fresh_call_input_reg(*addr, *mreg),
+        let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
+        let inst = RTLInst::Itailcall(Some(default_sig), Either::Left(fresh_callee), Arc::new(vec![]));
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Left(target_addr) = target,
+        call_args_collected_candidate(addr, args),
+        emit_function_signature_candidate(target_addr, sig),
+        let inst = RTLInst::Itailcall(Some(sig.clone()), Either::Right(target.clone()), args.clone());
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Left(target_addr) = target,
+        !call_args_collected_candidate(addr, _),
+        emit_function_signature_candidate(target_addr, sig),
+        let inst = RTLInst::Itailcall(Some(sig.clone()), Either::Right(target.clone()), Arc::new(vec![]));
+
+    // The extern signature table applies to a by-name target ONLY when the binary does not define that name; the twin rule below covers the gated symbol via inference.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        call_args_collected_candidate(addr, args),
+        !emit_function(_, symbol, _),
+        known_extern_signature(symbol, _, ret_type, known_params),
+        let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: CallConv::default() },
+        let inst = RTLInst::Itailcall(Some(sig), Either::Right(target.clone()), args.clone());
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        call_args_collected_candidate(addr, args),
+        !known_extern_signature(symbol, _, _, _),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Itailcall(Some(inferred_sig), Either::Right(target.clone()), args.clone());
+
+    // Hole-closer twin of the rule above: a locally-defined symbol that ALSO has a table entry (so `!known_extern_signature` is false) still gets a signature, inferred from the binary's own call-site args rather than the corpus table.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        call_args_collected_candidate(addr, args),
+        emit_function(_, symbol, _),
+        known_extern_signature(symbol, _, _, _),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Itailcall(Some(inferred_sig), Either::Right(target.clone()), args.clone());
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        !call_args_collected_candidate(addr, _),
+        !emit_function(_, symbol, _),
+        known_extern_signature(symbol, _, ret_type, _known_params),
+        let sig = Signature { sig_args: Arc::new(vec![]), sig_res: *ret_type, sig_cc: CallConv::default() },
+        let inst = RTLInst::Itailcall(Some(sig), Either::Right(target.clone()), Arc::new(vec![]));
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        !call_args_collected_candidate(addr, _),
+        !known_extern_signature(symbol, _, _, _),
+        let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
+        let inst = RTLInst::Itailcall(Some(default_sig), Either::Right(target.clone()), Arc::new(vec![]));
+
+    // Hole-closer twin: locally-defined symbol that also has a table entry -> default sig (matching the no-args fallback above) instead of the corpus table.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        !call_args_collected_candidate(addr, _),
+        emit_function(_, symbol, _),
+        known_extern_signature(symbol, _, _, _),
+        let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
+        let inst = RTLInst::Itailcall(Some(default_sig), Either::Right(target.clone()), Arc::new(vec![]));
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Left(target_addr) = target,
+        call_args_collected_candidate(addr, args),
+        !emit_function_signature_candidate(target_addr, _),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Itailcall(Some(inferred_sig), Either::Right(target.clone()), args.clone());
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Left(target_addr) = target,
+        !call_args_collected_candidate(addr, _),
+        !emit_function_signature_candidate(target_addr, _),
+        let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
+        let inst = RTLInst::Itailcall(Some(default_sig), Either::Right(target.clone()), Arc::new(vec![]));
+
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Left(target_addr) = target,
+        call_args_collected_candidate(addr, args),
+        call_result_rtl(addr, final_ret),
+        next(addr, next_addr),
+        !emit_function_signature_candidate(target_addr, _),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Right(target.clone()), args.clone(), Some(*final_ret), *next_addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Left(target_addr) = target,
+        call_args_collected_candidate(addr, args),
+        !call_result_rtl(addr, _),
+        next(addr, next_addr),
+        !emit_function_signature_candidate(target_addr, _),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Right(target.clone()), args.clone(), None, *next_addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        call_args_collected_candidate(addr, args),
+        call_result_rtl(addr, final_ret),
+        next(addr, next_addr),
+        !emit_function(_, symbol, _),
+        known_extern_signature(symbol, _, ret_type, known_params),
+        let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: CallConv::default() },
+        let inst = RTLInst::Icall(Some(sig), Either::Right(target.clone()), args.clone(), Some(*final_ret), *next_addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        call_args_collected_candidate(addr, args),
+        call_result_rtl(addr, final_ret),
+        next(addr, next_addr),
+        !known_extern_signature(symbol, _, _, _),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Right(target.clone()), args.clone(), Some(*final_ret), *next_addr);
+
+    // Hole-closer twin: locally-defined symbol that also has a table entry -> inferred sig.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        call_args_collected_candidate(addr, args),
+        call_result_rtl(addr, final_ret),
+        next(addr, next_addr),
+        emit_function(_, symbol, _),
+        known_extern_signature(symbol, _, _, _),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Right(target.clone()), args.clone(), Some(*final_ret), *next_addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        !call_result_rtl(addr, _),
+        call_args_collected_candidate(addr, args),
+        next(addr, next_addr),
+        !emit_function(_, symbol, _),
+        known_extern_signature(symbol, _, _, known_params),
+        let sig = Signature { sig_args: known_params.clone(), sig_res: XType::Xvoid, sig_cc: CallConv::default() },
+        let inst = RTLInst::Icall(Some(sig), Either::Right(target.clone()), args.clone(), None, *next_addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        !call_result_rtl(addr, _),
+        call_args_collected_candidate(addr, args),
+        next(addr, next_addr),
+        !known_extern_signature(symbol, _, _, _),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Right(target.clone()), args.clone(), None, *next_addr);
+
+    // Hole-closer twin: locally-defined symbol that also has a table entry -> inferred sig.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        !call_result_rtl(addr, _),
+        call_args_collected_candidate(addr, args),
+        next(addr, next_addr),
+        emit_function(_, symbol, _),
+        known_extern_signature(symbol, _, _, _),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
+        let inst = RTLInst::Icall(Some(inferred_sig), Either::Right(target.clone()), args.clone(), None, *next_addr);
+
+    ltl_builtin_unconverted(addr, name_sym, Arc::new(args.clone()), result.clone()) <--
+        ltl_inst(addr, ?LTLInst::Lbuiltin(name, args, result)),
+        let name_sym = Box::leak(name.clone().into_boxed_str()) as Symbol;
+
+    // LTL builtin -> RTL Ibuiltin: map each Mreg arg to its RTLReg via reg_rtl.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_builtin_unconverted(addr, name, args, result),
+        agg pairs = collect_builtin_reg_pairs(mreg, r) in reg_rtl(addr, mreg, r),
+        let inst = build_builtin_inst(*addr, name, args, result, &pairs);
+
+    // Builtin at a node with no reg_rtl entries: convert with an empty map.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_builtin_unconverted(addr, name, args, result),
+        !reg_rtl(addr, _, _),
+        let inst = build_builtin_inst(*addr, name, args, result, &[]);
+
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lbranch(target)),
+        // A synth-only semantic producer owns this address and supplies its
+        // structural successor separately.  Retaining the Linear fallback
+        // branch as a competing statement lets selection discard the load or
+        // store itself (notably immediate stack initializers in option arms).
+        !synth_only_addr(addr),
+        // R3 immediate global stores use a synthetic chain but are not members
+        // of synth_only_addr because their producer has a Linear operation.
+        !mach_imm_global_store(addr, _, _, _, _),
+        let inst = RTLInst::Ibranch(target.clone());
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcond(cond, mregs, target_true, target_false)),
+        if mregs.len() > 0,
+        !counter_branch_split_addr(addr),
+        cond_args_collected(addr, args),
+        let inst = RTLInst::Icond(cond.clone(), args.clone(), target_true.clone(), target_false.clone());
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcond(cond, mregs, target_true, target_false)),
+        if mregs.is_empty(),
+        !counter_branch_split_addr(addr),
+        let inst = RTLInst::Icond(cond.clone(), Arc::new(vec![]), target_true.clone(), target_false.clone());
+
+    // Decrement-and-branch (sub $1,%reg; jcc): split so the Iop decrement stays at addr and the Icond moves to the synthetic successor, shifting its immediate by the addend since it now runs post-decrement.
+    relation counter_branch_split_addr(Address);
+    counter_branch_split_addr(*addr) <--
+        counter_branch_op_addend(addr, dst, _),
+        ltl_inst(addr, ?LTLInst::Lcond(cond, cond_mregs, _, _)),
+        if counter_branch_shifted_cond(cond, 0).is_some(),
+        if cond_mregs.len() == 1 && &cond_mregs[0] == dst;
+
+    // An in-place immediate add (the persisted decrement) writing reg from reg, 32- or 64-bit; the 32-bit case was previously unmatched, dropping the decrement and freezing the counter.
+    relation counter_branch_op_addend(Address, Mreg, i64);
+    counter_branch_op_addend(*addr, *dst, *k) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Oaddimm(k), op_mregs, dst)),
+        if op_mregs.len() == 1 && &op_mregs[0] == dst;
+    counter_branch_op_addend(*addr, *dst, *k) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Oaddlimm(k), op_mregs, dst)),
+        if op_mregs.len() == 1 && &op_mregs[0] == dst;
+
+    rtl_inst_candidate(synth_addr, icond) <--
+        counter_branch_op_addend(addr, dst, k),
+        ltl_inst(addr, ?LTLInst::Lcond(cond, cond_mregs, target_true, target_false)),
+        if cond_mregs.len() == 1 && &cond_mregs[0] == dst,
+        if let Some(new_cond) = counter_branch_shifted_cond(cond, *k),
+        cond_args_collected(addr, args),
+        let synth_addr = *addr | (1u64 << 62),
+        let icond = RTLInst::Icond(new_cond, args.clone(), target_true.clone(), target_false.clone());
+
+    // Edge surgery for the split: route addr -> synth -> the branch's two targets, removing addr's direct branch edges.
+    rtl_edge_negated(addr, dst) <--
+        counter_branch_split_addr(addr),
+        rtl_next(addr, dst);
+    rtl_succ_candidate(addr, synth_addr), instr_in_function(synth_addr, func_start) <--
+        counter_branch_split_addr(addr),
+        instr_in_function(addr, func_start),
+        let synth_addr = *addr | (1u64 << 62);
+    rtl_succ_candidate(synth_addr, dst), instr_in_function(synth_addr, func_start) <--
+        counter_branch_split_addr(addr),
+        instr_in_function(addr, func_start),
+        rtl_next(addr, dst),
+        let synth_addr = *addr | (1u64 << 62);
+
+    // Where a stack-slot compare's Icond goes, and which JCC consumes its flags.
+    //
+    // Folding the condition onto the compare's own address is only sound when the JCC is the very
+    // next instruction.  The compiler is free to schedule flag-transparent work in between -- a
+    // MOVZX of an unrelated global is the common one -- and demanding adjacency then fired NEITHER
+    // half: the compare degraded to a no-op fallthrough and the JCC got no RTL form at all, so the
+    // branch and its edge to the taken block were deleted outright.  Control then fell
+    // unconditionally into what had been the taken path, which is why recovered `touch f` reported
+    // an option nobody passed.  1769 of the corpus's stack-slot compares sit in this gap.
+    //
+    // In the gap case the condition has to sit at the JCC, never at the compare, or the branch
+    // would jump over the instructions scheduled between them.  Nothing is materialized at the
+    // compare: its address may already carry the block-leader Lbranch, and a node holds exactly
+    // one instruction, so a second candidate there would silently displace one of the two.  The
+    // operands stay read at the compare's address, which is both the semantically correct point
+    // (the compare happened before the intervening work) and what the RIP-relative CMP rules
+    // already do when they place an Icond at a JCC.
+    //
+    // Restricted to a pairing within ONE basic block, which is the case cfg.rs resolves exactly by
+    // scanning backwards for the nearest flag definition.  Its cross-block fallback deliberately
+    // keeps EVERY reaching compare rather than guessing one, per the high-recall rule for Ascent
+    // inputs; an Icond built from a guess would be a WRONG branch, strictly worse than the missing
+    // one this repairs.  Same-block already implies a unique reaching compare -- the backward scan
+    // stops at the first one -- and the explicit guard below keeps that independent of how the
+    // dataflow is later refined.
+    #[local] relation jcc_has_other_flag_source(Address, Address);
+    jcc_has_other_flag_source(jcc_addr, addr) <--
+        flags_and_jump_pair(addr, jcc_addr, _),
+        flags_and_jump_pair(other, jcc_addr, _),
+        if *other != *addr;
+
+    #[local] relation stack_cmp_cond_site(Address, Address, Address);
+    stack_cmp_cond_site(addr, jcc_addr, *addr) <--
+        pcmp(addr, _, _),
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, _, _);
+    stack_cmp_cond_site(addr, jcc_addr, *jcc_addr) <--
+        pcmp(addr, _, _),
+        flags_and_jump_pair(addr, jcc_addr, _),
+        pjcc(jcc_addr, _, _),
+        next(addr, mid),
+        if *mid != *jcc_addr,
+        code_in_block(addr, block),
+        code_in_block(jcc_addr, block),
+        !jcc_has_other_flag_source(jcc_addr, addr);
+
+    // A CMP with a spilled-scalar stack slot folds into one Icond reading the slot's canonical SSA reg; both BP and SP bases, since -O2 spills loop bounds SP-relative.
+    rtl_inst_candidate(*site, inst) <--
+        pcmp(addr, sym1, sym2),
+        op_register(sym1, reg_str),
+        let reg1 = Mreg::x86(reg_str.to_string()),
+        op_indirect(sym2, _, reg_2, reg_3, _, _, sz),
+        if reg_2.ends_with("BP") || reg_2.ends_with("SP"),
+        if *reg_3 == "NONE" || reg_3.is_empty(),
+        instr_in_function(addr, func_start),
+        scalar_stack_cmp_var_slot(func_start, addr, slot),
+        !cmp_reads_escaped_stack_storage(addr),
+        stack_cmp_cond_site(addr, jcc_addr, site),
+        pjcc(jcc_addr, testcond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        next(jcc_addr, fallthrough),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz),
+        stack_var(func_start, addr, slot, arg_rtl),
+        reg_rtl(addr, reg1, reg_rtl2),
+        let inst = RTLInst::Icond(cond, Arc::new(vec![*reg_rtl2, *arg_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough));
+
+    rtl_inst_candidate(*site, inst) <--
+        pcmp(addr, sym1, sym2),
+        op_indirect(sym1, _, reg_2, reg_3, _, _, sz),
+        if reg_2.ends_with("BP") || reg_2.ends_with("SP"),
+        if *reg_3 == "NONE" || reg_3.is_empty(),
+        op_register(sym2, reg_str),
+        let reg1 = Mreg::x86(reg_str.to_string()),
+        instr_in_function(addr, func_start),
+        scalar_stack_cmp_var_slot(func_start, addr, slot),
+        !cmp_reads_escaped_stack_storage(addr),
+        stack_cmp_cond_site(addr, jcc_addr, site),
+        pjcc(jcc_addr, testcond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        next(jcc_addr, fallthrough),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz),
+        stack_var(func_start, addr, slot, arg_rtl),
+        reg_rtl(addr, reg1, reg_rtl2),
+        let inst = RTLInst::Icond(cond, Arc::new(vec![*arg_rtl, *reg_rtl2]), Either::Right(*target_addr), Either::Right(*fallthrough));
+
+    rtl_inst_candidate(*site, inst) <--
+        pcmp(addr, sym1, sym2),
+        op_indirect(sym1, reg_1a, reg_2a, reg_3a, mult_a, disp_a, sz_a),
+        if reg_2a.ends_with("BP") || reg_2a.ends_with("SP"),
+        op_indirect(sym2, reg_1, reg_2, reg_3, mult, disp, sz),
+        if reg_2.ends_with("BP") || reg_2.ends_with("SP"),
+        instr_in_function(addr, func_start),
+        stack_cmp_cond_site(addr, jcc_addr, site),
+        pjcc(jcc_addr, testcond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        next(jcc_addr, fallthrough),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz),
+        stack_var(func_start, addr, *disp_a, arg_rtl1),
+        stack_var(func_start, addr, *disp, arg_rtl2),
+        let inst = RTLInst::Icond(cond, Arc::new(vec![*arg_rtl1, *arg_rtl2]), Either::Right(*target_addr), Either::Right(*fallthrough));
+
+    rtl_inst_candidate(*site, inst) <--
+        pcmp(addr, sym1, sym2),
+        op_indirect(sym1, _, reg_2, reg_3, _, _, sz),
+        if reg_2.ends_with("BP") || reg_2.ends_with("SP"),
+        if *reg_3 == "NONE" || reg_3.is_empty(),
+        op_immediate(sym2, imm_val, _),
+        instr_in_function(addr, func_start),
+        scalar_stack_cmp_var_slot(func_start, addr, slot),
+        !cmp_reads_escaped_stack_storage(addr),
+        stack_cmp_cond_site(addr, jcc_addr, site),
+        pjcc(jcc_addr, testcond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        next(jcc_addr, fallthrough),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let sized_cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz),
+        let cond_with_imm = match sized_cond {
+            Condition::Ccomp(cmp) => Condition::Ccompimm(cmp, *imm_val),
+            Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, *imm_val),
+            Condition::Ccompl(cmp) => Condition::Ccomplimm(cmp, *imm_val),
+            Condition::Ccomplu(cmp) => Condition::Ccompluimm(cmp, *imm_val),
+            _ => sized_cond.clone(),
+        },
+        stack_var(func_start, addr, slot, arg_rtl),
+        let inst = RTLInst::Icond(cond_with_imm, Arc::new(vec![*arg_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough));
+
+
+    rtl_inst_candidate(*site, inst) <--
+        pcmp(addr, sym1, sym2),
+        op_immediate(sym1, imm_val, _),
+        op_indirect(sym2, _, reg_2, reg_3, _, _, sz),
+        if reg_2.ends_with("BP") || reg_2.ends_with("SP"),
+        if *reg_3 == "NONE" || reg_3.is_empty(),
+        instr_in_function(addr, func_start),
+        scalar_stack_cmp_var_slot(func_start, addr, slot),
+        !cmp_reads_escaped_stack_storage(addr),
+        stack_cmp_cond_site(addr, jcc_addr, site),
+        pjcc(jcc_addr, testcond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        next(jcc_addr, fallthrough),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let sized_cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *sz),
+        let cond_with_imm = match sized_cond {
+            Condition::Ccomp(cmp) => Condition::Ccompimm(cmp, *imm_val),
+            Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, *imm_val),
+            Condition::Ccompl(cmp) => Condition::Ccomplimm(cmp, *imm_val),
+            Condition::Ccomplu(cmp) => Condition::Ccompluimm(cmp, *imm_val),
+            _ => sized_cond.clone(),
+        },
+        stack_var(func_start, addr, slot, arg_rtl),
+        let inst = RTLInst::Icond(cond_with_imm, Arc::new(vec![*arg_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough));
+
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ljumptable(arg_reg, targets)),
+        reg_rtl(addr, *arg_reg, arg_rtl),
+        let inst = RTLInst::Ijumptable(*arg_rtl, Arc::new(targets.clone()));
+
+
+    // Direct def-use: the return value's defining instruction reaches the return.
+    relation ax_value_direct(Address, Address);
+    ax_value_direct(ret_addr, def_addr) <--
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        abi_ret_int_reg(rr),
+        reg_def_used(def_addr, rr, ret_addr);
+
+    // Availability-based void detection: any AX def reaching a return looks like a return value, so detect genuine void functions as those with a return reachable on a path setting no real value.
+
+    // A return-value AX def: an AX def-site NOT consumed by a non-return use, excluding compare-operand loads and intermediate computations while keeping mov-imm/arithmetic/used-call results; the dead-call-then-return shape is resolved by the control-flow availability below.
+    relation ltl_is_return(Address);
+    ltl_is_return(addr) <--
+        ltl_inst(addr, ?LTLInst::Lreturn);
+
+    // A flag-only compare use: Lcond reads its operands purely to set flags and branch (no dst Mreg, no store), so a value merely tested by a loop-exit / null-check cmp is NOT redefined nor stored and must still count as a return value.
+    #[local] relation flag_only_compare_use(Address);
+    flag_only_compare_use(addr) <-- ltl_inst(addr, ?LTLInst::Lcond(_, _, _, _));
+
+    relation ax_def_consumed_nonret(Address);
+    ax_def_consumed_nonret(def_addr) <--
+        abi_ret_int_reg(rr),
+        reg_def_used(def_addr, rr, use_addr),
+        !ltl_is_return(use_addr),
+        !flag_only_compare_use(use_addr);
+
+    // Base return-value AX def: an AX def-site whose only consumer is the return; split out so the void-callee analysis can build on it without a negation cycle with the final ax_retval_def (which subtracts void-callee calls from this base).
+    relation ax_retval_def_base(Address);
+    ax_retval_def_base(def_addr) <--
+        abi_ret_int_reg(rr),
+        reg_def_site(def_addr, rr),
+        !ax_def_consumed_nonret(def_addr);
+
+    // A def that some OTHER instruction also reads is still the return value
+    // when it additionally reaches a return: the non-return use does not consume
+    // it away.  `p = memcpy(dst, src, n); p[n] = 0; return p;` is the canonical
+    // shape -- gcc keeps memcpy's returned pointer in AX, stores through it, and
+    // returns it.  Judging that def by "consumed elsewhere" alone declared the
+    // whole function void, and the void Ireturn path then fabricates an AX reg
+    // with no definition, so every caller reads an uninitialized value.  The
+    // return use is established through reg_def_used, i.e. structurally.
+    ax_retval_def_base(def_addr) <--
+        abi_ret_int_reg(rr),
+        reg_def_site(def_addr, rr),
+        ax_def_consumed_nonret(def_addr),
+        reg_def_used(def_addr, rr, ret_addr),
+        ltl_is_return(ret_addr);
+
+    // Void-callee return-value exclusion: a call whose callee leaves no value in AX is a dead clobber, so a caller whose only value source is that clobber is itself void.
+
+    // A function genuinely produces a return value when a real AX/X0 value source reaches one of its returns; structural, so it can gate the void-callee exclusion below.
+    relation func_produces_retval(Address);
+    // (a) a non-call return-value AX def reaches a return (mov-imm / arithmetic / load result).
+    func_produces_retval(func_start) <--
+        instr_in_function(ret_addr, func_start),
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        ax_retval_def_base(def_addr),
+        !is_call_or_tailcall(def_addr),
+        abi_ret_int_reg(rr),
+        reg_def_used(def_addr, rr, ret_addr);
+    // (b) a float/double X0 VALUE def reaches a return (call X0 clobbers are events, not values - see x0_value_write).
+    func_produces_retval(func_start) <--
+        instr_in_function(ret_addr, func_start),
+        abi_ret_float_reg(float_ret),
+        def_reaches_return(ret_addr, def_addr, *float_ret),
+        x0_value_write(def_addr);
+    // (c) the function forwards a local callee's result and that callee itself produces a value (positive recursion; keeps the SCC negation-free and thus stratifiable).
+    func_produces_retval(func_start) <--
+        instr_in_function(call_addr, func_start),
+        ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Left(callee)))),
+        ax_retval_def_base(call_addr),
+        abi_ret_int_reg(rr),
+        reg_def_used(call_addr, rr, ret_addr),
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        func_produces_retval(callee);
+    // (d) the function forwards an extern/indirect callee's result; the callee return type is unknown here, so conservatively assume a value (never over-void unknown callees).
+    relation local_addr_call(Address);
+    local_addr_call(call_addr) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Left(_))));
+    local_addr_call(call_addr) <--
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(Either::Right(Either::Left(_))));
+    func_produces_retval(func_start) <--
+        instr_in_function(call_addr, func_start),
+        ax_retval_def_base(call_addr),
+        is_call_or_tailcall(call_addr),
+        !local_addr_call(call_addr),
+        abi_ret_int_reg(rr),
+        reg_def_used(call_addr, rr, ret_addr),
+        ltl_inst(ret_addr, ?LTLInst::Lreturn);
+
+    // A call site whose callee is a discovered local function that produces no return value.
+    relation void_callee_call(Address);
+    void_callee_call(call_addr) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Left(callee)))),
+        func_stacksz(callee, _, _, _),
+        !func_produces_retval(callee);
+
+    relation ax_retval_def(Address);
+    ax_retval_def(def_addr) <--
+        ax_retval_def_base(def_addr),
+        !void_callee_call(def_addr);
+
+    relation block_has_ax_retval_def(Address);
+    block_has_ax_retval_def(blk) <--
+        ax_retval_def(def_addr),
+        code_in_block(def_addr, blk);
+
+    // Forward may-undef over the block CFG: a block entered on some path with no return-value AX def set yet, seeded at each discovered function's entry block.
+    relation ax_retval_undef_at_block(Address);
+    ax_retval_undef_at_block(entry_blk) <--
+        func_stacksz(func_start, _, _, _),
+        code_in_block(func_start, entry_blk);
+    ax_retval_undef_at_block(succ_blk) <--
+        ax_retval_undef_at_block(blk),
+        !block_has_ax_retval_def(blk),
+        asm_block_next(blk, succ_node),
+        code_in_block(succ_node, succ_blk);
+
+    // A function has a void return path if some return is reached with no return-value AX def available (undef at the return's block entry and its own block sets none).
+    relation func_void_avail(Address);
+    func_void_avail(func_start) <--
+        instr_in_function(ret_addr, func_start),
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        code_in_block(ret_addr, ret_blk),
+        ax_retval_undef_at_block(ret_blk),
+        !block_has_ax_retval_def(ret_blk),
+        // Do not declare void when a genuine AX value def structurally reaches a return: a value read by a non-return use must still be returned, and func_ax_def_reaches_return stratifies here.
+        !func_ax_def_reaches_return(func_start);
+
+    // Gate the return-value binding on the function not being void: a void function has no ax_value_addr, so it gets no function_return_point_reg / has-return and its returns lower to the void Ireturn path; identical to the established void rendering.
+    ax_value_addr(ret_addr, def_addr) <--
+        ax_value_direct(ret_addr, def_addr),
+        instr_in_function(ret_addr, vfunc),
+        !func_void_avail(vfunc);
+
+    func_ax_def(func_start, addr, rtl_reg) <--
+        instr_in_function(addr, func_start),
+        abi_ret_int_reg(rr),
+        reg_def_site(addr, rr),
+        def_value_rtl(addr, rr, rtl_reg);
+
+    // Recovery when the return def-use is broken: bind an AX def that STRUCTURALLY reaches it, replacing the entry-order magnitude proxy that matched defs on disjoint branches.
+    relation ax_recovered_cand(Address, Address, Address);
+    ax_recovered_cand(func_start, ret_addr, def_addr) <--
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        !ax_value_direct(ret_addr, _),
+        instr_in_function(ret_addr, func_start),
+        abi_ret_int_reg(rr),
+        def_reaches_return(ret_addr, def_addr, *rr),
+        func_ax_def(func_start, def_addr, _);
+
+    // Several defs can reach one return, so keep one deterministic representative (max def address); this is a tie-break among structurally-proven candidates, not a reachability decision.
+    relation ax_recovered_killed(Address, Address, Address);
+    ax_recovered_killed(func_start, ret_addr, def_addr) <--
+        ax_recovered_cand(func_start, ret_addr, def_addr),
+        ax_recovered_cand(func_start, ret_addr, other_def),
+        if *other_def > *def_addr;
+
+    relation ax_recovered(Address, Address, Address);
+    ax_recovered(func_start, ret_addr, def_addr) <--
+        ax_recovered_cand(func_start, ret_addr, def_addr),
+        !ax_recovered_killed(func_start, ret_addr, def_addr);
+
+    ax_value_addr(ret_addr, def_addr) <--
+        ax_recovered(_, ret_addr, def_addr),
+        instr_in_function(ret_addr, vfunc),
+        !func_void_avail(vfunc);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lreturn),
+        !func_returns_float_at(addr),
+        ax_value_addr(addr, axaddr),
+        abi_ret_int_reg(rr),
+        reg_rtl(addr, rr, ret_rtl),
+        let inst = RTLInst::Ireturn(*ret_rtl);
+
+    // Float/double return: bind Ireturn to the real XMM0 def (mirror of the AX rule above).
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lreturn),
+        x0_value_addr(addr, x0addr),
+        abi_ret_float_reg(float_ret),
+        reg_rtl(addr, *float_ret, ret_rtl),
+        let inst = RTLInst::Ireturn(*ret_rtl);
+
+    // Recovery return: the return node has no propagated AX rtl reg, so build Ireturn over the recovered def's reg_rtl directly (consistent with function_return_point_reg).
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lreturn),
+        ax_recovered(_, addr, def_addr),
+        abi_ret_int_reg(rr),
+        !reg_rtl(addr, rr, _),
+        def_value_rtl(def_addr, rr, ret_rtl),
+        let inst = RTLInst::Ireturn(*ret_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lreturn),
+        !ax_value_addr(addr, _),
+        !x0_value_addr(addr, _),
+        abi_ret_int_reg(int_ret),
+        let void_reg = crate::decompile::passes::rtl_pass::fresh_xtl_reg(*addr, *int_ret),
+        let inst = RTLInst::Ireturn(void_reg);
+
+    // (3.2e) Extending load of an incoming stack arg binds its dst to the function's synthetic stack-param reg (position 6+idx), same as arith_load_uses_stack_param; without this, Lgetstack fallbacks fabricate an uninitialized local for the 7th+ int/short parameter.
+    #[local] relation lgetstack_is_stack_param(Node);
+    lgetstack_is_stack_param(addr) <--
+        extending_stack_arg_load(addr, func_start, disp, _),
+        stack_param_idx(func_start, disp, _);
+
+    rtl_inst_candidate(addr, inst) <--
+        extending_stack_arg_load(addr, func_start, disp, _),
+        stack_param_idx(func_start, disp, idx),
+        ltl_inst(addr, ?LTLInst::Lgetstack(_slot, _ofs, _typ, dst)),
+        reg_rtl(addr, *dst, dst_rtl),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![param_reg]), *dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        extending_stack_arg_load(addr, func_start, disp, _),
+        stack_param_idx(func_start, disp, idx),
+        ltl_inst(addr, ?LTLInst::Lgetstack(_slot, _ofs, _typ, dst)),
+        !reg_rtl(addr, dst, _),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let fresh_dst = fresh_xtl_reg(*addr, *dst) | FRESH_NS_REG_DST,
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![param_reg]), fresh_dst);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lgetstack(slot, ofs, typ, dst)),
+        reg_rtl(addr, *dst, dst_rtl),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, ofs, rtl_reg),
+        !lgetstack_is_stack_param(addr),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*rtl_reg]), *dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lgetstack(slot, ofs, typ, dst)),
+        reg_rtl(addr, *dst, dst_rtl),
+        instr_in_function(addr, func_start),
+        !stack_var(func_start, addr, ofs, _),
+        !lgetstack_is_stack_param(addr),
+        let fresh_src = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_STACK_SRC,
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![fresh_src]), *dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lgetstack(slot, ofs, typ, dst)),
+        !reg_rtl(addr, dst, _),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, ofs, rtl_reg),
+        !lgetstack_is_stack_param(addr),
+        let fresh_dst = fresh_xtl_reg(*addr, *dst) | FRESH_NS_REG_DST,
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*rtl_reg]), fresh_dst);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lgetstack(slot, ofs, typ, dst)),
+        !reg_rtl(addr, dst, _),
+        instr_in_function(addr, func_start),
+        !stack_var(func_start, addr, ofs, _),
+        !lgetstack_is_stack_param(addr),
+        let fresh_src = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_STACK_SRC,
+        let fresh_dst = fresh_xtl_reg(*addr, *dst) | FRESH_NS_REG_DST,
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![fresh_src]), fresh_dst);
+
+    // Reconstruct the dropped reload as the same scalar-stack SSA move used
+    // by Lgetstack.  stack_var is canonicalized across every reaching store,
+    // so branch joins become value phis without materializing pairwise reach.
+    rtl_inst_candidate(addr, inst) <--
+        raw_stack_reload(func_start, addr, ofs, dst),
+        stack_var(func_start, addr, ofs, stack_rtl),
+        reg_rtl(addr, dst, dst_rtl),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*stack_rtl]), *dst_rtl);
+
+    // Read the spill SOURCE id at the DEF site, but bind the load's def id at a load_overwrites_base site, or the ADDRESS is spilled instead of the loaded value and the load's real def is DSE'd.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        instr_in_function(addr, func_start),
+        reg_def_used(defaddr, *src, *addr),
+        !load_overwrites_base(defaddr, src),
+        def_value_rtl(defaddr, *src, src_rtl),
+        stack_var(func_start, addr, ofs, stack_rtl),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*src_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        instr_in_function(addr, func_start),
+        reg_def_used(defaddr, *src, *addr),
+        load_overwrites_base(defaddr, src),
+        is_def(defaddr, def_xtl),
+        reg_xtl(defaddr, *src, def_xtl),
+        xtl_canonical(def_xtl, src_rtl),
+        stack_var(func_start, addr, ofs, stack_rtl),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*src_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        instr_in_function(addr, func_start),
+        !reg_def_used(_, src, addr),
+        is_arg_reg(src),
+        func_param_validated(func_start, src),
+        reg_rtl(func_start, *src, src_rtl),
+        stack_var(func_start, addr, ofs, stack_rtl),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*src_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        instr_in_function(addr, func_start),
+        reg_rtl(addr, *src, src_rtl),
+        !stack_var(func_start, addr, ofs, _),
+        let fresh_stack = fresh_stack_slot_reg(*addr),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*src_rtl]), fresh_stack);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        instr_in_function(addr, func_start),
+        !reg_def_used(_, src, addr),
+        is_arg_reg(src),
+        !func_param_validated(func_start, src),
+        reg_rtl(addr, *src, src_rtl),
+        stack_var(func_start, addr, ofs, stack_rtl),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*src_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        instr_in_function(addr, func_start),
+        !reg_def_used(_, src, addr),
+        !is_arg_reg(src),
+        reg_rtl(addr, *src, src_rtl),
+        stack_var(func_start, addr, ofs, stack_rtl),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*src_rtl]), *stack_rtl);
+
+
+    // Corpus gauge for incoming parameters that make an exact frame
+    // spill/reload round trip.  The raw edge is intentionally stated from the
+    // decoded MOVs plus stack_def_used, so a missing Mach/LTL instruction is
+    // still visible.  Binding is stricter: the RTL candidate at the spill must
+    // move this function's incoming parameter web into the structurally
+    // reaching stack web.
+    #[local] relation parameter_frame_roundtrip_edge(Address, Address, Address, Mreg);
+    parameter_frame_roundtrip_edge(*func_start, *spill, *reload, src_mreg) <--
+        pmov(spill, spill_memory, spill_source),
+        op_register(spill_source, source_name),
+        let src_mreg = Mreg::x86(source_name.to_string()),
+        is_arg_reg(src_mreg),
+        op_indirect(spill_memory, _, spill_base, spill_index, _, _, _),
+        if matches!(Mreg::x86(*spill_base), Mreg::SP | Mreg::BP),
+        if *spill_index == "NONE" || spill_index.is_empty(),
+        stack_def_used(spill, _, _, reload, _, _),
+        pmov(reload, reload_destination, reload_memory),
+        op_register(reload_destination, _),
+        op_indirect(reload_memory, _, reload_base, reload_index, _, _, _),
+        if matches!(Mreg::x86(*reload_base), Mreg::SP | Mreg::BP),
+        if *reload_index == "NONE" || reload_index.is_empty(),
+        instr_in_function(spill, func_start),
+        instr_in_function(reload, func_start),
+        func_param_validated(func_start, src_mreg),
+        arg_reg_param_live_at(func_start, spill, src_mreg);
+
+    relation parameter_frame_roundtrip_site(Address, Address, Mreg);
+    parameter_frame_roundtrip_site(*func_start, *spill, *src) <--
+        parameter_frame_roundtrip_edge(func_start, spill, _, src);
+
+    relation parameter_frame_roundtrip_bound(Address, Address, Mreg);
+    parameter_frame_roundtrip_bound(*func_start, *spill, *src) <--
+        parameter_frame_roundtrip_site(func_start, spill, src),
+        ltl_inst(spill, ?LTLInst::Lsetstack(seen_src, _, ofs, _)),
+        if seen_src == src,
+        reg_rtl(func_start, *src, param_rtl),
+        stack_var(func_start, spill, ofs, stack_rtl),
+        rtl_inst_candidate(spill, ?RTLInst::Iop(Operation::Omove, args, dst)),
+        if args.as_slice() == [*param_rtl] && *dst == *stack_rtl;
+
+    // stack_offset_backedge_rescued_access is computed against the old
+    // all-edges exact-SP transfer function in asm_pass.  Intersecting it here
+    // gives a counterfactual pre-fix family count in the same corpus run.
+    relation parameter_frame_roundtrip_old_unbound(Address, Address, Mreg);
+    parameter_frame_roundtrip_old_unbound(*func_start, *spill, *src) <--
+        parameter_frame_roundtrip_edge(func_start, spill, _, src),
+        stack_offset_backedge_rescued_access(func_start, spill);
+    parameter_frame_roundtrip_old_unbound(*func_start, *spill, *src) <--
+        parameter_frame_roundtrip_edge(func_start, spill, reload, src),
+        stack_offset_backedge_rescued_access(func_start, reload);
+
+
+    // A BP-based memory operand names a frame slot only where the prologue made
+    // BP the frame pointer and the operand has no index; every other BP rule in
+    // this pass already says so (bp_indexed_load/store, imm_indirect_store_bp_-
+    // indexed).  Reading a frameless `disp(%rbp)` as Ainstack(disp) is not a
+    // cosmetic mislabel: it invents a frame cell for a computed address and can
+    // propagate that false cell identity through exact stack def-use edges.
+    // Stack cells have a private value-id namespace below, so this bad
+    // classification cannot additionally weld BP's register web to the cell,
+    // but the classification itself must still be structurally guarded.  An
+    // index likewise means the operand is a computed address, not a slot.
+    #[local] relation addr_in_framed_func(Address);
+    addr_in_framed_func(*addr) <--
+        real_addr_in_func(addr, func_start),
+        func_sets_fp_stable(func_start);
+
+    reg_xtl(addr, dst_mreg, dst_rtl), op_produces_ptr(addr, dst_rtl) <--
+        plea(addr, dst_sym, src_addr),
+        op_register(dst_sym, dst_str),
+        op_indirect(src_addr, _, base_str, index_str, _scale, disp, _),
+        if (*base_str).ends_with("BP"),
+        if *index_str == "NONE" || index_str.is_empty(),
+        addr_in_framed_func(addr),
+        let dst_mreg = Mreg::x86(dst_str.to_string()),
+        let dst_rtl = fresh_xtl_reg(*addr, dst_mreg);
+
+    rtl_inst_candidate(addr, inst) <--
+        plea(addr, dst_sym, src_addr),
+        op_register(dst_sym, dst_str),
+        op_indirect(src_addr, _, base_str, index_str, _scale, disp, _),
+        if (*base_str).ends_with("BP"),
+        if *index_str == "NONE" || index_str.is_empty(),
+        addr_in_framed_func(addr),
+        !variadic_next_arg_site(_, addr, _),
+        let dst_mreg = Mreg::x86(dst_str.to_string()),
+        let dst_rtl = fresh_xtl_reg(*addr, dst_mreg),
+        let inst = RTLInst::Iop(Operation::Olea(Addressing::Ainstack(*disp)), Arc::new(vec![]), dst_rtl);
+
+    ltl_inst(addr, ltl) <--
+        plea(addr, dst_sym, src_addr),
+        op_register(dst_sym, dst_str),
+        op_indirect(src_addr, _, base_str, index_str, _scale, disp, _),
+        if (*base_str).ends_with("BP"),
+        if *index_str == "NONE" || index_str.is_empty(),
+        addr_in_framed_func(addr),
+        let dst_mreg = Mreg::x86(dst_str.to_string()),
+        let ltl = LTLInst::Lop(Operation::Olea(Addressing::Ainstack(*disp)), Arc::new(vec![]), dst_mreg);
+
+
+    stack_mem_add_imm(addr, disp, imm_val, sz) <--
+        padd(addr, dst_sym, src_sym),
+        op_indirect(dst_sym, _, base_str, index_str, _, disp, sz),
+        if (*base_str).ends_with("BP"),
+        if *index_str == "NONE" || index_str.is_empty(),
+        addr_in_framed_func(addr),
+        op_immediate(src_sym, imm_val, _);
+
+    stack_mem_sub_imm(addr, disp, imm_val, sz) <--
+        psub(addr, dst_sym, src_sym),
+        op_indirect(dst_sym, _, base_str, index_str, _, disp, sz),
+        if (*base_str).ends_with("BP"),
+        if *index_str == "NONE" || index_str.is_empty(),
+        addr_in_framed_func(addr),
+        op_immediate(src_sym, imm_val, _);
+
+    stack_xtl(func_start, addr, disp, rtl_reg) <--
+        stack_mem_add_imm(addr, disp, _, _),
+        instr_in_function(addr, func_start),
+        let rtl_reg = fresh_stack_slot_reg(*addr);
+
+    stack_xtl(func_start, addr, disp, rtl_reg) <--
+        stack_mem_sub_imm(addr, disp, _, _),
+        instr_in_function(addr, func_start),
+        let rtl_reg = fresh_stack_slot_reg(*addr);
+
+    stack_xtl(func_start, addr, ofs, rtl_reg) <--
+        ltl_inst(addr, ?LTLInst::Lsetstack(_, _, ofs, _)),
+        instr_in_function(addr, func_start),
+        let rtl_reg = fresh_stack_slot_reg(*addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        stack_mem_add_imm(addr, disp, imm_val, sz),
+        if *sz == 8,
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, stack_rtl),
+        let inst = RTLInst::Iop(Operation::Oaddlimm(*imm_val), Arc::new(vec![*stack_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        stack_mem_add_imm(addr, disp, imm_val, sz),
+        if *sz == 4,
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, stack_rtl),
+        let inst = RTLInst::Iop(Operation::Oaddimm(*imm_val), Arc::new(vec![*stack_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        stack_mem_sub_imm(addr, disp, imm_val, sz),
+        if *sz == 8,
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, stack_rtl),
+        let inst = RTLInst::Iop(Operation::Oaddlimm(-*imm_val), Arc::new(vec![*stack_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        stack_mem_sub_imm(addr, disp, imm_val, sz),
+        if *sz == 4,
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, stack_rtl),
+        let inst = RTLInst::Iop(Operation::Oaddimm(-*imm_val), Arc::new(vec![*stack_rtl]), *stack_rtl);
+
+
+    relation reg_xtl(Node, Mreg, RTLReg);
+    relation reg_def_site(Node, Mreg);
+    relation is_def(Node, RTLReg);
+    relation reg_rtl(Node, Mreg, RTLReg);
+
+    relation alias_edge(RTLReg, RTLReg);
+
+    #[local] lattice xtl_canonical_lat(RTLReg, ascent::Dual<RTLReg>);
+
+    // Seed: each id maps to itself
+    xtl_canonical_lat(a, ascent::Dual(*a)) <-- reg_xtl(_, _, a);
+    xtl_canonical_lat(a, ascent::Dual(*a)) <-- is_def(_, a);
+    xtl_canonical_lat(a, ascent::Dual(*a)) <-- stack_xtl(_, _, _, a);
+    xtl_canonical_lat(a, ascent::Dual(*a)) <-- alias_edge(a, _);
+    xtl_canonical_lat(b, ascent::Dual(*b)) <-- alias_edge(_, b);
+
+    // Propagate min canonical through alias edges
+    xtl_canonical_lat(b, *canonical) <-- alias_edge(a, b), xtl_canonical_lat(a, canonical);
+    xtl_canonical_lat(a, *canonical) <-- alias_edge(a, b), xtl_canonical_lat(b, canonical);
+
+    // Project the settled lattice to exactly one regular fact per raw id.  A
+    // direct lattice-to-relation projection retains every improving value the
+    // lattice visits; consumers then see both the raw self-id and the final
+    // component representative.  That is especially visible for call-input
+    // joins, where one merge can otherwise create several Icall candidates.
+    // The aggregate is in the following stratum, after alias closure, and
+    // therefore publishes only the minimum representative of each component.
+    #[local] relation xtl_canonical_candidate(RTLReg, RTLReg);
+    xtl_canonical_candidate(id, canonical.0) <-- xtl_canonical_lat(id, canonical);
+
+    relation xtl_canonical(RTLReg, RTLReg);
+    xtl_canonical(id, minimum) <--
+        xtl_canonical_candidate(id, _),
+        agg minimum = ascent::aggregators::min(canonical)
+            in xtl_canonical_candidate(id, canonical);
+
+
+    #[local] relation param_reg_used_early(Address, Mreg);
+
+    relation return_val_used(Address, Address, Mreg, Address, i64);
+    // Raw call result, retaining the architectural result register.  The old
+    // two-column projection remains for consumers that only classify the
+    // value, but all dataflow uses keep the mreg so integer and FP results
+    // cannot cross.
+    #[local] relation call_return_mreg(Node, Mreg, RTLReg);
+    relation call_return_reg(Node, RTLReg);
+
+    // Canonical output value produced by a call.  Keep these projections
+    // separate from reg_rtl at the call node: an indirect call through the
+    // return register has both a pre-call target and a post-call result there.
+    #[local] relation call_output_rtl(Node, Mreg, RTLReg);
+    #[local] relation call_result_rtl(Node, RTLReg);
+
+    call_output_rtl(call_addr, mreg, *canonical) <--
+        call_return_mreg(call_addr, mreg, raw_result),
+        xtl_canonical(raw_result, canonical);
+
+    call_result_rtl(call_addr, result) <--
+        call_output_rtl(call_addr, _, result);
+
+    // Compatibility projection for downstream passes: publish the canonical
+    // output identity, never the pre-canonical raw definition id.
+    call_return_reg(call_addr, result) <--
+        call_output_rtl(call_addr, _, result);
+
+    // Every call_return_mreg fact is an RTL definition, including a known
+    // non-void result with no downstream machine use.  Classifying it here
+    // keeps same-node input aliasing from ever absorbing an unused result.
+    is_def(call_addr, raw_result) <--
+        call_return_mreg(call_addr, _, raw_result);
+
+    // Definition-side value projection.  Select the exact raw definition at a
+    // node before canonicalizing it, so two-address operations and indirect
+    // calls cannot expose an incoming use as their produced value.  A function
+    // entry pseudo-definition uses the narrow fallback only when this machine
+    // register has no effective definition at the node.  Testing the register,
+    // rather than whether the node defines anything, matters when the entry
+    // consumes one parameter while defining an unrelated destination register.
+    #[local] relation def_value_rtl(Node, Mreg, RTLReg);
+    def_value_rtl(node, mreg, *canonical) <--
+        is_def(node, raw),
+        reg_xtl(node, mreg, raw),
+        xtl_canonical(raw, canonical);
+    def_value_rtl(node, mreg, value) <--
+        reg_rtl(node, mreg, value),
+        !asm_effective_def(node, mreg);
+
+
+    relation asm_effective_def(Address, Mreg);
+    // Capstone correctly reports MOVHPS as an architectural XMM write, and
+    // asm_pass consumes that event for high-lane dataflow.  RTL's ordinary XMM
+    // pseudo represents the preserved low lane, however, so the partial write
+    // must neither define nor kill that scalar web.
+    #[local] relation movhps_partial_def(Address, Mreg);
+    movhps_partial_def(addr, *dst) <-- movhps_hi_load(addr, dst, _, _, _, _, _);
+
+    asm_effective_def(addr, reg) <--
+        reg_def(addr, reg),
+        !trim_instruction(addr),
+        !movhps_partial_def(addr, reg);
+    asm_effective_def(addr, reg) <--
+        ltl_inst(addr, ?LTLInst::Lcall(_)),
+        is_caller_saved(reg);
+
+    // Lbuiltin results are effective defs even at trimmed addresses (e.g. VLA alloca replaces trimmed MOV RSP)
+    asm_effective_def(addr, *dst_reg) <--
+        ltl_inst(addr, ?LTLInst::Lbuiltin(_, _, BuiltinArg::BA(dst_reg))),
+        if *dst_reg != Mreg::Unknown;
+
+    // A def-EVENT: every register write INCLUDING trimmed instructions, so older defs are not spliced through a trimmed site; value-consuming rules additionally require asm_effective_def.
+    relation asm_def_kill(Address, Mreg);
+    asm_def_kill(addr, reg) <-- reg_def(addr, reg), !movhps_partial_def(addr, reg);
+    asm_def_kill(addr, reg) <-- asm_effective_def(addr, reg);
+
+    reg_use(addr, ret_reg) <--
+        ltl_inst(addr, ?LTLInst::Lreturn),
+        abi_ret_int_reg(ret_reg);
+
+    // Float (XMM0) returns are unseen by the AX-keyed machinery, so a function returns float iff some return is reached by an in-function X0 def and no AX value reaches any return.
+
+    // X0 VALUE writes: an Lop/Lload/Lgetstack producing X0, or a call whose callee actually returns float; a bare call's caller-saved X0 clobber is an EVENT, not a value.
+    #[local] relation x0_value_write(Address);
+    x0_value_write(addr) <-- abi_ret_float_reg(ret_reg), ltl_inst(addr, ?LTLInst::Lop(_, _, dst)), if dst == ret_reg;
+    x0_value_write(addr) <-- abi_ret_float_reg(ret_reg), ltl_inst(addr, ?LTLInst::Lload(_, _, _, dst)), if dst == ret_reg;
+    x0_value_write(addr) <-- abi_ret_float_reg(ret_reg), ltl_inst(addr, ?LTLInst::Lgetstack(_, _, _, dst)), if dst == ret_reg;
+    x0_value_write(addr) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Right(Either::Left(callee)))),
+        func_returns_float(callee);
+    x0_value_write(addr) <--
+        external_call_site(addr, _, name),
+        known_extern_signature(name, _, ret, _),
+        if matches!(ret, XType::Xfloat | XType::Xsingle);
+    // 3.8 R1: a FUSED float op writing X0 is a genuine X0 VALUE write; it has no Lop/Lload, so func_returns_float stayed false and DCE collapsed the body to return 0.
+    x0_value_write(addr) <--
+        abi_ret_float_reg(ret_reg),
+        float_load_op(addr, _, _, _, _, dst, _),
+        if dst == ret_reg,
+        !has_ltl_op(addr);
+    x0_value_write(addr) <--
+        abi_ret_float_reg(ret_reg),
+        float_arith_stack_op(addr, _, _, _, dst),
+        if dst == ret_reg,
+        !has_ltl_op(addr);
+
+    relation func_x0_def_reaches_return(Address);
+    func_x0_def_reaches_return(func_start) <--
+        instr_in_function(ret_addr, func_start),
+        abi_ret_float_reg(ret_reg),
+        def_reaches_return(ret_addr, def_addr, *ret_reg),
+        x0_value_write(def_addr);
+
+    // An AX def-site reaching a return means an int/ptr/bool result in AX, not a float return; structural (reg_def_site only) so it stays OUT of the reg_def_used/reg_use SCC.
+    #[local] relation ax_value_write(Address);
+    ax_value_write(addr) <-- abi_ret_int_reg(rr), ltl_inst(addr, ?LTLInst::Lop(_, _, d)), if d == rr;
+    ax_value_write(addr) <-- abi_ret_int_reg(rr), ltl_inst(addr, ?LTLInst::Lload(_, _, _, d)), if d == rr;
+    ax_value_write(addr) <-- abi_ret_int_reg(rr), ltl_inst(addr, ?LTLInst::Lgetstack(_, _, _, d)), if d == rr;
+
+    // An AX def that is an internal float->int conversion is a SCRATCH integer, not the return value, so excluding it stops it lighting func_ax_def_reaches_return and suppressing func_returns_float.
+    #[local] relation ax_conv_to_int_def(Address);
+    ax_conv_to_int_def(addr) <-- abi_ret_int_reg(ret_reg), ltl_inst(addr, ?LTLInst::Lop(Operation::Ointofsingle, _, dst)), if dst == ret_reg;
+    ax_conv_to_int_def(addr) <-- abi_ret_int_reg(ret_reg), ltl_inst(addr, ?LTLInst::Lop(Operation::Ointoffloat, _, dst)), if dst == ret_reg;
+
+    // An AX def that is a verbatim COPY of an XMM value is gcc's ABI/NaN-canonicalization bitcast holding raw float bits, not an int return, so it is likewise disqualified.
+    #[local] relation ax_float_shuffle_def(Address);
+    ax_float_shuffle_def(addr) <--
+        abi_ret_int_reg(ret_reg),
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Omove, args, dst)),
+        if dst == ret_reg,
+        if args.len() == 1,
+        if is_float_mreg(&args[0]);
+
+    // Positive, NON-recursive X0-value-reaches-return signal using only direct X0 writes, deliberately excluding the recursive Lcall arm so the negation below stays stratified.
+    #[local] relation x0_value_write_direct(Address);
+    x0_value_write_direct(addr) <-- abi_ret_float_reg(ret_reg), ltl_inst(addr, ?LTLInst::Lop(_, _, dst)), if dst == ret_reg;
+    x0_value_write_direct(addr) <-- abi_ret_float_reg(ret_reg), ltl_inst(addr, ?LTLInst::Lload(_, _, _, dst)), if dst == ret_reg;
+    x0_value_write_direct(addr) <-- abi_ret_float_reg(ret_reg), ltl_inst(addr, ?LTLInst::Lgetstack(_, _, _, dst)), if dst == ret_reg;
+    x0_value_write_direct(addr) <--
+        abi_ret_float_reg(ret_reg),
+        float_load_op(addr, _, _, _, _, dst, _),
+        if dst == ret_reg,
+        !has_ltl_op(addr);
+    x0_value_write_direct(addr) <--
+        abi_ret_float_reg(ret_reg),
+        float_arith_stack_op(addr, _, _, _, dst),
+        if dst == ret_reg,
+        !has_ltl_op(addr);
+    relation func_x0_value_reaches_return(Address);
+    func_x0_value_reaches_return(func_start) <--
+        instr_in_function(ret_addr, func_start),
+        abi_ret_float_reg(ret_reg),
+        def_reaches_return(ret_addr, def_addr, *ret_reg),
+        x0_value_write_direct(def_addr);
+
+    // An AX def reaching a return that is DISQUALIFIED as the int return: an internal float->int conversion in a function that genuinely returns a float in X0.
+    relation ax_return_def_disqualified(Address, Address);
+    ax_return_def_disqualified(func_start, *def_addr) <--
+        instr_in_function(ret_addr, func_start),
+        abi_ret_int_reg(ret_reg),
+        def_reaches_return(ret_addr, def_addr, *ret_reg),
+        ax_conv_to_int_def(def_addr),
+        func_x0_value_reaches_return(func_start);
+
+    // The AX reaching the ret is a float-bits bitcast, not the int return, so a double-returning function whose epilogue shuffles X0 through AX is still classified float.
+    ax_return_def_disqualified(func_start, *def_addr) <--
+        instr_in_function(ret_addr, func_start),
+        abi_ret_int_reg(ret_reg),
+        def_reaches_return(ret_addr, def_addr, *ret_reg),
+        ax_float_shuffle_def(def_addr),
+        func_x0_value_reaches_return(func_start);
+
+    // The return's OWN block computes a float VALUE: an X0 value def is the block-last X0 def at the return, a structural in-block dominance fact, not an address comparison.
+    #[local] relation func_x0_inblock_return(Address);
+    func_x0_inblock_return(func_start) <--
+        instr_in_function(ret_addr, func_start),
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        abi_ret_float_reg(ret_reg),
+        block_last_def(ret_addr, x0_def, *ret_reg),
+        x0_value_write_direct(x0_def);
+
+    // The return's OWN block computes an int/ptr VALUE: an ax_value_write def is the block-last AX def at the return.
+    #[local] relation func_ax_inblock_return(Address);
+    func_ax_inblock_return(func_start) <--
+        instr_in_function(ret_addr, func_start),
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        abi_ret_int_reg(rr),
+        block_last_def(ret_addr, ax_def, *rr),
+        ax_value_write(ax_def);
+
+    // Disqualify a reaching AX def when the return's block computes a float and no int value, so a stale cross-block loop counter cannot suppress a float-accumulator return.
+    ax_return_def_disqualified(func_start, *def_addr) <--
+        func_x0_inblock_return(func_start),
+        !func_ax_inblock_return(func_start),
+        instr_in_function(ret_addr, func_start),
+        abi_ret_int_reg(ret_reg),
+        def_reaches_return(ret_addr, def_addr, *ret_reg),
+        ax_value_write(def_addr);
+
+    // The block-last AX reaching the ret is an ADDRESS when its value is read as a load/store base; built SCC-safe from block_last_def and gated on X0 genuinely carrying a float to the ret.
+    ltl_inst_reads_addr_base(addr, base_mreg) <--
+        ltl_inst(addr, ?LTLInst::Lload(_, lddr, args, _)),
+        if matches!(lddr, Addressing::Aindexed(_) | Addressing::Aindexed2(_) | Addressing::Aindexed2scaled(_, _)),
+        if !args.is_empty(),
+        let base_mreg = args[0];
+    ltl_inst_reads_addr_base(addr, base_mreg) <--
+        ltl_inst(addr, ?LTLInst::Lstore(_, sddr, args, _)),
+        if matches!(sddr, Addressing::Aindexed(_) | Addressing::Aindexed2(_) | Addressing::Aindexed2scaled(_, _)),
+        if !args.is_empty(),
+        let base_mreg = args[0];
+
+    #[local] relation ax_def_used_as_addr_base(Address);
+    ax_def_used_as_addr_base(*def_addr) <--
+        ax_value_write(def_addr),
+        abi_ret_int_reg(ret_reg),
+        asm_effective_def(def_addr, *ret_reg),
+        ltl_inst_reads_addr_base(use_addr, *ret_reg),
+        block_last_def(use_addr, def_addr, *ret_reg);
+    ax_def_used_as_addr_base(*def_addr) <--
+        ax_value_write(def_addr),
+        abi_ret_int_reg(ret_reg),
+        asm_effective_def(def_addr, *ret_reg),
+        ltl_inst_reads_addr_base(use_addr, *ret_reg),
+        code_in_block(use_addr, blk),
+        instr_in_function(use_addr, func),
+        !block_last_def(use_addr, _, *ret_reg),
+        reaching_def_in(func, blk, *ret_reg, s),
+        if s.0.contains(def_addr);
+
+    ax_return_def_disqualified(func_start, *def_addr) <--
+        func_x0_value_reaches_return(func_start),
+        instr_in_function(ret_addr, func_start),
+        abi_ret_int_reg(ret_reg),
+        def_reaches_return(ret_addr, def_addr, *ret_reg),
+        ax_def_used_as_addr_base(def_addr);
+
+    // A call's AX result genuinely live in the body, consumed by a real instruction operand; built from ltl_inst_uses_mreg plus block_last_def so it stays out of the func_returns_float SCC.
+    #[local] relation ax_call_result_used_in_body(Address);
+    ax_call_result_used_in_body(*def_addr) <--
+        is_call_or_tailcall(def_addr),
+        abi_ret_int_reg(ret_reg),
+        asm_effective_def(def_addr, *ret_reg),
+        ltl_inst_uses_mreg(use_addr, *ret_reg),
+        !ltl_is_return(use_addr),
+        !flag_only_compare_use(use_addr),
+        block_last_def(use_addr, def_addr, *ret_reg);
+    ax_call_result_used_in_body(*def_addr) <--
+        is_call_or_tailcall(def_addr),
+        abi_ret_int_reg(ret_reg),
+        asm_effective_def(def_addr, *ret_reg),
+        ltl_inst_uses_mreg(use_addr, *ret_reg),
+        !ltl_is_return(use_addr),
+        !flag_only_compare_use(use_addr),
+        code_in_block(use_addr, blk),
+        instr_in_function(use_addr, func),
+        !block_last_def(use_addr, _, *ret_reg),
+        reaching_def_in(func, blk, *ret_reg, s),
+        if s.0.contains(def_addr);
+
+    // A call result consumed ONLY by a flag-only compare is bound as a returned value so the compare operand resolves, but kept SEPARATE so it does not feed func_ax_def_reaches_return or void detection.
+    #[local] relation ax_call_result_used_in_cond(Address);
+    ax_call_result_used_in_cond(*def_addr) <--
+        is_call_or_tailcall(def_addr),
+        abi_ret_int_reg(ret_reg),
+        asm_effective_def(def_addr, *ret_reg),
+        ltl_inst_uses_mreg(use_addr, *ret_reg),
+        flag_only_compare_use(use_addr),
+        block_last_def(use_addr, def_addr, *ret_reg);
+    ax_call_result_used_in_cond(*def_addr) <--
+        is_call_or_tailcall(def_addr),
+        abi_ret_int_reg(ret_reg),
+        asm_effective_def(def_addr, *ret_reg),
+        ltl_inst_uses_mreg(use_addr, *ret_reg),
+        flag_only_compare_use(use_addr),
+        code_in_block(use_addr, blk),
+        instr_in_function(use_addr, func),
+        !block_last_def(use_addr, _, *ret_reg),
+        reaching_def_in(func, blk, *ret_reg, s),
+        if s.0.contains(def_addr);
+
+    call_returns_value(*call_addr, *ret_reg) <--
+        ax_call_result_used_in_cond(call_addr),
+        abi_ret_int_reg(ret_reg);
+
+    relation func_ax_def_reaches_return(Address);
+    func_ax_def_reaches_return(func_start) <--
+        instr_in_function(ret_addr, func_start),
+        abi_ret_int_reg(rr),
+        def_reaches_return(ret_addr, def_addr, *rr),
+        ax_value_write(def_addr),
+        !ax_return_def_disqualified(func_start, def_addr);
+    func_ax_def_reaches_return(func_start) <--
+        instr_in_function(ret_addr, func_start),
+        abi_ret_int_reg(rr),
+        def_reaches_return(ret_addr, def_addr, *rr),
+        ax_call_result_used_in_body(def_addr);
+
+    // The X0 def consumed by an X0-to-memory store (intra-block last def, else lattice membership at the store's block) - same def-reaches-point shape as def_reaches_return/def_reaches_call.
+    #[local] relation x0_store_consumed_def(Address, Address);
+    x0_store_consumed_def(*st_addr, *def_addr) <--
+        ltl_inst(st_addr, ?LTLInst::Lstore(_, _, _, st_src)),
+        abi_ret_float_reg(ret_reg),
+        if *st_src == *ret_reg,
+        block_last_def(st_addr, def_addr, *ret_reg),
+        asm_effective_def(def_addr, *ret_reg);
+    x0_store_consumed_def(*st_addr, *def_addr) <--
+        ltl_inst(st_addr, ?LTLInst::Lstore(_, _, _, st_src)),
+        abi_ret_float_reg(ret_reg),
+        if *st_src == *ret_reg,
+        code_in_block(st_addr, blk),
+        instr_in_function(st_addr, func),
+        !block_last_def(st_addr, _, *ret_reg),
+        reaching_def_in(func, blk, *ret_reg, s),
+        for def_addr in s.0.iter();
+    // Stack-slot store form: SIMD struct copies lift as Lgetstack(X0)/Lsetstack(X0) pairs, so the Lstore-only match missed them and the X0 temp was misread as a float return value the moment no AX value reached the return.
+    x0_store_consumed_def(*st_addr, *def_addr) <--
+        ltl_inst(st_addr, ?LTLInst::Lsetstack(st_src, _, _, _)),
+        abi_ret_float_reg(ret_reg),
+        if *st_src == *ret_reg,
+        block_last_def(st_addr, def_addr, *ret_reg),
+        asm_effective_def(def_addr, *ret_reg);
+    x0_store_consumed_def(*st_addr, *def_addr) <--
+        ltl_inst(st_addr, ?LTLInst::Lsetstack(st_src, _, _, _)),
+        abi_ret_float_reg(ret_reg),
+        if *st_src == *ret_reg,
+        code_in_block(st_addr, blk),
+        instr_in_function(st_addr, func),
+        !block_last_def(st_addr, _, *ret_reg),
+        reaching_def_in(func, blk, *ret_reg, s),
+        for def_addr in s.0.iter();
+
+    // An X0 arriving at a return that was also stored to memory is a computed temp, not a float return; the SAME def feeds both, replacing an order proxy that matched unrelated stores.
+    relation func_x0_stored_before_return(Address);
+    func_x0_stored_before_return(func_start) <--
+        instr_in_function(ret_addr, func_start),
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        abi_ret_float_reg(ret_reg),
+        def_reaches_return(ret_addr, def_addr, *ret_reg),
+        x0_store_consumed_def(st_addr, def_addr),
+        instr_in_function(st_addr, func_start);
+
+    relation func_returns_float(Address);
+    func_returns_float(func_start) <--
+        func_x0_def_reaches_return(func_start),
+        !func_ax_def_reaches_return(func_start),
+        !func_x0_stored_before_return(func_start);
+
+    // Per-return-node projection of func_returns_float, used to suppress the AX Ireturn and return-point binding since the value is in X0.
+    relation func_returns_float_at(Address);
+    func_returns_float_at(ret_addr) <--
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        instr_in_function(ret_addr, func_start),
+        func_returns_float(func_start);
+
+    // X0 return reg_use, gated to float-returning functions so int functions are unaffected.
+    reg_use(addr, ret_reg) <--
+        ltl_inst(addr, ?LTLInst::Lreturn),
+        instr_in_function(addr, func_start),
+        func_returns_float(func_start),
+        abi_ret_float_reg(ret_reg);
+
+    relation x0_value_direct(Address, Address);
+    x0_value_direct(ret_addr, def_addr) <--
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        abi_ret_float_reg(ret_reg),
+        reg_def_used(def_addr, *ret_reg, ret_addr);
+
+    relation x0_value_addr(Address, Address);
+    x0_value_addr(ret_addr, def_addr) <--
+        x0_value_direct(ret_addr, def_addr);
+
+    relation block_last_insn(Address, Address);
+    block_last_insn(block_start, last_insn) <--
+        block_boundaries(block_start, last_insn, _);
+
+    relation asm_block_next(Address, Address);
+    // The disassembly CFG deliberately records a physical fallthrough after every
+    // call before symbols/signatures are known. Once Linear has proved a call
+    // noreturn, that edge is infeasible and must not enter RTL dataflow: otherwise
+    // the bytes laid out after e.g. __stack_chk_fail can form a false cycle that
+    // taints live-ins and reaching defs at an earlier join.
+    asm_block_next(src_block, dst) <--
+        ddisasm_cfg_edge(src, dst, edge_type),
+        if *edge_type != "call" && *edge_type != "indirect" && *edge_type != "indirect_call",
+        !call_targets_noreturn(src),
+        code_in_block(src, src_block);
+
+    // block_last_def: the last def-EVENT for r strictly before u in u's block, chaining on asm_def_kill so a trimmed def stops older defs; value consumers must also check asm_effective_def.
+    relation block_last_def(Address, Address, Mreg);
+
+    block_last_def(next_addr, def_addr, reg) <--
+        asm_def_kill(def_addr, reg),
+        next(def_addr, next_addr),
+        code_in_block(def_addr, blk),
+        code_in_block(next_addr, blk);
+
+    block_last_def(next_addr, def_addr, reg) <--
+        block_last_def(curr_addr, def_addr, reg),
+        !asm_def_kill(curr_addr, reg),
+        next(curr_addr, next_addr),
+        code_in_block(curr_addr, blk),
+        code_in_block(next_addr, blk);
+
+    relation last_def_in_block(Address, Address, Mreg);
+
+    last_def_in_block(block, last_insn, reg) <--
+        block_last_insn(block, last_insn),
+        asm_effective_def(last_insn, reg);
+
+    last_def_in_block(block, def_addr, reg) <--
+        block_last_insn(block, last_insn),
+        block_last_def(last_insn, def_addr, reg),
+        asm_effective_def(def_addr, reg),
+        !asm_def_kill(last_insn, reg);
+
+    relation asm_defined_in_block(Address, Mreg);
+    asm_defined_in_block(block, reg) <--
+        asm_def_kill(ea, reg),
+        code_in_block(ea, block);
+
+    reg_def_used(def_addr, reg, use_addr) <--
+        reg_use(use_addr, reg),
+        !trim_instruction(use_addr),
+        block_last_def(use_addr, def_addr, reg),
+        asm_effective_def(def_addr, reg);
+
+    reg_def_used(*def_addr, *reg, *use_addr) <--
+        reg_use(use_addr, reg),
+        !trim_instruction(use_addr),
+        code_in_block(use_addr, use_block),
+        instr_in_function(use_addr, func),
+        !block_last_def(use_addr, _, reg),
+        reaching_def_in(func, use_block, reg, defs),
+        for def_addr in defs.0.iter(),
+        asm_effective_def(def_addr, reg);
+
+    param_reg_used_early(*func_start, *mreg) <--
+        arg_reg_param_live_at(func_start, use_addr, mreg),
+        is_arg_reg(mreg),
+        reg_use(use_addr, mreg),
+        !trim_instruction(use_addr);
+
+    reg_def_used(*func_start, *mreg, *use_addr) <--
+        param_reg_used_early(func_start, mreg),
+        arg_reg_param_live_at(func_start, use_addr, mreg),
+        is_arg_reg(mreg),
+        reg_use(use_addr, mreg),
+        !trim_instruction(use_addr);
+
+    // (is_early_arg_use deleted: the entry-BFS-distance window is replaced by param_still_live / instr_in_function partitioning in the reg_xtl binding rules; distance must never decide which def binds a use.)
+
+    // Float (XMM) parameter early reaching-def mirroring the integer edge, since is_arg_reg holds only int regs; gated on is_float_arg_reg to stay out of the validation negation cycle.
+    #[local] relation float_param_reg_used_early(Address, Mreg);
+    float_param_reg_used_early(*func_start, *mreg) <--
+        arg_reg_param_live_at(func_start, use_addr, mreg),
+        is_float_arg_reg(mreg),
+        reg_use(use_addr, mreg),
+        !trim_instruction(use_addr);
+
+    reg_def_used(*func_start, *mreg, *use_addr) <--
+        float_param_reg_used_early(func_start, mreg),
+        arg_reg_param_live_at(func_start, use_addr, mreg),
+        is_float_arg_reg(mreg),
+        reg_use(use_addr, mreg),
+        !trim_instruction(use_addr);
+
+    relation stack_xtl(Address, Address, i64, RTLReg);
+    relation stack_var(Address, Address, i64, RTLReg);
+
+    stack_var(func_start, use_addr, ofs, canonical.0) <--
+        stack_xtl(func_start, use_addr, ofs, xtl_id),
+        xtl_canonical_lat(xtl_id, canonical);
+
+    relation unrefinedinstruction(Address, usize, &'static str, &'static str, Symbol, Symbol, Symbol, Symbol, usize, usize);
+    relation symbol_table(Address, usize, Symbol, Symbol, Symbol, usize, Symbol, usize, Symbol);
+    relation op_indirect(Symbol, &'static str, &'static str, &'static str, i64, i64, usize);
+    relation op_register(Symbol, &'static str);
+
+    relation global_symbol(Address, Symbol);
+    global_symbol(addr, name) <--
+        symbol_table(addr, _size, _type, _binding, _section_type, _section_idx, _section_name, _name_idx, name),
+        if *_binding == "GLOBAL" || *_binding == "LOCAL",
+        if *_type == "OBJECT",
+        if *addr > 0;
+
+    relation rip_relative_access(Address, Size, i64);
+    rip_relative_access(addr, size, disp) <--
+        unrefinedinstruction(addr, size, _, _, op1, _, _, _, _, _),
+        op_indirect(op1, _, base_reg, _, disp, _, _),
+        if is_rip(base_reg);
+
+    rip_relative_access(addr, size, disp) <--
+        unrefinedinstruction(addr, size, _, _, _, op2, _, _, _, _),
+        op_indirect(op2, _, base_reg, _, disp, _, _),
+        if is_rip(base_reg);
+
+    rip_relative_access(addr, size, disp) <--
+        unrefinedinstruction(addr, size, _, _, op1, _, _, _, _, _),
+        op_indirect(op1, _, base_reg, _, _, disp, _),
+        if is_rip(base_reg);
+
+    rip_relative_access(addr, size, disp) <--
+        unrefinedinstruction(addr, size, _, _, _, op2, _, _, _, _),
+        op_indirect(op2, _, base_reg, _, _, disp, _),
+        if is_rip(base_reg);
+
+    global_symbol(target_addr, name_sym) <--
+        rip_relative_access(addr, size, disp),
+        let target_addr = (*addr as i64 + *size as i64 + *disp) as Address,
+        !symbol_table(target_addr, _, _, _, _, _, _, _, _),
+        !plt_entry(target_addr, _),
+        !func_span(_, target_addr, _),
+        let name_string = format!("SUB_{:x}", target_addr),
+        let name_sym = Box::leak(name_string.into_boxed_str()) as &'static str;
+
+    symbols(addr, name, name) <--
+        global_symbol(addr, name);
+
+    relation stack_var_chunk(Address, i64, MemoryChunk);
+
+    relation ltl_use(Node, Mreg);
+    relation param_alias_source(Address, Mreg);
+
+    reg_rtl(node, mreg, *canonical) <--
+        reg_xtl(node, mreg, xtl_id),
+        xtl_canonical(xtl_id, canonical);
+
+    // Machine register-class evidence, per value web. reg_rtl already names
+    // every (node, machine register) the web occupies, so the register file of
+    // those registers is a direct architectural fact about the value: a web
+    // that only ever lives in general-purpose registers holds an integer or a
+    // pointer and cannot hold a float, whatever a width-based guess suggests.
+    // A web carrying BOTH classes is not a value at all -- it is two values the
+    // aliasing merged into one web -- so it is reported, never guessed at.
+    relation web_class_gpr(RTLReg);
+    relation web_class_fp(RTLReg);
+
+    web_class_gpr(canonical) <--
+        reg_rtl(_, mreg, canonical),
+        if mreg.reg_class() == Some(RegClass::Gpr);
+
+    web_class_fp(canonical) <--
+        reg_rtl(_, mreg, canonical),
+        if mreg.reg_class() == Some(RegClass::Fp);
+
+    relation load_overwrites_base(Node, Mreg);
+    load_overwrites_base(addr, *dst_reg) <--
+        ltl_inst(addr, ?LTLInst::Lload(_, _, args, dst_reg)),
+        for src in args.iter(),
+        if src == dst_reg;
+
+    relation load_overwrite_use_id(Node, Mreg, RTLReg);
+    load_overwrite_use_id(addr, *src, use_id) <--
+        load_overwrites_base(addr, src),
+        let use_id = fresh_xtl_reg(*addr, *src) | (1u64 << 62);
+
+    reg_xtl(addr, *src, use_id) <--
+        load_overwrite_use_id(addr, src, use_id);
+
+    // Merge use-side IDs only at the same node; defs kill values so def/use IDs must not alias (alias_edge handles def-to-use).
+    alias_edge(id1, id2) <--
+        reg_xtl(node, mreg, id1),
+        reg_xtl(node, mreg, id2),
+        if id1 != id2,
+        !load_overwrites_base(node, mreg),
+        !lop_overwrites_input(node, mreg),
+        !is_def(node, id1),
+        !is_def(node, id2);
+
+    // Block-level dominator computation for back-edge detection; entry block of each function is the block containing the function start address.
+    #[local] relation func_entry_block(Address, Address);
+    func_entry_block(func, entry_block) <--
+        block_in_function(entry_block, func),
+        code_in_block(func, entry_block);
+
+    // Block-dominator lattice (Cooper-Harvey-Kennedy) stored as Dual<Set> so the join is intersection: O(blocks * depth) rather than the old O(blocks^2) workspace, with no pairwise relation.
+    #[local] lattice block_strict_dom_set(Address, Address, Dual<Set<Address>>);
+    lattice block_dom_set(Address, Address, Dual<Set<Address>>);
+
+    block_dom_set(*func, *entry_block, Dual(Set::singleton(*entry_block))) <--
+        func_entry_block(func, entry_block);
+
+    block_strict_dom_set(*func, *n, Dual(p_doms.0.clone())) <--
+        block_dom_set(func, p, p_doms),
+        asm_block_next(p, n),
+        block_in_function(n, func),
+        !func_entry_block(func, n);
+
+    block_dom_set(*func, *n, Dual(dom_set_with_self(&strict.0, *n))) <--
+        block_strict_dom_set(func, n, strict),
+        !func_entry_block(func, n);
+
+    // Back-edge: ltl_succ (src, dst) where dst's block dominates src's block in the same function.
+    #[local] relation is_loop_back_edge(Address, Address);
+    is_loop_back_edge(src, dst) <--
+        rtl_next(src, dst),
+        code_in_block(src, src_block),
+        code_in_block(dst, dst_block),
+        if *src_block != *dst_block,
+        instr_in_function(src, func),
+        block_dom_set(func, src_block, doms),
+        if doms.0.contains(dst_block);
+    // A loop whose jump and header share one basic-block identity is still
+    // recognized from the explicit branch edge, never from address order.
+    is_loop_back_edge(src, dst) <--
+        rtl_next(src, dst),
+        ddisasm_cfg_edge(src, dst, "branch"),
+        code_in_block(src, blk),
+        code_in_block(dst, blk);
+
+    // Forward MAY-reaching-defs at each block ENTRY (join is union).  Keep the
+    // state keyed by (function, block, register): consumers may materialize the
+    // actual def-use edges, but reachability itself must remain a lattice rather
+    // than a pairwise relation.  Tracking every non-stack register is required
+    // here; restricting the lattice to ABI registers left callee-saved values on
+    // the older backward walk, which could carry a pre-loop definition through
+    // a real overwrite.
+    #[local] relation reg_of_interest(Mreg);
+    reg_of_interest(r) <-- is_arg_reg(r);
+    reg_of_interest(r) <-- is_xmm_arg_reg(r);
+    // Architecture-neutral coverage for every real definition. This keeps the
+    // reaching-def lattice complete for AArch64/ARM32 callee-saved registers as
+    // well as x86 registers; the explicit rows below retain implicit ABI/return
+    // registers that can be consumed without a raw machine definition.
+    reg_of_interest(*r) <--
+        asm_effective_def(_, r),
+        if !r.is_stack_pointer() && !r.is_unknown();
+    reg_of_interest(Mreg::AX);
+    reg_of_interest(Mreg::BX);
+    reg_of_interest(Mreg::CX);
+    reg_of_interest(Mreg::DX);
+    reg_of_interest(Mreg::SI);
+    reg_of_interest(Mreg::DI);
+    reg_of_interest(Mreg::BP);
+    reg_of_interest(Mreg::R8);
+    reg_of_interest(Mreg::R9);
+    reg_of_interest(Mreg::R10);
+    reg_of_interest(Mreg::R11);
+    reg_of_interest(Mreg::R12);
+    reg_of_interest(Mreg::R13);
+    reg_of_interest(Mreg::R14);
+    reg_of_interest(Mreg::R15);
+    reg_of_interest(Mreg::X0);
+    reg_of_interest(Mreg::X1);
+    reg_of_interest(Mreg::X2);
+    reg_of_interest(Mreg::X3);
+    reg_of_interest(Mreg::X4);
+    reg_of_interest(Mreg::X5);
+    reg_of_interest(Mreg::X6);
+    reg_of_interest(Mreg::X7);
+    reg_of_interest(Mreg::X8);
+    reg_of_interest(Mreg::X9);
+    reg_of_interest(Mreg::X10);
+    reg_of_interest(Mreg::X11);
+    reg_of_interest(Mreg::X12);
+    reg_of_interest(Mreg::X13);
+    reg_of_interest(Mreg::X14);
+    reg_of_interest(Mreg::X15);
+    reg_of_interest(Mreg::FP0);
+
+    #[local] lattice reaching_def_in(Address, Address, Mreg, Set<Address>);
+
+    // gen: the def of r leaving block blk (its in-block last def) reaches every successor's entry and kills any incoming value of r along that block.
+    reaching_def_in(*func, *succ, *r, Set::singleton(*d)) <--
+        reg_of_interest(r),
+        last_def_in_block(blk, d, r),
+        block_in_function(blk, func),
+        asm_block_next(blk, succ),
+        instr_in_function(succ, func);
+
+    // pass-through: blk does not define r, so its incoming reaching set flows unchanged to successors.
+    reaching_def_in(*func, *succ, *r, in_set.clone()) <--
+        reaching_def_in(func, blk, r, in_set),
+        !asm_defined_in_block(blk, r),
+        asm_block_next(blk, succ),
+        instr_in_function(succ, func);
+
+    // def_addr reaches ret_addr intra-block via block_last_def, else via membership in the reaching set at the return's block; the structural replacement for the def_order <= ret_order proxy.
+    relation def_reaches_return(Address, Address, Mreg);
+    def_reaches_return(*ret_addr, *def_addr, *r) <--
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        reg_of_interest(r),
+        block_last_def(ret_addr, def_addr, r),
+        asm_effective_def(def_addr, r);
+    def_reaches_return(*ret_addr, *def_addr, *r) <--
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        reg_of_interest(r),
+        code_in_block(ret_addr, blk),
+        instr_in_function(ret_addr, func),
+        !block_last_def(ret_addr, _, r),
+        reaching_def_in(func, blk, r, s),
+        for def_addr in s.0.iter();
+
+    // def_addr reaches call_addr the same way, mirroring def_reaches_return; reaching_def_in already excludes any def clobbered before the call, so no distance window or ordering is needed.
+    relation def_reaches_call(Address, Address, Mreg);
+    def_reaches_call(*call_addr, *def_addr, *r) <--
+        is_call_instruction(call_addr),
+        reg_of_interest(r),
+        block_last_def(call_addr, def_addr, r),
+        asm_effective_def(def_addr, r);
+    def_reaches_call(*call_addr, *def_addr, *r) <--
+        is_call_instruction(call_addr),
+        reg_of_interest(r),
+        code_in_block(call_addr, blk),
+        instr_in_function(call_addr, func),
+        !block_last_def(call_addr, _, r),
+        reaching_def_in(func, blk, r, s),
+        for def_addr in s.0.iter();
+
+    // param_live_block is MUST-live: the param reaches the block on ALL paths with no intervening def, unlike the earlier MAY-reach that bound params at joins where they no longer hold.
+    relation param_block_reach(Address, Address, Mreg);
+    relation param_def_tainted(Address, Address, Mreg);
+    relation param_live_block(Address, Address, Mreg);
+
+    // The successor guard confines propagation to the function's own blocks, since asm_block_next is the raw CFG and can cross function boundaries, leaking a param program-wide.
+    param_block_reach(func_start, entry_block, mreg) <--
+        func_param_validated(func_start, mreg),
+        code_in_block(func_start, entry_block);
+    param_block_reach(func_start, succ_block, mreg) <--
+        param_block_reach(func_start, curr_block, mreg),
+        asm_block_next(curr_block, succ_block),
+        instr_in_function(succ_block, func_start);
+
+    // def-tainted: some path entry->block passes through a reachable block that defines (clobbers, including a CALL of a caller-saved reg) mreg, so on that path mreg no longer holds the param.
+    param_def_tainted(func_start, succ_block, mreg) <--
+        param_block_reach(func_start, curr_block, mreg),
+        asm_defined_in_block(curr_block, mreg),
+        asm_block_next(curr_block, succ_block),
+        instr_in_function(succ_block, func_start);
+    param_def_tainted(func_start, succ_block, mreg) <--
+        param_def_tainted(func_start, curr_block, mreg),
+        asm_block_next(curr_block, succ_block),
+        instr_in_function(succ_block, func_start);
+
+    param_live_block(func_start, block, mreg) <--
+        param_block_reach(func_start, block, mreg),
+        !param_def_tainted(func_start, block, mreg);
+
+    // arg_reg_param_live_at is MUST: the arg register still holds the incoming caller value at addr; seeded structurally on is_arg_reg to stay out of the param-validation SCC, distance-independent.
+    #[local] relation arg_reg_param_reach(Address, Address, Mreg);
+    #[local] relation arg_reg_param_tainted(Address, Address, Mreg);
+    #[local] relation arg_reg_param_live_block(Address, Address, Mreg);
+    relation arg_reg_param_live_at(Address, Address, Mreg);
+
+    // Only seed/propagate arg regs actually used in the function; arg_reg_param_live_at is consumed only at reg uses, so unused arg regs would propagate through the whole CFG for nothing.
+    #[local] relation arg_reg_used_somewhere(Address, Mreg);
+    arg_reg_used_somewhere(*func, *r) <-- is_arg_reg(r), reg_use(addr, r), instr_in_function(addr, func);
+    arg_reg_used_somewhere(*func, *r) <-- is_float_arg_reg(r), reg_use(addr, r), instr_in_function(addr, func);
+
+    // A direct call to a known-signature callee implicitly READS its first sig_count ABI argument registers, seeded here so a forwarded parameter is recognized as live; confined to arg_reg_used_somewhere.
+    arg_reg_used_somewhere(*func, *arg_reg) <--
+        call_known_sig_gp_position(call_addr, pos),
+        instr_in_function(call_addr, func),
+        is_arg_reg(arg_reg),
+        abi_int_arg_position(arg_reg, pos);
+
+    // Calls do not list their ABI argument registers as operands, so seed the fixed set in call-containing functions; forwarding_corroborated still requires real evidence before materializing an argument.
+    arg_reg_used_somewhere(*func, *arg_reg) <--
+        is_call_instruction(call_addr),
+        instr_in_function(call_addr, func),
+        is_arg_reg(arg_reg);
+    arg_reg_used_somewhere(*func, *arg_reg) <--
+        is_call_instruction(call_addr),
+        instr_in_function(call_addr, func),
+        is_float_arg_reg(arg_reg);
+
+    arg_reg_param_reach(*func, *entry_block, *r) <--
+        arg_reg_used_somewhere(func, r), func_entry_block(func, entry_block);
+    arg_reg_param_reach(*func, *succ, *r) <--
+        arg_reg_param_reach(func, blk, r),
+        asm_block_next(blk, succ),
+        instr_in_function(succ, func);
+
+    arg_reg_param_tainted(*func, *succ, *r) <--
+        arg_reg_param_reach(func, blk, r),
+        asm_defined_in_block(blk, r),
+        asm_block_next(blk, succ),
+        instr_in_function(succ, func);
+    arg_reg_param_tainted(*func, *succ, *r) <--
+        arg_reg_param_tainted(func, blk, r),
+        asm_block_next(blk, succ),
+        instr_in_function(succ, func);
+
+    arg_reg_param_live_block(*func, *blk, *r) <--
+        arg_reg_param_reach(func, blk, r),
+        !arg_reg_param_tainted(func, blk, r);
+
+    arg_reg_param_live_at(*func, *addr, *r) <--
+        arg_reg_param_live_block(func, blk, r),
+        code_in_block(addr, blk),
+        instr_in_function(addr, func),
+        !block_last_def(addr, _, r);
+
+    // Loop-induction param entry value: recompute the taint over FORWARD edges only, since tainting via the back-edge drops the param's first-iteration value and the walker is read uninitialized.
+    #[local] relation block_back_edge(Address, Address);
+    block_back_edge(blk, succ) <--
+        asm_block_next(blk, succ),
+        instr_in_function(blk, func),
+        block_dom_set(func, blk, doms),
+        if doms.0.contains(succ);
+
+    #[local] relation arg_reg_param_tainted_fwd(Address, Address, Mreg);
+    arg_reg_param_tainted_fwd(*func, *succ, *r) <--
+        arg_reg_param_reach(func, blk, r),
+        asm_defined_in_block(blk, r),
+        asm_block_next(blk, succ),
+        !block_back_edge(blk, succ),
+        instr_in_function(succ, func);
+    arg_reg_param_tainted_fwd(*func, *succ, *r) <--
+        arg_reg_param_tainted_fwd(func, blk, r),
+        asm_block_next(blk, succ),
+        !block_back_edge(blk, succ),
+        instr_in_function(succ, func);
+
+    #[local] relation arg_reg_param_live_block_fwd(Address, Address, Mreg);
+    arg_reg_param_live_block_fwd(*func, *blk, *r) <--
+        arg_reg_param_reach(func, blk, r),
+        !arg_reg_param_tainted_fwd(func, blk, r);
+
+    #[local] relation arg_reg_param_live_at_fwd(Address, Address, Mreg);
+    arg_reg_param_live_at_fwd(*func, *addr, *r) <--
+        arg_reg_param_live_block_fwd(func, blk, r),
+        code_in_block(addr, blk),
+        instr_in_function(addr, func),
+        !block_last_def(addr, _, r);
+
+    reg_def_used(*func_start, *mreg, *use_addr) <--
+        arg_reg_param_live_at_fwd(func_start, use_addr, mreg),
+        is_arg_reg(mreg),
+        reg_use(use_addr, mreg),
+        !trim_instruction(use_addr),
+        // Only the genuine loop delta: a use the MUST-live path drops because the param is tainted by its own back-edge; for non-loop uses arg_reg_param_live_at already binds the param.
+        !arg_reg_param_live_at(func_start, use_addr, mreg);
+
+    alias_edge(def_id, use_id) <--
+        reg_def_used(defaddr, mreg, useaddr),
+        is_def(defaddr, def_id),
+        reg_xtl(defaddr, mreg, def_id),
+        load_overwrite_use_id(useaddr, mreg, use_id),
+        if def_id != use_id;
+
+    alias_edge(def_id, use_id) <--
+        reg_def_used(defaddr, mreg, useaddr),
+        is_def(defaddr, def_id),
+        reg_xtl(defaddr, mreg, def_id),
+        lop_overwrite_use_id(useaddr, mreg, use_id),
+        if def_id != use_id;
+
+    // Param case of the Osel preserve binding: bind the preserve use-id to the function's param reg when dst still holds the incoming caller value, since an entry pseudo-def carries no is_def.
+    alias_edge(param_id, use_id) <--
+        lop_overwrite_use_id(node, mreg, use_id),
+        is_arg_reg(mreg),
+        arg_reg_param_live_at(func_start, node, mreg),
+        reg_xtl(func_start, mreg, param_id),
+        if param_id != use_id;
+
+    // Param case of a load whose destination reuses its address register,
+    // e.g. `mov (%rdi), %rdi`: the address is the incoming parameter value,
+    // while the load definition is a distinct new value.  An entry parameter
+    // is a pseudo-definition and therefore cannot satisfy the ordinary
+    // reg_def_used/is_def rule above; bind only the shadow USE id to it.
+    alias_edge(param_id, use_id) <--
+        load_overwrite_use_id(node, mreg, use_id),
+        is_arg_reg(mreg),
+        arg_reg_param_live_at(func_start, node, mreg),
+        reg_xtl(func_start, mreg, param_id),
+        if param_id != use_id;
+
+    // CMP/TEST+SETCC fusion: capstone still tags the SETCC as the reg_def, so alias the two def ids or that phantom shadows the Ocmp's def and its consumer reads an uninitialized register.
+    alias_edge(lop_def_id, setcc_def_id) <--
+        ltl_inst(lop_addr, ?LTLInst::Lop(Operation::Ocmp(_), _, dst_mreg)),
+        next(lop_addr, setcc_addr),
+        reg_def(setcc_addr, *dst_mreg),
+        !ltl_inst(setcc_addr, _),
+        !trim_instruction(setcc_addr),
+        is_def(lop_addr, lop_def_id),
+        reg_xtl(lop_addr, *dst_mreg, lop_def_id),
+        is_def(setcc_addr, setcc_def_id),
+        reg_xtl(setcc_addr, *dst_mreg, setcc_def_id),
+        if lop_def_id != setcc_def_id;
+
+    // IDs eligible to receive a reaching definition.  Ordinary RTL
+    // instructions retain their established same-node behavior; calls alone
+    // split pre-call inputs from post-call caller-saved definitions.
+    #[local] relation reg_input_id_at_use(Node, Mreg, RTLReg);
+    reg_input_id_at_use(node, mreg, id) <--
+        reg_xtl(node, mreg, id),
+        !is_call_or_tailcall(node);
+    reg_input_id_at_use(node, mreg, id) <--
+        reg_xtl(node, mreg, id),
+        is_call_or_tailcall(node),
+        !is_def(node, id);
+
+    alias_edge(def_id, use_id) <--
+        reg_def_used(defaddr, mreg, useaddr),
+        load_overwrites_base(defaddr, mreg),
+        is_def(defaddr, def_id),
+        reg_xtl(defaddr, mreg, def_id),
+        reg_input_id_at_use(useaddr, mreg, use_id),
+        if def_id != use_id,
+        !load_overwrites_base(useaddr, mreg),
+        !lop_overwrites_input(useaddr, mreg);
+
+    alias_edge(def_id, use_id) <--
+        reg_def_used(defaddr, mreg, useaddr),
+        !load_overwrites_base(defaddr, mreg),
+        is_def(defaddr, def_id),
+        reg_xtl(defaddr, mreg, def_id),
+        reg_input_id_at_use(useaddr, mreg, use_id),
+        if def_id != use_id,
+        !load_overwrites_base(useaddr, mreg),
+        !lop_overwrites_input(useaddr, mreg);
+
+    // Value-phi at a shared return: alias every def that STRUCTURALLY reaches the return to the return's AX use-id, so all arms' values coalesce and each survives DSE on its own arm.
+    alias_edge(def_id, use_id) <--
+        func_produces_retval(func),
+        instr_in_function(ret_addr, func),
+        abi_ret_int_reg(ret_reg),
+        def_reaches_return(ret_addr, def_addr, *ret_reg),
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        reg_xtl(ret_addr, *ret_reg, use_id),
+        !is_def(ret_addr, use_id),
+        is_def(def_addr, def_id),
+        reg_xtl(def_addr, *ret_reg, def_id),
+        if def_id != use_id;
+
+    relation param_still_live(Address, Address, Mreg);
+    param_still_live(func_start, use_addr, mreg) <--
+        func_param_validated(func_start, mreg),
+        instr_in_function(use_addr, func_start),
+        code_in_block(use_addr, block),
+        param_live_block(func_start, block, mreg),
+        !block_last_def(use_addr, _, mreg);
+
+    // Float-param liveness mirroring param_live_block for XMM args, so an XMM-param use reachable def-free from entry binds to the func_start param reg instead of a fresh undefined one.
+    relation float_param_block_reach(Address, Address, Mreg);
+    relation float_param_def_tainted(Address, Address, Mreg);
+    relation float_param_live_block(Address, Address, Mreg);
+
+    float_param_block_reach(func_start, entry_block, mreg) <--
+        func_float_param_validated(func_start, mreg, _),
+        code_in_block(func_start, entry_block);
+    float_param_block_reach(func_start, succ_block, mreg) <--
+        float_param_block_reach(func_start, curr_block, mreg),
+        asm_block_next(curr_block, succ_block),
+        instr_in_function(succ_block, func_start);
+
+    float_param_def_tainted(func_start, succ_block, mreg) <--
+        float_param_block_reach(func_start, curr_block, mreg),
+        asm_defined_in_block(curr_block, mreg),
+        asm_block_next(curr_block, succ_block),
+        instr_in_function(succ_block, func_start);
+    float_param_def_tainted(func_start, succ_block, mreg) <--
+        float_param_def_tainted(func_start, curr_block, mreg),
+        asm_block_next(curr_block, succ_block),
+        instr_in_function(succ_block, func_start);
+
+    float_param_live_block(func_start, block, mreg) <--
+        float_param_block_reach(func_start, block, mreg),
+        !float_param_def_tainted(func_start, block, mreg);
+
+    relation float_param_still_live(Address, Address, Mreg);
+    float_param_still_live(func_start, use_addr, mreg) <--
+        func_float_param_validated(func_start, mreg, _),
+        instr_in_function(use_addr, func_start),
+        code_in_block(use_addr, block),
+        float_param_live_block(func_start, block, mreg),
+        !block_last_def(use_addr, _, mreg);
+
+    // Thread the float param's func_start reg to an early XMM-param use with no in-function def (mirrors the integer func_param_validated reg_xtl rule), else the use got a fresh undefined xtl id (self-undef fabs / undefined compare operand).
+    reg_xtl(*use_addr, *mreg, param_id) <--
+        func_float_param_validated(func_start, mreg, _),
+        reg_xtl(func_start, mreg, param_id),
+        float_param_still_live(func_start, use_addr, mreg),
+        reg_use(use_addr, mreg),
+        !reg_def_site(use_addr, mreg);
+
+    // 3.8 R1: a fused float RMW both reads and writes its dst, so the threading rule is blocked by its own reg_def_site; alias the param web onto the op's ids under the 2-address model.
+    alias_edge(param_id, op_id) <--
+        float_load_op(addr, _, _, _, _, mreg, false),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        func_float_param_validated(func_start, mreg, _),
+        float_param_still_live(func_start, addr, mreg),
+        reg_xtl(func_start, mreg, param_id),
+        reg_xtl(addr, *mreg, op_id),
+        if param_id != op_id;
+
+    param_alias_source(useaddr, mreg) <-- arg_reg_has_external_def(useaddr, mreg);
+    param_alias_source(useaddr, mreg) <-- arg_reg_used_no_def(useaddr, mreg);
+    param_alias_source(useaddr, mreg) <-- arg_reg_used_very_early(useaddr, mreg);
+
+    param_alias_source(use_addr, mreg) <--
+        param_still_live(func_start, use_addr, mreg),
+        reg_xtl(use_addr, mreg, _),
+        !asm_effective_def(use_addr, mreg);
+
+    alias_edge(def_id, use_id) <--
+        param_alias_source(useaddr, mreg),
+        instr_in_function(useaddr, func_start),
+        func_param_validated(func_start, mreg),
+        reg_xtl(func_start, mreg, def_id),
+        reg_xtl(useaddr, mreg, use_id),
+        if def_id != use_id;
+
+    // Param-bind an arg-reg use over an external def edge whenever the reg still holds the incoming value; the old entry-distance window was a magnitude proxy that dropped deep clean uses.
+    reg_xtl(*useaddr, *reg, param_id) <--
+        reg_def_used(defaddr, reg, useaddr),
+        if *reg != Mreg::SP,
+        instr_in_function(useaddr, func_start),
+        is_arg_reg(reg),
+        !instr_in_function(defaddr, func_start),
+        func_arg_reg_used(func_start, reg),
+        reg_xtl(func_start, reg, param_id),
+        param_still_live(func_start, useaddr, reg);
+
+    reg_xtl(*use_addr, *mreg, param_id) <--
+        func_param_validated(func_start, mreg),
+        reg_xtl(func_start, mreg, param_id),
+        param_still_live(func_start, use_addr, mreg),
+        reg_use(use_addr, mreg),
+        !reg_def_site(use_addr, mreg);
+
+    reg_xtl(*useaddr, *reg, def_id) <--
+        reg_def_used(defaddr, reg, useaddr),
+        if *reg != Mreg::SP,
+        !is_arg_reg(reg),
+        !return_val_used(defaddr, _, reg, useaddr, _),
+        !load_overwrites_base(useaddr, reg),
+        reg_xtl(defaddr, reg, def_id),
+        is_def(defaddr, def_id);
+
+    reg_xtl(node, mreg, rtl_reg) <--
+        call_return_mreg(node, mreg, rtl_reg);
+
+    reg_xtl(*use_addr, *mreg, ret_rtl) <--
+        return_val_used(call_addr, _, mreg, use_addr, _),
+        call_return_mreg(call_addr, mreg, ret_rtl);
+
+
+    reg_xtl(node, ret_reg, fresh) <--
+        ltl_inst(node, ?LTLInst::Lreturn),
+        abi_ret_int_reg(ret_reg),
+        let fresh = fresh_xtl_reg(*node, *ret_reg);
+
+    // External-def edge whose use is NOT param-bindable (the reg no longer holds the caller value there): fresh id, reconnected to its def by alias_edge downstream. Exact complement of the param-bind rule above, replacing the "use is far from entry" (!is_early_arg_use) distance proxy.
+    reg_xtl(*useaddr, *reg, rtl_reg) <--
+        reg_def_used(defaddr, reg, useaddr),
+        if *reg != Mreg::SP,
+        is_arg_reg(reg),
+        instr_in_function(useaddr, func_start),
+        !instr_in_function(defaddr, func_start),
+        func_arg_reg_used(func_start, reg),
+        !param_still_live(func_start, useaddr, reg),
+        let rtl_reg = fresh_xtl_reg(*useaddr, *reg);
+
+    reg_xtl(*useaddr, *reg, rtl_reg) <--
+        reg_def_used(defaddr, reg, useaddr),
+        if *reg != Mreg::SP,
+        is_arg_reg(reg),
+        instr_in_function(useaddr, func_start),
+        !instr_in_function(defaddr, func_start),
+        !func_arg_reg_used(func_start, reg),
+        let rtl_reg = fresh_xtl_reg(*useaddr, *reg);
+
+    // Internal-def edge to an arg-reg use: always a fresh id (the def-to-use connection is made by alias_edge / xtl canonicalization). The old is_early_arg_use condition merely split this one semantic case across two window variants.
+    reg_xtl(*useaddr, *reg, rtl_reg) <--
+        reg_def_used(defaddr, reg, useaddr),
+        if *reg != Mreg::SP,
+        is_arg_reg(reg),
+        instr_in_function(useaddr, func_start),
+        instr_in_function(defaddr, func_start),
+        let rtl_reg = fresh_xtl_reg(*useaddr, *reg);
+
+    reg_def_site(defaddr, dst_reg) <--
+        ltl_inst(defaddr, ?LTLInst::Lop(_, _, dst_reg)),
+        !movhps_hi_load(defaddr, dst_reg, _, _, _, _, _);
+
+    reg_def_site(defaddr, *dst_reg) <--
+        ltl_inst(defaddr, ?LTLInst::Lload(_, _, _, dst_reg));
+
+    reg_def_site(defaddr, *dst_reg) <--
+        ltl_inst(defaddr, ?LTLInst::Lgetstack(_, _, _, dst_reg));
+
+    reg_def_site(defaddr, *dst_reg) <--
+        ltl_inst(defaddr, ?LTLInst::Lbuiltin(_, _, BuiltinArg::BA(dst_reg))),
+        if *dst_reg != Mreg::Unknown;
+
+    reg_xtl(defaddr, dst_reg, rtl_reg), is_def(defaddr, rtl_reg) <--
+        reg_def_site(defaddr, dst_reg),
+        let rtl_reg = fresh_xtl_reg(*defaddr, *dst_reg);
+
+    ltl_use(addr, src_reg) <--
+        ltl_inst(addr, ?LTLInst::Lop(_, srcs, _)),
+        for src_reg in srcs.iter();
+
+    ltl_use(addr, arg_reg) <--
+        ltl_inst(addr, ?LTLInst::Lload(_, _, args, _)),
+        for arg_reg in args.iter();
+
+    ltl_use(addr, src_reg) <--
+        ltl_inst(addr, ?LTLInst::Lstore(_, _, _, src_reg));
+
+    ltl_use(addr, arg_reg) <--
+        ltl_inst(addr, ?LTLInst::Lstore(_, _, args, _)),
+        for arg_reg in args.iter();
+
+    ltl_use(addr, arg_reg) <--
+        ltl_inst(addr, ?LTLInst::Lcond(_, args, _, _)),
+        for arg_reg in args.iter();
+
+    reg_xtl(addr, *reg, fresh_id) <--
+        ltl_use(addr, reg),
+        if *reg != Mreg::SP,
+        let fresh_id = fresh_xtl_reg(*addr, *reg);
+
+    ltl_use(addr, src) <--
+        ltl_inst(addr, ?LTLInst::Lsetstack(src, _, _, _));
+
+    ltl_use(addr, reg) <--
+        ltl_inst(addr, ?LTLInst::Ljumptable(reg, _));
+
+    ltl_use(addr, reg) <--
+        ltl_inst(addr, ?LTLInst::Lcall(tgt)),
+        if let Either::Left(reg) = tgt;
+
+    ltl_use(addr, reg) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(tgt)),
+        if let Either::Left(reg) = tgt;
+
+    ltl_use(addr, arg_reg) <--
+        ltl_inst(addr, ?LTLInst::Lbuiltin(_, args, _)),
+        for arg in args.iter(),
+        if let BuiltinArg::BA(arg_reg) = arg;
+
+
+    stack_xtl(func_start, addr, ofs, rtlreg) <--
+        mach_imm_stack_init(addr, ofs, _, _),
+        instr_in_function(addr, func_start),
+        let rtlreg = fresh_stack_slot_reg(*addr);
+
+    // Propagate stack_xtl through def-use chains, joining on def offset and emitting use offset.
+    stack_xtl(func_start, use_addr, use_ofs, rtlreg) <--
+        stack_xtl(func_start, def_addr, def_ofs, rtlreg),
+        instr_in_function(def_addr, func_start),
+        stack_def_used(def_addr, _, def_ofs, use_addr, _, use_ofs),
+        instr_in_function(use_addr, func_start);
+
+    // A raw displacement only names a frame cell together with the SP state it was
+    // taken in.  StackAnalysis pairs a store with the load that reads the same cell
+    // across an SP adjustment and reports each side's own displacement, so the rule
+    // above deliberately republishes a name under the use's displacement -- which,
+    // in the settled frame, belongs to a DIFFERENT cell.  `mov (%rsp),%ecx` followed
+    // by two outgoing-argument pushes and `mov 0x10(%rsp),%ecx` is the everyday
+    // shape: displacement 0x10 there is displacement 0 everywhere else.
+    //
+    // Mark exactly those re-based publications.  The whole-slot closures below
+    // wildcard the node and would otherwise read "same displacement anywhere in the
+    // function" as "same memory cell", fusing every web that ever borrowed that
+    // displacement into one local.  A base-register rename also shifts the offset
+    // but leaves both sides settled, so the two bases must agree for the shift to
+    // be an SP adjustment.
+    #[local] relation stack_xtl_rebased(Address, Address, i64);
+    stack_xtl_rebased(func_start, use_addr, *use_ofs) <--
+        stack_def_used(_, def_base, def_ofs, use_addr, use_base, use_ofs),
+        if *def_base == *use_base,
+        if *def_ofs != *use_ofs,
+        instr_in_function(use_addr, func_start);
+
+    stack_xtl(func_start, addr, ofs, rtlreg) <--
+        ltl_inst(addr, ?LTLInst::Lgetstack(_, ofs, _, _)),
+        instr_in_function(addr, func_start),
+        !stack_def_used(_, _, _, addr, _, ofs),
+        let rtlreg = fresh_stack_slot_reg(*addr);
+
+    stack_xtl(func_start, addr, ofs, rtlreg) <--
+        ltl_inst(addr, ?LTLInst::Lload(_, Addressing::Ainstack(ofs), _, _)),
+        instr_in_function(addr, func_start),
+        !stack_def_used(_, _, _, addr, _, ofs),
+        let rtlreg = fresh_stack_slot_reg(*addr);
+
+    stack_xtl(func_start, addr, ofs, rtlreg) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Olea(Addressing::Ainstack(ofs)), _, _)),
+        instr_in_function(addr, func_start),
+        let rtlreg = fresh_stack_slot_reg(*addr);
+
+
+    alias_edge(rtlreg1, rtlreg2) <--
+        stack_xtl(func_start, use_addr, ofs, rtlreg1),
+        stack_xtl(func_start, use_addr, ofs, rtlreg2),
+        if rtlreg1 != rtlreg2;
+
+    // Bucket E: a reload of an address-taken slot has no reaching def, so alias its stack_xtl with the escaping slot's and both resolve to the SAME local the callee wrote through &local.
+    #[local] relation slot_addr_escaped(Address, Address, i64);
+
+    // A register definitely holding &slot(ofs), seeded by an exact stack LEA
+    // and carried through explicit copies. reg_def_used is intentionally MAY at
+    // CFG joins, so the origin lattice retains every possible source. Only a
+    // singleton Slot is projected below; Slot+NonStack and two distinct slots
+    // remain ambiguous and cannot manufacture an escaped caller-frame object.
+    #[local] relation stack_addr_lea_def(Address, Address, Mreg, i64);
+    stack_addr_lea_def(func_start, lea_addr, *dst_reg, *ofs) <--
+        ltl_inst(lea_addr, ?LTLInst::Lop(Operation::Olea(Addressing::Ainstack(ofs)), _, dst_reg)),
+        instr_in_function(lea_addr, func_start);
+
+    #[local] relation explicit_reg_copy(Address, Mreg, Mreg);
+    explicit_reg_copy(mov_addr, *src_reg, *dst_reg) <--
+        ltl_inst(mov_addr, ?LTLInst::Lop(Operation::Omove, args, dst_reg)),
+        if args.len() == 1,
+        let src_reg = &args[0];
+
+    // A compiler may spill a frame address before putting it in an argument
+    // register.  The stack reaching-definition edge is the structural proof
+    // that the reload carries the value stored by this exact Lsetstack; follow
+    // it just like an explicit register copy.  Without this edge an out-param
+    // passed through a spill is not classified as escaped, and the optimizer
+    // can propagate the slot's initializer across the call that mutates it.
+    #[local] relation stack_addr_reload_edge(Address, Address, Mreg, Address, Mreg);
+    stack_addr_reload_edge(*func_start, *reload_addr, *dst_reg, *spill_addr, *src_reg) <--
+        ltl_inst(reload_addr, ?LTLInst::Lgetstack(_, _, _, dst_reg)),
+        instr_in_function(reload_addr, func_start),
+        stack_def_used(spill_addr, _, _, reload_addr, _, _),
+        ltl_inst(spill_addr, ?LTLInst::Lsetstack(src_reg, _, _, _)),
+        instr_in_function(spill_addr, func_start);
+
+    #[local] lattice reg_stack_addr_origins(Address, Address, Mreg, Set<StackAddrOrigin>);
+
+    reg_stack_addr_origins(*func_start, *lea_addr, *dst_reg, Set::singleton(StackAddrOrigin::Slot(*ofs))) <--
+        stack_addr_lea_def(func_start, lea_addr, dst_reg, ofs);
+
+    // Every ordinary definition that is neither a stack LEA nor a copy starts
+    // a definitely non-stack value. Copies get their complete source set from
+    // the reaching definitions below instead of being pessimistically seeded.
+    reg_stack_addr_origins(*func_start, *def_addr, *reg, Set::singleton(StackAddrOrigin::NonStack)) <--
+        asm_effective_def(def_addr, reg),
+        instr_in_function(def_addr, func_start),
+        !stack_addr_lea_def(func_start, def_addr, reg, _),
+        !explicit_reg_copy(def_addr, _, reg),
+        !stack_addr_reload_edge(func_start, def_addr, reg, _, _);
+
+    // Entry pseudo-definitions represent caller values, never addresses of this
+    // callee's own frame. The asm_effective_def guard avoids adding NonStack to
+    // a real definition that happens to sit at the function-entry address.
+    reg_stack_addr_origins(*func_start, *func_start, *reg, Set::singleton(StackAddrOrigin::NonStack)) <--
+        reg_def_used(func_start, reg, use_addr),
+        instr_in_function(use_addr, func_start),
+        !asm_effective_def(func_start, reg);
+
+    reg_stack_addr_origins(*func_start, *mov_addr, *dst_reg, origins.clone()) <--
+        explicit_reg_copy(mov_addr, src_reg, dst_reg),
+        instr_in_function(mov_addr, func_start),
+        reg_def_used(src_def, src_reg, mov_addr),
+        reg_stack_addr_origins(func_start, src_def, src_reg, origins);
+
+    reg_stack_addr_origins(*func_start, *reload_addr, *dst_reg, origins.clone()) <--
+        stack_addr_reload_edge(func_start, reload_addr, dst_reg, spill_addr, src_reg),
+        reg_def_used(src_def, src_reg, spill_addr),
+        reg_stack_addr_origins(func_start, src_def, src_reg, origins);
+
+    // An explicit copy without a recovered source definition is unknown, not a
+    // proof that it carries some earlier stack address.
+    reg_stack_addr_origins(*func_start, *mov_addr, *dst_reg, Set::singleton(StackAddrOrigin::NonStack)) <--
+        explicit_reg_copy(mov_addr, src_reg, dst_reg),
+        instr_in_function(mov_addr, func_start),
+        !reg_def_used(_, src_reg, mov_addr);
+
+    #[local] relation reg_holds_slot_addr(Address, Address, i64, Mreg);
+    reg_holds_slot_addr(func_start, def_addr, ofs, reg) <--
+        reg_stack_addr_origins(func_start, def_addr, reg, origins),
+        if let Some(ofs) = sole_stack_slot(origins);
+
+    slot_addr_escaped(func_start, lea_addr, *ofs) <--
+        ltl_inst(lea_addr, ?LTLInst::Lop(Operation::Olea(Addressing::Ainstack(ofs)), _, _)),
+        instr_in_function(lea_addr, func_start),
+        reg_holds_slot_addr(func_start, def_addr, *ofs, dst_reg),
+        arg_setup_candidate(def_addr, dst_reg, _);
+
+    alias_edge(reload_rtl, lea_rtl) <--
+        ltl_inst(reload_addr, ?LTLInst::Lgetstack(_slot, ofs, _typ, _dst)),
+        instr_in_function(reload_addr, func_start),
+        !stack_def_used(_, _, _, reload_addr, _, ofs),
+        slot_addr_escaped(func_start, lea_addr, ofs),
+        if *lea_addr != *reload_addr,
+        stack_xtl(func_start, reload_addr, ofs, reload_rtl),
+        stack_xtl(func_start, lea_addr, ofs, lea_rtl),
+        if reload_rtl != lea_rtl;
+
+    // Whole-slot unification for an escaped address-taken slot: every access at that frame offset denotes one memory cell, so unify the LEA's address reg with every stack_xtl reg at the same offset. A re-based name is excluded: its displacement here was borrowed from another SP state and names a different cell.
+    alias_edge(lea_rtl, other_rtl) <--
+        slot_addr_escaped(func_start, lea_addr, ofs),
+        stack_xtl(func_start, lea_addr, ofs, lea_rtl),
+        !stack_xtl_rebased(func_start, lea_addr, *ofs),
+        stack_xtl(func_start, other_addr, ofs, other_rtl),
+        !stack_xtl_rebased(func_start, other_addr, *ofs),
+        if lea_rtl != other_rtl;
+
+    // Bucket E parity for synthetic-only stack reads: export the slot's single escaped canonical so a fresh-RTEMP Iload resolves deterministically instead of via the multi-valued stack_local_at.
+    #[local] relation slot_escaped_canonical_raw(Address, i64, RTLReg);
+    slot_escaped_canonical_raw(func_start, ofs, canonical) <--
+        slot_addr_escaped(func_start, lea_addr, ofs),
+        stack_var(func_start, lea_addr, ofs, canonical);
+
+    relation slot_escaped_canonical(Address, i64, RTLReg);
+    slot_escaped_canonical(func, ofs, m) <--
+        slot_escaped_canonical_raw(func, ofs, _),
+        agg m = ascent::aggregators::min(c) in slot_escaped_canonical_raw(func, ofs, c);
+
+    // A pointer to a stack slot can expose a whole constant-offset region, not
+    // just the first scalar cell.  Match the caller's proven address argument
+    // to the callee parameter at the same ABI position, then project only the
+    // callee's direct constant-offset memory accesses.  This is structural
+    // interprocedural evidence; instruction/address magnitude is never used to
+    // infer dataflow or reachability.
+    // For each current function/value, retain the set of original
+    // (direct-callee, ABI-position) parameters whose pointer value it carries.
+    // This point-keyed union lattice follows explicit moves and internal-call
+    // argument mappings, so an escaped caller object remains visible when a
+    // wrapper forwards its pointer to a deeper helper.  It does not materialize
+    // pairwise call-graph reachability.
+    #[local] lattice callee_param_origins(Address, RTLReg, Set<(Address, usize)>);
+    callee_param_origins(*callee, *param_rtl, Set::singleton((*callee, *pos))) <--
+        func_param_validated(callee, param_mreg),
+        abi_int_arg_position(param_mreg, pos),
+        reg_rtl(callee, param_mreg, param_rtl);
+
+    // Candidate instructions can retain a raw SSA id while call mappings and
+    // entry parameters expose the canonical representative of that same
+    // alias web.  Close the provenance over the existing canonical lattice in
+    // both directions.  This is still one set-valued fact per value id, not a
+    // pairwise reachability relation, and every connection is justified by an
+    // explicit alias edge already validated by RTL dataflow.
+    // `canonical` is unified inside the atom rather than compared afterwards: a
+    // trailing `if *mapped == *canonical` leaves both columns free, so the lookup
+    // degrades to a scan of every canonical edge for each origin fact, on every
+    // iteration of this SCC.
+    callee_param_origins(*current, *raw, origins.clone()) <--
+        callee_param_origins(current, canonical, origins),
+        xtl_canonical(raw, canonical),
+        if *raw != *canonical;
+
+    callee_param_origins(*current, *canonical, origins.clone()) <--
+        callee_param_origins(current, raw, origins),
+        xtl_canonical(raw, canonical),
+        if *raw != *canonical;
+
+    // Single-operand Omove value edges, keyed by the function and the value the
+    // move reads.  Matching the move out of rtl_inst_candidate inside the
+    // provenance rule below leaves `copy` free, which makes it a scan of every
+    // candidate instruction per origin fact per iteration; keying it here turns
+    // that into an indexed lookup and keeps the edge set built exactly once.
+    #[local] relation rtl_move_value_edge(Address, RTLReg, RTLReg);
+    rtl_move_value_edge(*func, src, *dst) <--
+        rtl_inst_candidate(copy, ?RTLInst::Iop(Operation::Omove, args, dst)),
+        if args.len() == 1,
+        let src = args[0],
+        instr_in_function(copy, func);
+
+    // Callee-saved register moves commonly preserve a pointer parameter for
+    // use after calls (for example R8 -> RBX).  Follow only explicit RTL Omove
+    // value edges within that callee; the destination SSA reg is the exact
+    // value consumed by subsequent Iload/Istore candidates.
+    callee_param_origins(*current, *dst, origins.clone()) <--
+        callee_param_origins(current, src, origins),
+        rtl_move_value_edge(current, src, dst);
+
+    // Forward the origin set through an exact internal-call argument mapping
+    // to the corresponding validated parameter of the nested callee.
+    callee_param_origins(*nested, *nested_param_rtl, origins.clone()) <--
+        callee_param_origins(current, arg_rtl, origins),
+        call_arg_mapping(call_addr, pos, arg_rtl),
+        instr_in_function(call_addr, current),
+        call_target_func(call_addr, nested),
+        func_param_validated(nested, nested_param_mreg),
+        abi_int_arg_position(nested_param_mreg, pos),
+        reg_rtl(nested, nested_param_mreg, nested_param_rtl);
+
+    // Inverted index over the origin lattice: the (function, value) pairs that
+    // carry the pointer originally passed as parameter `pos` of `callee`.  That
+    // is the direction the escape rules below need; testing set membership after
+    // an unbound `callee_param_origins(current, ...)` atom instead leaves both
+    // the function and the value free, so the lattice is scanned in full for
+    // every candidate argument -- and then scanned again per access.
+    #[local] relation param_origin_carrier(Address, usize, Address, RTLReg);
+    param_origin_carrier(*origin_func, *origin_pos, *current, *param_rtl) <--
+        callee_param_origins(current, param_rtl, origins),
+        for (origin_func, origin_pos) in origins.0.iter();
+
+    // A dynamic store to `buffer[capacity - 1]` proves which integer
+    // parameter bounds which pointer parameter.  Because parameter origins are
+    // propagated through exact internal-call mappings, the same contract is
+    // learned for a thin forwarding wrapper without constructing transitive
+    // call-graph reachability.  A generic indexed access is deliberately not
+    // enough: its displacement and access width must place the final written
+    // byte exactly at the capacity boundary.
+    #[local] relation param_byte_capacity_position(Address, usize, usize);
+    param_byte_capacity_position(*origin_func, *buffer_pos, *capacity_pos) <--
+        rtl_inst_candidate(store, ?RTLInst::Istore(chunk, addressing, args, _)),
+        if args.len() == 2 && indexed_store_ends_at_extent(addressing, chunk),
+        let buffer_rtl = args[0],
+        let capacity_rtl = args[1],
+        instr_in_function(store, current),
+        param_origin_carrier(origin_func, buffer_pos, current, buffer_rtl),
+        param_origin_carrier(origin_func, capacity_pos, current, capacity_rtl),
+        if *buffer_pos != *capacity_pos;
+
+    // Non-negative constant-offset accesses through a single base value, keyed by
+    // the function and that base.  Loads and stores carry the same field evidence
+    // here, so one relation serves both escape rules and the candidate scan is
+    // paid once instead of once per surviving argument tuple.
+    #[local] relation param_base_field_access(Address, RTLReg, i64, MemoryChunk);
+    param_base_field_access(*func, base, *field_ofs, *chunk) <--
+        rtl_inst_candidate(access, ?RTLInst::Iload(chunk, Addressing::Aindexed(field_ofs), args, _)),
+        if *field_ofs >= 0 && args.len() == 1,
+        let base = args[0],
+        instr_in_function(access, func);
+
+    param_base_field_access(*func, base, *field_ofs, *chunk) <--
+        rtl_inst_candidate(access, ?RTLInst::Istore(chunk, Addressing::Aindexed(field_ofs), args, _)),
+        if *field_ofs >= 0 && args.len() == 1,
+        let base = args[0],
+        instr_in_function(access, func);
+
+    relation escaped_stack_region_field(Address, i64, i64, MemoryChunk);
+    escaped_stack_region_field(caller, base_ofs, *field_ofs, *chunk) <--
+        reg_holds_slot_addr(caller, def_addr, base_ofs, arg_mreg),
+        arg_setup_candidate(def_addr, arg_mreg, call_addr),
+        abi_int_arg_position(arg_mreg, pos),
+        call_target_func(call_addr, callee),
+        param_origin_carrier(callee, pos, current, param_rtl),
+        param_base_field_access(current, param_rtl, field_ofs, chunk);
+
+    // Projecting the callee's own accesses only works when the callee has a body
+    // in this binary.  Everything an EXTERNAL callee writes through an escaped
+    // frame pointer (lstat filling a struct stat, fstat, gettimeofday) is
+    // invisible that way, so the caller's object is sized from whatever the
+    // caller itself happened to touch -- which is how a 144-byte struct stat
+    // ends up declared as a 4-byte int and the callee smashes the stack.
+    //
+    // Two structural sources of extent, both bounded by the frame:
+    //   * cells the caller reloads with no reaching frame store (they can only
+    //     hold what the call wrote), and
+    //   * a frame that exists solely to hold one escaped object, in which case
+    //     the object simply IS the frame.
+    // These are offsets inside one frame -- address arithmetic within a single
+    // memory object, not an ordering used to infer reachability; whether a
+    // store reaches a load stays a structural stack_def_used question.
+    #[local] relation frame_slot_read_undefined(Address, i64);
+    frame_slot_read_undefined(func, *ofs) <--
+        ltl_inst(addr, ?LTLInst::Lgetstack(_, ofs, _, _)),
+        instr_in_function(addr, func),
+        !stack_def_used(_, _, _, addr, _, ofs);
+
+    // A 16-byte frame load reads BOTH its cells, but only the low one lifts as
+    // an Lgetstack; the high cell's read is this same undefined-reload
+    // evidence.  Without it the cell never joins the escaped region it sits in
+    // (touch loads a stat buffer's timespec pair wide), so the recovered high
+    // lane read an undefined local instead of the region's storage.
+    frame_slot_read_undefined(func, hi_ofs) <--
+        sse_wide_frame_load(load_addr, _, ofs),
+        instr_in_function(load_addr, func),
+        let hi_ofs = *ofs + 8,
+        !stack_def_used(_, _, _, load_addr, _, hi_ofs);
+
+    stack_var_chunk(*func, hi_ofs, MemoryChunk::MAny64) <--
+        sse_wide_frame_load(load_addr, _, ofs),
+        instr_in_function(load_addr, func),
+        let hi_ofs = ofs + 8;
+
+    #[local] relation escaped_base_slot(Address, i64);
+    escaped_base_slot(func, *ofs) <-- slot_addr_escaped(func, _, ofs);
+
+    // Nearest enclosing escaped base, as a per-slot aggregate rather than a
+    // pairwise shadowing relation: the pairwise form is quadratic in the number
+    // of escaped bases and pushed large binaries past the decompile timeout.
+    #[local] relation slot_base_candidate(Address, i64, i64);
+    slot_base_candidate(func, *slot, *base) <--
+        frame_slot_read_undefined(func, slot),
+        escaped_base_slot(func, base),
+        if *base <= *slot;
+
+    #[local] relation slot_owner_base(Address, i64, i64);
+    slot_owner_base(func, slot, owner) <--
+        slot_base_candidate(func, slot, _),
+        agg owner = ascent::aggregators::max(b) in slot_base_candidate(func, slot, b);
+
+    #[local] relation escaped_region_cell(Address, i64, i64);
+    escaped_region_cell(func, *owner, *slot) <--
+        slot_owner_base(func, slot, owner),
+        if *slot > *owner;
+
+    // A frame holding no modeled local other than the escaped object itself:
+    // the compiler reserved that frame for this one out-parameter, so the
+    // object spans it.  This is the case with no field reloads at all, where
+    // the caller only hands the address to the callee.
+    // stack_var carries one row per access site, so deduplicate to distinct
+    // frame offsets before pairing them with every escaped base.
+    #[local] relation frame_slot_offset(Address, i64);
+    frame_slot_offset(func, *ofs) <-- stack_var(func, _, ofs, _);
+
+    #[local] relation other_frame_object(Address, i64);
+    other_frame_object(func, *base) <--
+        escaped_base_slot(func, base),
+        frame_slot_offset(func, ofs),
+        if *ofs != *base;
+
+    escaped_region_cell(func, *base, *base) <--
+        escaped_base_slot(func, base),
+        !other_frame_object(func, base);
+
+    // Kept apart from escaped_stack_region_field: where the callee's body IS
+    // visible its access widths are the better evidence, and a caller-side
+    // width at the same offset must not compete with it (one offset carrying
+    // two widths invalidates the whole region).  The layout builder merges
+    // these only at offsets the callee projection never covered.
+    relation escaped_stack_region_caller_field(Address, i64, i64, MemoryChunk);
+
+    escaped_stack_region_caller_field(func, *base, slot - base, *chunk) <--
+        escaped_region_cell(func, base, slot),
+        if *slot > *base,
+        stack_var_chunk(func, slot, chunk);
+
+    escaped_stack_region_caller_field(func, *base, 0, *chunk) <--
+        escaped_region_base(func, base),
+        stack_var_chunk(func, *base, chunk);
+
+    escaped_stack_region_caller_field(func, *base, 0, MemoryChunk::MInt8Unsigned) <--
+        escaped_region_base(func, base),
+        !stack_var_chunk(func, base, _);
+
+    // A frame slot whose address is taken and then dereferenced at a constant
+    // offset INSIDE the same function is at least that large, whether or not
+    // the address ever reaches a call.  The x86-64 register save area a varargs
+    // prologue builds is the canonical case: `lea disp(%rsp),%rN` followed by
+    // `mov 16(%rN),%eax` reads one multi-word object, and sizing that object
+    // from the narrow access that happens to name its first cell lets the read
+    // run off the end of the local.  The base must be the exact SSA value the
+    // LEA produced, so an unrelated pointer's field access can never widen it.
+    #[local] relation slot_addr_taken_reg(Address, Address, i64, RTLReg);
+    slot_addr_taken_reg(func, *lea_addr, *ofs, *base_rtl) <--
+        rtl_inst_candidate(lea_addr, ?RTLInst::Iop(Operation::Olea(Addressing::Ainstack(ofs)), _, base_rtl)),
+        instr_in_function(lea_addr, func);
+
+    slot_addr_taken_reg(func, *lea_addr, *ofs, *dst) <--
+        slot_addr_taken_reg(func, lea_addr, ofs, src),
+        rtl_inst_candidate(copy, ?RTLInst::Iop(Operation::Omove, args, dst)),
+        instr_in_function(copy, func),
+        if args.len() == 1 && args[0] == *src;
+
+    // Keyed on the base register so the join below is an index lookup.  Testing
+    // args[0] inside the join instead would rescan every Aindexed access for
+    // every address-taken slot, which is quadratic on a large function.
+    #[local] relation aindexed_field_access(Address, RTLReg, i64, MemoryChunk);
+    aindexed_field_access(func, args[0], *field_ofs, *chunk) <--
+        rtl_inst_candidate(access, ?RTLInst::Iload(chunk, Addressing::Aindexed(field_ofs), args, _)),
+        instr_in_function(access, func),
+        if *field_ofs > 0 && args.len() == 1;
+
+    aindexed_field_access(func, args[0], *field_ofs, *chunk) <--
+        rtl_inst_candidate(access, ?RTLInst::Istore(chunk, Addressing::Aindexed(field_ofs), args, _)),
+        instr_in_function(access, func),
+        if *field_ofs > 0 && args.len() == 1;
+
+    #[local] relation slot_local_deref_field(Address, i64, i64, MemoryChunk);
+    slot_local_deref_field(func, *ofs, *field_ofs, *chunk) <--
+        slot_addr_taken_reg(func, _, ofs, base_rtl),
+        aindexed_field_access(func, base_rtl, field_ofs, chunk);
+
+    #[local] relation slot_has_local_deref_field(Address, i64);
+    slot_has_local_deref_field(func, *ofs) <-- slot_local_deref_field(func, ofs, _, _);
+
+    // A taken slot address that is ADVANCED by pointer arithmetic and then
+    // dereferenced walks the object instead of naming one field, so no single
+    // access reveals its extent: the loop that reads `p->f; p += 16` shows only
+    // the constant 16.  Bound the object structurally, the same way an escaped
+    // region is bounded -- by the next address-taken object above it, else the
+    // end of the frame -- and claim every frame cell in that range.  Without
+    // this the array's initializing stores are dead by SSA liveness (their only
+    // reader is the pointer) and DSE deletes all but the first two.
+    #[local] relation slot_addr_base_deref(Address, RTLReg);
+    slot_addr_base_deref(func, args[0]) <--
+        rtl_inst_candidate(access, ?RTLInst::Iload(_, Addressing::Aindexed(_), args, _)),
+        instr_in_function(access, func),
+        if args.len() == 1;
+    slot_addr_base_deref(func, args[0]) <--
+        rtl_inst_candidate(access, ?RTLInst::Istore(_, Addressing::Aindexed(_), args, _)),
+        instr_in_function(access, func),
+        if args.len() == 1;
+
+    #[local] relation slot_addr_advanced(Address, RTLReg);
+    slot_addr_advanced(func, *base_rtl) <--
+        rtl_inst_candidate(step, ?RTLInst::Iop(op, args, _)),
+        instr_in_function(step, func),
+        if matches!(op, Operation::Oadd | Operation::Oaddl
+                      | Operation::Oaddimm(_) | Operation::Oaddlimm(_)),
+        for base_rtl in args.iter();
+
+    #[local] relation slot_addr_walked(Address, i64);
+    slot_addr_walked(func, *ofs) <--
+        slot_addr_taken_reg(func, _, ofs, base_rtl),
+        slot_addr_advanced(func, base_rtl),
+        slot_addr_base_deref(func, base_rtl);
+
+    #[local] relation slot_addr_taken_base(Address, i64);
+    slot_addr_taken_base(func, *ofs) <-- slot_addr_taken_reg(func, _, ofs, _);
+
+    #[local] relation slot_walk_next_base(Address, i64, i64);
+    slot_walk_next_base(func, *base, *other) <--
+        slot_addr_walked(func, base),
+        slot_addr_taken_base(func, other),
+        if *other > *base;
+
+    #[local] relation slot_walk_limit(Address, i64, i64);
+    slot_walk_limit(func, *base, limit) <--
+        slot_addr_walked(func, base),
+        agg limit = ascent::aggregators::min(o) in slot_walk_next_base(func, base, o);
+    slot_walk_limit(func, *base, limit) <--
+        slot_addr_walked(func, base),
+        !slot_walk_next_base(func, base, _),
+        func_stacksz(func, _, _, size),
+        if let Ok(size_i64) = i64::try_from(*size),
+        let limit = size_i64;
+
+    escaped_stack_region_caller_field(func, *base, field_ofs, MemoryChunk::MAny64) <--
+        slot_walk_limit(func, base, limit),
+        frame_slot_offset(func, cell),
+        if *cell >= *base && *cell < *limit,
+        let field_ofs = *cell - *base;
+
+    escaped_stack_region_caller_field(func, *ofs, *field_ofs, *chunk) <--
+        slot_local_deref_field(func, ofs, field_ofs, chunk);
+
+    escaped_stack_region_caller_field(func, *ofs, 0, *chunk) <--
+        slot_has_local_deref_field(func, ofs),
+        stack_var_chunk(func, *ofs, chunk);
+
+    escaped_stack_region_caller_field(func, *ofs, 0, MemoryChunk::MInt8Unsigned) <--
+        slot_has_local_deref_field(func, ofs),
+        !stack_var_chunk(func, ofs, _);
+
+    // The layout builder needs a base local for the region.  Publish one only
+    // for slots actually proven wider than their own cell, so ordinary
+    // address-taken scalars keep their existing single-cell treatment.
+    slot_escaped_canonical_raw(func, *ofs, *canonical) <--
+        slot_has_local_deref_field(func, ofs),
+        slot_addr_taken_reg(func, lea_addr, ofs, _),
+        stack_var(func, lea_addr, ofs, canonical);
+
+    // Backing storage must cover what the callee may write, which the caller's
+    // own accesses under-report.  Bound it by the frame: up to the next escaped
+    // object above, else the end of the frame.  Over-reserving is safe (the
+    // spare bytes go unused); under-reserving is the stack smash.
+    // escaped_region_cell holds one row per cell; the extent is a property of
+    // the base, so collapse to distinct bases before the pairings below.
+    // A frame slot handed to an external function that the ABI says writes a
+    // fixed-size object through that parameter.  The callee has no body here, so
+    // this is the only evidence of the object -- and it is exact.
+    //
+    // The callee is named through the call site itself, NOT through
+    // call_has_known_signature: that gate conditioned the pointee table's
+    // authority on the unrelated signature table's completeness, and 16 of the
+    // 35 pointee-table functions (fstatfs among them) had no signature row, so
+    // their extents silently never derived and every frame slot handed to them
+    // stayed sized by whatever the caller happened to read back.
+    #[local] relation known_extern_out_param_slot(Address, i64, usize);
+    known_extern_out_param_slot(caller, *base, *bytes) <--
+        reg_holds_slot_addr(caller, def_addr, base, arg_mreg),
+        arg_setup_candidate(def_addr, arg_mreg, call_addr),
+        abi_int_arg_position(arg_mreg, pos),
+        external_call_site(call_addr, _, name),
+        known_func_param_pointee_size(name, pos, bytes);
+
+    known_extern_out_param_slot(caller, *base, *bytes) <--
+        reg_holds_slot_addr(caller, def_addr, base, arg_mreg),
+        arg_setup_candidate(def_addr, arg_mreg, call_addr),
+        abi_int_arg_position(arg_mreg, pos),
+        ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Right(name)))),
+        // A local definition sharing a tabled libc name is not that libc call.
+        !emit_function(_, name, _),
+        known_func_param_pointee_size(name, pos, bytes);
+
+    // Internal functions do not have an ABI table entry, but their bodies can
+    // prove a byte-capacity parameter structurally.  At a concrete call site,
+    // pair that contract with the exact constant argument and retain it only
+    // when the claimed object fits in the caller's recovered frame.  The frame
+    // check is a physical-layout bound; it does not infer control-flow or
+    // reaching definitions from address magnitude.
+    #[local] relation internal_capacity_param_slot(Address, i64, i64);
+    internal_capacity_param_slot(caller, *base, extent) <--
+        reg_holds_slot_addr(caller, def_addr, base, arg_mreg),
+        arg_setup_candidate(def_addr, arg_mreg, call_addr),
+        abi_int_arg_position(arg_mreg, buffer_pos),
+        call_target_func(call_addr, callee),
+        param_byte_capacity_position(callee, buffer_pos, capacity_pos),
+        call_arg_mapping(call_addr, capacity_pos, capacity_rtl),
+        single_def_const(capacity_rtl, constant),
+        if let Some(extent) = positive_integral_extent(constant),
+        func_stacksz(caller, _, _, frame_size),
+        if let Ok(frame_top) = i64::try_from(*frame_size),
+        if let Some(object_end) = base.checked_add(extent),
+        if object_end <= frame_top;
+
+    // The ABI proves the region exists, not just how large it is.  Deriving the
+    // base cell here is what admits the common shape the structural sources both
+    // miss: the caller reads a field or two back at the base itself, so there is
+    // no undefined reload above the base to seed a cell, and the frame holds a
+    // canary besides, so it is not a whole-frame object either.
+    escaped_region_cell(caller, *base, *base) <--
+        known_extern_out_param_slot(caller, base, _);
+
+    // Unlike the frame-bounded fallback above, this contract already carries
+    // an exact capacity.  Publish its byte backing field directly instead of
+    // seeding escaped_region_cell, which would conservatively widen it to the
+    // next escaped base (often the entire frame) and absorb unrelated locals.
+    escaped_stack_region_caller_field(caller, *base, 0, MemoryChunk::MInt8Unsigned) <--
+        internal_capacity_param_slot(caller, base, _);
+
+    #[local] relation escaped_region_base(Address, i64);
+    escaped_region_base(func, *base) <-- escaped_region_cell(func, base, _);
+
+    #[local] relation escaped_region_next_base(Address, i64, i64);
+    escaped_region_next_base(func, *base, *inner) <--
+        escaped_region_base(func, base),
+        escaped_base_slot(func, inner),
+        if *inner > *base;
+
+    #[local] relation escaped_region_limit(Address, i64, i64);
+    escaped_region_limit(func, *base, limit) <--
+        escaped_region_base(func, base),
+        agg limit = ascent::aggregators::min(o) in escaped_region_next_base(func, base, o);
+
+    escaped_region_limit(func, *base, limit) <--
+        escaped_region_base(func, base),
+        !escaped_region_next_base(func, base, _),
+        func_stacksz(func, _, _, size),
+        if let Ok(size_i64) = i64::try_from(*size),
+        let limit = size_i64;
+
+    relation escaped_stack_region_extent(Address, i64, i64);
+    escaped_stack_region_extent(func, *base, extent) <--
+        escaped_region_limit(func, base, limit),
+        if *limit > *base,
+        let extent = limit - base;
+
+    // An external callee has no body here to project, so everything it writes
+    // through the pointer is invisible and the object gets sized from whatever
+    // fields the caller happens to read back.  For the ones whose out-parameter
+    // is a fixed ABI object the size is simply known -- `lstat` fills 144 bytes
+    // of `struct stat` whatever the caller does with it.
+    escaped_stack_region_extent(caller, *base, extent) <--
+        known_extern_out_param_slot(caller, base, bytes),
+        if let Ok(extent) = i64::try_from(*bytes);
+
+    escaped_stack_region_extent(caller, *base, *extent) <--
+        internal_capacity_param_slot(caller, base, extent);
+
+    // Canonical caller locals for every callee-observed field.  RTL DSE reads
+    // this alongside slot_escaped_canonical so stores into neighboring cells
+    // survive even though their only use is through the escaped base pointer.
+    #[local] relation slot_escaped_region_canonical_raw(Address, i64, RTLReg);
+    slot_escaped_region_canonical_raw(caller, slot_ofs, local) <--
+        escaped_stack_region_field(caller, base_ofs, field_ofs, _),
+        if let Some(slot_ofs) = base_ofs.checked_add(*field_ofs),
+        stack_var(caller, _, slot_ofs, local);
+
+    // Same protection for cells only the caller observed; without it DSE can
+    // drop a store into a cell whose only other reader is the callee.
+    slot_escaped_region_canonical_raw(caller, slot_ofs, local) <--
+        escaped_stack_region_caller_field(caller, base_ofs, field_ofs, _),
+        if let Some(slot_ofs) = base_ofs.checked_add(*field_ofs),
+        stack_var(caller, _, slot_ofs, local);
+
+    relation slot_escaped_region_canonical(Address, i64, RTLReg);
+    slot_escaped_region_canonical(func, ofs, local) <--
+        slot_escaped_region_canonical_raw(func, ofs, _),
+        agg local = ascent::aggregators::min(c) in slot_escaped_region_canonical_raw(func, ofs, c);
+
+    stack_var_chunk(*func, ofs, chunk) <--
+        ltl_inst(node, ?LTLInst::Lload(chunk, Addressing::Ainstack(ofs), _, _)),
+        instr_in_function(node, func);
+
+    stack_var_chunk(*func, ofs, chunk) <--
+        ltl_inst(node, ?LTLInst::Lstore(chunk, Addressing::Ainstack(ofs), _, _)),
+        instr_in_function(node, func);
+
+    stack_var_chunk(*func, ofs, chunk) <--
+        ltl_inst(node, ?LTLInst::Lgetstack(_, ofs, typ, _)),
+        let chunk = typ_to_chunk(*typ),
+        instr_in_function(node, func);
+
+    stack_var_chunk(*func, ofs, chunk) <--
+        ltl_inst(node, ?LTLInst::Lsetstack(_, _, ofs, typ)),
+        let chunk = typ_to_chunk(*typ),
+        instr_in_function(node, func);
+
+    // An immediate-to-stack store has no ltl_inst, so record its width here like any other stack access, or an 8-byte zero-init out-param falls back to int and truncates to 4 bytes.
+    stack_var_chunk(*func, ofs, chunk) <--
+        mach_imm_stack_init(addr, ofs, _, typ),
+        instr_in_function(addr, func),
+        let chunk = typ_to_chunk(*typ);
+
+
+    relation plt_function(Address, Symbol);
+
+    plt_function(addr, clean_name_sym) <--
+        plt_entry(addr, raw_name),
+        let clean_name = raw_name.split('@').next().unwrap_or(raw_name),
+        let clean_name_sym = Box::leak(clean_name.to_string().into_boxed_str()) as Symbol;
+
+    plt_function(addr, clean_name_sym) <--
+        plt_block(addr, raw_name),
+        let clean_name = raw_name.split('@').next().unwrap_or(raw_name),
+        let clean_name_sym = Box::leak(clean_name.to_string().into_boxed_str()) as Symbol;
+
+    relation external_call_site(Node, Address, Symbol);
+
+    external_call_site(call_site, target, *name) <--
+        ltl_inst(call_site, ?LTLInst::Lcall(Either::Right(Either::Left(target)))),
+        plt_function(target, name);
+
+
+    external_call_site(call_site, target, *name) <--
+        ltl_inst(call_site, ?LTLInst::Lcall(Either::Right(Either::Left(target)))),
+        let offset_target = target + ENDBR64_LEN,
+        plt_function(offset_target, name);
+
+    external_call_site(call_site, target, *name) <--
+        ltl_inst(call_site, ?LTLInst::Lcall(Either::Right(Either::Left(target)))),
+        if *target >= ENDBR64_LEN,
+        let offset_target = target - ENDBR64_LEN,
+        plt_function(offset_target, name);
+
+    external_call_site(call_site, target, *name) <--
+        ltl_inst(call_site, ?LTLInst::Ltailcall(Either::Right(Either::Left(target)))),
+        plt_function(target, name);
+
+    external_call_site(call_site, target, *name) <--
+        ltl_inst(call_site, ?LTLInst::Ltailcall(Either::Right(Either::Left(target)))),
+        let offset_target = target + ENDBR64_LEN,
+        plt_function(offset_target, name);
+
+    external_call_site(call_site, target, *name) <--
+        ltl_inst(call_site, ?LTLInst::Ltailcall(Either::Right(Either::Left(target)))),
+        if *target >= ENDBR64_LEN,
+        let offset_target = target - ENDBR64_LEN,
+        plt_function(offset_target, name);
+
+    external_call_site(call_site, target, *name) <--
+        ltl_inst(call_site, ?LTLInst::Lcall(Either::Right(Either::Left(target)))),
+        base_ident_to_symbol(target_id, name),
+        if *target as usize == *target_id,
+        // Local def wins: a binary's own function sharing a tabled libc name is not an extern call.
+        !emit_function(_, name, _),
+        known_extern_signature(name, _, _, _);
+
+    relation call_site(Node, Symbol);
+    relation call_arg(Node, usize, RTLReg);
+
+    call_site(node, *name) <--
+        external_call_site(node, _, name);
+
+    call_site(call_addr, *name) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Left(target)))),
+        emit_function(target, name, _);
+
+    call_arg(node, pos, reg) <--
+        call_arg_mapping(node, pos, reg);
+
+
+    ident_to_symbol(id, *name) <-- base_ident_to_symbol(id, name);
+    ident_to_symbol(target_id, *name) <--
+        external_call_site(_, target, name),
+        let target_id = *target as usize;
+
+
+    relation resolved_extern_signature(Symbol, usize, XType, Arc<Vec<XType>>);
+
+    resolved_extern_signature(*name, *count, *ret, params.clone()) <--
+        plt_function(_, name),
+        known_extern_signature(name, count, ret, params);
+
+    call_has_known_signature(call_site, *name, *param_count, *ret_type) <--
+        external_call_site(call_site, _, name),
+        known_extern_signature(name, param_count, ret_type, _);
+
+    // Also match symbol-based calls (Right(Right(name))) against known signatures
+    call_has_known_signature(call_site, *name, *param_count, *ret_type) <--
+        ltl_inst(call_site, ?LTLInst::Lcall(Either::Right(Either::Right(name)))),
+        !emit_function(_, name, _),
+        known_extern_signature(name, param_count, ret_type, _);
+
+    call_has_known_signature(call_site, *name, *param_count, *ret_type) <--
+        ltl_inst(call_site, ?LTLInst::Ltailcall(Either::Right(Either::Right(name)))),
+        !emit_function(_, name, _),
+        known_extern_signature(name, param_count, ret_type, _);
+
+    // Count of GP-class params in a known signature: float args consume no integer position, so gating forwarded-param evidence on this count stops a pure-float callee fabricating a phantom int param.
+    #[local] relation known_sig_gp_param_count(Symbol, usize);
+    known_sig_gp_param_count(*name, gp) <--
+        known_extern_signature(name, _, _, params),
+        let gp = params.iter().filter(|t| !matches!(**t, XType::Xfloat | XType::Xsingle)).count();
+
+    #[local] relation known_sig_gp_position(Symbol, usize);
+    known_sig_gp_position(name, pos) <--
+        known_sig_gp_param_count(name, gp),
+        !abi_shared_arg_slots(true),
+        !abi_reg_args_per_function(true),
+        abi_int_arg_position(_, pos),
+        if *pos < *gp;
+    // Where the register slots are per-function, a signature's parameter count says nothing about which of them ride in registers: under the cdecl default they are all on the stack, and only a fastcall decoration claims ECX/EDX.
+    known_sig_gp_position(name, pos) <--
+        abi_reg_args_per_function(true),
+        known_sig_gp_param_count(name, gp),
+        extern_decorated_reg_args(name, n),
+        abi_int_arg_position(_, pos),
+        if *pos < *gp && *pos < *n;
+    known_sig_gp_position(*name, pos) <--
+        known_extern_signature(name, _, _, params),
+        abi_shared_arg_slots(true),
+        abi_int_arg_position(_, pos),
+        if *pos < params.len(),
+        if !matches!(params[*pos], XType::Xfloat | XType::Xsingle);
+
+    relation call_known_sig_gp_position(Node, usize);
+    call_known_sig_gp_position(*call_site, *pos) <--
+        call_has_known_signature(call_site, name, _, _),
+        known_sig_gp_position(name, pos);
+
+    relation unknown_extern(Symbol);
+
+    unknown_extern(*name) <--
+        plt_function(_, name),
+        !known_extern_signature(name, _, _, _);
+
+    relation call_arg_mapping(Node, usize, RTLReg);
+    relation call_arg_position_allowed(Node, usize);
+
+    relation call_target_func(Node, Address);
+
+    call_target_func(call_addr, *target) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Left(target))));
+
+    call_target_func(call_addr, *target) <--
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(Either::Right(Either::Left(target))));
+
+    relation func_param_position_type(Address, usize, XType);
+
+    func_param_position_type(func_start, 0, xtype) <--
+        func_has_param_at_position(func_start, 0),
+        !abi_shared_arg_slots(true),
+        func_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::DI, rtl_reg),
+        emit_var_type_candidate(rtl_reg, xtype);
+
+    func_param_position_type(func_start, 1, xtype) <--
+        func_has_param_at_position(func_start, 1),
+        !abi_shared_arg_slots(true),
+        func_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::SI, rtl_reg),
+        emit_var_type_candidate(rtl_reg, xtype);
+
+    func_param_position_type(func_start, 2, xtype) <--
+        func_has_param_at_position(func_start, 2),
+        !abi_shared_arg_slots(true),
+        func_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::DX, rtl_reg),
+        emit_var_type_candidate(rtl_reg, xtype);
+
+    func_param_position_type(func_start, 3, xtype) <--
+        func_has_param_at_position(func_start, 3),
+        !abi_shared_arg_slots(true),
+        func_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::CX, rtl_reg),
+        emit_var_type_candidate(rtl_reg, xtype);
+
+    func_param_position_type(func_start, 4, xtype) <--
+        func_has_param_at_position(func_start, 4),
+        !abi_shared_arg_slots(true),
+        func_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::R8, rtl_reg),
+        emit_var_type_candidate(rtl_reg, xtype);
+
+    func_param_position_type(func_start, 5, xtype) <--
+        func_has_param_at_position(func_start, 5),
+        !abi_shared_arg_slots(true),
+        func_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::R9, rtl_reg),
+        emit_var_type_candidate(rtl_reg, xtype);
+
+    func_param_position_type(func_start, 0, XType::Xint) <--
+        func_has_param_at_position(func_start, 0),
+        !abi_shared_arg_slots(true),
+        func_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::DI, rtl_reg),
+        !emit_var_type_candidate(rtl_reg, _);
+
+    func_param_position_type(func_start, 1, XType::Xint) <--
+        func_has_param_at_position(func_start, 1),
+        !abi_shared_arg_slots(true),
+        func_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::SI, rtl_reg),
+        !emit_var_type_candidate(rtl_reg, _);
+
+    func_param_position_type(func_start, 2, XType::Xint) <--
+        func_has_param_at_position(func_start, 2),
+        !abi_shared_arg_slots(true),
+        func_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::DX, rtl_reg),
+        !emit_var_type_candidate(rtl_reg, _);
+
+    func_param_position_type(func_start, 3, XType::Xint) <--
+        func_has_param_at_position(func_start, 3),
+        !abi_shared_arg_slots(true),
+        func_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::CX, rtl_reg),
+        !emit_var_type_candidate(rtl_reg, _);
+
+    func_param_position_type(func_start, 4, XType::Xint) <--
+        func_has_param_at_position(func_start, 4),
+        !abi_shared_arg_slots(true),
+        func_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::R8, rtl_reg),
+        !emit_var_type_candidate(rtl_reg, _);
+
+    func_param_position_type(func_start, 5, XType::Xint) <--
+        func_has_param_at_position(func_start, 5),
+        !abi_shared_arg_slots(true),
+        func_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::R9, rtl_reg),
+        !emit_var_type_candidate(rtl_reg, _);
+
+    // Windows shared-slot GP parameter typing.
+    func_param_position_type(func_start, *pos, xtype) <--
+        abi_shared_arg_slots(true),
+        func_param_validated(func_start, mreg),
+        abi_int_arg_position(mreg, pos),
+        func_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, mreg, rtl_reg),
+        emit_var_type_candidate(rtl_reg, xtype);
+    func_param_position_type(func_start, *pos, XType::Xint) <--
+        abi_shared_arg_slots(true),
+        func_param_validated(func_start, mreg),
+        abi_int_arg_position(mreg, pos),
+        func_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, mreg, rtl_reg),
+        !emit_var_type_candidate(rtl_reg, _);
+
+    // Integer-only param count, used as offset for SysV float param positions.
+    relation emit_function_int_param_count(Address, usize);
+
+    emit_function_int_param_count(target_addr, count) <--
+        !abi_shared_arg_slots(true),
+        func_param_validated(target_addr, _),
+        agg count = ascent::aggregators::count() in func_param_validated(target_addr, _);
+
+    emit_function_int_param_count(target_addr, 0) <--
+        !abi_shared_arg_slots(true),
+        func_stacksz(target_addr, _, _, _),
+        !func_param_validated(target_addr, _);
+
+    // Float param position types appended after integer params
+    func_param_position_type(func_start, *int_count + 0, xtype) <--
+        func_float_param_validated(func_start, Mreg::X0, 0),
+        emit_function_int_param_count(func_start, int_count),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::X0, rtl_reg),
+        emit_var_type_candidate(rtl_reg, xtype);
+    func_param_position_type(func_start, *int_count + 0, XType::Xfloat) <--
+        func_float_param_validated(func_start, Mreg::X0, 0),
+        emit_function_int_param_count(func_start, int_count),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::X0, rtl_reg),
+        !emit_var_type_candidate(rtl_reg, _);
+
+    func_param_position_type(func_start, *int_count + 1, xtype) <--
+        func_float_param_validated(func_start, Mreg::X1, 1),
+        emit_function_int_param_count(func_start, int_count),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::X1, rtl_reg),
+        emit_var_type_candidate(rtl_reg, xtype);
+    func_param_position_type(func_start, *int_count + 1, XType::Xfloat) <--
+        func_float_param_validated(func_start, Mreg::X1, 1),
+        emit_function_int_param_count(func_start, int_count),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::X1, rtl_reg),
+        !emit_var_type_candidate(rtl_reg, _);
+
+    func_param_position_type(func_start, *int_count + 2, xtype) <--
+        func_float_param_validated(func_start, Mreg::X2, 2),
+        emit_function_int_param_count(func_start, int_count),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::X2, rtl_reg),
+        emit_var_type_candidate(rtl_reg, xtype);
+    func_param_position_type(func_start, *int_count + 2, XType::Xfloat) <--
+        func_float_param_validated(func_start, Mreg::X2, 2),
+        emit_function_int_param_count(func_start, int_count),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::X2, rtl_reg),
+        !emit_var_type_candidate(rtl_reg, _);
+
+    func_param_position_type(func_start, *int_count + 3, xtype) <--
+        func_float_param_validated(func_start, Mreg::X3, 3),
+        emit_function_int_param_count(func_start, int_count),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::X3, rtl_reg),
+        emit_var_type_candidate(rtl_reg, xtype);
+    func_param_position_type(func_start, *int_count + 3, XType::Xfloat) <--
+        func_float_param_validated(func_start, Mreg::X3, 3),
+        emit_function_int_param_count(func_start, int_count),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::X3, rtl_reg),
+        !emit_var_type_candidate(rtl_reg, _);
+
+    func_param_position_type(func_start, *int_count + 4, xtype) <--
+        func_float_param_validated(func_start, Mreg::X4, 4),
+        emit_function_int_param_count(func_start, int_count),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::X4, rtl_reg),
+        emit_var_type_candidate(rtl_reg, xtype);
+    func_param_position_type(func_start, *int_count + 4, XType::Xfloat) <--
+        func_float_param_validated(func_start, Mreg::X4, 4),
+        emit_function_int_param_count(func_start, int_count),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::X4, rtl_reg),
+        !emit_var_type_candidate(rtl_reg, _);
+
+    func_param_position_type(func_start, *int_count + 5, xtype) <--
+        func_float_param_validated(func_start, Mreg::X5, 5),
+        emit_function_int_param_count(func_start, int_count),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::X5, rtl_reg),
+        emit_var_type_candidate(rtl_reg, xtype);
+    func_param_position_type(func_start, *int_count + 5, XType::Xfloat) <--
+        func_float_param_validated(func_start, Mreg::X5, 5),
+        emit_function_int_param_count(func_start, int_count),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::X5, rtl_reg),
+        !emit_var_type_candidate(rtl_reg, _);
+
+    func_param_position_type(func_start, *int_count + 6, xtype) <--
+        func_float_param_validated(func_start, Mreg::X6, 6),
+        emit_function_int_param_count(func_start, int_count),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::X6, rtl_reg),
+        emit_var_type_candidate(rtl_reg, xtype);
+    func_param_position_type(func_start, *int_count + 6, XType::Xfloat) <--
+        func_float_param_validated(func_start, Mreg::X6, 6),
+        emit_function_int_param_count(func_start, int_count),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::X6, rtl_reg),
+        !emit_var_type_candidate(rtl_reg, _);
+
+    func_param_position_type(func_start, *int_count + 7, xtype) <--
+        func_float_param_validated(func_start, Mreg::X7, 7),
+        emit_function_int_param_count(func_start, int_count),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::X7, rtl_reg),
+        emit_var_type_candidate(rtl_reg, xtype);
+    func_param_position_type(func_start, *int_count + 7, XType::Xfloat) <--
+        func_float_param_validated(func_start, Mreg::X7, 7),
+        emit_function_int_param_count(func_start, int_count),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, Mreg::X7, rtl_reg),
+        !emit_var_type_candidate(rtl_reg, _);
+
+    // Windows floating-point registers use the same source-language ordinal as their GP counterparts rather than an appended XMM sequence.
+    func_param_position_type(func_start, *pos, xtype) <--
+        abi_shared_arg_slots(true),
+        func_float_param_validated(func_start, mreg, pos),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, mreg, rtl_reg),
+        emit_var_type_candidate(rtl_reg, xtype);
+    func_param_position_type(func_start, *pos, XType::Xfloat) <--
+        abi_shared_arg_slots(true),
+        func_float_param_validated(func_start, mreg, pos),
+        func_float_arg_used_undefined(func_start, rtl_reg),
+        reg_xtl(func_start, mreg, rtl_reg),
+        !emit_var_type_candidate(rtl_reg, _);
+
+    // U1: route inferred-pointer evidence into the SIGNATURE param types, not just the decl, or the callee's int signature makes every call site cast the pointer arg to (int).
+    func_param_position_type(func_start, 0, XType::Xptr) <--
+        func_has_param_at_position(func_start, 0),
+        !abi_shared_arg_slots(true),
+        param_inferred_type_is_pointer(func_start, Mreg::DI);
+    func_param_position_type(func_start, 1, XType::Xptr) <--
+        func_has_param_at_position(func_start, 1),
+        !abi_shared_arg_slots(true),
+        param_inferred_type_is_pointer(func_start, Mreg::SI);
+    func_param_position_type(func_start, 2, XType::Xptr) <--
+        func_has_param_at_position(func_start, 2),
+        !abi_shared_arg_slots(true),
+        param_inferred_type_is_pointer(func_start, Mreg::DX);
+    func_param_position_type(func_start, 3, XType::Xptr) <--
+        func_has_param_at_position(func_start, 3),
+        !abi_shared_arg_slots(true),
+        param_inferred_type_is_pointer(func_start, Mreg::CX);
+    func_param_position_type(func_start, 4, XType::Xptr) <--
+        func_has_param_at_position(func_start, 4),
+        !abi_shared_arg_slots(true),
+        param_inferred_type_is_pointer(func_start, Mreg::R8);
+    func_param_position_type(func_start, 5, XType::Xptr) <--
+        func_has_param_at_position(func_start, 5),
+        !abi_shared_arg_slots(true),
+        param_inferred_type_is_pointer(func_start, Mreg::R9);
+
+    func_param_position_type(func_start, *pos, XType::Xptr) <--
+        abi_shared_arg_slots(true),
+        func_param_validated(func_start, mreg),
+        abi_int_arg_position(mreg, pos),
+        param_inferred_type_is_pointer(func_start, mreg);
+
+    relation func_param_types(Address, Arc<Vec<XType>>);
+
+    func_param_types(func_start, param_types) <--
+        func_param_position_type(func_start, _, _),
+        agg param_types = build_xtype_vec(pos, xtype) in func_param_position_type(func_start, pos, xtype);
+
+    // For internal functions matching known externs, use known sig to avoid false variadic params.
+    relation func_has_known_extern_sig(Address);
+
+    // Only suppress inferred sigs for variadic functions; non-variadic may be custom implementations.
+    func_has_known_extern_sig(func_start) <--
+        emit_function(func_start, name, _),
+        known_varargs_function(name, _);
+
+    relation emit_function_signature_candidate(Address, Signature);
+
+    // When a known varargs extern signature exists, prefer it over inferred signature.
+    emit_function_signature_candidate(func_start, sig) <--
+        emit_function(func_start, name, _),
+        known_varargs_function(name, _),
+        known_extern_signature(name, _, ret_type, known_params),
+        let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: CallConv::default() };
+
+    emit_function_signature_candidate(func_start, sig) <--
+        emit_function(func_start, _, _),
+        !func_has_known_extern_sig(func_start),
+        func_param_types(func_start, param_types),
+        emit_function_return_type_xtype_candidate(func_start, ret_type),
+        let sig = Signature { sig_args: param_types.clone(), sig_res: *ret_type, sig_cc: CallConv::default() };
+
+    emit_function_signature_candidate(func_start, sig) <--
+        emit_function(func_start, _, _),
+        !func_has_known_extern_sig(func_start),
+        func_param_types(func_start, param_types),
+        !emit_function_return_type_xtype_candidate(func_start, _),
+        let sig = Signature { sig_args: param_types.clone(), sig_res: XType::Xvoid, sig_cc: CallConv::default() };
+
+    emit_function_signature_candidate(func_start, sig) <--
+        emit_function(func_start, _, _),
+        !func_has_known_extern_sig(func_start),
+        !func_param_types(func_start, _),
+        emit_function_return_type_xtype_candidate(func_start, ret_type),
+        let sig = Signature { sig_args: Arc::new(vec![]), sig_res: *ret_type, sig_cc: CallConv::default() };
+
+    emit_function_signature_candidate(func_start, sig) <--
+        emit_function(func_start, _, _),
+        !func_has_known_extern_sig(func_start),
+        !func_param_types(func_start, _),
+        !emit_function_return_type_xtype_candidate(func_start, _),
+        let sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xvoid, sig_cc: CallConv::default() };
+
+
+    call_arg_position_allowed(call_addr, pos) <--
+        call_has_arg_at_position(call_addr, pos),
+        !call_has_known_signature(call_addr, _, _, _);
+
+    call_arg_position_allowed(call_addr, pos) <--
+        call_has_arg_at_position(call_addr, pos),
+        call_has_known_signature(call_addr, name, _, _),
+        known_varargs_function(name, _);
+
+    call_arg_position_allowed(call_addr, pos) <--
+        call_has_arg_at_position(call_addr, pos),
+        call_has_known_signature(call_addr, name, sig_arg_count, _),
+        !known_varargs_function(name, _),
+        !abi_shared_arg_slots(true),
+        if pos < sig_arg_count;
+
+    call_arg_position_allowed(call_addr, pos) <--
+        call_has_arg_at_position(call_addr, pos),
+        call_has_known_signature(call_addr, name, _, _),
+        !known_varargs_function(name, _),
+        known_extern_signature(name, _, _, arg_types),
+        abi_shared_arg_slots(true),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < arg_types.len(),
+        if *pos >= *first_stack || !matches!(arg_types[*pos], XType::Xfloat | XType::Xsingle);
+
+    call_arg_mapping(*call_addr, pos, rtl_reg) <--
+        call_arg_setup_detected(_, dst_reg, call_addr),
+        call_input_rtl(call_addr, dst_reg, rtl_reg),
+        abi_int_arg_position(dst_reg, pos),
+        call_reg_arg_slot_ok(call_addr, pos),
+        call_arg_position_allowed(call_addr, pos);
+
+    call_arg_mapping(*call_addr, pos, rtl_reg) <--
+        tailcall_arg_setup_detected(_, dst_reg, call_addr),
+        call_input_rtl(call_addr, dst_reg, rtl_reg),
+        abi_int_arg_position(dst_reg, pos),
+        call_reg_arg_slot_ok(call_addr, pos),
+        call_arg_position_allowed(call_addr, pos);
+
+    // R3: outgoing STACK arguments anchored in the ENTRY frame so they reconcile against the call's RSP; an approximation that may under-recover an arg stored in an earlier block but never fabricates one for a local.
+    #[local] relation og_arg_store(Address, i64, RTLReg, Address);
+    og_arg_store(*st_addr, abs_slot, *src_rtl, *func) <--
+        ltl_inst(st_addr, ?LTLInst::Lstore(_, Addressing::Aindexed(ofs), args, src)),
+        if args.len() == 1 && args[0] == Mreg::SP,
+        if *ofs >= 0,
+        instr_in_function(st_addr, func),
+        // Only slot existence matters here.  Keep this pre-canonical so an
+        // outgoing-argument phi can feed aliasing without a cycle through the
+        // settled canonical lattice.
+        !stack_xtl(func, st_addr, *ofs, _),
+        sp_entry_ofs(func, st_addr, sp_offsets),
+        for sp_st in sp_offsets.0.iter(),
+        let abs_slot = *ofs + *sp_st,
+        reg_xtl(st_addr, *src, src_rtl);
+
+    // Simple [rsp+disp] = reg stores lift through Lsetstack, so recover their entry-anchored slot; these shapes are WEAK and need callee-body corroboration, while the Lstore and PUSH shapes stay strong.
+    #[local] relation og_arg_store_weak(Address, i64, RTLReg);
+
+    og_arg_store(*st_addr, abs_slot, *src_rtl, *func),
+    og_arg_store_weak(*st_addr, abs_slot, *src_rtl) <--
+        ltl_inst(st_addr, ?LTLInst::Lsetstack(src, _, ofs, _)),
+        pmov(st_addr, dst_sym, _),
+        op_indirect(dst_sym, _, base_str, idx_str, _, disp, _),
+        if Mreg::x86(*base_str) == Mreg::SP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp == *ofs,
+        instr_in_function(st_addr, func),
+        sp_entry_ofs(func, st_addr, sp_offsets),
+        for sp_st in sp_offsets.0.iter(),
+        let abs_slot = *disp + *sp_st,
+        reg_xtl(st_addr, *src, src_rtl);
+
+    // Immediate stack stores have no LTL instruction, and mach_imm_stack_init's slot omits absorbed callee-save pushes, so re-anchor the raw displacement with this pass's CFG-derived SP state.
+    og_arg_store(*st_addr, abs_slot, *src_rtl, *func),
+    og_arg_store_weak(*st_addr, abs_slot, *src_rtl) <--
+        mach_imm_stack_init(st_addr, stack_ofs, _, _),
+        pmov(st_addr, dst_sym, _),
+        op_indirect(dst_sym, _, base_str, idx_str, _, disp, _),
+        if Mreg::x86(*base_str) == Mreg::SP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        instr_in_function(st_addr, func),
+        sp_entry_ofs(func, st_addr, sp_offsets),
+        for sp_st in sp_offsets.0.iter(),
+        let abs_slot = *disp + *sp_st,
+        stack_xtl(func, st_addr, stack_ofs, src_rtl);
+
+    // Point-keyed may-reaching state for outgoing stack stores.  Argument
+    // marshalling commonly crosses a basic-block edge when several cases share
+    // the final register setup and call.  The old materialized store-to-point
+    // walk stopped at that edge and silently discarded every pushed argument.
+    // A Set lattice is the ordinary reaching-def domain: predecessor joins are
+    // union, a store kills older values for its exact entry-anchored slot, and a
+    // call is a barrier so one call's arguments never leak into the next.
+    // State is keyed by (function, node), never by an origin/destination pair.
+    #[local] relation og_cfg_step(Address, Address, Address);
+    og_cfg_step(*func, *src, *dst) <--
+        next(src, dst),
+        code_in_block(src, block),
+        code_in_block(dst, block),
+        instr_in_function(src, func),
+        instr_in_function(dst, func);
+    og_cfg_step(*func, *src, *dst) <--
+        ddisasm_cfg_edge(src, dst, edge_type),
+        if *edge_type != "call" && *edge_type != "indirect" && *edge_type != "indirect_call",
+        instr_in_function(src, func),
+        instr_in_function(dst, func);
+
+    #[local] lattice og_store_in(Address, Address, Set<(i64, RTLReg, bool)>);
+    #[local] lattice og_store_out(Address, Address, Set<(i64, RTLReg, bool)>);
+
+    og_store_in(*func, *succ, state.clone()) <--
+        og_store_out(func, addr, state),
+        og_cfg_step(func, addr, succ);
+
+    og_store_out(*func, *addr, Set::singleton((*abs_slot, *src_rtl, true))) <--
+        og_arg_store_weak(addr, abs_slot, src_rtl),
+        instr_in_function(addr, func);
+    og_store_out(*func, *addr, Set::singleton((*abs_slot, *src_rtl, false))) <--
+        og_arg_store(addr, abs_slot, src_rtl, func),
+        !og_arg_store_weak(addr, *abs_slot, *src_rtl);
+
+    og_store_out(*func, *addr, Set::singleton((*abs_slot, *src_rtl, *weak))) <--
+        og_store_in(func, addr, state),
+        for (abs_slot, src_rtl, weak) in state.0.iter(),
+        !og_arg_store(addr, *abs_slot, _, _),
+        !is_call_or_tailcall(addr);
+
+    // Source position of a call's FIRST outgoing stack argument: the callee's own register-argument count where its convention is known (a fastcall callee's stack args start at position 2), else the image-wide default; func_reg_arg_count is empty on every other ABI, which therefore keeps abi_first_stack_arg_position verbatim.
+    #[local] relation call_callee_has_reg_args(Node);
+    call_callee_has_reg_args(call_addr) <--
+        call_target_func(call_addr, callee),
+        func_reg_arg_count(callee, _);
+
+    #[local] relation call_stack_arg_base_position(Node, usize);
+    call_stack_arg_base_position(call_addr, *n) <--
+        is_call_instruction(call_addr),
+        call_target_func(call_addr, callee),
+        func_reg_arg_count(callee, n);
+    call_stack_arg_base_position(call_addr, *first_pos) <--
+        is_call_instruction(call_addr),
+        abi_first_stack_arg_position(first_pos),
+        !call_callee_has_reg_args(call_addr);
+
+    // At a call, map every structurally reaching store using the callee's first
+    // stack position, shadow-space base, and slot width.  Preserve the store's
+    // provenance here: strong PUSH/Lstore facts establish an argument directly;
+    // weak Lsetstack facts need corroboration below.
+    #[local] relation call_reaching_stack_candidate(Node, usize, RTLReg, bool);
+    call_reaching_stack_candidate(*call_addr, pos, *src_rtl, *weak) <--
+        is_call_instruction(call_addr),
+        instr_in_function(call_addr, func),
+        og_store_in(func, call_addr, stores),
+        for (abs_slot, src_rtl, weak) in stores.0.iter(),
+        sp_entry_ofs(func, call_addr, sp_offsets),
+        for sp_call in sp_offsets.0.iter(),
+        let k = *abs_slot - *sp_call,
+        abi_outgoing_stack_base(stack_base),
+        call_stack_arg_base_position(call_addr, first_pos),
+        abi_stack_slot_size(slot_size),
+        if k >= *stack_base && (k - *stack_base) % *slot_size == 0,
+        let pos = *first_pos + ((k - *stack_base) / *slot_size) as usize;
+
+    #[local] relation strong_call_outgoing_stack_arg(Node, usize, RTLReg);
+    strong_call_outgoing_stack_arg(call_addr, pos, src_rtl) <--
+        call_reaching_stack_candidate(call_addr, pos, src_rtl, ?false);
+
+    // Keep candidates loose in the rules, then join predecessor-specific
+    // values into one web before publishing the call argument.
+    #[local] relation raw_call_outgoing_stack_arg(Node, usize, RTLReg);
+    raw_call_outgoing_stack_arg(call_addr, pos, src_rtl) <--
+        strong_call_outgoing_stack_arg(call_addr, pos, src_rtl);
+
+    // A weak store materializes an argument where the callee's body proves it
+    // reads a stack parameter at that ordinal.
+    raw_call_outgoing_stack_arg(*call_addr, pos, *src_rtl) <--
+        call_reaching_stack_candidate(call_addr, pos, src_rtl, ?true),
+        call_stack_arg_base_position(call_addr, first_pos),
+        call_target_func(call_addr, callee),
+        emit_function_stack_param_count(callee, stack_params),
+        if *pos < *first_pos + *stack_params;
+
+    // The predecessor-specific values for one (call, position) are an SSA phi
+    // in source-language terms.  Connect each candidate to one deterministic
+    // hub so canonicalization produces a single variable that every incoming
+    // path defines.  The minimum is only the hub's identity; it does not decide
+    // reachability or select one predecessor's value.
+    #[local] relation stack_call_input_anchor(Node, usize, RTLReg);
+    stack_call_input_anchor(call_addr, pos, minimum) <--
+        raw_call_outgoing_stack_arg(call_addr, pos, _),
+        agg minimum = ascent::aggregators::min(src_rtl)
+            in raw_call_outgoing_stack_arg(call_addr, pos, src_rtl);
+
+    alias_edge(*src_rtl, *anchor) <--
+        raw_call_outgoing_stack_arg(call_addr, pos, src_rtl),
+        stack_call_input_anchor(call_addr, pos, anchor),
+        if src_rtl != anchor;
+
+    #[local] relation call_outgoing_stack_arg(Node, usize, RTLReg);
+    call_outgoing_stack_arg(*call_addr, *pos, *canonical) <--
+        stack_call_input_anchor(call_addr, pos, anchor),
+        xtl_canonical(anchor, canonical);
+
+    call_has_arg_evidence(call_addr, pos) <--
+        call_outgoing_stack_arg(call_addr, pos, _);
+
+    call_arg_mapping(*call_addr, *pos, *src_rtl) <--
+        call_outgoing_stack_arg(call_addr, pos, src_rtl),
+        call_arg_position_allowed(call_addr, pos);
+
+    // R3b: outgoing stack args marshaled via PUSH, recovered into the same
+    // og_arg_store relation.  A contiguous structural prologue prefix is
+    // frame setup, not call marshalling: saved registers (and Clang's scratch
+    // alignment push) otherwise remain live to the first call and fabricate a
+    // tail of stack arguments.  This is a CFG-next prefix rooted at the
+    // function entry; no address/distance comparison decides membership.
+    #[local] relation prologue_prefix_kind(Address);
+    prologue_prefix_kind(addr) <--
+        instruction(addr, _, _, "PUSH", operand, _, _, _, _, _),
+        op_register(operand, reg_str),
+        let reg = Mreg::x86(*reg_str),
+        !is_arg_reg(reg),
+        if reg != Mreg::SP;
+    prologue_prefix_kind(addr) <--
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "ENDBR32" | "ENDBR64" | "NOP");
+    prologue_prefix_kind(addr) <--
+        stack_base_move(addr, src, dst),
+        if Mreg::x86(*src) == Mreg::SP && Mreg::x86(*dst) == Mreg::BP;
+    prologue_prefix_kind(addr) <--
+        adjusts_stack(addr, "RSP", delta),
+        if *delta < 0,
+        !instruction(addr, _, _, "PUSH", _, _, _, _, _, _);
+
+    #[local] relation prologue_prefix(Address, Address);
+    prologue_prefix(func, *entry) <--
+        emit_function(func, _, entry),
+        prologue_prefix_kind(entry);
+    prologue_prefix(func, *next_addr) <--
+        prologue_prefix(func, addr),
+        next(addr, next_addr),
+        instr_in_function(next_addr, func),
+        prologue_prefix_kind(next_addr);
+
+    #[local] relation prologue_frame_push(Address);
+    prologue_frame_push(addr) <--
+        prologue_prefix(_, addr),
+        instruction(addr, _, _, "PUSH", _, _, _, _, _, _);
+
+    #[local] relation push_arg_reg(Address, Mreg);
+    push_arg_reg(*addr, Mreg::x86(reg_str)) <--
+        instruction(addr, _, _, "PUSH", operand, _, _, _, _, _),
+        op_register(operand, reg_str),
+        !prologue_frame_push(addr);
+
+    // Track pushed registers in the reaching-def lattice so a cross-block arg value resolves, since a call ends a basic block; only the few registers actually pushed, so the lattice stays bounded.
+    reg_of_interest(r) <-- push_arg_reg(_, r);
+
+    // The def supplying the pushed value: intra-block last def (block_last_def), else the cross-block may-reaching def at the push's block entry (with no in-block shadow). Mirrors def_reaches_call / arg_reg_block_reaching_def.
+    #[local] relation push_arg_def(Address, Mreg, Address);
+    push_arg_def(*push_addr, *mreg, *def_addr) <--
+        push_arg_reg(push_addr, mreg),
+        block_last_def(push_addr, def_addr, mreg);
+    push_arg_def(*push_addr, *mreg, *def_addr) <--
+        push_arg_reg(push_addr, mreg),
+        !block_last_def(push_addr, _, mreg),
+        instr_in_function(push_addr, func),
+        code_in_block(push_addr, blk),
+        reaching_def_in(func, blk, mreg, defs),
+        for def_addr in defs.iter();
+
+    og_arg_store(*push_addr, abs_slot, *src_rtl, *func) <--
+        push_arg_def(push_addr, mreg, def_addr),
+        // A raw PUSH is deliberately excluded from ordinary data-use
+        // liveness, so its producer may be trimmed or fused into another LTL
+        // node and have no value identity at def_addr. The structural reaching
+        // def above proves this is not a prologue save; retain the raw value at
+        // the PUSH use so the call-position join can canonicalize every arm.
+        reg_xtl(push_addr, *mreg, src_rtl),
+        instr_in_function(push_addr, func),
+        sp_entry_ofs(func, push_addr, sp_offsets),
+        for sp_push in sp_offsets.0.iter(),
+        abi_stack_slot_size(slot_size),
+        let abs_slot = *sp_push - *slot_size;
+
+    // A memory-operand PUSH reads its value before decrementing SP.  When the
+    // stack analysis has an exact reaching frame cell for that read, carry the
+    // raw cell identity directly into the outgoing slot.  No extra RTL load is
+    // needed: canonicalization makes the existing reaching store/reload web the
+    // call operand, while PUSH itself supplies the strong ABI marshalling fact.
+    #[local] relation push_arg_stack(Address, i64);
+    push_arg_stack(*push_addr, *use_ofs) <--
+        instruction(push_addr, _, _, "PUSH", operand, _, _, _, _, _),
+        op_indirect(operand, _, base_str, idx_str, _, _, _),
+        if matches!(Mreg::x86(*base_str), Mreg::SP | Mreg::BP),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        stack_def_used(_, _, _, push_addr, _, use_ofs);
+
+    og_arg_store(*push_addr, abs_slot, *src_rtl, *func) <--
+        push_arg_stack(push_addr, use_ofs),
+        instr_in_function(push_addr, func),
+        stack_xtl(func, push_addr, *use_ofs, src_rtl),
+        sp_entry_ofs(func, push_addr, sp_offsets),
+        for sp_push in sp_offsets.0.iter(),
+        abi_stack_slot_size(slot_size),
+        let abs_slot = *sp_push - *slot_size;
+
+    // R3c: an outgoing stack arg marshaled as push $imm, synthesized as a fresh const reg spliced onto every CFG edge into the call so the constant dominates it.
+    #[local] relation push_arg_imm(Address, i64);
+    push_arg_imm(*addr, *imm) <--
+        instruction(addr, _, _, "PUSH", operand, _, _, _, _, _),
+        op_immediate(operand, imm, _);
+
+    // The call this immediate push set up an arg for is its own block's terminator; uses a DIRECT Lcall check, since is_call_instruction depends on emit_function and would form an unstratifiable cycle.
+    #[local] relation is_direct_call_insn(Node);
+    is_direct_call_insn(addr) <-- ltl_inst(addr, ?LTLInst::Lcall(_));
+    is_direct_call_insn(addr) <-- ltl_inst(addr, ?LTLInst::Ltailcall(_));
+
+    #[local] relation imm_push_call(Address, i64, Node);
+    imm_push_call(*push_addr, *imm, *call_addr) <--
+        push_arg_imm(push_addr, imm),
+        code_in_block(push_addr, blk),
+        code_in_block(call_addr, blk),
+        // Calls terminate the disassembly basic block.  Therefore membership
+        // in the same block is the structural proof that this PUSH belongs to
+        // this call; address order is neither necessary nor CFG-safe.
+        is_direct_call_insn(call_addr);
+
+    og_arg_store(*push_addr, abs_slot, fresh_reg, *func) <--
+        imm_push_call(push_addr, _imm, _call),
+        instr_in_function(push_addr, func),
+        sp_entry_ofs(func, push_addr, sp_offsets),
+        for sp_push in sp_offsets.0.iter(),
+        abi_stack_slot_size(slot_size),
+        let abs_slot = *sp_push - *slot_size,
+        let fresh_reg = fresh_xtl_reg(*push_addr, Mreg::AX);
+
+    // Define the constant at a synthetic node and splice it before the call
+    // (dominates it).  The explicit is_def fact is essential: unlike ordinary
+    // LTL destinations, this fresh pseudo has no reg_xtl seed.  Without it the
+    // outgoing-slot candidate reaches the call but has no xtl_canonical row,
+    // so a lone immediate PUSH (notably a variadic NULL sentinel) disappears.
+    rtl_inst_candidate(synth, inst), instr_in_function(synth, *func), is_def(synth, fresh_reg) <--
+        imm_push_call(push_addr, imm, _call),
+        instr_in_function(push_addr, func),
+        let synth = *push_addr | (1u64 << 62),
+        let fresh_reg = fresh_xtl_reg(*push_addr, Mreg::AX),
+        let inst = RTLInst::Iop(Operation::Olongconst(*imm), Arc::new(vec![]), fresh_reg);
+
+    rtl_edge_negated(pred, *call_addr) <--
+        imm_push_call(_push_addr, _imm, call_addr),
+        rtl_next(pred, call_addr);
+    rtl_succ_candidate(*pred, synth), instr_in_function(synth, *func) <--
+        imm_push_call(push_addr, _imm, call_addr),
+        rtl_next(pred, call_addr),
+        instr_in_function(push_addr, func),
+        let synth = *push_addr | (1u64 << 62);
+    rtl_succ_candidate(synth, *call_addr) <--
+        imm_push_call(push_addr, _imm, call_addr),
+        let synth = *push_addr | (1u64 << 62);
+
+
+    relation arg_setup_candidate(Node, Mreg, Node);
+    relation is_call_instruction(Node);
+
+    is_call_instruction(addr) <-- ltl_inst(addr, ?LTLInst::Lcall(_));
+    is_call_instruction(addr) <-- ltl_inst(addr, ?LTLInst::Ltailcall(_));
+    is_call_instruction(addr) <--
+        ltl_inst(addr, ?LTLInst::Lbranch(Either::Right(target))),
+        emit_function(_, _, target);
+
+    // Split from arg_setup_candidate so corroboration counting doesn't depend on its own gated output.
+    relation arg_setup_candidate_real(Node, Mreg, Node);
+
+    arg_setup_candidate_real(*defaddr, *dst_reg, *call_addr) <--
+        ltl_inst(defaddr, ?LTLInst::Lop(_, _, dst_reg)),
+        is_arg_reg(dst_reg),
+        def_reaches_call(call_addr, defaddr, dst_reg);
+
+    arg_setup_candidate_real(*defaddr, *dst_reg, *call_addr) <--
+        ltl_inst(defaddr, ?LTLInst::Lgetstack(_slot, _ofs, _typ, dst_reg)),
+        is_arg_reg(dst_reg),
+        def_reaches_call(call_addr, defaddr, dst_reg);
+
+    arg_setup_candidate_real(*defaddr, *dst_reg, *call_addr) <--
+        ltl_inst(defaddr, ?LTLInst::Lload(_, _, _, dst_reg)),
+        is_arg_reg(dst_reg),
+        def_reaches_call(call_addr, defaddr, dst_reg);
+
+    // c19: veto crediting an arg position a body-analysed callee provably does not take, since every call site of a 0-param callee carries the same leftover regs and cross-site agreement is not evidence.
+    #[local] relation callee_takes_no_arg_at(Node, Mreg);
+    callee_takes_no_arg_at(call_addr, mreg) <--
+        call_target_func(call_addr, callee),
+        func_stacksz(callee, _, _, _),
+        abi_int_arg_position(mreg, _),
+        !func_param_validated(callee, mreg);
+
+    arg_setup_candidate(defaddr, mreg, call_addr) <--
+        arg_setup_candidate_real(defaddr, mreg, call_addr),
+        !callee_takes_no_arg_at(call_addr, mreg);
+
+    // Fix 1: an ABI arg register that is a validated parameter and is not redefined before a resolved call still holds the incoming value, so forward it as a call arg.
+    relation call_has_resolved_callee(Node);
+    call_has_resolved_callee(call_addr) <-- call_target_func(call_addr, _);
+    call_has_resolved_callee(call_addr) <-- call_has_known_signature(call_addr, _, _, _);
+
+    // arg_reg_param_live_at gates the forward on MUST-liveness, or every resolved call receives a copy of every register including long-dead ones; fabrication is prevented downstream.
+    #[local] relation forwarded_param_candidate(Node, Mreg, Node);
+    forwarded_param_candidate(func_start, mreg, call_addr) <--
+        is_arg_reg(mreg),
+        is_call_instruction(call_addr),
+        instr_in_function(call_addr, func_start),
+        call_has_resolved_callee(call_addr),
+        arg_reg_param_live_at(func_start, call_addr, mreg);
+
+    // Corroboration gate: a forwarded still-live param materializes only when the callee validates the position or a second call site agrees, preventing arity fabricated from leftover state.
+    #[local] relation forwarding_corroborated(Node, Mreg);
+
+    // Callee-side, internal: the callee's own body validates the register as one of its params.
+    forwarding_corroborated(call_addr, mreg) <--
+        forwarded_param_candidate(_, mreg, call_addr),
+        call_target_func(call_addr, callee),
+        func_param_validated(callee, mreg);
+
+    // Callee-side known signature: the GP-class param count covers the GP position, since pure-float params occupy XMM and must not corroborate a forwarded GP register.
+    forwarding_corroborated(call_addr, mreg) <--
+        forwarded_param_candidate(_, mreg, call_addr),
+        call_known_sig_gp_position(call_addr, pos),
+        abi_int_arg_position(mreg, pos);
+
+    // Cross-site agreement: another distinct call site of the same callee also carries this position.
+    #[local] relation callee_arg_reg_site(Address, Mreg, Node);
+    callee_arg_reg_site(callee, mreg, call_addr) <--
+        call_target_func(call_addr, callee),
+        arg_setup_candidate_real(_, mreg, call_addr);
+    callee_arg_reg_site(callee, mreg, call_addr) <--
+        call_target_func(call_addr, callee),
+        forwarded_param_candidate(_, mreg, call_addr);
+
+    forwarding_corroborated(call_addr, mreg) <--
+        forwarded_param_candidate(_, mreg, call_addr),
+        call_target_func(call_addr, callee),
+        callee_arg_reg_site(callee, mreg, other_site),
+        if *other_site != *call_addr;
+
+    arg_setup_candidate(func_start, mreg, call_addr) <--
+        forwarded_param_candidate(func_start, mreg, call_addr),
+        forwarding_corroborated(call_addr, mreg),
+        !callee_takes_no_arg_at(call_addr, mreg);
+
+    // Position-anchored pass-through: real local-def evidence at a higher
+    // argument position commits the call to a contiguous ABI argument list.
+    // A lower position whose register has no local definition used to become
+    // a DEFAULT_VAR hole even when MUST-liveness proves it still contains this
+    // function's incoming parameter. Fill only positions below the maximum
+    // established by real evidence; this rule therefore cannot raise arity or
+    // bootstrap from its own output. Outgoing stack stores are intentionally
+    // excluded because their canonicalization depends on this stratum.
+    #[local] relation call_real_arg_position_evidence(Node, usize);
+    call_real_arg_position_evidence(call_addr, pos) <--
+        arg_setup_candidate_real(_, mreg, call_addr),
+        abi_int_arg_position(mreg, pos);
+
+    #[local] relation call_real_arg_filled(Node, usize);
+    call_real_arg_filled(call_addr, max_pos) <--
+        call_real_arg_position_evidence(call_addr, _),
+        agg max_pos = ascent::aggregators::max(pos) in call_real_arg_position_evidence(call_addr, pos);
+    call_real_arg_filled(call_addr, p_lower) <--
+        call_real_arg_filled(call_addr, p),
+        if *p >= 1,
+        let p_lower = *p - 1;
+
+    arg_setup_candidate(func_start, mreg, call_addr) <--
+        call_real_arg_filled(call_addr, pos),
+        abi_int_arg_position(mreg, pos),
+        instr_in_function(call_addr, func_start),
+        arg_reg_param_live_at(func_start, call_addr, mreg),
+        !callee_takes_no_arg_at(call_addr, mreg);
+
+    // Float analog of the pass-through forward: an incoming XMM param still live at a resolved call is forwarded as that call's float argument, under the same corroboration discipline as the integer forward.
+    #[local] relation float_forwarded_param_candidate(Node, Mreg, Node);
+    float_forwarded_param_candidate(func_start, mreg, call_addr) <--
+        is_xmm_arg_reg(mreg),
+        is_call_instruction(call_addr),
+        instr_in_function(call_addr, func_start),
+        call_has_resolved_callee(call_addr),
+        arg_reg_param_live_at(func_start, call_addr, mreg);
+
+    #[local] relation float_forwarding_corroborated(Node, Mreg);
+    float_forwarding_corroborated(call_addr, mreg) <--
+        float_forwarded_param_candidate(_, mreg, call_addr),
+        call_target_func(call_addr, callee),
+        func_float_param_validated(callee, mreg, _);
+    float_forwarding_corroborated(call_addr, mreg) <--
+        float_forwarded_param_candidate(_, mreg, call_addr),
+        call_has_known_signature(call_addr, name, _, _),
+        !known_varargs_function(name, _),
+        known_extern_signature(name, _, _, arg_types),
+        abi_float_arg_position(mreg, pos),
+        !abi_shared_arg_slots(true),
+        if arg_types.iter().filter(|t| matches!(t, XType::Xfloat | XType::Xsingle)).count() > *pos;
+    float_forwarding_corroborated(call_addr, mreg) <--
+        float_forwarded_param_candidate(_, mreg, call_addr),
+        call_has_known_signature(call_addr, name, _, _),
+        !known_varargs_function(name, _),
+        known_extern_signature(name, _, _, arg_types),
+        abi_float_arg_position(mreg, pos),
+        abi_shared_arg_slots(true),
+        if *pos < arg_types.len(),
+        if matches!(arg_types[*pos], XType::Xfloat | XType::Xsingle);
+    #[local] relation callee_float_arg_reg_site(Address, Mreg, Node);
+    callee_float_arg_reg_site(callee, mreg, call_addr) <--
+        call_target_func(call_addr, callee),
+        float_arg_setup_candidate(_, mreg, call_addr);
+    callee_float_arg_reg_site(callee, mreg, call_addr) <--
+        call_target_func(call_addr, callee),
+        float_forwarded_param_candidate(_, mreg, call_addr);
+    float_forwarding_corroborated(call_addr, mreg) <--
+        float_forwarded_param_candidate(_, mreg, call_addr),
+        call_target_func(call_addr, callee),
+        callee_float_arg_reg_site(callee, mreg, other_site),
+        if *other_site != *call_addr;
+
+    float_arg_setup_candidate(func_start, mreg, call_addr) <--
+        float_forwarded_param_candidate(func_start, mreg, call_addr),
+        float_forwarding_corroborated(call_addr, mreg);
+
+    // The old order-based between-call clobber suppression is removed: arg_setup_candidate now comes from def_reaches_call, which already excludes any def clobbered before the call.
+
+    // A call at a CFG merge consumes a phi-like PRE-call value: every
+    // definition that structurally reaches the call assigns the same input
+    // pseudo-register.  This relation is shared by ABI arguments and an
+    // indirect register target.  The dedicated namespace is essential: the
+    // ordinary fresh_xtl_reg(call, mreg) belongs to the POST-call
+    // caller-saved definition.
+    #[local] relation call_input_join(Node, Mreg, RTLReg);
+    call_input_join(call_addr, mreg, use_id) <--
+        arg_setup_candidate(_, mreg, call_addr),
+        let use_id = fresh_call_input_reg(*call_addr, *mreg);
+    call_input_join(call_addr, mreg, use_id) <--
+        float_arg_setup_candidate(_, mreg, call_addr),
+        let use_id = fresh_call_input_reg(*call_addr, *mreg);
+
+    // A register-indirect transfer structurally consumes its operand even when
+    // reaching-def recovery has no incoming edge.  Always materialize that
+    // PRE-call pseudo; an exact edge, when present, aliases the pseudo to its
+    // source below.  Memory-indirect calls use call_through_memory_load instead
+    // and must not reinterpret their address base as the loaded callee.
+    call_input_join(addr, mreg, use_id) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Left(mreg))),
+        !call_through_memory(addr, _, _, _, _),
+        let use_id = fresh_call_input_reg(*addr, *mreg);
+    call_input_join(addr, mreg, use_id) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(Either::Left(mreg))),
+        !call_through_memory(addr, _, _, _, _),
+        let use_id = fresh_call_input_reg(*addr, *mreg);
+
+    // Memory-indirect transfers consume their address registers before the
+    // call clobbers caller-saved state.  Put base and index through the same
+    // pre-call join, while call_through_memory continues to keep the base out
+    // of the direct-callee rules above.
+    call_input_join(addr, base_mreg, use_id) <--
+        call_through_memory(addr, base, _, _, _),
+        if *base != "NONE" && !base.is_empty(),
+        if !is_rip(base),
+        let base_mreg = Mreg::x86(*base),
+        let use_id = fresh_call_input_reg(*addr, base_mreg);
+    call_input_join(addr, index_mreg, use_id) <--
+        call_through_memory(addr, _, index, _, _),
+        if *index != "NONE" && !index.is_empty(),
+        let index_mreg = Mreg::x86(*index),
+        let use_id = fresh_call_input_reg(*addr, index_mreg);
+
+    reg_xtl(*call_addr, *mreg, *use_id) <--
+        call_input_join(call_addr, mreg, use_id);
+
+    // Canonical PRE-call value consumed by either an ABI argument position or
+    // an indirect target.  Reachability is established above and by the
+    // setup aliases below; canonicalization only names the resulting value
+    // web, it does not choose a reaching definition.
+    #[local] relation call_input_rtl(Node, Mreg, RTLReg);
+    call_input_rtl(call_addr, mreg, *canonical) <--
+        call_input_join(call_addr, mreg, use_id),
+        xtl_canonical(use_id, canonical);
+
+    // Ordinary setup definitions join to the call use.  Restrict the source
+    // to its def id so a two-address instruction's old-value use is not
+    // accidentally merged with its newly defined result.
+    alias_edge(*def_id, *use_id) <--
+        call_input_join(call_addr, mreg, use_id),
+        arg_setup_candidate(def_addr, mreg, call_addr),
+        is_def(def_addr, def_id),
+        reg_xtl(def_addr, mreg, def_id),
+        if def_id != use_id;
+    alias_edge(*def_id, *use_id) <--
+        call_input_join(call_addr, mreg, use_id),
+        float_arg_setup_candidate(def_addr, mreg, call_addr),
+        is_def(def_addr, def_id),
+        reg_xtl(def_addr, mreg, def_id),
+        if def_id != use_id;
+
+    // A forwarded incoming parameter is a pseudo-definition at func_start and
+    // therefore has no is_def fact; join that canonical parameter id too.
+    alias_edge(*param_id, *use_id) <--
+        call_input_join(call_addr, mreg, use_id),
+        instr_in_function(call_addr, func_start),
+        arg_setup_candidate(func_start, mreg, call_addr),
+        reg_xtl(func_start, mreg, param_id),
+        if param_id != use_id;
+    alias_edge(*param_id, *use_id) <--
+        call_input_join(call_addr, mreg, use_id),
+        instr_in_function(call_addr, func_start),
+        float_arg_setup_candidate(func_start, mreg, call_addr),
+        reg_xtl(func_start, mreg, param_id),
+        if param_id != use_id;
+
+    // An incoming parameter used only as an unresolved register target or a
+    // memory-call base has no arg_setup_candidate: the callee is precisely
+    // what is unresolved.  Its pseudo-definition edge is nevertheless an
+    // exact structural reaching-def fact, so bind that entry value directly
+    // into the shared pre-call input join.
+    alias_edge(*param_id, *use_id) <--
+        call_input_join(call_addr, mreg, use_id),
+        instr_in_function(call_addr, func_start),
+        reg_def_used(func_start, mreg, call_addr),
+        reg_xtl(func_start, mreg, param_id),
+        !is_def(func_start, param_id),
+        if param_id != use_id;
+
+    relation call_arg_setup_detected(Node, Mreg, Node);
+
+    call_arg_setup_detected(defaddr, mreg, call_addr) <--
+        arg_setup_candidate(defaddr, mreg, call_addr),
+        ltl_inst(call_addr, ?LTLInst::Lcall(_));
+
+    relation tailcall_arg_setup_detected(Node, Mreg, Node);
+
+    tailcall_arg_setup_detected(defaddr, mreg, call_addr) <--
+        arg_setup_candidate(defaddr, mreg, call_addr),
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(_));
+
+    tailcall_arg_setup_detected(defaddr, mreg, call_addr) <--
+        arg_setup_candidate(defaddr, mreg, call_addr),
+        ltl_inst(call_addr, ?LTLInst::Lbranch(Either::Right(target))),
+        emit_function(_, _, target);
+
+    // Call arg positions use max-evidence approach instead of requiring consecutive regs
+    relation call_has_arg_evidence(Node, usize);
+
+    // Where the integer register slots are per-function (Windows x86-32), a register carries an argument only into a callee whose OWN convention claims that slot: a value left in ECX/EDX across a cdecl or stdcall call is caller state, not an argument. Every other ABI allows every slot at every call, exactly as before.
+    #[local] relation reg_arg_setup_site(Node);
+    reg_arg_setup_site(call_addr) <-- call_arg_setup_detected(_, _, call_addr);
+    reg_arg_setup_site(call_addr) <-- tailcall_arg_setup_detected(_, _, call_addr);
+
+    #[local] relation call_reg_arg_slot_ok(Node, usize);
+    call_reg_arg_slot_ok(call_addr, pos) <--
+        reg_arg_setup_site(call_addr),
+        abi_int_arg_position(_, pos),
+        !abi_reg_args_per_function(true);
+    call_reg_arg_slot_ok(call_addr, pos) <--
+        abi_reg_args_per_function(true),
+        reg_arg_setup_site(call_addr),
+        call_target_func(call_addr, callee),
+        func_reg_arg_count(callee, n),
+        abi_int_arg_position(_, pos),
+        if *pos < *n;
+    // An import has no body to inspect, so only its own decorated name can claim a register slot.
+    call_reg_arg_slot_ok(call_addr, pos) <--
+        abi_reg_args_per_function(true),
+        reg_arg_setup_site(call_addr),
+        external_call_site(call_addr, _, name),
+        extern_decorated_reg_args(name, n),
+        abi_int_arg_position(_, pos),
+        if *pos < *n;
+
+    call_has_arg_evidence(call_addr, pos) <--
+        call_arg_setup_detected(_, mreg, call_addr),
+        abi_int_arg_position(mreg, pos),
+        call_reg_arg_slot_ok(call_addr, pos);
+    call_has_arg_evidence(call_addr, pos) <--
+        tailcall_arg_setup_detected(_, mreg, call_addr),
+        abi_int_arg_position(mreg, pos),
+        call_reg_arg_slot_ok(call_addr, pos);
+
+    relation call_max_arg_position(Node, usize);
+
+    call_max_arg_position(call_addr, max_pos) <--
+        call_has_arg_evidence(call_addr, _),
+        agg max_pos = ascent::aggregators::max(pos) in call_has_arg_evidence(call_addr, pos);
+
+    relation call_has_arg_at_position(Node, usize);
+
+    // ABI position-fill: arguments occupy contiguous ordinal slots including stack positions, with the positive recursion downstream of the aggregate.
+    call_has_arg_at_position(call_addr, *max_pos) <--
+        call_max_arg_position(call_addr, max_pos);
+    call_has_arg_at_position(call_addr, p_lower) <--
+        call_has_arg_at_position(call_addr, p),
+        if *p >= 1,
+        let p_lower = *p - 1;
+
+    // Float arg setup detection at call sites (XMM0-XMM7, independent from integer args)
+    relation float_arg_setup_candidate(Node, Mreg, Node);
+
+    float_arg_setup_candidate(*defaddr, *dst_reg, *call_addr) <--
+        ltl_inst(defaddr, ?LTLInst::Lop(_, _, dst_reg)),
+        is_xmm_arg_reg(dst_reg),
+        def_reaches_call(call_addr, defaddr, dst_reg);
+
+    float_arg_setup_candidate(*defaddr, *dst_reg, *call_addr) <--
+        ltl_inst(defaddr, ?LTLInst::Lgetstack(_slot, _ofs, _typ, dst_reg)),
+        is_xmm_arg_reg(dst_reg),
+        def_reaches_call(call_addr, defaddr, dst_reg);
+
+    float_arg_setup_candidate(*defaddr, *dst_reg, *call_addr) <--
+        ltl_inst(defaddr, ?LTLInst::Lload(_, _, _, dst_reg)),
+        is_xmm_arg_reg(dst_reg),
+        def_reaches_call(call_addr, defaddr, dst_reg);
+
+    relation call_float_arg_setup_detected(Node, Mreg, Node);
+
+    call_float_arg_setup_detected(defaddr, mreg, call_addr) <--
+        float_arg_setup_candidate(defaddr, mreg, call_addr),
+        ltl_inst(call_addr, ?LTLInst::Lcall(_));
+
+    call_float_arg_setup_detected(defaddr, mreg, call_addr) <--
+        float_arg_setup_candidate(defaddr, mreg, call_addr),
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(_));
+
+    relation call_has_float_arg_evidence(Node, usize);
+
+    call_has_float_arg_evidence(call_addr, pos) <--
+        call_float_arg_setup_detected(_, mreg, call_addr),
+        abi_float_arg_position(mreg, pos);
+
+    relation call_float_arg_max_position(Node, usize);
+
+    call_float_arg_max_position(call_addr, max_pos) <--
+        call_has_float_arg_evidence(call_addr, _),
+        agg max_pos = ascent::aggregators::max(pos) in call_has_float_arg_evidence(call_addr, pos);
+
+    relation call_has_float_arg_at_position(Node, usize);
+
+    // SysV XMM registers form their own compact sequence, so evidence for Xk fills X0..Xk; Windows shares slots with GP arguments, so only direct evidence is valid there.
+    call_has_float_arg_at_position(call_addr, pos) <--
+        call_has_float_arg_evidence(call_addr, pos),
+        abi_shared_arg_slots(true);
+    call_has_float_arg_at_position(call_addr, *max_pos) <--
+        call_float_arg_max_position(call_addr, max_pos),
+        !abi_shared_arg_slots(true);
+    call_has_float_arg_at_position(call_addr, lower) <--
+        call_has_float_arg_at_position(call_addr, pos),
+        !abi_shared_arg_slots(true),
+        if *pos > 0,
+        let lower = *pos - 1;
+
+    // Gate XMM/float-arg positions by the callee signature, mirroring the integer path; its remaining job is class filtering for stray same-function XMM defs that reach the call without being args.
+    relation call_float_arg_position_allowed(Node, usize);
+
+    // No known signature, direct internal target whose inferred param count covers this ordinal.
+    call_float_arg_position_allowed(call_addr, pos) <--
+        call_has_float_arg_at_position(call_addr, pos),
+        !call_has_known_signature(call_addr, _, _, _),
+        call_target_func(call_addr, target),
+        func_has_param_at_position(target, pos);
+
+    // No known signature and the direct target has no recovered param info: stay permissive (mirror of the integer rule) rather than dropping real float args.
+    call_float_arg_position_allowed(call_addr, pos) <--
+        call_has_float_arg_at_position(call_addr, pos),
+        !call_has_known_signature(call_addr, _, _, _),
+        call_target_func(call_addr, target),
+        !func_has_param_at_position(target, _);
+
+    // Known varargs function (printf-family with %f, etc.): allow any float position.
+    call_float_arg_position_allowed(call_addr, pos) <--
+        call_has_float_arg_at_position(call_addr, pos),
+        call_has_known_signature(call_addr, name, _, _),
+        known_varargs_function(name, _);
+
+    // Known non-varargs signature: allow float position k only if the signature declares more than k float-valued (Xfloat/Xsingle) parameters. Pointer args (e.g. char*) travel in integer regs and do not count toward XMM positions.
+    call_float_arg_position_allowed(call_addr, pos) <--
+        call_has_float_arg_at_position(call_addr, pos),
+        call_has_known_signature(call_addr, name, _, _),
+        !known_varargs_function(name, _),
+        known_extern_signature(name, _, _, arg_types),
+        !abi_shared_arg_slots(true),
+        if arg_types.iter().filter(|t| matches!(t, XType::Xfloat | XType::Xsingle)).count() > *pos;
+
+    // Windows x64 uses the source-language ordinal directly for XMM0..3.
+    call_float_arg_position_allowed(call_addr, pos) <--
+        call_has_float_arg_at_position(call_addr, pos),
+        call_has_known_signature(call_addr, name, _, _),
+        !known_varargs_function(name, _),
+        known_extern_signature(name, _, _, arg_types),
+        abi_shared_arg_slots(true),
+        if *pos < arg_types.len(),
+        if matches!(arg_types[*pos], XType::Xfloat | XType::Xsingle);
+
+    relation call_float_arg_mapping(Node, usize, RTLReg);
+
+    call_float_arg_mapping(*call_addr, pos, rtl_reg) <--
+        call_float_arg_setup_detected(_, dst_reg, call_addr),
+        call_input_rtl(call_addr, dst_reg, rtl_reg),
+        abi_float_arg_position(dst_reg, pos),
+        call_float_arg_position_allowed(call_addr, pos);
+
+    // Windows has one ordinal argument sequence, so feed the selected XMM value into the ordinary positional mapping instead of an independent SysV float vector.
+    call_arg_mapping(call_addr, pos, reg) <--
+        abi_shared_arg_slots(true),
+        call_float_arg_mapping(call_addr, pos, reg);
+
+    relation call_float_args_collected(Node, Args);
+
+    call_float_args_collected(call_addr, args) <--
+        !abi_shared_arg_slots(true),
+        ltl_inst(call_addr, ?LTLInst::Lcall(_)),
+        agg args = build_call_args(pos, reg) in call_float_arg_mapping(call_addr, pos, reg);
+
+    call_float_args_collected(call_addr, args) <--
+        !abi_shared_arg_slots(true),
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(_)),
+        agg args = build_call_args(pos, reg) in call_float_arg_mapping(call_addr, pos, reg);
+
+    call_float_args_collected(call_addr, Arc::new(vec![])) <--
+        !abi_shared_arg_slots(true),
+        ltl_inst(call_addr, ?LTLInst::Lcall(_)),
+        !call_float_arg_mapping(call_addr, _, _);
+
+    call_float_args_collected(call_addr, Arc::new(vec![])) <--
+        !abi_shared_arg_slots(true),
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(_)),
+        !call_float_arg_mapping(call_addr, _, _);
+
+    call_float_args_collected(call_addr, Arc::new(vec![])) <--
+        abi_shared_arg_slots(true),
+        ltl_inst(call_addr, ?LTLInst::Lcall(_));
+    call_float_args_collected(call_addr, Arc::new(vec![])) <--
+        abi_shared_arg_slots(true),
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(_));
+
+    relation arg_reg_used_early_in_func(Address, Address, Mreg);
+    relation func_float_arg_used_undefined(Address, RTLReg);
+    relation emit_function_float_param(Address, RTLReg);
+
+    func_float_arg_used_undefined(func_start, id), reg_xtl(func_start, mreg, id) <--
+        func_float_param_validated(func_start, mreg, _),
+        let id = fresh_xtl_reg(*func_start, *mreg);
+
+    emit_function_float_param(func_start, *canonical) <--
+        func_float_arg_used_undefined(func_start, v),
+        xtl_canonical(v, canonical);
+
+    // A PUSH's operand read is stack bookkeeping, not a data use, so it must not turn a live-from-entry arg register into parameter evidence; a push never survives lifting to anchor body dataflow.
+    #[local] relation push_operand_use(Address);
+    push_operand_use(addr) <--
+        instruction(addr, _, _, "PUSH", _, _, _, _, _, _);
+
+    // An arg register used where it still holds the incoming caller value IS a parameter use, exactly; this one structural rule replaces the six entry-distance window variants.
+    arg_reg_used_early_in_func(func_start, addr, *reg) <--
+        arg_reg_param_live_at(func_start, addr, reg),
+        is_arg_reg(reg),
+        reg_use(addr, reg),
+        !push_operand_use(addr);
+
+    relation arg_reg_has_external_def(Address, Mreg);
+
+    arg_reg_has_external_def(func_start, *mreg) <--
+        is_arg_reg(mreg),
+        arg_reg_param_live_at(func_start, use_addr, mreg),
+        reg_use(use_addr, mreg),
+        !push_operand_use(use_addr);
+
+    relation arg_reg_used_very_early(Address, Mreg);
+    // (Dead internal-def helpers removed: arg_reg_used_very_early no longer references them; arg_reg_param_live_at already excludes a register that has an internal def before the use.)
+
+    arg_reg_used_very_early(func_start, *mreg) <--
+        is_arg_reg(mreg),
+        arg_reg_param_live_at(func_start, early_addr, mreg),
+        reg_use(early_addr, mreg),
+        !push_operand_use(early_addr);
+
+    relation arg_reg_used_no_def(Address, Mreg);
+
+    // A self-XOR is a zeroing idiom that defines without reading, so exclude its spurious operand or the zeroed register is wrongly credited as a parameter.
+    #[local] relation ltl_self_xor_zero(Address, Mreg);
+    ltl_self_xor_zero(addr, *dst) <--
+        ltl_inst(addr, ?LTLInst::Lop(op, args, dst)),
+        if matches!(op, Operation::Oxor | Operation::Oxorl),
+        if !args.is_empty() && args.iter().all(|a| a == dst);
+
+    arg_reg_used_no_def(func_start, mreg) <--
+        is_arg_reg(mreg),
+        arg_reg_param_live_at(func_start, use_addr, mreg),
+        ltl_inst_uses_mreg(use_addr, mreg),
+        !ltl_self_xor_zero(use_addr, mreg);
+
+    relation arg_reg_spilled_to_stack(Address, Mreg);
+
+    // An arg register spilled while it still holds the incoming caller value is a parameter spill; the three store shapes are kept, with the distance window replaced by arg_reg_param_live_at.
+    arg_reg_spilled_to_stack(func_start, *src) <--
+        ltl_inst(addr, ?LTLInst::Lsetstack(src, _slot, _ofs, _typ)),
+        is_arg_reg(src),
+        arg_reg_param_live_at(func_start, addr, src);
+
+    arg_reg_spilled_to_stack(func_start, *src) <--
+        ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Ainstack(_), _, src)),
+        is_arg_reg(src),
+        arg_reg_param_live_at(func_start, addr, src);
+
+    arg_reg_spilled_to_stack(func_start, *src) <--
+        ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Aindexed(ofs), args, src)),
+        if *ofs < 0,
+        for arg in args.iter(),
+        if *arg == Mreg::BP,
+        is_arg_reg(src),
+        arg_reg_param_live_at(func_start, addr, src);
+
+    relation arg_reg_copied_early(Address, Mreg, Mreg);
+    // Same copies with the copy site kept, so the consumption check can follow the copy's OWN def-use edge instead of a distance window.
+    relation arg_reg_copy_site(Address, Address, Mreg, Mreg);
+    relation arg_reg_used_via_copy(Address, Mreg);
+
+    // An arg register move-copied to a non-arg register while it still holds the caller value: the source is a parameter forwarded through the copy. Window + external/no-def variants -> arg_reg_param_live_at.
+    arg_reg_copy_site(func_start, *addr, *src, *dst) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Omove, srcs, dst)),
+        if srcs.len() == 1,
+        for src in srcs.iter(),
+        is_arg_reg(src),
+        !is_arg_reg(dst),
+        if *dst != Mreg::SP && *dst != Mreg::BP,
+        arg_reg_param_live_at(func_start, addr, src);
+
+    // Frameless (-O2 FPO) functions forward a parameter into rbp as scratch, so gate the dst==BP exclusion on func_sets_frame_pointer or every pointer param held in rbp loses its pointer evidence.
+    arg_reg_copy_site(func_start, *addr, *src, *dst) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Omove, srcs, dst)),
+        if srcs.len() == 1,
+        for src in srcs.iter(),
+        is_arg_reg(src),
+        if *dst == Mreg::BP,
+        arg_reg_param_live_at(func_start, addr, src),
+        !func_sets_frame_pointer(func_start);
+
+    arg_reg_copied_early(func_start, src, dst) <--
+        arg_reg_copy_site(func_start, _, src, dst);
+
+    // The copied value is actually consumed (the copy's own def reaches a use), replacing a distance-512 window that could credit a use of a different, later def of dst.
+    arg_reg_used_via_copy(func_start, *arg_reg) <--
+        arg_reg_copy_site(func_start, copy_addr, arg_reg, dst_reg),
+        reg_def_used(copy_addr, dst_reg, use_addr),
+        instr_in_function(use_addr, func_start);
+
+    relation func_arg_reg_used(Address, Mreg);
+
+    func_arg_reg_used(func_start, mreg) <--
+        arg_reg_used_early_in_func(func_start, _, mreg);
+
+    func_arg_reg_used(func_start, mreg) <--
+        arg_reg_has_external_def(func_start, mreg);
+
+    func_arg_reg_used(func_start, mreg) <--
+        arg_reg_used_no_def(func_start, mreg);
+
+    func_arg_reg_used(func_start, mreg) <--
+        arg_reg_used_very_early(func_start, mreg);
+
+    func_arg_reg_used(func_start, mreg) <--
+        arg_reg_spilled_to_stack(func_start, mreg);
+
+    func_arg_reg_used(func_start, mreg) <--
+        arg_reg_used_via_copy(func_start, mreg);
+
+    // SysV variadic prologue: the 8 movaps stores spill the XMM register save area, not real float params; detect an XMM arg reg stack-stored near entry with no in-function def chain.
+    relation xmm_arg_spilled_in_prologue(Address, Mreg);
+
+    // Same evidence keyed on the storing instruction, so the save area's frame
+    // extent can be read off the slots the spills write.
+    #[local] relation xmm_arg_spill_site(Address, Mreg, Address);
+
+    // XMM arg reg stored to a BP/SP-relative stack slot while it holds the incoming caller value = variadic XMM save-area spill. Window + external/no-def variants -> arg_reg_param_live_at.
+    xmm_arg_spill_site(func_start, *src, *addr) <--
+        ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Aindexed(_), args, src)),
+        is_xmm_arg_reg(src),
+        for arg in args.iter(),
+        if *arg == Mreg::BP || *arg == Mreg::SP,
+        arg_reg_param_live_at(func_start, addr, src);
+
+    // setstack form.
+    xmm_arg_spill_site(func_start, *src, *addr) <--
+        ltl_inst(addr, ?LTLInst::Lsetstack(src, _slot, _ofs, _typ)),
+        is_xmm_arg_reg(src),
+        arg_reg_param_live_at(func_start, addr, src);
+
+    // Lstore (Ainstack) form.
+    xmm_arg_spill_site(func_start, *src, *addr) <--
+        ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Ainstack(_), _, src)),
+        is_xmm_arg_reg(src),
+        arg_reg_param_live_at(func_start, addr, src);
+
+    xmm_arg_spilled_in_prologue(func_start, mreg) <--
+        xmm_arg_spill_site(func_start, mreg, _);
+
+    // Function has the canonical variadic-prologue XMM register save (all 8 XMMs spilled); real functions never spill all 8 XMM arg regs at entry.
+    relation func_has_variadic_xmm_prologue(Address);
+    func_has_variadic_xmm_prologue(func_start) <--
+        !abi_shared_arg_slots(true),
+        xmm_arg_spilled_in_prologue(func_start, Mreg::X0),
+        xmm_arg_spilled_in_prologue(func_start, Mreg::X1),
+        xmm_arg_spilled_in_prologue(func_start, Mreg::X2),
+        xmm_arg_spilled_in_prologue(func_start, Mreg::X3),
+        xmm_arg_spilled_in_prologue(func_start, Mreg::X4),
+        xmm_arg_spilled_in_prologue(func_start, Mreg::X5),
+        xmm_arg_spilled_in_prologue(func_start, Mreg::X6),
+        xmm_arg_spilled_in_prologue(func_start, Mreg::X7);
+
+    // Frame slot each XMM save-area spill writes.
+    #[local] relation xmm_arg_spill_slot(Address, Mreg, i64);
+    xmm_arg_spill_slot(func_start, mreg, *ofs) <--
+        xmm_arg_spill_site(func_start, mreg, addr),
+        stack_var(func_start, addr, ofs, _);
+
+    #[local] relation variadic_xmm_block_base(Address, i64);
+    variadic_xmm_block_base(func, lo) <--
+        func_has_variadic_xmm_prologue(func),
+        agg lo = ascent::aggregators::min(o) in xmm_arg_spill_slot(func, _, o);
+
+    // The x86-64 register save area a variadic prologue builds is ONE object:
+    // 48 bytes of general-purpose argument registers immediately below the
+    // 128-byte XMM block the prologue spills.  Its address leaves the function
+    // only inside a va_list, so no access here reveals its extent -- and
+    // without the ABI's own layout the spills are dead by SSA liveness and
+    // every va_arg in the callee reads a neighbouring local instead (gnulib's
+    // `version_etc` handing a va_list to `version_etc_va` is the canonical
+    // case).  Claim all 176 bytes, not just the cells this frame happens to
+    // name, since the callee indexes the block by gp_offset/fp_offset.
+    escaped_stack_region_caller_field(func, base, ofs, MemoryChunk::MAny64) <--
+        variadic_xmm_block_base(func, xmm_base),
+        let base = *xmm_base - 48,
+        for cell in 0..22usize,
+        let ofs = (cell as i64) * 8;
+
+    // The save area's address escapes by being STORED into the va_list rather
+    // than passed as a call argument, so slot_addr_escaped never sees it and
+    // the region above would have no base local to attach to.
+    slot_escaped_canonical_raw(func, base, canonical) <--
+        variadic_xmm_block_base(func, xmm_base),
+        let base = *xmm_base - 48,
+        stack_var(func, _, base, canonical);
+
+    relation func_float_param_used(Address, Mreg);
+
+    // (Dead helper xmm_arg_use_has_internal_def removed: func_float_param_used now uses arg_reg_param_live_at, which already excludes an XMM register with an internal def.)
+
+    // An XMM arg register used while it still holds the incoming caller value is a float parameter (excluding the variadic XMM save-area prologue). Window + internal/external-def variants -> arg_reg_param_live_at (covers X0-X7 by register value, subsumes the no-internal-def condition).
+    func_float_param_used(func_start, *mreg) <--
+        is_float_arg_reg(mreg),
+        arg_reg_param_live_at(func_start, addr, mreg),
+        ltl_inst_uses_mreg(addr, mreg),
+        !func_has_variadic_xmm_prologue(func_start);
+
+    // 3.8 R1: the XMM read of a FUSED float op (float_load_op binary form reads its dst) is float-param evidence too; it has no ltl_inst, so ltl_inst_uses_mreg above never sees it and a function whose ONLY float-param use is fused (`addsd k(%rip),%xmm0; ret`) validated no float params at all.
+    func_float_param_used(func_start, *mreg) <--
+        is_float_arg_reg(mreg),
+        arg_reg_param_live_at(func_start, addr, mreg),
+        float_load_op(addr, _, _, _, _, mreg, false),
+        !has_ltl_op(addr),
+        !func_has_variadic_xmm_prologue(func_start);
+
+    // Positional chain: X_k validates only if X_{k-1} did, so a stray param-live use cannot fabricate k+1 float params. Known limit (DF-3): an unused lower-position sibling cannot validate here.
+    relation func_float_param_validated(Address, Mreg, usize);
+
+    func_float_param_validated(func_start, mreg, pos) <--
+        abi_shared_arg_slots(true),
+        func_float_param_used(func_start, mreg),
+        abi_float_arg_position(mreg, pos);
+
+    func_float_param_validated(func_start, mreg, pos) <--
+        !abi_shared_arg_slots(true),
+        func_float_param_used(func_start, mreg),
+        abi_float_arg_position(mreg, pos),
+        if *pos == 0;
+    func_float_param_validated(func_start, mreg, pos) <--
+        !abi_shared_arg_slots(true),
+        func_float_param_used(func_start, mreg),
+        abi_float_arg_position(mreg, pos),
+        if *pos > 0,
+        let previous = *pos - 1,
+        func_float_param_validated(func_start, _, previous);
+
+    relation emit_function_float_param_count(Address, usize);
+
+    emit_function_float_param_count(func_start, count) <--
+        func_float_param_validated(func_start, _, _),
+        agg count = ascent::aggregators::count() in func_float_param_validated(func_start, _, _);
+
+    emit_function_float_param_count(func_start, 0) <--
+        emit_function(func_start, _, _),
+        !func_float_param_validated(func_start, _, _);
+
+
+    relation stack_passed_param(Address, i64);
+
+    // Incoming stack storage is classified by its ABI coordinate in the
+    // function-entry frame, at every owned instruction.  BP is accepted only
+    // after an explicit RSP->RBP frame setup; SP is rebased through the
+    // point-keyed must-offset lattice below.  Those structural facts do not
+    // expire after an arbitrary number of CFG edges, and caller-frame storage
+    // cannot become a callee local merely because its first use is deep in the
+    // function.
+
+    // ABI-1: exact entry-anchored SP offset at each instruction.  Stack height
+    // is a must property: if structural CFG paths disagree, using either path's
+    // offset can turn a local into a caller argument or map an outgoing argument
+    // to the wrong position.  Dual<Set> intersects predecessor states, retaining
+    // one exact offset when all paths agree and becoming empty (unknown) on a
+    // disagreement or an unbalanced cycle.  Besides being the sound abstract
+    // domain, this avoids the combinatorial path-sum explosion of a may-union
+    // lattice on functions with many conditional stack adjustments.  State is
+    // point-keyed (O(V)), never materialized as pairwise reachability.
+    #[local] lattice sp_entry_ofs(Address, Address, Dual<Set<i64>>);
+
+    #[local] relation sp_offset_intra_step(Address, Address);
+    sp_offset_intra_step(src, dst) <--
+        next(src, dst),
+        code_in_block(src, block),
+        code_in_block(dst, block),
+        !call_targets_noreturn(src);
+
+    #[local] relation sp_offset_inter_step(Address, Address);
+    sp_offset_inter_step(src, dst) <--
+        ddisasm_cfg_edge(src, dst, edge_type),
+        if *edge_type != "call" && *edge_type != "indirect" && *edge_type != "indirect_call",
+        !call_targets_noreturn(src);
+
+    // Drop only structurally proven loop back-edges.  This bounds stack states
+    // for stack-probe loops while preserving both arms and forward join edges.
+    #[local] relation sp_offset_back_edge(Address, Address);
+    sp_offset_back_edge(src, dst) <--
+        sp_offset_inter_step(src, dst),
+        code_in_block(src, src_block),
+        code_in_block(dst, dst_block),
+        instr_in_function(src, func_start),
+        instr_in_function(dst, func_start),
+        block_dom_set(func_start, src_block, doms),
+        if doms.0.contains(dst_block);
+
+    sp_entry_ofs(*func_start, *func_start, Dual(Set::singleton(0))) <--
+        func_span(_, func_start, _);
+
+    sp_entry_ofs(*func_start, *curaddr, Dual(shift_sp_offsets(&prev_offsets.0, *delta))) <--
+        sp_entry_ofs(func_start, prevaddr, prev_offsets),
+        sp_offset_intra_step(prevaddr, curaddr),
+        instr_in_function(curaddr, func_start),
+        adjusts_stack(prevaddr, "RSP", delta);
+
+    sp_entry_ofs(*func_start, *curaddr, Dual(prev_offsets.0.clone())) <--
+        sp_entry_ofs(func_start, prevaddr, prev_offsets),
+        sp_offset_intra_step(prevaddr, curaddr),
+        instr_in_function(curaddr, func_start),
+        !adjusts_stack(prevaddr, "RSP", _);
+
+    sp_entry_ofs(*func_start, *curaddr, Dual(shift_sp_offsets(&prev_offsets.0, *delta))) <--
+        sp_entry_ofs(func_start, prevaddr, prev_offsets),
+        sp_offset_inter_step(prevaddr, curaddr),
+        !sp_offset_back_edge(prevaddr, curaddr),
+        instr_in_function(curaddr, func_start),
+        adjusts_stack(prevaddr, "RSP", delta);
+
+    sp_entry_ofs(*func_start, *curaddr, Dual(prev_offsets.0.clone())) <--
+        sp_entry_ofs(func_start, prevaddr, prev_offsets),
+        sp_offset_inter_step(prevaddr, curaddr),
+        !sp_offset_back_edge(prevaddr, curaddr),
+        instr_in_function(curaddr, func_start),
+        !adjusts_stack(prevaddr, "RSP", _);
+
+    // BP-based arg detection requires an actual frame pointer: in frameless functions RBP is a callee-saved scratch (often a struct pointer), so a positive-offset BP load is a field deref, not an incoming arg. With a frame pointer, caller args start at BP+16 (BP+0=saved RBP, BP+8=return address).
+    #[local] relation func_sets_frame_pointer(Address);
+    func_sets_frame_pointer(func_start) <--
+        stack_base_move(addr, src, dst),
+        if *src == "RSP" && *dst == "RBP",
+        instr_in_function(addr, func_start);
+
+    // SP-relative address of an incoming stack argument.  Normalize only for
+    // the classification check; retain the raw frame displacement as the key
+    // so it shares the existing stack_param_idx ordering with direct loads.
+    incoming_stack_tail_base(*func_start, *addr, *disp, dst_mreg) <--
+        plea(addr, dst_sym, src_sym),
+        op_register(dst_sym, dst_str),
+        let dst_mreg = Mreg::x86(dst_str.to_string()),
+        op_indirect(src_sym, _, base_str, idx_str, _, disp, _),
+        if (*idx_str == "NONE" || idx_str.is_empty()) && Mreg::x86(*base_str) == Mreg::SP,
+        instr_in_function(addr, func_start),
+        sp_entry_ofs(func_start, addr, sp_offsets),
+        for sp_ofs in sp_offsets.0.iter(),
+        abi_incoming_sp_stack_base(stack_base),
+        if *disp + *sp_ofs >= *stack_base,
+        !func_sets_frame_pointer(func_start);
+
+    // Frame-pointer counterpart: BP+16 and above belongs to the caller's
+    // argument area once the function has structurally established RBP as its
+    // frame pointer.
+    incoming_stack_tail_base(*func_start, *addr, *disp, dst_mreg) <--
+        plea(addr, dst_sym, src_sym),
+        op_register(dst_sym, dst_str),
+        let dst_mreg = Mreg::x86(dst_str.to_string()),
+        op_indirect(src_sym, _, base_str, idx_str, _, disp, _),
+        if (*idx_str == "NONE" || idx_str.is_empty()) && Mreg::x86(*base_str) == Mreg::BP,
+        instr_in_function(addr, func_start),
+        abi_incoming_bp_stack_base(stack_base),
+        if *disp >= *stack_base,
+        func_sets_frame_pointer(func_start);
+
+    // Preserve the incoming-tail provenance through register copies using the
+    // same exact def-use relation as the rest of RTL lifting.  This is a
+    // point-to-point dataflow fact, not an address-order approximation.
+    incoming_stack_tail_base(*func_start, *copy_addr, *base_ofs, *dst_reg) <--
+        incoming_stack_tail_base(func_start, def_addr, base_ofs, src_reg),
+        reg_def_used(def_addr, src_reg, copy_addr),
+        ltl_inst(copy_addr, ?LTLInst::Lop(Operation::Omove, args, dst_reg)),
+        if args.len() == 1 && args[0] == *src_reg,
+        instr_in_function(copy_addr, func_start);
+
+    // A load at a constant displacement from that proven base names the
+    // corresponding incoming stack slot.  checked_add rejects malformed
+    // offsets instead of wrapping them into an unrelated parameter position.
+    incoming_stack_tail_load(*load_addr, *func_start, stack_ofs) <--
+        incoming_stack_tail_base(func_start, def_addr, base_ofs, base_reg),
+        reg_def_used(def_addr, base_reg, load_addr),
+        ltl_inst(load_addr, ?LTLInst::Lload(_, Addressing::Aindexed(rel_ofs), args, _)),
+        if args.len() == 1 && args[0] == *base_reg,
+        if let Some(stack_ofs) = base_ofs.checked_add(*rel_ofs),
+        instr_in_function(load_addr, func_start);
+
+    // The SysV register save area starts 48 bytes below the first XMM save.
+    // va_start stores its address one pointer-width after overflow_arg_area.
+    // Following both LEA definitions into adjacent Lsetstack fields avoids
+    // mistaking an ordinary address of an incoming parameter for va_start.
+    variadic_register_save_area_init(*func_start, *save_slot) <--
+        func_has_variadic_xmm_prologue(func_start),
+        !abi_shared_arg_slots(true),
+        abi_pointer_size(8),
+        variadic_xmm_block_base(func_start, xmm_base),
+        ltl_inst(lea_addr, ?LTLInst::Lop(Operation::Olea(Addressing::Ainstack(base)), args, dst_mreg)),
+        if args.is_empty(),
+        if let Some(expected_base) = xmm_base.checked_sub(48),
+        if *base == expected_base,
+        instr_in_function(lea_addr, func_start),
+        reg_def_used(lea_addr, dst_mreg, store_addr),
+        ltl_inst(store_addr, ?LTLInst::Lsetstack(store_src, Slot::Local, save_slot, _)),
+        if store_src == dst_mreg,
+        instr_in_function(store_addr, func_start);
+
+    variadic_overflow_arg_area_init(*func_start, *addr, *dst_mreg, *overflow_slot) <--
+        func_has_variadic_xmm_prologue(func_start),
+        !abi_shared_arg_slots(true),
+        abi_pointer_size(pointer_size),
+        incoming_stack_tail_base(func_start, addr, _, dst_mreg),
+        reg_def_used(addr, dst_mreg, store_addr),
+        ltl_inst(store_addr, ?LTLInst::Lsetstack(store_src, Slot::Local, overflow_slot, _)),
+        if store_src == dst_mreg,
+        instr_in_function(store_addr, func_start),
+        variadic_register_save_area_init(func_start, save_slot),
+        if let Some(expected_save_slot) = overflow_slot.checked_add(*pointer_size),
+        if *save_slot == expected_save_slot;
+
+    // Frameless SysV form.  Convert the point-local displacement to the entry
+    // frame with the exact SP lattice.  The distance from the ABI's first
+    // incoming stack slot is exactly the number of fixed stack parameters;
+    // deriving it here means an otherwise-unused last named argument is still
+    // present when the signature is selected.
+    variadic_next_arg_prefix_candidate(*func_start, *addr, *dst_mreg, fixed_stack_count) <--
+        variadic_overflow_arg_area_init(func_start, addr, dst_mreg, _),
+        incoming_stack_tail_base(func_start, addr, disp, dst_mreg),
+        plea(addr, dst_sym, src_sym),
+        op_register(dst_sym, dst_str),
+        if Mreg::x86(dst_str.to_string()) == *dst_mreg,
+        op_indirect(src_sym, _, base_str, index_str, _, raw_disp, _),
+        if Mreg::x86(*base_str) == Mreg::SP,
+        if *index_str == "NONE" || index_str.is_empty(),
+        if *raw_disp == *disp,
+        sp_entry_ofs(func_start, addr, sp_offsets),
+        for sp_ofs in sp_offsets.0.iter(),
+        abi_incoming_sp_stack_base(stack_base),
+        abi_stack_slot_size(slot_size),
+        if let Some(actual) = raw_disp.checked_add(*sp_ofs),
+        if let Some(fixed_stack_bytes) = actual.checked_sub(*stack_base),
+        if *slot_size > 0 && fixed_stack_bytes >= 0 && fixed_stack_bytes % *slot_size == 0,
+        let fixed_stack_count_i64 = fixed_stack_bytes / *slot_size,
+        if let Ok(fixed_stack_count) = usize::try_from(fixed_stack_count_i64);
+
+    // Frame-pointer counterpart.  RBP's incoming-argument base already
+    // includes the saved frame pointer and return address, so no SP transfer is
+    // needed after the structural RSP->RBP proof.
+    variadic_next_arg_prefix_candidate(*func_start, *addr, *dst_mreg, fixed_stack_count) <--
+        variadic_overflow_arg_area_init(func_start, addr, dst_mreg, _),
+        func_sets_frame_pointer(func_start),
+        incoming_stack_tail_base(func_start, addr, disp, dst_mreg),
+        plea(addr, dst_sym, src_sym),
+        op_register(dst_sym, dst_str),
+        if Mreg::x86(dst_str.to_string()) == *dst_mreg,
+        op_indirect(src_sym, _, base_str, index_str, _, raw_disp, _),
+        if Mreg::x86(*base_str) == Mreg::BP,
+        if *index_str == "NONE" || index_str.is_empty(),
+        if *raw_disp == *disp,
+        abi_incoming_bp_stack_base(stack_base),
+        abi_stack_slot_size(slot_size),
+        if let Some(fixed_stack_bytes) = raw_disp.checked_sub(*stack_base),
+        if *slot_size > 0 && fixed_stack_bytes >= 0 && fixed_stack_bytes % *slot_size == 0,
+        let fixed_stack_count_i64 = fixed_stack_bytes / *slot_size,
+        if let Ok(fixed_stack_count) = usize::try_from(fixed_stack_count_i64);
+
+    variadic_next_arg_site(*func_start, *addr, *dst_mreg) <--
+        variadic_next_arg_prefix_candidate(func_start, addr, dst_mreg, _);
+
+    // Publish the definition-side prefix evidence for the later, stricter
+    // signature solve.  Multiple va_start sites normally publish the same
+    // count; signature reconciliation reduces any candidates deterministically.
+    variadic_fixed_stack_prefix_count(func_start, count) <--
+        variadic_next_arg_prefix_candidate(func_start, _, _, count);
+
+    stack_passed_param(func_start, *ofs) <--
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lload(_, Addressing::Aindexed(ofs), args, _)),
+        for arg in args.iter(),
+        abi_incoming_bp_stack_base(stack_base),
+        if *arg == Mreg::BP && *ofs >= *stack_base,
+        func_sets_frame_pointer(func_start);
+
+    // SP rules use *ofs + sp_ofs.0 >= 8 (ENTRY-frame anchor); a missing sp_entry_ofs row conservatively yields no param claim.
+    stack_passed_param(func_start, *ofs) <--
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lload(_, Addressing::Aindexed(ofs), args, _)),
+        sp_entry_ofs(func_start, addr, sp_offsets),
+        for sp_ofs in sp_offsets.0.iter(),
+        for arg in args.iter(),
+        abi_incoming_sp_stack_base(stack_base),
+        if *arg == Mreg::SP && *ofs + *sp_ofs >= *stack_base,
+        !func_sets_frame_pointer(func_start);
+
+    // Memory-operand arithmetic like `add 0x8(%rsp), %eax` is lifted via arith_load_op
+    stack_passed_param(func_start, *ofs) <--
+        instr_in_function(addr, func_start),
+        arith_load_op(addr, _, _, base, ofs, _),
+        sp_entry_ofs(func_start, addr, sp_offsets),
+        for sp_ofs in sp_offsets.0.iter(),
+        abi_incoming_sp_stack_base(stack_base),
+        if *base == Mreg::SP && *ofs + *sp_ofs >= *stack_base,
+        !func_sets_frame_pointer(func_start);
+
+    stack_passed_param(func_start, *ofs) <--
+        instr_in_function(addr, func_start),
+        arith_load_op(addr, _, _, base, ofs, _),
+        abi_incoming_bp_stack_base(stack_base),
+        if *base == Mreg::BP && *ofs >= *stack_base,
+        func_sets_frame_pointer(func_start);
+
+    // Fused scalar float arithmetic with an SP/BP memory source bypasses LTL, so it needs its own incoming-parameter classification with the same entry-frame anchors.
+    stack_passed_param(func_start, *disp) <--
+        instr_in_function(addr, func_start),
+        float_arith_stack_op(addr, _, base, disp, _),
+        if *base == Mreg::SP,
+        sp_entry_ofs(func_start, addr, sp_offsets),
+        for sp_ofs in sp_offsets.0.iter(),
+        abi_incoming_sp_stack_base(stack_base),
+        if *disp + *sp_ofs >= *stack_base,
+        !func_sets_frame_pointer(func_start);
+
+    stack_passed_param(func_start, *disp) <--
+        instr_in_function(addr, func_start),
+        float_arith_stack_op(addr, _, base, disp, _),
+        if *base == Mreg::BP,
+        abi_incoming_bp_stack_base(stack_base),
+        if *disp >= *stack_base,
+        func_sets_frame_pointer(func_start);
+
+    // Sign/zero-extending stack-arg loads bypass Lload, so the capstone operand pins base, width and signedness; restricted to extending mnemonics since plain MOV includes callee-save reloads.
+    #[local] relation extending_stack_arg_load(Node, Address, i64, MemoryChunk);
+
+    // SP-relative: disp + sp_entry_ofs >= 8 anchors to the ENTRY frame.  Frame
+    // status comes only from the structural RSP->RBP setup; a frameless
+    // function is free to use callee-saved RBP as an ordinary object pointer.
+    // !stack_var would self-defeat against the asm pass's shadow Olea.
+    extending_stack_arg_load(addr, *func_start, *disp, mc) <--
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lgetstack(_, ofs, _, _)),
+        instruction(addr, _, _, mnem, src, _, _, _, _, _),
+        op_indirect(src, _, base_str, idx_str, _, disp, msize),
+        if *disp == *ofs,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == Mreg::SP,
+        sp_entry_ofs(func_start, addr, sp_offsets),
+        for sp_ofs in sp_offsets.0.iter(),
+        abi_incoming_sp_stack_base(stack_base),
+        if *disp + *sp_ofs >= *stack_base,
+        !func_sets_frame_pointer(func_start),
+        !stack_def_used(_, _, _, addr, _, disp),
+        if let Some(mc) = extending_load_chunk(mnem, *msize);
+
+    // A stack argument is normally read with plain MOV, not an extending load. Soundness here is ABI-NEUTRAL and comes from the guards, not from the calling convention: the entry-SP anchor puts the slot in the CALLER's frame (a local or callee-save reload always lies below entry SP, and the return address at entry_sp+0 is excluded by stack_base), and the reaching stack-def veto drops a slot the callee overwrote. Formerly gated on abi_shared_arg_slots(true); that gate was over-narrow -- under cdecl EVERY argument arrives this way, and on SysV x86-64 a 7th+ argument first read by plain MOV was silently lost as a local.
+    extending_stack_arg_load(addr, *func_start, *disp, mc) <--
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lgetstack(_, ofs, typ, _)),
+        instruction(addr, _, _, mnem, src, _, _, _, _, _),
+        if matches!(*mnem, "MOV" | "MOVSS" | "MOVSD" | "VMOVSS" | "VMOVSD"),
+        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        if *disp == *ofs,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == Mreg::SP,
+        sp_entry_ofs(func_start, addr, sp_offsets),
+        for sp_ofs in sp_offsets.0.iter(),
+        abi_incoming_sp_stack_base(stack_base),
+        if *disp + *sp_ofs >= *stack_base,
+        !func_sets_frame_pointer(func_start),
+        !stack_def_used(_, _, _, addr, _, disp),
+        let mc = typ_to_chunk(*typ);
+
+    // Frame-pointer form of the same plain-MOV argument read; the BP anchor plays the role the entry-SP anchor plays above.
+    extending_stack_arg_load(addr, *func_start, *disp, mc) <--
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lgetstack(_, ofs, typ, _)),
+        instruction(addr, _, _, mnem, src, _, _, _, _, _),
+        if matches!(*mnem, "MOV" | "MOVSS" | "MOVSD" | "VMOVSS" | "VMOVSD"),
+        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        if *disp == *ofs,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == Mreg::BP,
+        abi_incoming_bp_stack_base(stack_base),
+        if *disp >= *stack_base,
+        func_sets_frame_pointer(func_start),
+        !stack_def_used(_, _, _, addr, _, disp),
+        let mc = typ_to_chunk(*typ);
+
+    // BP-relative (framed): args at BP+16+; func_sets_frame_pointer is EXPLICIT so the rule cannot silently widen if lifting conditions change (frameless RBP is a callee-saved scratch, not a frame pointer).
+    extending_stack_arg_load(addr, *func_start, *disp, mc) <--
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lgetstack(_, ofs, _, _)),
+        instruction(addr, _, _, mnem, src, _, _, _, _, _),
+        op_indirect(src, _, base_str, idx_str, _, disp, msize),
+        if *disp == *ofs,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == Mreg::BP,
+        abi_incoming_bp_stack_base(stack_base),
+        if *disp >= *stack_base,
+        func_sets_frame_pointer(func_start),
+        !stack_def_used(_, _, _, addr, _, disp),
+        if let Some(mc) = extending_load_chunk(mnem, *msize);
+
+    stack_passed_param(func_start, *ofs) <--
+        extending_stack_arg_load(_, func_start, ofs, _);
+
+    // Tail-walk loads are parameter evidence even though their machine base is
+    // a LEA-derived general register rather than SP/BP at the load itself.
+    stack_passed_param(func_start, *ofs) <--
+        incoming_stack_tail_load(_, func_start, ofs);
+
+    // TR-5 companion: extension width/signedness pins the sub-int XType for the synthetic stack-param reg (more precise than the arith/Lload chunk rules).
+    emit_function_param_type_candidate(func_start, param_reg, xt) <--
+        extending_stack_arg_load(_, func_start, disp, chunk),
+        stack_param_idx(func_start, disp, idx),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let xt = match chunk {
+            MemoryChunk::MInt32 => XType::Xint,
+            MemoryChunk::MInt16Signed => XType::Xint16signed,
+            MemoryChunk::MInt16Unsigned => XType::Xint16unsigned,
+            MemoryChunk::MInt8Signed => XType::Xint8signed,
+            MemoryChunk::MInt8Unsigned => XType::Xint8unsigned,
+            _ => XType::Xany64,
+        };
+
+    emit_function_param_type_candidate(func_start, param_reg, xt) <--
+        incoming_stack_tail_load(addr, func_start, disp),
+        stack_param_idx(func_start, disp, idx),
+        ltl_inst(addr, ?LTLInst::Lload(chunk, _, _, _)),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let xt = match chunk {
+            MemoryChunk::MInt32 => XType::Xint,
+            MemoryChunk::MInt64 | MemoryChunk::MAny64 => XType::Xlong,
+            MemoryChunk::MFloat64 => XType::Xfloat,
+            MemoryChunk::MFloat32 => XType::Xsingle,
+            MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned
+            | MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => XType::Xint,
+            _ => XType::Xany64,
+        };
+
+    relation emit_function_stack_param_count(Address, usize);
+
+    emit_function_stack_param_count(func_start, count) <--
+        stack_passed_param(func_start, _),
+        agg count = ascent::aggregators::count() in stack_passed_param(func_start, _);
+
+    emit_function_stack_param_count(func_start, 0) <--
+        emit_function(func_start, _, _),
+        !stack_passed_param(func_start, _);
+
+
+    relation dx_has_non_div_use(Address);
+
+    // DX used (non-div) while it still holds the incoming caller value = DX is a genuine parameter, not just the high half of a division. Window -> arg_reg_param_live_at.
+    dx_has_non_div_use(func_start) <--
+        arg_reg_param_live_at(func_start, addr, ?&Mreg::DX),
+        ltl_inst(addr, ?LTLInst::Lop(_, args, _)),
+        for arg in args.iter(),
+        if *arg == Mreg::DX,
+        !pdiv(addr, _, _);
+
+    dx_has_non_div_use(func_start) <--
+        arg_reg_param_live_at(func_start, addr, ?&Mreg::DX),
+        ltl_inst(addr, ?LTLInst::Lstore(_, _, _, src)),
+        if *src == Mreg::DX,
+        !pdiv(addr, _, _);
+
+    dx_has_non_div_use(func_start) <--
+        arg_reg_param_live_at(func_start, addr, ?&Mreg::DX),
+        ltl_inst(addr, ?LTLInst::Lload(_, _, args, _)),
+        for arg in args.iter(),
+        if *arg == Mreg::DX;
+
+    dx_has_non_div_use(func_start) <--
+        arg_reg_param_live_at(func_start, addr, ?&Mreg::DX),
+        ltl_inst(addr, ?LTLInst::Lcond(_, args, _, _)),
+        for arg in args.iter(),
+        if *arg == Mreg::DX;
+
+    dx_has_non_div_use(func_start) <--
+        arg_reg_copied_early(func_start, ?&Mreg::DX, _);
+
+    relation dx_used_only_in_div(Address);
+
+    dx_used_only_in_div(func_start) <--
+        func_arg_reg_used(func_start, Mreg::DX),
+        !arg_reg_spilled_to_stack(func_start, Mreg::DX),
+        !dx_has_non_div_use(func_start),
+        func_has_div_instr(func_start);
+
+    // CX filter: suppress CX as param evidence when it's only used as shift/rotate count
+    relation func_has_shift_instr(Address);
+
+    func_has_shift_instr(func_start) <--
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lop(op, args, _)),
+        for arg in args.iter(),
+        if *arg == Mreg::CX,
+        if is_shift_or_rotate_op(op);
+
+    relation cx_has_non_shift_use(Address);
+
+    // CX used (non-shift) while it still holds the incoming caller value = CX is a genuine parameter, not just a shift count. Window -> arg_reg_param_live_at (CX holds the caller value at the use).
+    cx_has_non_shift_use(func_start) <--
+        arg_reg_param_live_at(func_start, addr, ?&Mreg::CX),
+        ltl_inst(addr, ?LTLInst::Lop(op, args, _)),
+        for arg in args.iter(),
+        if *arg == Mreg::CX,
+        if !is_shift_or_rotate_op(op);
+
+    cx_has_non_shift_use(func_start) <--
+        arg_reg_param_live_at(func_start, addr, ?&Mreg::CX),
+        ltl_inst(addr, ?LTLInst::Lstore(_, _, _, src)),
+        if *src == Mreg::CX;
+
+    cx_has_non_shift_use(func_start) <--
+        arg_reg_param_live_at(func_start, addr, ?&Mreg::CX),
+        ltl_inst(addr, ?LTLInst::Lload(_, _, args, _)),
+        for arg in args.iter(),
+        if *arg == Mreg::CX;
+
+    cx_has_non_shift_use(func_start) <--
+        arg_reg_param_live_at(func_start, addr, ?&Mreg::CX),
+        ltl_inst(addr, ?LTLInst::Lcond(_, args, _, _)),
+        for arg in args.iter(),
+        if *arg == Mreg::CX;
+
+    cx_has_non_shift_use(func_start) <--
+        arg_reg_copied_early(func_start, ?&Mreg::CX, _);
+
+    relation cx_used_only_in_shift(Address);
+
+    cx_used_only_in_shift(func_start) <--
+        func_arg_reg_used(func_start, Mreg::CX),
+        !arg_reg_spilled_to_stack(func_start, Mreg::CX),
+        !cx_has_non_shift_use(func_start),
+        func_has_shift_instr(func_start);
+
+    // The old scratch-register filter is removed: func_arg_reg_used now derives from arg_reg_param_live_at, which already excludes a defined-first scratch register.
+
+    // Func param positions use max-evidence: all positions up to max are filled per ABI
+    relation func_has_param_evidence(Address, usize);
+    #[local] relation func_gp_param_evidence(Address, usize);
+    #[local] relation func_float_param_evidence_at(Address, usize);
+
+    func_gp_param_evidence(func_start, pos) <--
+        func_arg_reg_used(func_start, mreg),
+        abi_int_arg_position(mreg, pos),
+        if *mreg != Mreg::DX && *mreg != Mreg::CX;
+    func_gp_param_evidence(func_start, pos) <--
+        func_arg_reg_used(func_start, Mreg::DX),
+        abi_int_arg_position(?&Mreg::DX, pos),
+        !dx_used_only_in_div(func_start);
+    func_gp_param_evidence(func_start, pos) <--
+        func_arg_reg_used(func_start, Mreg::CX),
+        abi_int_arg_position(?&Mreg::CX, pos),
+        !cx_used_only_in_shift(func_start);
+
+    func_has_param_evidence(func_start, pos) <--
+        func_gp_param_evidence(func_start, pos);
+
+    // Leading argument positions a function takes in integer registers: on Windows x86-32 cdecl claims none, fastcall two and thiscall one, evidenced independently by a live-in ECX/EDX at entry and by a fastcall-decorated name.
+    relation func_decorated_reg_args(Address, usize);
+    relation extern_decorated_reg_args(Symbol, usize);
+    #[local] relation func_reg_arg_count_cand(Address, usize);
+    relation func_reg_arg_count(Address, usize);
+
+    func_reg_arg_count_cand(func_start, max_pos + 1) <--
+        abi_reg_args_per_function(true),
+        func_gp_param_evidence(func_start, _),
+        agg max_pos = ascent::aggregators::max(pos) in func_gp_param_evidence(func_start, pos);
+    func_reg_arg_count_cand(func_start, n) <--
+        abi_reg_args_per_function(true),
+        func_decorated_reg_args(func_start, n);
+
+    func_reg_arg_count(func_start, n) <--
+        func_reg_arg_count_cand(func_start, _),
+        agg n = ascent::aggregators::max(c) in func_reg_arg_count_cand(func_start, c);
+    // On Windows a used XMM register occupies that source-language ordinal in the same sequence as GP args.
+    func_float_param_evidence_at(func_start, pos) <--
+        abi_shared_arg_slots(true),
+        func_float_param_used(func_start, mreg),
+        abi_float_arg_position(mreg, pos);
+    func_has_param_evidence(func_start, pos) <--
+        func_float_param_evidence_at(func_start, pos);
+
+    // Forwarded-only parameter evidence: an arg register still holding the caller value at a call the callee consumes as a parameter IS a parameter, closing the pass-through chicken-and-egg.
+    func_has_param_evidence(func_start, pos) <--
+        is_call_instruction(call_addr),
+        instr_in_function(call_addr, func_start),
+        call_target_func(call_addr, callee),
+        is_arg_reg(arg_reg),
+        arg_reg_param_live_at(func_start, call_addr, arg_reg),
+        func_arg_reg_used(callee, arg_reg),
+        abi_int_arg_position(arg_reg, pos);
+
+    // Companion for a KNOWN-SIGNATURE extern callee, which has no body to corroborate: a live pass-through arg register within the extern's fixed param count IS a parameter of this function.
+    func_has_param_evidence(func_start, pos) <--
+        forwarded_param_candidate(func_start, arg_reg, call_addr),
+        call_known_sig_gp_position(call_addr, pos),
+        abi_int_arg_position(arg_reg, pos);
+
+    relation func_max_param_position(Address, usize);
+
+    func_max_param_position(func_start, max_pos) <--
+        func_has_param_evidence(func_start, _),
+        agg max_pos = ascent::aggregators::max(pos) in func_has_param_evidence(func_start, pos);
+
+    relation func_has_param_at_position(Address, usize);
+
+    func_has_param_at_position(func_start, *max_pos) <--
+        func_max_param_position(func_start, max_pos);
+    func_has_param_at_position(func_start, lower) <--
+        func_has_param_at_position(func_start, pos),
+        if *pos > 0,
+        let lower = *pos - 1;
+
+    relation func_param_validated(Address, Mreg);
+
+    // SysV's GP sequence is independent and compact; Windows fills an unknown lower shared slot with the GP-class fallback but never where positive XMM evidence identifies the ordinal as float.
+    func_param_validated(func_start, mreg) <--
+        !abi_shared_arg_slots(true),
+        abi_int_arg_position(mreg, pos),
+        func_has_param_at_position(func_start, pos);
+    func_param_validated(func_start, mreg) <--
+        abi_shared_arg_slots(true),
+        abi_int_arg_position(mreg, pos),
+        func_has_param_at_position(func_start, pos),
+        !func_float_param_evidence_at(func_start, pos);
+
+    relation func_arg_used_undefined(Address, RTLReg);
+
+    func_arg_used_undefined(func_start, id), reg_xtl(func_start, mreg, id) <--
+        func_param_validated(func_start, mreg),
+        let id = fresh_xtl_reg(*func_start, *mreg);
+
+
+    relation param_used_in_deref(Address, Mreg);
+
+    // Only check base register (args[0]) for pointer not index
+    param_used_in_deref(func_start, *arg_reg) <--
+        func_param_validated(func_start, arg_reg),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lload(_, _, args, _)),
+        if !args.is_empty() && args[0] == *arg_reg;
+
+    param_used_in_deref(func_start, *arg_reg) <--
+        func_param_validated(func_start, arg_reg),
+        arg_reg_copied_early(func_start, arg_reg, copy_dst),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lload(_, _, args, _)),
+        if !args.is_empty() && args[0] == *copy_dst;
+
+    param_used_in_deref(func_start, *arg_reg) <--
+        func_param_validated(func_start, arg_reg),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lstore(_, _, args, _)),
+        if !args.is_empty() && args[0] == *arg_reg;
+
+    param_used_in_deref(func_start, *arg_reg) <--
+        func_param_validated(func_start, arg_reg),
+        arg_reg_copied_early(func_start, arg_reg, copy_dst),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lstore(_, _, args, _)),
+        if !args.is_empty() && args[0] == *copy_dst;
+
+    // The value-web canonicals carrying a parameter's INCOMING value: at -O0 the prologue spills the arg and each reload is a fresh value, so track the spill slot and add every reload's canonical.
+    relation param_value_canon(Address, Mreg, RTLReg);
+
+    param_value_canon(func_start, *arg_reg, canon) <--
+        func_param_validated(func_start, arg_reg),
+        reg_xtl(func_start, arg_reg, raw_v),
+        xtl_canonical(raw_v, canon);
+
+    param_value_canon(func_start, *arg_reg, reload_canon) <--
+        func_param_validated(func_start, arg_reg),
+        instr_in_function(spill, func_start),
+        ltl_inst(spill, ?LTLInst::Lsetstack(src, _, ofs, _)),
+        if src == arg_reg,
+        arg_reg_param_live_at(func_start, spill, arg_reg),
+        instr_in_function(reload, func_start),
+        ltl_inst(reload, ?LTLInst::Lgetstack(_, ofs2, _, dst)),
+        if ofs2 == ofs,
+        reg_rtl(reload, *dst, reload_canon);
+
+    // A callee commonly preserves an incoming pointer in a callee-saved
+    // register and later moves it back into an argument register.  The two SSA
+    // values are deliberately not alias-unified (they are distinct defs), but
+    // they carry the same parameter value.  Follow that value only across an
+    // explicit one-source Omove in the same function.  This supplies the
+    // missing bridge between entry provenance and a later known pointer call
+    // slot without using address order or pairwise reachability.
+    param_value_canon(func_start, *arg_reg, *dst_rtl) <--
+        param_value_canon(func_start, arg_reg, src_rtl),
+        ltl_inst(copy, ?LTLInst::Lop(Operation::Omove, args, dst_mreg)),
+        instr_in_function(copy, func_start),
+        if args.len() == 1,
+        reg_rtl(copy, args[0], seen_src_rtl),
+        if seen_src_rtl == src_rtl,
+        reg_rtl(copy, *dst_mreg, dst_rtl);
+
+    // Value-web deref evidence: any register sharing a param value canonical used as a load/store BASE proves the param is a pointer, subsuming the -O0 spill/reload case.
+    param_used_in_deref(func_start, *arg_reg) <--
+        param_value_canon(func_start, arg_reg, canon),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lload(_, _, args, _)),
+        if !args.is_empty(),
+        reg_rtl(addr, args[0], canon);
+
+    param_used_in_deref(func_start, *arg_reg) <--
+        param_value_canon(func_start, arg_reg, canon),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lstore(_, _, args, _)),
+        if !args.is_empty(),
+        reg_rtl(addr, args[0], canon);
+
+    // Value-web address-arithmetic evidence: the param is the base of a lea/add whose RESULT is itself a memory base, requiring base_addr_usage so a cmov/clamp lea does not over-pointerize a scalar.
+    param_used_in_deref(func_start, *arg_reg) <--
+        param_value_canon(func_start, arg_reg, canon),
+        instr_in_function(lea_addr, func_start),
+        ltl_inst(lea_addr, ?LTLInst::Lop(op, srcs, dst)),
+        if matches!(op, Operation::Olea(_) | Operation::Oleal(_)),
+        if !srcs.is_empty(),
+        reg_rtl(lea_addr, srcs[0], canon),
+        reg_rtl(lea_addr, *dst, result_canon),
+        base_addr_usage(_, result_canon, _);
+
+    // param_used_in_lea removed: a bare LEA base is not pointer evidence; the genuine LEA-base-then-deref case is covered by param_used_in_deref, gated on base_addr_usage of the result.
+
+    relation param_used_in_null_check(Address, Mreg);
+
+    param_used_in_null_check(func_start, *arg_reg) <--
+        func_param_validated(func_start, arg_reg),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lop(op, srcs, _)),
+        if is_null_comparison_op(op),
+        for reg in srcs.iter(),
+        if *reg == *arg_reg;
+
+    relation param_type_evidence_pointer(Address, Mreg);
+
+    param_type_evidence_pointer(func_start, mreg) <--
+        param_used_in_deref(func_start, mreg);
+
+    // param_used_in_lea is intentionally NOT a pointer signal: gcc emits LEA for plain integer arithmetic on a scalar param, and treating it as evidence declared count/length params void* and made their arithmetic wild.
+
+    param_type_evidence_pointer(func_start, mreg) <--
+        param_used_in_null_check(func_start, mreg);
+
+    // U1: a parameter forwarded into a callee argument slot known to take a pointer is itself a pointer, the only path that saves a thin forwarder whose value-web is_ptr is cancelled by competing int evidence.
+    relation callee_ptr_param_at(Node, usize);
+
+    callee_ptr_param_at(call_node, *arg_idx) <--
+        call_site(call_node, func_name),
+        call_arg(call_node, arg_idx, _),
+        known_func_param_is_ptr(func_name, arg_idx);
+
+    callee_ptr_param_at(call_node, *arg_idx) <--
+        call_site(call_node, func_name),
+        call_arg(call_node, arg_idx, _),
+        !emit_function(_, func_name, _),
+        known_extern_signature(func_name, _, _, params),
+        if *arg_idx < params.len(),
+        if matches!(params[*arg_idx], XType::Xptr | XType::Xcharptr);
+
+    // Symbol-form libc calls are not covered by call_site, so read the callee pointer arg directly off the symbol name.
+    callee_ptr_param_at(call_node, *arg_idx) <--
+        ltl_inst(call_node, ?LTLInst::Lcall(Either::Right(Either::Right(name)))),
+        !emit_function(_, name, _),
+        call_arg(call_node, arg_idx, _),
+        known_func_param_is_ptr(name, arg_idx);
+
+    callee_ptr_param_at(call_node, *arg_idx) <--
+        ltl_inst(call_node, ?LTLInst::Lcall(Either::Right(Either::Right(name)))),
+        !emit_function(_, name, _),
+        call_arg(call_node, arg_idx, _),
+        known_extern_signature(name, _, _, params),
+        if *arg_idx < params.len(),
+        if matches!(params[*arg_idx], XType::Xptr | XType::Xcharptr);
+
+    // A direct internal call carries the same positional evidence as a named
+    // extern call.  Keep the dependency on the callee's structural pointer
+    // fact, before func_param_position_type's aggregated type construction;
+    // feeding that aggregate back here would make the Ascent strata cyclic.
+    // The explicit call_target_func edge lets a thin wrapper inherit a seed
+    // without materializing call-graph reachability.  Positive recursion is
+    // intentional: it propagates an existing seed through forwarding wrappers,
+    // but cannot manufacture one in an unseeded SCC.
+    callee_ptr_param_at(call_node, *arg_idx) <--
+        call_target_func(call_node, callee),
+        call_arg(call_node, arg_idx, _),
+        func_param_validated(callee, callee_mreg),
+        abi_int_arg_position(callee_mreg, arg_idx),
+        param_inferred_type_is_pointer(callee, callee_mreg);
+
+    // The parameter's incoming value (possibly preserved through explicit
+    // register copies or a spill/reload) is passed as a pointer-typed call
+    // argument somewhere in the body.  Compare the carried value webs here;
+    // requiring the call argument to retain the entry web's canonical id
+    // bypasses param_value_canon and drops ordinary callee-saved preservation.
+    param_type_evidence_pointer(func_start, mreg) <--
+        func_param_validated(func_start, mreg),
+        param_value_canon(func_start, mreg, carried),
+        xtl_canonical(carried, canon),
+        instr_in_function(call_node, func_start),
+        call_arg(call_node, pos, arg_reg),
+        xtl_canonical(arg_reg, canon),
+        callee_ptr_param_at(call_node, pos);
+
+    relation param_inferred_type_is_pointer(Address, Mreg);
+
+    param_inferred_type_is_pointer(func_start, mreg) <--
+        func_param_validated(func_start, mreg),
+        param_type_evidence_pointer(func_start, mreg);
+
+    relation emit_function_param_candidate(Address, RTLReg);
+    relation emit_function_param_is_pointer_candidate(Address, RTLReg);
+    relation emit_function_return(Address, RTLReg);
+    relation emit_function_has_return_candidate(Address);
+    relation emit_function_void_candidate(Address);
+    relation emit_function_return_type_candidate(Address, ClightType);
+
+    emit_function(func_start, *name, func_start) <--
+        func_stacksz(func_start, _func_end, name, stacksize);
+
+    emit_function_param_candidate(func_start, *canonical) <--
+        func_stacksz(func_start, _func_end, name, stacksize),
+        func_arg_used_undefined(func_start, v),
+        xtl_canonical(v, canonical);
+
+    emit_function_param_candidate(func_start, *canonical) <--
+        func_float_arg_used_undefined(func_start, v),
+        xtl_canonical(v, canonical);
+
+    emit_function_param_is_pointer_candidate(func_start, *canonical) <--
+        emit_function_param_candidate(func_start, canonical),
+        func_arg_used_undefined(func_start, raw_v),
+        xtl_canonical(raw_v, canonical),
+        reg_xtl(func_start, mreg, raw_v),
+        param_inferred_type_is_pointer(func_start, mreg);
+
+
+    relation function_return_point_reg(Address, Node, RTLReg);
+
+    // Gated !func_returns_float: a float return has no AX return value, so exclude the AX point entirely or a stale address def is selected as THE return reg and defeats the float candidate.
+    function_return_point_reg(func_start, addr, rtl_reg) <--
+        emit_function(func_start, _, entry_node),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, LTLInst::Lreturn),
+        !func_returns_float(func_start),
+        ax_value_addr(addr, defaddr),
+        abi_ret_int_reg(rr),
+        def_value_rtl(defaddr, rr, rtl_reg);
+
+    // Float-return point reg: bind the return to the real XMM0 def (mirror of the AX rule).
+    function_return_point_reg(func_start, addr, rtl_reg) <--
+        emit_function(func_start, _, entry_node),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, LTLInst::Lreturn),
+        x0_value_addr(addr, defaddr),
+        abi_ret_float_reg(ret_reg),
+        def_value_rtl(defaddr, *ret_reg, rtl_reg);
+
+    emit_function_return(func_start, min_ret) <--
+        function_return_point_reg(func_start, _, _),
+        agg min_ret = ascent::aggregators::min(ret) in function_return_point_reg(func_start, _, ret);
+
+    emit_function_has_return_candidate(addr) <--
+        emit_function_return(addr, _);
+
+    relation emit_function_param_type_candidate(Address, RTLReg, XType);
+
+    emit_function_param_type_candidate(func_start, param_rtl, xtype) <--
+        emit_function_param_candidate(func_start, param_rtl),
+        emit_var_type_candidate(param_rtl, xtype);
+
+    emit_function_param_type_candidate(func_start, param_rtl, XType::Xfloat) <--
+        emit_function_float_param(func_start, param_rtl),
+        !emit_var_type_candidate(param_rtl, _);
+
+    // A parameter with pointer evidence gets a pointer type candidate, since its own pre-copy value web often carries only int-width candidates; Xptr lifts but never downgrades a more refined type.
+    emit_function_param_type_candidate(func_start, param_rtl, XType::Xptr) <--
+        emit_function_param_is_pointer_candidate(func_start, param_rtl);
+
+    relation emit_function_return_type_xtype_candidate(Address, XType);
+
+    emit_function_return_type_xtype_candidate(func_start, xtype) <--
+        emit_function_return(func_start, ret_rtl),
+        emit_var_type_candidate(ret_rtl, xtype);
+
+    // Emit Xlong for every 64-bit-typed return point, or an early-exit return 0 (Xint, priority 4) outranks a bare Xany64 (3) and truncates a genuine 64-bit return. These classes are 64-bit at ANY pointer width (a long long return uses EDX:EAX on i386), so this rule is width-independent.
+    emit_function_return_type_xtype_candidate(func_start, XType::Xlong) <--
+        function_return_point_reg(func_start, _, ret_rtl),
+        emit_var_type_candidate(ret_rtl, xt),
+        if matches!(xt, XType::Xany64 | XType::Xlong | XType::Xlongunsigned);
+
+    // The same anti-truncation widening for POINTER-typed return points, but only where a pointer really is 64-bit. On ptr32 a pointer is exactly int-width, so there is nothing to protect against and widening it to Xlong would itself be the error -- it printed `long f(void)` for an int-returning i386 function.
+    emit_function_return_type_xtype_candidate(func_start, XType::Xlong) <--
+        abi_pointer_size(8),
+        function_return_point_reg(func_start, _, ret_rtl),
+        emit_var_type_candidate(ret_rtl, xt),
+        if matches!(xt,
+            XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr
+            | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_));
+
+    // Same anti-truncation guard keyed on the POINTER CLASSIFICATION, for a returned pointer whose pointer-ness was severed to a bare Xint candidate; an int-returning function never classifies its return reg is_ptr. Width-gated for the same reason as above.
+    emit_function_return_type_xtype_candidate(func_start, XType::Xlong) <--
+        abi_pointer_size(8),
+        function_return_point_reg(func_start, _, ret_rtl),
+        is_ptr(ret_rtl);
+
+    // BUG2: track which frame slots hold a pointer, then type any return reg reloading such a slot is_ptr, since an -O0 pointer return is spilled and its reload's value web is severed from the producing def.
+    relation call_returns_ptr_value(Address);
+    call_returns_ptr_value(call_addr) <--
+        call_has_known_signature(call_addr, _, _, ret),
+        if matches!(ret, XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr
+            | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_));
+    call_returns_ptr_value(call_addr) <--
+        external_call_site(call_addr, _, name),
+        known_func_returns_ptr(name);
+
+    relation stack_slot_stored_ptr(Address, i64);
+    // (i) a stored value already classified is_ptr in rtl (an Olea result, internal ptr-returning callee, or deref-base value web).
+    stack_slot_stored_ptr(func_start, *ofs) <--
+        instr_in_function(spill, func_start),
+        ltl_inst(spill, ?LTLInst::Lsetstack(src, _, ofs, _)),
+        reg_def_used(defaddr, *src, *spill),
+        def_value_rtl(defaddr, *src, src_rtl),
+        is_ptr(src_rtl);
+    // (ii) the AX result of a pointer-returning call, keyed on the call signature directly since by-name externs have no rtl is_ptr.
+    stack_slot_stored_ptr(func_start, *ofs) <--
+        instr_in_function(spill, func_start),
+        ltl_inst(spill, ?LTLInst::Lsetstack(src, _, ofs, _)),
+        abi_ret_int_reg(ret_reg),
+        if *src == *ret_reg,
+        reg_def_used(call_addr, *ret_reg, *spill),
+        call_returns_ptr_value(call_addr);
+    // (iii) the spill of an inferred-pointer parameter (the returned-output-array-param case).
+    stack_slot_stored_ptr(func_start, *ofs) <--
+        instr_in_function(spill, func_start),
+        ltl_inst(spill, ?LTLInst::Lsetstack(src, _, ofs, _)),
+        param_inferred_type_is_pointer(func_start, *src),
+        arg_reg_param_live_at(func_start, spill, *src);
+
+    is_ptr(ret_rtl) <--
+        instr_in_function(ret_addr, func_start),
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        ax_value_addr(ret_addr, defaddr),
+        abi_ret_int_reg(ret_reg),
+        ltl_inst(defaddr, ?LTLInst::Lgetstack(_, ofs, _, dst)),
+        if *dst == *ret_reg,
+        stack_slot_stored_ptr(func_start, *ofs),
+        def_value_rtl(defaddr, *ret_reg, ret_rtl);
+
+    // 3.8 R1: float return type for fused-op-fed X0 returns, whose def has no ltl Lop; derive the class from the op that structurally reaches the return (*fs results single, the rest double).
+    emit_function_return_type_xtype_candidate(func_start, xt) <--
+        func_returns_float(func_start),
+        instr_in_function(ret_addr, func_start),
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        abi_ret_float_reg(ret_reg),
+        def_reaches_return(ret_addr, def_addr, *ret_reg),
+        float_load_op(def_addr, op, _, _, _, dst, _),
+        if dst == ret_reg,
+        !has_ltl_op(def_addr),
+        let xt = if matches!(op, Operation::Oaddfs | Operation::Osubfs | Operation::Omulfs | Operation::Odivfs | Operation::Osingleoffloat) { XType::Xsingle } else { XType::Xfloat };
+
+    // (B) Float return-type class for an X0 return fed by a PLAIN reg-reg float op, tracing back through Omove copies; single iff the producing op is single-precision, gated on func_returns_float.
+    #[local] relation float_value_class(Address, Mreg, bool);
+    float_value_class(*addr, *dst, true) <--
+        ltl_inst(addr, ?LTLInst::Lop(op, _, dst)),
+        if crate::x86::types::is_single_operation(op);
+    float_value_class(*addr, *dst, false) <--
+        ltl_inst(addr, ?LTLInst::Lop(op, _, dst)),
+        if crate::x86::types::is_float_operation(op);
+    float_value_class(*addr, dst, single) <--
+        float_load_op(addr, op, _, _, _, dst, _),
+        let single = matches!(op, Operation::Oaddfs | Operation::Osubfs | Operation::Omulfs | Operation::Odivfs | Operation::Osingleoffloat | Operation::Osingleofint | Operation::Osingleoflong);
+    float_value_class(*addr, *dst, single) <--
+        float_arith_stack_op(addr, op, _, _, dst),
+        let single = crate::x86::types::is_single_operation(op);
+    float_value_class(*addr, *dst, single) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Omove, src_args, dst)),
+        if src_args.len() == 1,
+        let src = src_args[0],
+        reg_def_used(src_def, src, *addr),
+        float_value_class(src_def, src, single);
+
+    emit_function_return_type_xtype_candidate(func_start, xt) <--
+        func_returns_float(func_start),
+        instr_in_function(ret_addr, func_start),
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        abi_ret_float_reg(ret_reg),
+        def_reaches_return(ret_addr, def_addr, *ret_reg),
+        float_value_class(def_addr, *ret_reg, single),
+        let xt = if *single { XType::Xsingle } else { XType::Xfloat };
+
+    emit_function_return_type_xtype_candidate(callee_func, xtype) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Left(callee_func)))),
+        call_result_rtl(call_addr, ret_rtl),
+        emit_var_type_candidate(ret_rtl, xtype),
+        if *xtype != XType::Xvoid,
+        !emit_function_return(callee_func, _);
+
+    // U3: tail-call-only forwarders have zero Lreturn, so the ladder types them Xvoid and a value-returning caller emits an invalid use of void; their true return type is the tail-call target's.
+    relation func_has_lreturn(Address);
+    func_has_lreturn(func_start) <--
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Lreturn);
+
+    relation func_tailcalls_local(Address, Address);
+    func_tailcalls_local(func_start, target) <--
+        emit_function(func_start, _, _),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Ltailcall(Either::Right(Either::Left(target))));
+
+    // (A) Body: synthesize a return reg for a tail-call-only function whose target returns a value, so clight_pass lowers it as ret = target(); return ret; recursing up the tail-call chain.
+    emit_function_return(func_start, ret_rtl) <--
+        func_tailcalls_local(func_start, target),
+        !func_has_lreturn(func_start),
+        emit_function_return(target, _),
+        abi_ret_int_reg(ret_reg),
+        let ret_rtl = fresh_xtl_reg(*func_start, *ret_reg);
+
+    // (B) Decl type: inherit the tail-call target's non-void return type by positive recursion within the candidate relation.
+    emit_function_return_type_xtype_candidate(func_start, xtype) <--
+        func_tailcalls_local(func_start, target),
+        !func_has_lreturn(func_start),
+        emit_function_return_type_xtype_candidate(target, xtype),
+        if *xtype != XType::Xvoid;
+
+    emit_function_return_type_candidate(func_start, clight_ty) <--
+        emit_function_return_type_xtype_candidate(func_start, xtype),
+        let clight_ty = clight_type_from_xtype(xtype);
+
+
+    relation called_address(Address);
+
+    called_address(target) <--
+        ltl_inst(_caller, ?LTLInst::Lcall(Either::Right(Either::Left(target)))),
+        instr_in_function(target, _);
+
+    called_address(target2) <--
+        ltl_inst(_caller2, ?LTLInst::Ltailcall(Either::Right(Either::Left(target2)))),
+        instr_in_function(target2, _);
+
+    emit_function(func_entry, *sym_name, func_entry) <--
+        called_address(func_entry),
+        !func_stacksz(func_entry, _, _, _),
+        !plt_entry(func_entry, _),
+        !plt_block(func_entry, _),
+        symbols(func_entry, sym_name, _);
+
+    emit_function(func_entry, func_name, func_entry) <--
+        called_address(func_entry),
+        !func_stacksz(func_entry, _, _, _),
+        !plt_entry(func_entry, _),
+        !plt_block(func_entry, _),
+        !symbols(func_entry, _, _),
+        let func_name = Box::leak(format!("FUN_{:x}", func_entry).into_boxed_str()) as Symbol;
+
+    emit_function(addr, *sym_name, addr) <--
+        symbols(addr, sym_name, _),
+        instr_in_function(addr, addr),
+        !func_stacksz(addr, _, _, _),
+        !called_address(addr),
+        !plt_entry(addr, _),
+        !plt_block(addr, _);
+
+    emit_function_void_candidate(undiscov_addr2) <--
+        called_address(undiscov_addr2),
+        !func_stacksz(undiscov_addr2, _, _, _),
+        instr_in_function(ret_point2, undiscov_addr2),
+        ltl_inst(ret_point2, ?LTLInst::Lreturn),
+        abi_ret_int_reg(ret_reg),
+        !reg_rtl(ret_point2, *ret_reg, _);
+
+    // A function has a return value if any return point resolves an AX value (direct def-use or recovered last-def); ax_value_addr is keyed on the return node.
+    relation func_has_ax_return_value(Address);
+    func_has_ax_return_value(func_start) <--
+        instr_in_function(ret_point, func_start),
+        ltl_inst(ret_point, ?LTLInst::Lreturn),
+        ax_value_addr(ret_point, _);
+
+    // Float/double returns place the result in XMM0 (X0), which the AX-keyed machinery misses; treat an X0 def reaching a return as a return value so they are not misclassified as void.
+    func_has_ax_return_value(func_start) <--
+        instr_in_function(ret_point, func_start),
+        abi_ret_float_reg(ret_reg),
+        def_reaches_return(ret_point, _, *ret_reg);
+
+    // Genuine void: a function whose return points have no AX/X0 value source at all; without this the void fallback fabricates an undefined AX reg typed as `long`, emitting `return <uninitialized var>`.
+    emit_function_void_candidate(func_start) <--
+        func_stacksz(func_start, _, _, _),
+        instr_in_function(ret_point, func_start),
+        ltl_inst(ret_point, ?LTLInst::Lreturn),
+        !func_has_ax_return_value(func_start);
+
+
+    relation emit_function_param_count_candidate(Address, usize);
+
+    // Total param count includes both register and stack-passed params
+    emit_function_param_count_candidate(target_addr, reg_count + *stack_count) <--
+        emit_function_param_candidate(target_addr, _),
+        agg reg_count = ascent::aggregators::count() in emit_function_param_candidate(target_addr, _),
+        emit_function_stack_param_count(target_addr, stack_count);
+
+    emit_function_param_count_candidate(target_addr, *stack_count) <--
+        emit_function(target_addr, _, _),
+        !emit_function_param_candidate(target_addr, _),
+        emit_function_stack_param_count(target_addr, stack_count);
+
+
+    is_ptr(reg) <-- op_produces_ptr(_, reg);
+    is_ptr(reg) <-- base_addr_usage(_, reg, _);
+    is_not_ptr(reg) <-- op_produces_data(_, reg);
+
+    is_not_ptr(reg) <--
+        comparison_operand(_, cond, reg),
+        if matches!(cond, Condition::Ccomp(_) | Condition::Ccompu(_)
+            | Condition::Ccompimm(_, _) | Condition::Ccompuimm(_, _)),
+        if !is_null_comparison_cond(cond);
+
+    // USE-SIDE 64-bit width floor (c16): operands of a genuine 64-bit comparison are 64-bit, but contribute is_long ONLY, since a 64-bit comparison may compare two pointers.
+    is_long(reg) <--
+        comparison_operand(_, cond, reg),
+        if matches!(cond, Condition::Ccompl(_) | Condition::Ccomplu(_)
+            | Condition::Ccomplimm(_, _) | Condition::Ccompluimm(_, _));
+
+    must_be_ptr(reg) <-- arg_constrained_as_ptr(_, reg);
+    must_be_ptr(ret_reg) <--
+        call_site(node, func_name),
+        abi_ret_int_reg(ret_mreg),
+        call_output_rtl(node, *ret_mreg, ret_reg),
+        !emit_function(_, func_name, _),
+        known_func_returns_ptr(func_name);
+    must_be_ptr(rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Oindirectsymbol(_), _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+
+    arg_constrained_as_ptr(node, arg_reg) <--
+        call_site(node, func_name),
+        call_arg(node, arg_idx, arg_reg),
+        known_func_param_is_ptr(func_name, arg_idx);
+
+    is_ptr(reg) <-- arg_constrained_as_ptr(_, reg);
+
+    is_char_ptr(arg_reg) <--
+        call_site(node, func_name),
+        call_arg(node, arg_idx, arg_reg),
+        !emit_function(_, func_name, _),
+        known_extern_signature(func_name, _, _, params),
+        if *arg_idx < params.len(),
+        if matches!(params[*arg_idx], XType::Xcharptr);
+
+    // ABI 64-bit width floor (c16): an argument passed to an extern parameter known to be 64-bit is itself 64-bit; Xany64 is excluded as too ambiguous and would over-widen narrow args.
+    is_long(arg_reg) <--
+        call_site(node, func_name),
+        call_arg(node, arg_idx, arg_reg),
+        !emit_function(_, func_name, _),
+        known_extern_signature(func_name, _, _, params),
+        if *arg_idx < params.len(),
+        if matches!(params[*arg_idx], XType::Xlong | XType::Xlongunsigned);
+
+    is_ptr(ret_reg) <--
+        call_site(node, func_name),
+        abi_ret_int_reg(ret_mreg),
+        call_output_rtl(node, *ret_mreg, ret_reg),
+        !emit_function(_, func_name, _),
+        known_func_returns_ptr(func_name);
+
+    // (A) A by-NAME pointer-returning extern call result is a pointer: the call_site-gated rules cover only by-address PLT calls, so a by-name malloc/realloc result never got is_ptr and its return truncated.
+    is_ptr(ret_rtl) <--
+        call_returns_ptr_value(call_addr),
+        abi_ret_int_reg(ret_mreg),
+        call_output_rtl(call_addr, *ret_mreg, ret_rtl);
+
+    is_char_ptr(ret_reg) <--
+        call_site(node, func_name),
+        abi_ret_int_reg(ret_mreg),
+        call_output_rtl(node, *ret_mreg, ret_reg),
+        !emit_function(_, func_name, _),
+        known_extern_signature(func_name, _, ret_type, _),
+        if matches!(ret_type, XType::Xcharptr);
+
+    // (A) By-NAME char-pointer extern call result refines is_ptr to char*;
+    // Xcharptr outranks the bare Xptr above.
+    is_char_ptr(ret_rtl) <--
+        call_has_known_signature(call_addr, name, _, ret_type),
+        !emit_function(_, name, _),
+        if matches!(ret_type, XType::Xcharptr),
+        abi_ret_int_reg(ret_mreg),
+        call_output_rtl(call_addr, *ret_mreg, ret_rtl);
+
+    // ABI 64-bit width floor (c16): the result of an extern call known to return a 64-bit value is 64-bit, from known_func_returns_long or an explicit Xlong in the full signature.
+    is_long(ret_reg) <--
+        call_site(node, func_name),
+        abi_ret_int_reg(ret_mreg),
+        call_output_rtl(node, *ret_mreg, ret_reg),
+        !emit_function(_, func_name, _),
+        known_func_returns_long(func_name);
+
+    is_long(ret_reg) <--
+        call_site(node, func_name),
+        abi_ret_int_reg(ret_mreg),
+        call_output_rtl(node, *ret_mreg, ret_reg),
+        !emit_function(_, func_name, _),
+        known_extern_signature(func_name, _, ret_type, _),
+        if matches!(ret_type, XType::Xlong | XType::Xlongunsigned);
+
+    is_ptr(b) <--
+        is_ptr(a),
+        alias_edge(a, b),
+        !is_not_ptr(b);
+
+    is_ptr(a) <--
+        is_ptr(b),
+        alias_edge(a, b),
+        !is_not_ptr(a);
+
+    is_not_ptr(b) <--
+        is_not_ptr(a),
+        alias_edge(a, b),
+        !must_be_ptr(b);
+
+    is_not_ptr(a) <--
+        is_not_ptr(b),
+        alias_edge(a, b),
+        !must_be_ptr(a);
+
+    is_char_ptr(b) <--
+        is_char_ptr(a),
+        alias_edge(a, b),
+        !is_not_ptr(b);
+
+    is_char_ptr(a) <--
+        is_char_ptr(b),
+        alias_edge(a, b),
+        !is_not_ptr(a);
+
+    // 64-bit width propagates across value-identity copies (c16): alias_edge connects same-value same-width webs, so this only completes Xint -> Xlong while ptr/float/subint still dominate.
+    is_long(b) <-- is_long(a), alias_edge(a, b);
+    is_long(a) <-- is_long(b), alias_edge(a, b);
+
+
+    is_int(reg) <-- op_produces_int(_, reg);
+    is_long(reg) <-- op_produces_long(_, reg);
+    is_float(reg) <-- op_produces_float(_, reg);
+    is_single(reg) <-- op_produces_single(_, reg);
+    is_bool(reg) <-- op_produces_bool(_, reg);
+    is_int8signed(reg) <-- op_produces_int8signed(_, reg);
+    is_int8unsigned(reg) <-- op_produces_int8unsigned(_, reg);
+    is_int16signed(reg) <-- op_produces_int16signed(_, reg);
+    is_int16unsigned(reg) <-- op_produces_int16unsigned(_, reg);
+
+
+    op_produces_data(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(op, _, dst_mreg)),
+        if (is_int_operation(op) || is_long_operation(op)) && !is_pointer_operation(op),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+
+    op_produces_int8signed(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Ocast8signed, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_int8unsigned(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Ocast8unsigned, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_int16signed(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Ocast16signed, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_int16unsigned(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Ocast16unsigned, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_long(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Ocast32signed, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_long(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Ocast32unsigned, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_int(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(op, _, dst_mreg)),
+        if is_int_operation(op) && !matches!(op,
+            Operation::Ocast8signed | Operation::Ocast8unsigned |
+            Operation::Ocast16signed | Operation::Ocast16unsigned),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_long(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(op, _, dst_mreg)),
+        if is_long_operation(op) && !matches!(op,
+            Operation::Ocast32signed | Operation::Ocast32unsigned |
+            Operation::Oleal(_)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    // USE-SIDE 64-bit width floor (c16): an operand of a genuine 64-bit arithmetic op is 64-bit, excluding width-changing casts, Omakelong, Oleal and the float-input conversions.
+    op_produces_long(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(op, mregs, _)),
+        if is_long_operation(op) && !matches!(op,
+            Operation::Ocast32signed | Operation::Ocast32unsigned |
+            Operation::Omakelong | Operation::Oleal(_) |
+            Operation::Olongoffloat | Operation::Olongofsingle),
+        for mreg in mregs.iter(),
+        reg_rtl(node, *mreg, rtl_reg);
+
+    op_produces_float(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(op, _, dst_mreg)),
+        if is_float_operation(op),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_single(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(op, _, dst_mreg)),
+        if is_single_operation(op),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_bool(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(op, _, dst_mreg)),
+        if is_boolean_operation(op),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    // cmov/Olea un-pointerize: a LEA result is a pointer ONLY from use-based evidence, since gcc emits LEA for plain integer arithmetic; Oindirectsymbol stays unconditionally a pointer.
+    op_produces_ptr(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Oindirectsymbol(_), _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_int(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Ointconst(_), _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_long(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Olongconst(_), _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_float(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Ofloatconst(_), _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_single(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Osingleconst(_), _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_int(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Ointoffloat, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_int(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Ointofsingle, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_long(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Olongoffloat, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_long(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Olongofsingle, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_float(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Ofloatofint, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_float(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Ofloatoflong, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_float(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Ofloatofsingle, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_single(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Osingleoffloat, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_single(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Osingleofint, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_single(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Osingleoflong, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_long(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Omakelong, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_int(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Olowlong, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_int(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Ohighlong, _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+
+    op_produces_int(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lstore(chunk, _, _, src_mreg)),
+        if matches!(chunk, MemoryChunk::MInt32 | MemoryChunk::MAny32),
+        reg_rtl(node, *src_mreg, rtl_reg);
+
+    op_produces_long(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lstore(chunk, _, _, src_mreg)),
+        if matches!(chunk, MemoryChunk::MInt64 | MemoryChunk::MAny64),
+        reg_rtl(node, *src_mreg, rtl_reg);
+
+    op_produces_float(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lstore(chunk, _, _, src_mreg)),
+        if matches!(chunk, MemoryChunk::MFloat64),
+        reg_rtl(node, *src_mreg, rtl_reg);
+
+    op_produces_single(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lstore(chunk, _, _, src_mreg)),
+        if matches!(chunk, MemoryChunk::MFloat32),
+        reg_rtl(node, *src_mreg, rtl_reg);
+
+    op_produces_int8signed(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lstore(chunk, _, _, src_mreg)),
+        if matches!(chunk, MemoryChunk::MInt8Signed),
+        reg_rtl(node, *src_mreg, rtl_reg);
+
+    op_produces_int8unsigned(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lstore(chunk, _, _, src_mreg)),
+        if matches!(chunk, MemoryChunk::MInt8Unsigned | MemoryChunk::MBool),
+        reg_rtl(node, *src_mreg, rtl_reg);
+
+    op_produces_int16signed(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lstore(chunk, _, _, src_mreg)),
+        if matches!(chunk, MemoryChunk::MInt16Signed),
+        reg_rtl(node, *src_mreg, rtl_reg);
+
+    op_produces_int16unsigned(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lstore(chunk, _, _, src_mreg)),
+        if matches!(chunk, MemoryChunk::MInt16Unsigned),
+        reg_rtl(node, *src_mreg, rtl_reg);
+
+    op_produces_int(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lload(chunk, _, _, dst_mreg)),
+        if matches!(chunk, MemoryChunk::MInt32 | MemoryChunk::MAny32),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_long(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lload(chunk, _, _, dst_mreg)),
+        if matches!(chunk, MemoryChunk::MInt64 | MemoryChunk::MAny64),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_float(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lload(chunk, _, _, dst_mreg)),
+        if matches!(chunk, MemoryChunk::MFloat64),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_single(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lload(chunk, _, _, dst_mreg)),
+        if matches!(chunk, MemoryChunk::MFloat32),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_int8signed(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lload(chunk, _, _, dst_mreg)),
+        if matches!(chunk, MemoryChunk::MInt8Signed),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_int8unsigned(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lload(chunk, _, _, dst_mreg)),
+        if matches!(chunk, MemoryChunk::MInt8Unsigned | MemoryChunk::MBool),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_int16signed(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lload(chunk, _, _, dst_mreg)),
+        if matches!(chunk, MemoryChunk::MInt16Signed),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    op_produces_int16unsigned(node, rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lload(chunk, _, _, dst_mreg)),
+        if matches!(chunk, MemoryChunk::MInt16Unsigned),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+
+    is_unsigned(rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(op, _, dst_mreg)),
+        if is_unsigned_operation(op),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    is_signed(rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(op, _, dst_mreg)),
+        if is_signed_operation(op),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    is_unsigned(rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(op, args, _)),
+        if is_unsigned_operation(op),
+        for mreg in args.iter(),
+        reg_rtl(node, *mreg, rtl_reg);
+
+    is_signed(rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(op, args, _)),
+        if is_signed_operation(op),
+        for mreg in args.iter(),
+        reg_rtl(node, *mreg, rtl_reg);
+
+
+    relation zero_int_const_reg(RTLReg);
+
+    zero_int_const_reg(rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Ointconst(0), _, dst_mreg)),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+
+    zero_int_const_reg(b) <-- zero_int_const_reg(a), alias_edge(a, b);
+    zero_int_const_reg(a) <-- zero_int_const_reg(b), alias_edge(a, b);
+
+    relation has_float_int_zero_conflict(RTLReg);
+    has_float_int_zero_conflict(reg) <-- zero_int_const_reg(reg), is_int(reg), is_float(reg);
+    has_float_int_zero_conflict(reg) <-- zero_int_const_reg(reg), is_long(reg), is_float(reg);
+    has_float_int_zero_conflict(reg) <-- zero_int_const_reg(reg), is_int(reg), is_single(reg);
+    has_float_int_zero_conflict(reg) <-- zero_int_const_reg(reg), is_long(reg), is_single(reg);
+
+
+    relation has_type_conflict(RTLReg);
+    has_type_conflict(reg) <-- is_ptr(reg), is_not_ptr(reg);
+    relation has_float_ptr_conflict(RTLReg);
+    has_float_ptr_conflict(reg) <-- is_float(reg), is_ptr(reg);
+    has_float_ptr_conflict(reg) <-- is_float(reg), must_be_ptr(reg);
+    has_float_ptr_conflict(reg) <-- is_single(reg), is_ptr(reg);
+    has_float_ptr_conflict(reg) <-- is_single(reg), must_be_ptr(reg);
+    has_long_type(reg) <-- has_type_conflict(reg);
+    has_long_type(reg) <-- has_float_ptr_conflict(reg);
+
+    has_ptr_type(reg) <-- is_ptr(reg), !is_not_ptr(reg);
+    has_ptr_type(reg) <-- must_be_ptr(reg), !has_type_conflict(reg);
+    has_char_ptr_type(reg) <-- is_char_ptr(reg), !is_not_ptr(reg);
+    has_char_ptr_type(reg) <-- is_char_ptr(reg), must_be_ptr(reg), !has_type_conflict(reg);
+    // RC-2 float/register-class brake. The float evidence feeding is_float is
+    // largely CHUNK based -- an MFloat64 load or store width -- and a chunk can
+    // be mis-resolved, whereas the register file the value actually lives in
+    // cannot be. When the two disagree and the web never touches an XMM/VFP
+    // register, the chunk is wrong: keep the value integral.
+    //
+    // This has to sit on has_float_type rather than on the Xfloat emission
+    // below, because has_float_type ALSO suppresses the integer candidates; a
+    // bogus float otherwise leaves the register with no int candidate to fall
+    // back to, and the C lifting bakes the float spelling into the only
+    // statement candidate it builds for the node.
+    //
+    // A web with BOTH classes is two values merged by aliasing, not a float
+    // value; it is deliberately untouched here and reported by the adequacy
+    // audit instead.
+    #[local] relation web_gpr_only(RTLReg);
+    web_gpr_only(reg) <-- web_class_gpr(reg), !web_class_fp(reg);
+
+    has_float_type(reg) <-- is_float(reg), !has_float_int_zero_conflict(reg), !web_gpr_only(reg);
+    has_single_type(reg) <-- is_single(reg), !has_float_int_zero_conflict(reg), !web_gpr_only(reg);
+    has_long_type(reg) <-- is_long(reg);
+    has_int_type(reg) <-- is_int(reg);
+    has_subint_type(reg) <-- is_int8signed(reg);
+    has_subint_type(reg) <-- is_int8unsigned(reg);
+    has_subint_type(reg) <-- is_int16signed(reg);
+    has_subint_type(reg) <-- is_int16unsigned(reg);
+
+    emit_var_type_candidate(reg, XType::Xcharptr) <--
+        has_char_ptr_type(reg);
+
+    emit_var_type_candidate(reg, XType::Xptr) <--
+        has_ptr_type(reg),
+        !has_char_ptr_type(reg);
+
+    emit_var_type_candidate(reg, XType::Xsingle) <--
+        has_single_type(reg),
+        !has_ptr_type(reg),
+        !has_float_ptr_conflict(reg);
+
+    emit_var_type_candidate(reg, XType::Xfloat) <--
+        has_float_type(reg),
+        !has_ptr_type(reg),
+        !has_single_type(reg),
+        !has_float_ptr_conflict(reg);
+
+    emit_var_type_candidate(reg, XType::Xint8signed) <--
+        is_int8signed(reg),
+        !has_ptr_type(reg),
+        !has_float_type(reg),
+        !has_single_type(reg);
+
+    emit_var_type_candidate(reg, XType::Xint8unsigned) <--
+        is_int8unsigned(reg),
+        !has_ptr_type(reg),
+        !has_float_type(reg),
+        !has_single_type(reg),
+        !is_int8signed(reg);
+
+    emit_var_type_candidate(reg, XType::Xint16signed) <--
+        is_int16signed(reg),
+        !has_ptr_type(reg),
+        !has_float_type(reg),
+        !has_single_type(reg);
+
+    emit_var_type_candidate(reg, XType::Xint16unsigned) <--
+        is_int16unsigned(reg),
+        !has_ptr_type(reg),
+        !has_float_type(reg),
+        !has_single_type(reg),
+        !is_int16signed(reg);
+
+    emit_var_type_candidate(reg, XType::Xbool) <--
+        is_bool(reg),
+        !has_ptr_type(reg),
+        !has_float_type(reg),
+        !has_single_type(reg),
+        !has_long_type(reg),
+        !has_int_type(reg),
+        !has_subint_type(reg);
+
+
+    emit_var_type_candidate(reg, XType::Xlongunsigned) <--
+        has_long_type(reg),
+        is_unsigned(reg),
+        !is_signed(reg),
+        !has_ptr_type(reg),
+        !has_float_type(reg),
+        !has_single_type(reg),
+        !has_subint_type(reg);
+
+    emit_var_type_candidate(reg, XType::Xlong) <--
+        has_long_type(reg),
+        !has_ptr_type(reg),
+        !has_float_type(reg),
+        !has_single_type(reg),
+        !has_subint_type(reg),
+        !is_unsigned(reg);
+
+    emit_var_type_candidate(reg, XType::Xlong) <--
+        has_long_type(reg),
+        is_unsigned(reg),
+        is_signed(reg),
+        !has_ptr_type(reg),
+        !has_float_type(reg),
+        !has_single_type(reg),
+        !has_subint_type(reg);
+
+    emit_var_type_candidate(reg, XType::Xintunsigned) <--
+        has_int_type(reg),
+        !has_long_type(reg),
+        is_unsigned(reg),
+        !is_signed(reg),
+        !has_ptr_type(reg),
+        !has_float_type(reg),
+        !has_single_type(reg),
+        !has_subint_type(reg);
+
+    emit_var_type_candidate(reg, XType::Xint) <--
+        has_int_type(reg),
+        !has_long_type(reg),
+        !has_ptr_type(reg),
+        !has_float_type(reg),
+        !has_single_type(reg),
+        !has_subint_type(reg),
+        !is_unsigned(reg);
+
+    emit_var_type_candidate(reg, XType::Xint) <--
+        has_int_type(reg),
+        !has_long_type(reg),
+        is_unsigned(reg),
+        is_signed(reg),
+        !has_ptr_type(reg),
+        !has_float_type(reg),
+        !has_single_type(reg),
+        !has_subint_type(reg);
+
+    relation single_def_const(RTLReg, Constant);
+
+    single_def_const(dst_rtl, cst) <--
+        rtl_inst_candidate(_, ?RTLInst::Iop(op, args, dst_rtl)),
+        if args.is_empty(),
+        if let Some(cst) = crate::decompile::passes::cminor_pass::constant_from_operation(op);
+
+    #[local] relation var_used(RTLReg);
+
+    var_used(*reg) <--
+        rtl_inst_candidate(_, ?RTLInst::Iop(_, args, _)),
+        for reg in args.iter();
+
+    var_used(*reg) <--
+        rtl_inst_candidate(_, ?RTLInst::Iload(_, _, args, _)),
+        for reg in args.iter();
+
+    var_used(*reg) <--
+        rtl_inst_candidate(_, ?RTLInst::Istore(_, _, args, _)),
+        for reg in args.iter();
+    var_used(*src) <--
+        rtl_inst_candidate(_, ?RTLInst::Istore(_, _, _, src));
+
+    var_used(*reg) <--
+        rtl_inst_candidate(_, ?RTLInst::Icall(_, callee, _, _, _)),
+        if let Either::Left(reg) = callee;
+    var_used(*reg) <--
+        rtl_inst_candidate(_, ?RTLInst::Icall(_, _, args, _, _)),
+        for reg in args.iter();
+
+    var_used(*reg) <--
+        rtl_inst_candidate(_, ?RTLInst::Itailcall(_, callee, _)),
+        if let Either::Left(reg) = callee;
+    var_used(*reg) <--
+        rtl_inst_candidate(_, ?RTLInst::Itailcall(_, _, args)),
+        for reg in args.iter();
+
+    var_used(*reg) <--
+        rtl_inst_candidate(_, ?RTLInst::Icond(_, args, _, _)),
+        for reg in args.iter();
+
+    var_used(*reg) <--
+        rtl_inst_candidate(_, ?RTLInst::Ijumptable(reg, _));
+
+    var_used(*reg) <--
+        rtl_inst_candidate(_, ?RTLInst::Ireturn(reg));
+
+    relation dead_def(RTLReg);
+    dead_def(*dst) <--
+        rtl_inst_candidate(_, ?RTLInst::Icall(_, _, _, Some(dst), _)),
+        !var_used(*dst);
+
+}
+
+#[inline]
+fn is_shift_or_rotate_op(op: &Operation) -> bool {
+    matches!(
+        op,
+        Operation::Oshl
+            | Operation::Oshr
+            | Operation::Oshru
+            | Operation::Oshll
+            | Operation::Oshrl
+            | Operation::Oshrlu
+    )
+}
+
+// True for a floating-point register; x86's XMM file and AArch64's V file both answer this, so it is asked of the register file rather than one architecture's names.
+fn is_float_mreg(r: &Mreg) -> bool {
+    match r {
+        Mreg::X86(x) => x.is_xmm(),
+        Mreg::A64(a) => a.is_vec(),
+        Mreg::A32(a) => a.is_vec(),
+        Mreg::Unknown => false,
+    }
+}
+
+#[inline]
+pub fn infer_signature_from_args(args: &[RTLReg], has_return: bool) -> Signature {
+    let sig_args: Vec<XType> = args.iter().map(|_| XType::Xlong).collect();
+    let sig_res = if has_return {
+        XType::Xint
+    } else {
+        XType::Xvoid
+    };
+    Signature {
+        sig_args: Arc::new(sig_args),
+        sig_res,
+        sig_cc: CallConv::default(),
+    }
+}
+
+// Dense register id packed into the low MREG_DISCRIMINANT_BITS: x86 occupies 0..=33, AArch64's 66 follow at 34..=99 and ARM32's 97 at 100..=196, which is why the field is 8 bits.
+fn mreg_discriminant(reg: Mreg) -> u64 {
+    match reg {
+        Mreg::Unknown => MREG_UNKNOWN_DISCRIMINANT,
+        Mreg::X86(x) => match x {
+            X86Mreg::AX => 0,
+            X86Mreg::BX => 1,
+            X86Mreg::CX => 2,
+            X86Mreg::DX => 3,
+            X86Mreg::SI => 4,
+            X86Mreg::DI => 5,
+            X86Mreg::BP => 6,
+            X86Mreg::R8 => 7,
+            X86Mreg::R9 => 8,
+            X86Mreg::R10 => 9,
+            X86Mreg::R11 => 10,
+            X86Mreg::R12 => 11,
+            X86Mreg::R13 => 12,
+            X86Mreg::R14 => 13,
+            X86Mreg::R15 => 14,
+            X86Mreg::X0 => 15,
+            X86Mreg::X1 => 16,
+            X86Mreg::X2 => 17,
+            X86Mreg::X3 => 18,
+            X86Mreg::X4 => 19,
+            X86Mreg::X5 => 20,
+            X86Mreg::X6 => 21,
+            X86Mreg::X7 => 22,
+            X86Mreg::X8 => 23,
+            X86Mreg::X9 => 24,
+            X86Mreg::X10 => 25,
+            X86Mreg::X11 => 26,
+            X86Mreg::X12 => 27,
+            X86Mreg::X13 => 28,
+            X86Mreg::X14 => 29,
+            X86Mreg::X15 => 30,
+            X86Mreg::FP0 => 31,
+            X86Mreg::SP => 32,
+            X86Mreg::Unknown => MREG_UNKNOWN_DISCRIMINANT,
+        },
+        Mreg::A64(a) => 34 + a.index(),
+        Mreg::A32(a) => 100 + a.index(),
+    }
+}
+
+pub fn build_call_args<'a>(
+    inp: impl Iterator<Item = (&'a usize, &'a RTLReg)>,
+) -> impl Iterator<Item = Args> {
+    let mut pairs: Vec<(usize, RTLReg)> = inp.map(|(pos, reg)| (*pos, *reg)).collect();
+    pairs.sort();
+    pairs.dedup_by_key(|(pos, _)| *pos);
+
+    // Scatter by position into a dense vector padded with DEFAULT_VAR so a missing leading arg leaves a sentinel hole instead of left-shifting later args into its slot.
+    let len = pairs.last().map(|(pos, _)| *pos + 1).unwrap_or(0);
+    let mut args: Vec<RTLReg> = vec![DEFAULT_VAR as RTLReg; len];
+    for (pos, reg) in pairs {
+        args[pos] = reg;
+    }
+    std::iter::once(Arc::new(args))
+}
+
+/// Build an Addrmode for a CMP/Iload operand with optional base, index, and scale; falls back to base-only when the index register is absent.
+pub fn build_cmp_addrmode(base_str: &str, idx_str: &str, scale: i64, disp: i64) -> Addrmode {
+    let has_base = base_str != "NONE" && !base_str.is_empty();
+    let has_idx = idx_str != "NONE" && !idx_str.is_empty();
+    let base = if has_base {
+        Some(Ireg::from(base_str))
+    } else {
+        None
+    };
+    let index = if has_idx {
+        Some((Ireg::from(idx_str), scale))
+    } else {
+        None
+    };
+    Addrmode {
+        base,
+        index,
+        disp: Displacement::from(disp),
+    }
+}
+
+// Width of the machine-register field in fresh_xtl_reg: 8, since ARM32 pushes the id range to 196; query.rs::is_fabricated_operand decodes it and must use the same width.
+pub(crate) const MREG_DISCRIMINANT_BITS: u32 = 8;
+pub(crate) const MREG_DISCRIMINANT_MASK: u64 = (1 << MREG_DISCRIMINANT_BITS) - 1;
+
+/// The discriminant of the unknown / RTEMP-backed register, shared with query.rs::is_fabricated_operand so the two decodings cannot drift.
+pub(crate) const MREG_UNKNOWN_DISCRIMINANT: u64 = 33;
+
+pub(crate) fn fresh_xtl_reg(node: Node, reg: Mreg) -> RTLReg {
+    let mreg_id = mreg_discriminant(reg);
+    (1u64 << 63) | (node << MREG_DISCRIMINANT_BITS) | (mreg_id & MREG_DISCRIMINANT_MASK)
+}
+
+// SETcc mnemonic -> the TestCond it materializes as a 0/1 boolean, used by the CMP+SETcc memory-operand Ocmp fusion to recover the dropped boolean.
+pub(crate) fn setcc_mnem_testcond(mnem: &str) -> Option<TestCond> {
+    Some(match mnem {
+        "SETE" | "SETZ" => TestCond::CondE,
+        "SETNE" | "SETNZ" => TestCond::CondNe,
+        "SETL" => TestCond::CondL,
+        "SETLE" => TestCond::CondLe,
+        "SETG" => TestCond::CondG,
+        "SETGE" => TestCond::CondGe,
+        "SETB" | "SETC" => TestCond::CondB,
+        "SETBE" => TestCond::CondBe,
+        "SETA" => TestCond::CondA,
+        "SETAE" | "SETNC" => TestCond::CondAe,
+        _ => return None,
+    })
+}
+
+pub(crate) const FRESH_NS_STACK_SRC: u64 = 1 << 54;
+pub(crate) const FRESH_NS_REG_DST: u64 = 1 << 55;
+pub(crate) const FRESH_NS_SP_BASE: u64 = 1 << 56;
+pub(crate) const FRESH_NS_STACK_PARAM: u64 = 1 << 57;
+// The upper cell of a 16-byte frame move shares its instruction's address with
+// the lower one, so its frame pseudo needs a namespace of its own.
+pub(crate) const FRESH_NS_XMM_HI: u64 = 1 << 58;
+
+// The carry-accumulate expansion defines two values at one instruction address:
+// the carry sum, then the residual constant add.  fresh_xtl_reg shifts the synth
+// node bits out, so the intermediate cannot be keyed on the synthetic node and
+// needs a namespace of its own.
+pub(crate) const FRESH_NS_CARRY_SUM: u64 = 1 << 59;
+
+// The high lane of a general-base 16-byte store is computed into a temporary
+// before it is stored, at the same instruction address as the low half; same
+// reason as the carry sum, so it gets its own namespace too.
+pub(crate) const FRESH_NS_XMM_HI_VALUE: u64 = 1 << 60;
+
+// A call reads argument/target registers before defining its caller-saved
+// outputs.  Both events occur at one machine address, so the input join needs
+// a namespace distinct from the ordinary fresh_xtl_reg(call, mreg) output.
+pub(crate) const FRESH_NS_CALL_INPUT: u64 = 1 << 61;
+
+// A frame cell is storage, not the BP register value used as the historical
+// pseudo-register when allocating its id.  Without a private namespace, an
+// Lsetstack whose real source is BP gives the cell and source use exactly the
+// same fresh_xtl_reg(address, BP), welding two values before canonicalization.
+pub(crate) const FRESH_NS_STACK_SLOT: u64 = 1 << 53;
+
+pub(crate) fn fresh_stack_slot_reg(node: Node) -> RTLReg {
+    fresh_xtl_reg(node, Mreg::BP) | FRESH_NS_STACK_SLOT
+}
+
+pub(crate) fn fresh_call_input_reg(node: Node, reg: Mreg) -> RTLReg {
+    fresh_xtl_reg(node, reg) | FRESH_NS_CALL_INPUT
+}
+
+// Keeps MREG_UNKNOWN_DISCRIMINANT in the low field so query.rs recognizes this
+// as a temporary with no backing machine register, like every fresh_xtl_reg.
+pub(crate) fn fresh_carry_sum_reg(node: Node) -> RTLReg {
+    (1u64 << 63) | FRESH_NS_CARRY_SUM | (node << MREG_DISCRIMINANT_BITS) | MREG_UNKNOWN_DISCRIMINANT
+}
+
+pub(crate) fn fresh_xmm_hi_value_reg(node: Node) -> RTLReg {
+    (1u64 << 63)
+        | FRESH_NS_XMM_HI_VALUE
+        | (node << MREG_DISCRIMINANT_BITS)
+        | MREG_UNKNOWN_DISCRIMINANT
+}
+
+pub(crate) fn fresh_stack_param_reg(func_addr: Node, stack_idx: usize) -> RTLReg {
+    (1u64 << 63) | FRESH_NS_STACK_PARAM | (func_addr << 6) | ((stack_idx as u64) & 0x3F)
+}
+
+pub fn convert_builtin_arg(
+    node: Node,
+    arg: &BuiltinArg<Mreg>,
+    reg_rtl_map: &HashMap<(Node, Mreg), RTLReg>,
+) -> BuiltinArg<RTLReg> {
+    match arg {
+        BuiltinArg::BA(mreg) => BuiltinArg::BA(
+            reg_rtl_map
+                .get(&(node, *mreg))
+                .copied()
+                .unwrap_or(DEFAULT_VAR as u64),
+        ),
+        BuiltinArg::BAInt(z) => BuiltinArg::BAInt(*z),
+        BuiltinArg::BALong(z) => BuiltinArg::BALong(*z),
+        BuiltinArg::BAFloat(f) => BuiltinArg::BAFloat(*f),
+        BuiltinArg::BASingle(f) => BuiltinArg::BASingle(*f),
+        BuiltinArg::BALoadStack(chunk, ptrofs) => BuiltinArg::BALoadStack(*chunk, *ptrofs),
+        BuiltinArg::BAAddrStack(ptrofs) => BuiltinArg::BAAddrStack(*ptrofs),
+        BuiltinArg::BALoadGlobal(chunk, ident, ptrofs) => {
+            BuiltinArg::BALoadGlobal(*chunk, ident.clone(), *ptrofs)
+        }
+        BuiltinArg::BAAddrGlobal(ident, ptrofs) => BuiltinArg::BAAddrGlobal(ident.clone(), *ptrofs),
+        BuiltinArg::BASplitLong(a, b) => BuiltinArg::BASplitLong(
+            Box::new(convert_builtin_arg(node, a, reg_rtl_map)),
+            Box::new(convert_builtin_arg(node, b, reg_rtl_map)),
+        ),
+        BuiltinArg::BAAddPtr(a, b) => BuiltinArg::BAAddPtr(
+            Box::new(convert_builtin_arg(node, a, reg_rtl_map)),
+            Box::new(convert_builtin_arg(node, b, reg_rtl_map)),
+        ),
+    }
+}
+
+pub fn convert_ltl_builtins_to_rtl(
+    builtin_data: &Vec<(Node, Symbol, Arc<Vec<BuiltinArg<Mreg>>>, BuiltinArg<Mreg>)>,
+    reg_rtl_map: &HashMap<(Node, Mreg), RTLReg>,
+) -> Vec<(Node, RTLInst)> {
+    builtin_data
+        .iter()
+        .map(|(addr, name, args, result)| {
+            let args_rtl: Vec<BuiltinArg<RTLReg>> = args
+                .iter()
+                .map(|arg| convert_builtin_arg(*addr, arg, reg_rtl_map))
+                .collect();
+            let result_rtl = convert_builtin_arg(*addr, result, reg_rtl_map);
+            let inst = RTLInst::Ibuiltin(name.to_string(), args_rtl, result_rtl);
+            (*addr, inst)
+        })
+        .collect()
+}
+
+// Ascent aggregator: collect a node's reg_rtl entries into sorted (Mreg, RTLReg) pairs, keeping the minimum RTLReg per Mreg (matches the imperative builder).
+pub fn collect_builtin_reg_pairs<'a>(
+    inp: impl Iterator<Item = (&'a Mreg, &'a RTLReg)>,
+) -> impl Iterator<Item = Arc<Vec<(Mreg, RTLReg)>>> {
+    let mut groups: HashMap<Mreg, RTLReg> = HashMap::new();
+    for (m, r) in inp {
+        groups
+            .entry(*m)
+            .and_modify(|cur| {
+                if *r < *cur {
+                    *cur = *r;
+                }
+            })
+            .or_insert(*r);
+    }
+    let mut pairs: Vec<(Mreg, RTLReg)> = groups.into_iter().collect();
+    pairs.sort_by_key(|(m, r)| (mreg_discriminant(*m), *r));
+    std::iter::once(Arc::new(pairs))
+}
+
+// Convert one LTL builtin to RTLInst::Ibuiltin using a per-node Mreg->RTLReg map.
+pub fn build_builtin_inst(
+    node: Node,
+    name: &Symbol,
+    args: &Arc<Vec<BuiltinArg<Mreg>>>,
+    result: &BuiltinArg<Mreg>,
+    pairs: &[(Mreg, RTLReg)],
+) -> RTLInst {
+    let reg_rtl_map: HashMap<(Node, Mreg), RTLReg> =
+        pairs.iter().map(|&(m, r)| ((node, m), r)).collect();
+    let args_rtl: Vec<BuiltinArg<RTLReg>> = args
+        .iter()
+        .map(|arg| convert_builtin_arg(node, arg, &reg_rtl_map))
+        .collect();
+    let result_rtl = convert_builtin_arg(node, result, &reg_rtl_map);
+    RTLInst::Ibuiltin(name.to_string(), args_rtl, result_rtl)
+}
+
+pub(crate) fn adjust_condition_size(cond: Condition, size: usize) -> Condition {
+    match (cond, size) {
+        (Condition::Ccompl(c), 4) => Condition::Ccomp(c),
+        (Condition::Ccomplu(c), 4) => Condition::Ccompu(c),
+        (Condition::Ccomp(c), 8) => Condition::Ccompl(c),
+        (Condition::Ccompu(c), 8) => Condition::Ccomplu(c),
+        (c, _) => c,
+    }
+}
+
+/// Attach an immediate operand to a register/register comparison condition.
+/// This is used when a memory compare had to be split into an RTL load plus a
+/// condition-consuming operation.  Non-comparison conditions are rejected
+/// rather than silently replaced with an always-true predicate.
+pub(crate) fn condition_with_immediate(cond: Condition, value: i64) -> Option<Condition> {
+    match cond {
+        Condition::Ccomp(cmp) => Some(Condition::Ccompimm(cmp, value)),
+        Condition::Ccompu(cmp) => Some(Condition::Ccompuimm(cmp, value)),
+        Condition::Ccompl(cmp) => Some(Condition::Ccomplimm(cmp, value)),
+        Condition::Ccomplu(cmp) => Some(Condition::Ccompluimm(cmp, value)),
+        _ => None,
+    }
+}
+
+// Counter-branch split helper: only Ceq/Cne are shift-invariant under addition, plus the sub $1;jae/jb carry form, where unsigned >= 1 is exactly != 0 and so is an equality in disguise.
+pub(crate) fn counter_branch_shifted_cond(cond: &Condition, k: i64) -> Option<Condition> {
+    let is_eq = |cmp: &Comparison| matches!(cmp, Comparison::Ceq | Comparison::Cne);
+    let carry_to_eq = |cmp: &Comparison| match cmp {
+        Comparison::Cge => Some(Comparison::Cne),
+        Comparison::Clt => Some(Comparison::Ceq),
+        _ => None,
+    };
+    match cond {
+        Condition::Ccompimm(cmp, m) if is_eq(cmp) => Some(Condition::Ccompimm(*cmp, *m + k)),
+        Condition::Ccompuimm(cmp, m) if is_eq(cmp) => Some(Condition::Ccompuimm(*cmp, *m + k)),
+        Condition::Ccomplimm(cmp, m) if is_eq(cmp) => Some(Condition::Ccomplimm(*cmp, *m + k)),
+        Condition::Ccompluimm(cmp, m) if is_eq(cmp) => Some(Condition::Ccompluimm(*cmp, *m + k)),
+        Condition::Ccompuimm(cmp, 1) => carry_to_eq(cmp).map(|eq| Condition::Ccompuimm(eq, k)),
+        Condition::Ccompluimm(cmp, 1) => carry_to_eq(cmp).map(|eq| Condition::Ccompluimm(eq, k)),
+        _ => None,
+    }
+}
+
+pub(crate) fn extract_builtin_arg_regs(arg: &BuiltinArg<Mreg>) -> Vec<Mreg> {
+    match arg {
+        BuiltinArg::BA(reg) => vec![*reg],
+        BuiltinArg::BASplitLong(a, b) => {
+            let mut regs = extract_builtin_arg_regs(a.as_ref());
+            regs.extend(extract_builtin_arg_regs(b.as_ref()));
+            regs
+        }
+        BuiltinArg::BAAddPtr(a, b) => {
+            let mut regs = extract_builtin_arg_regs(a.as_ref());
+            regs.extend(extract_builtin_arg_regs(b.as_ref()));
+            regs
+        }
+        _ => vec![],
+    }
+}
+
+pub fn is_rip(reg: &str) -> bool {
+    reg.to_uppercase().ends_with("IP")
+}
+
+pub fn typ_to_chunk(typ: Typ) -> MemoryChunk {
+    match typ {
+        Typ::Tint => MemoryChunk::MInt32,
+        Typ::Tlong => MemoryChunk::MInt64,
+        Typ::Tfloat => MemoryChunk::MFloat64,
+        Typ::Tsingle => MemoryChunk::MFloat32,
+        Typ::Tany32 => MemoryChunk::MAny32,
+        Typ::Tany64 => MemoryChunk::MAny64,
+        Typ::Unknown => MemoryChunk::Unknown,
+    }
+}
+
+#[inline]
+pub fn is_null_comparison_cond(cond: &Condition) -> bool {
+    matches!(
+        cond,
+        Condition::Ccompimm(Comparison::Ceq, 0)
+            | Condition::Ccompuimm(Comparison::Ceq, 0)
+            | Condition::Ccompimm(Comparison::Cne, 0)
+            | Condition::Ccompuimm(Comparison::Cne, 0)
+            | Condition::Ccomplimm(Comparison::Ceq, 0)
+            | Condition::Ccompluimm(Comparison::Ceq, 0)
+            | Condition::Ccomplimm(Comparison::Cne, 0)
+            | Condition::Ccompluimm(Comparison::Cne, 0)
+    )
+}
+
+pub fn is_null_comparison_op(op: &Operation) -> bool {
+    matches!(
+        op,
+        Operation::Ocmp(Condition::Ccompimm(Comparison::Ceq, 0))
+            | Operation::Ocmp(Condition::Ccompuimm(Comparison::Ceq, 0))
+            | Operation::Ocmp(Condition::Ccompimm(Comparison::Cne, 0))
+            | Operation::Ocmp(Condition::Ccompuimm(Comparison::Cne, 0))
+            | Operation::Ocmp(Condition::Ccomplimm(Comparison::Ceq, 0))
+            | Operation::Ocmp(Condition::Ccompluimm(Comparison::Ceq, 0))
+            | Operation::Ocmp(Condition::Ccomplimm(Comparison::Cne, 0))
+            | Operation::Ocmp(Condition::Ccompluimm(Comparison::Cne, 0))
+    )
+}
+
+pub fn chunk_size_bits(chunk: &MemoryChunk) -> u8 {
+    match chunk {
+        MemoryChunk::MBool | MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned => 8,
+        MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => 16,
+        MemoryChunk::MInt32 | MemoryChunk::MAny32 | MemoryChunk::MFloat32 => 32,
+        MemoryChunk::MInt64 | MemoryChunk::MAny64 | MemoryChunk::MFloat64 => 64,
+        MemoryChunk::Unknown => 64,
+    }
+}
+
+pub(crate) fn build_xtype_vec<'a>(
+    inp: impl Iterator<Item = (&'a usize, &'a XType)>,
+) -> impl Iterator<Item = Arc<Vec<XType>>> {
+    use crate::decompile::passes::clight_pass::xtype_refine_priority;
+    // Exactly one xtype per position, keeping the most-refined candidate: without the dedup two candidates produced two vec entries, shifting every later param and emitting a scalar signature for a pointer.
+    let mut by_pos: std::collections::BTreeMap<usize, XType> = std::collections::BTreeMap::new();
+    for (pos, xt) in inp {
+        by_pos
+            .entry(*pos)
+            .and_modify(|cur| {
+                if xtype_refine_priority(xt) > xtype_refine_priority(cur) {
+                    *cur = *xt;
+                }
+            })
+            .or_insert(*xt);
+    }
+    let args: Vec<XType> = by_pos.into_values().collect();
+    std::iter::once(Arc::new(args))
+}
+
+pub struct RTLPass;
+
+impl IRPass for RTLPass {
+    fn name(&self) -> &'static str {
+        "rtl"
+    }
+
+    fn run(&self, db: &mut DecompileDB) {
+        run_pass!(db, RTLPassProgram);
+
+        let total = db
+            .rel_iter::<(Address, Address, Mreg)>("parameter_frame_roundtrip_site")
+            .count();
+        let old_unbound = db
+            .rel_iter::<(Address, Address, Mreg)>("parameter_frame_roundtrip_old_unbound")
+            .count();
+        let after_bound = db
+            .rel_iter::<(Address, Address, Mreg)>("parameter_frame_roundtrip_bound")
+            .count();
+        eprintln!(
+            "[rtl] parameter-frame-roundtrip sites={} old-unbound={} after-bound={} after-unbound={}",
+            total,
+            old_unbound,
+            after_bound,
+            total.saturating_sub(after_bound),
+        );
+
+        if std::env::var_os("MANIFOLD_TRACE_PARAM_FRAME").is_some() {
+            let sites: std::collections::BTreeSet<_> = db
+                .rel_iter::<(Address, Address, Mreg)>("parameter_frame_roundtrip_site")
+                .copied()
+                .collect();
+            let bound: std::collections::BTreeSet<_> = db
+                .rel_iter::<(Address, Address, Mreg)>("parameter_frame_roundtrip_bound")
+                .copied()
+                .collect();
+            for (func, spill, src) in sites.difference(&bound) {
+                eprintln!(
+                    "[rtl] unbound parameter-frame-roundtrip func={func:#x} spill={spill:#x} src={src:?}"
+                );
+            }
+        }
+    }
+
+    fn inputs(&self) -> &'static [&'static str] {
+        RTLPassProgram::inputs_only()
+    }
+
+    fn outputs(&self) -> &'static [&'static str] {
+        RTLPassProgram::rule_outputs()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        fresh_call_input_reg, fresh_stack_param_reg, fresh_stack_slot_reg, fresh_xmm_hi_value_reg,
+        fresh_xtl_reg, indexed_store_ends_at_extent, simd_broadcast_lane_node, xmm_hi_lane_node,
+        xmm_hi_store_node, RTLPassProgram, FRESH_NS_SP_BASE,
+    };
+    use crate::aarch64::mach::A64Mreg;
+    use crate::mreg::Mreg;
+    use crate::x86::asm::TestCond;
+    use crate::x86::op::{Addressing, Comparison, Condition, Operation};
+    use crate::x86::types::{BuiltinArg, LTLInst, MemoryChunk, RTLInst, Slot, Typ, XType};
+    use either::Either;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    fn synthetic_ids<const N: usize>() -> [u64; N] {
+        std::array::from_fn(|index| index as u64 + 1)
+    }
+
+    fn on_large_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024 * 1024)
+            .spawn(test)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn seed_materialized_branch(
+        prog: &mut RTLPassProgram,
+        func: u64,
+        source: u64,
+        jcc: u64,
+        stale: u64,
+        taken: u64,
+    ) {
+        prog.next.push((source, jcc));
+        prog.next.push((jcc, stale));
+        prog.ltl_inst.push((stale, LTLInst::Lreturn));
+        prog.pjcc.push((jcc, TestCond::CondE, "taken"));
+        prog.rtl_inst_candidate.push((
+            jcc,
+            RTLInst::Icond(
+                Condition::Ccompimm(Comparison::Ceq, 0),
+                Arc::new(vec![0x7777]),
+                Either::Right(taken),
+                Either::Right(stale),
+            ),
+        ));
+        for node in [source, jcc, stale, taken] {
+            prog.instr_in_function.push((node, func));
+        }
+    }
+
+    #[test]
+    fn scheduled_setcc_reads_compare_value_and_defines_at_setcc() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let compare = 0x900;
+            let setcc = 0x100;
+            let compared_value = 0x5000;
+            let boolean_value = fresh_xtl_reg(setcc, Mreg::AX);
+
+            prog.setcc_compare_site.push((setcc, compare));
+            prog.ltl_inst.push((
+                setcc,
+                LTLInst::Lop(
+                    Operation::Ocmp(Condition::Ccompimm(Comparison::Ceq, 5)),
+                    Arc::new(vec![Mreg::AX]),
+                    Mreg::AX,
+                ),
+            ));
+            prog.reg_xtl.push((compare, Mreg::AX, compared_value));
+
+            prog.run();
+
+            assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == setcc
+                    && matches!(
+                        inst,
+                        RTLInst::Iop(Operation::Ocmp(_), args, dst)
+                            if args.as_slice() == [compared_value] && *dst == boolean_value
+                    )
+            }));
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == setcc
+                    && matches!(
+                        inst,
+                        RTLInst::Iop(Operation::Ocmp(_), args, _)
+                            if args.as_slice() == [boolean_value]
+                    )
+            }));
+        });
+    }
+
+    #[test]
+    fn memory_immediate_setcc_uses_normalized_operands_and_flags_origin() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let compare = 0x900;
+            let gap = 0x100;
+            let setcc = 0x700;
+            let base_value = 0x1234;
+            let boolean_value = fresh_xtl_reg(setcc, Mreg::AX);
+
+            // Raw instruction operands are source-first, while pcmp is
+            // destination-first: Intel `cmp byte ptr [rax], 0` is therefore
+            // (zero, memory) in instruction and (memory, zero) in pcmp.
+            prog.instruction
+                .push((compare, 3, "", "CMP", "zero", "byte_at_rax", "", "", 0, 0));
+            prog.pcmp.push((compare, "byte_at_rax", "zero"));
+            prog.op_immediate.push(("zero", 0, 1));
+            prog.op_indirect
+                .push(("byte_at_rax", "", "RAX", "NONE", 1, 0, 1));
+            prog.reg_xtl.push((compare, Mreg::AX, base_value));
+
+            // The SETcc consumes CMP's flags across a scheduled flag-neutral
+            // node.  Numeric address order is deliberately unrelated to CFG
+            // order; the exported provenance fact is authoritative.
+            prog.next.push((compare, gap));
+            prog.next.push((gap, setcc));
+            prog.setcc_compare_site.push((setcc, compare));
+            prog.instruction
+                .push((setcc, 3, "", "SETNE", "bool_dst", "0", "0", "0", 0, 0));
+            prog.op_register.push(("bool_dst", "AL"));
+            prog.reg_xtl.push((setcc, Mreg::AX, boolean_value));
+            for node in [compare, gap, setcc] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            prog.run();
+
+            let loaded = fresh_xtl_reg(compare, Mreg::x86("RTEMP"));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    compare,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt8Unsigned,
+                        Addressing::Aindexed(0),
+                        Arc::new(vec![base_value]),
+                        loaded,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    setcc,
+                    RTLInst::Iop(
+                        Operation::Ocmp(Condition::Ccompimm(Comparison::Cne, 0)),
+                        Arc::new(vec![loaded]),
+                        boolean_value,
+                    ),
+                )
+            }));
+        });
+    }
+
+    #[test]
+    fn load_overwriting_arg_register_reads_incoming_parameter_value() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x1000;
+            let node = 0x1010;
+            let param_id = fresh_xtl_reg(func, Mreg::DI);
+            let shadow_use_id = fresh_xtl_reg(node, Mreg::DI) | (1u64 << 62);
+
+            prog.ltl_inst.push((
+                node,
+                LTLInst::Lload(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed(0),
+                    Arc::new(vec![Mreg::DI]),
+                    Mreg::DI,
+                ),
+            ));
+            // Seed the already-proven structural fact under test: DI still
+            // holds the caller's value at this load.
+            prog.is_arg_reg.push((Mreg::DI,));
+            prog.arg_reg_param_live_at.push((func, node, Mreg::DI));
+            prog.reg_xtl.push((func, Mreg::DI, param_id));
+
+            prog.run();
+
+            assert!(prog
+                .alias_edge
+                .iter()
+                .any(|fact| fact == &(param_id, shadow_use_id)));
+            assert!(prog
+                .rtl_inst_candidate
+                .iter()
+                .any(|(candidate_node, inst)| {
+                    *candidate_node == node
+                        && matches!(
+                            inst,
+                            RTLInst::Iload(_, Addressing::Aindexed(0), args, _)
+                                if args.as_slice() == [param_id]
+                        )
+                }));
+        });
+    }
+
+    #[test]
+    fn entry_parameter_spill_ignores_an_unrelated_same_node_definition() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x1000;
+            let spill = 0x1054;
+            let param_id = fresh_xtl_reg(func, Mreg::DI);
+            let unrelated_id = fresh_xtl_reg(func, Mreg::DX);
+            let stack_id = 0x5000;
+
+            // A function-entry instruction may consume an incoming parameter
+            // while defining a different register (for example
+            // `movzbl (%rdi), %edx`).  The entry node therefore has a real DX
+            // definition alongside DI's synthetic incoming-value definition.
+            prog.reg_xtl.push((func, Mreg::DI, param_id));
+            prog.reg_xtl.push((func, Mreg::DX, unrelated_id));
+            prog.reg_def.push((func, Mreg::DX));
+            prog.is_def.push((func, unrelated_id));
+
+            prog.ltl_inst.push((
+                spill,
+                LTLInst::Lsetstack(Mreg::DI, Slot::Local, 8, Typ::Tany64),
+            ));
+            prog.instr_in_function.push((spill, func));
+            prog.reg_def_used.push((func, Mreg::DI, spill));
+            prog.stack_var.push((func, spill, 8, stack_id));
+
+            prog.run();
+
+            assert!(prog
+                .asm_effective_def
+                .iter()
+                .any(|fact| fact == &(func, Mreg::DX)));
+            assert!(!prog
+                .asm_effective_def
+                .iter()
+                .any(|fact| fact == &(func, Mreg::DI)));
+            assert!(prog
+                .def_value_rtl
+                .iter()
+                .any(|fact| fact == &(func, Mreg::DI, param_id)));
+            assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == spill
+                    && matches!(
+                        inst,
+                        RTLInst::Iop(Operation::Omove, args, dst)
+                            if args.as_slice() == [param_id] && *dst == stack_id
+                    )
+            }));
+        });
+    }
+
+    #[test]
+    fn pushed_stack_arguments_across_cfg_merge_form_one_value_web() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let entry = 0x1000;
+            let dispatch = 0x1010;
+            let def = 0x2000;
+            let push = 0x2010;
+            let alternate_def = 0x3000;
+            let alternate_push = 0x3010;
+            let call = 0x2020;
+            let successor = 0x2030;
+            let source_rtl = 0x5000;
+            let alternate_source_rtl = 0x6000;
+
+            prog.func_span.push(("FUN_1000", entry, successor));
+            prog.next.push((entry, dispatch));
+            prog.adjusts_stack.push((entry, "RSP", -32));
+            prog.jump_table_target.push((dispatch, 0, def));
+            // Jump-table recovery publishes the same target as a structural
+            // branch edge in the disassembly CFG; stack state follows that
+            // ordinary edge rather than a duplicate jump-table-specific rule.
+            prog.ddisasm_cfg_edge.push((dispatch, def, "branch"));
+            prog.ddisasm_cfg_edge
+                .push((dispatch, alternate_def, "fallthrough"));
+            prog.next.push((def, push));
+            prog.next.push((alternate_def, alternate_push));
+            prog.next.push((push, call));
+            prog.next.push((call, successor));
+            for node in [
+                entry,
+                dispatch,
+                def,
+                push,
+                alternate_def,
+                alternate_push,
+                call,
+                successor,
+            ] {
+                prog.instr_in_function.push((node, entry));
+            }
+            for node in [entry, dispatch] {
+                prog.code_in_block.push((node, entry));
+            }
+            for node in [def, push] {
+                prog.code_in_block.push((node, def));
+            }
+            for node in [alternate_def, alternate_push] {
+                prog.code_in_block.push((node, alternate_def));
+            }
+            for node in [call, successor] {
+                prog.code_in_block.push((node, call));
+            }
+            // The shared register-setup/call tail is a distinct block target.
+            // A register PUSH and a stack-memory PUSH cross separate
+            // structural predecessors into it.
+            prog.ddisasm_cfg_edge.push((push, call, "fallthrough"));
+            prog.ddisasm_cfg_edge
+                .push((alternate_push, call, "fallthrough"));
+            prog.reg_def.push((def, Mreg::CX));
+            prog.reg_def.push((alternate_def, Mreg::DX));
+            prog.reg_xtl.push((push, Mreg::CX, source_rtl));
+            prog.trim_instruction.push((def,));
+            prog.trim_instruction.push((alternate_def,));
+            prog.instruction
+                .push((push, 1, "", "PUSH", "push_src", "", "", "", 0, 0));
+            prog.op_register.push(("push_src", "RCX"));
+            prog.adjusts_stack.push((push, "RSP", -8));
+            prog.instruction.push((
+                alternate_push,
+                1,
+                "",
+                "PUSH",
+                "stack_push_src",
+                "",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.op_indirect
+                .push(("stack_push_src", "", "RSP", "NONE", 1, 0, 8));
+            prog.stack_def_used
+                .push((alternate_def, "RSP", 0, alternate_push, "RSP", 0));
+            prog.stack_xtl
+                .push((entry, alternate_push, 0, alternate_source_rtl));
+            prog.adjusts_stack.push((alternate_push, "RSP", -8));
+            prog.ltl_inst.push((
+                call,
+                LTLInst::Lcall(Either::Right(Either::Right("__fprintf_chk"))),
+            ));
+            prog.abi_first_stack_arg_position.push((6,));
+            prog.abi_outgoing_stack_base.push((0,));
+            prog.abi_stack_slot_size.push((8,));
+
+            prog.run();
+
+            let raw_sources: BTreeSet<_> = prog
+                .raw_call_outgoing_stack_arg
+                .iter()
+                .filter_map(|(node, pos, source)| (*node == call && *pos == 6).then_some(*source))
+                .collect();
+            assert!(raw_sources.is_superset(&BTreeSet::from([source_rtl, alternate_source_rtl])));
+
+            let call_values: Vec<_> = prog
+                .call_outgoing_stack_arg
+                .iter()
+                .filter_map(|(node, pos, value)| (*node == call && *pos == 6).then_some(*value))
+                .collect();
+            assert_eq!(call_values.len(), 1);
+            let call_value = call_values[0];
+            for source in [source_rtl, alternate_source_rtl] {
+                assert!(prog
+                    .xtl_canonical
+                    .iter()
+                    .any(|fact| fact == &(source, call_value)));
+            }
+        });
+    }
+
+    #[test]
+    fn rtl_stack_state_diamonds_become_unknown_without_path_sum_growth() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x9000;
+            let mut predecessor = func;
+            let mut next_node = 0x8000;
+
+            prog.func_span.push(("f", func, 0xa000));
+            prog.instr_in_function.push((func, func));
+
+            // Each arm contributes a distinct optional stack adjustment.  A
+            // may-union state grows to 2^N path sums here even though the CFG is
+            // acyclic.  Exact stack height is a must fact, so the first unequal
+            // merge becomes unknown and later diamonds remain bounded.
+            for level in 0..8 {
+                let left = next_node;
+                let right = next_node - 1;
+                let merge = next_node - 2;
+                next_node -= 3;
+
+                for node in [left, right, merge] {
+                    prog.instr_in_function.push((node, func));
+                }
+                prog.ddisasm_cfg_edge.push((predecessor, left, "branch"));
+                prog.ddisasm_cfg_edge
+                    .push((predecessor, right, "fallthrough"));
+                prog.ddisasm_cfg_edge.push((left, merge, "fallthrough"));
+                prog.ddisasm_cfg_edge.push((right, merge, "fallthrough"));
+                prog.adjusts_stack.push((left, "RSP", -(1_i64 << level)));
+                predecessor = merge;
+            }
+
+            prog.run();
+
+            let final_state = prog
+                .sp_entry_ofs
+                .iter()
+                .find_map(|fact| {
+                    let fact = fact.read().unwrap();
+                    (fact.0 == func && fact.1 == predecessor).then(|| fact.2 .0.clone())
+                })
+                .expect("final diamond must have a stack-state fact");
+            assert!(final_state.is_empty());
+            assert!(prog.sp_entry_ofs.iter().all(|fact| {
+                let fact = fact.read().unwrap();
+                fact.0 != func || fact.2 .0.len() <= 1
+            }));
+        });
+    }
+
+    #[test]
+    fn contiguous_entry_pushes_are_frame_setup_not_call_arguments() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [entry, align, body, end] = synthetic_ids();
+
+            prog.func_stacksz.push((entry, end, "frame_user", 0));
+            prog.next.push((entry, align));
+            prog.next.push((align, body));
+            for node in [entry, align, body] {
+                prog.instr_in_function.push((node, entry));
+            }
+            prog.instruction
+                .push((entry, 1, "", "PUSH", "saved", "", "", "", 0, 0));
+            prog.instruction
+                .push((align, 1, "", "PUSH", "scratch", "", "", "", 0, 0));
+            prog.op_register.push(("saved", "RBP"));
+            prog.op_register.push(("scratch", "RAX"));
+            prog.is_arg_reg.push((Mreg::DI,));
+
+            prog.run();
+
+            assert!(prog
+                .prologue_frame_push
+                .iter()
+                .any(|fact| fact == &(entry,)));
+            assert!(prog
+                .prologue_frame_push
+                .iter()
+                .any(|fact| fact == &(align,)));
+            assert!(!prog
+                .push_arg_reg
+                .iter()
+                .any(|(node, _)| { *node == entry || *node == align }));
+        });
+    }
+
+    #[test]
+    fn body_register_push_remains_a_stack_argument_candidate() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [entry, def, push, end] = synthetic_ids();
+
+            prog.func_stacksz.push((entry, end, "caller", 0));
+            prog.next.push((entry, def));
+            prog.next.push((def, push));
+            for node in [entry, def, push] {
+                prog.instr_in_function.push((node, entry));
+            }
+            prog.instruction
+                .push((entry, 1, "", "XOR", "", "", "", "", 0, 0));
+            prog.instruction
+                .push((push, 1, "", "PUSH", "arg", "", "", "", 0, 0));
+            prog.op_register.push(("arg", "RAX"));
+            prog.is_arg_reg.push((Mreg::DI,));
+
+            prog.run();
+
+            assert!(!prog.prologue_frame_push.iter().any(|fact| fact == &(push,)));
+            assert!(prog
+                .push_arg_reg
+                .iter()
+                .any(|fact| fact == &(push, Mreg::AX)));
+        });
+    }
+
+    #[test]
+    fn stack_address_provenance_stops_at_register_redefinition() {
+        on_large_stack(|| {
+            let [func, block, lea, redefine, copy] = synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+
+            for node in [lea, redefine, copy] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, block));
+            }
+            prog.next.extend([(lea, redefine), (redefine, copy)]);
+            prog.reg_def
+                .extend([(lea, Mreg::R15), (redefine, Mreg::R15), (copy, Mreg::DI)]);
+            prog.reg_use
+                .extend([(redefine, Mreg::AX), (copy, Mreg::R15)]);
+            prog.ltl_inst.push((
+                lea,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Ainstack(16)),
+                    Arc::new(vec![]),
+                    Mreg::R15,
+                ),
+            ));
+            prog.ltl_inst.push((
+                redefine,
+                LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::AX]), Mreg::R15),
+            ));
+            prog.ltl_inst.push((
+                copy,
+                LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::R15]), Mreg::DI),
+            ));
+
+            prog.run();
+
+            assert!(prog
+                .reg_def_used
+                .iter()
+                .any(|fact| fact == &(redefine, Mreg::R15, copy)));
+            assert!(!prog
+                .reg_def_used
+                .iter()
+                .any(|fact| fact == &(lea, Mreg::R15, copy)));
+            assert!(!prog
+                .reg_holds_slot_addr
+                .iter()
+                .any(|fact| fact == &(func, copy, 16, Mreg::DI)));
+        });
+    }
+
+    #[test]
+    fn stack_address_provenance_follows_an_unredefined_copy() {
+        on_large_stack(|| {
+            let [func, block, lea, copy] = synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+
+            for node in [lea, copy] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, block));
+            }
+            prog.next.push((lea, copy));
+            prog.reg_def.extend([(lea, Mreg::R15), (copy, Mreg::DI)]);
+            prog.reg_use.push((copy, Mreg::R15));
+            prog.ltl_inst.push((
+                lea,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Ainstack(16)),
+                    Arc::new(vec![]),
+                    Mreg::R15,
+                ),
+            ));
+            prog.ltl_inst.push((
+                copy,
+                LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::R15]), Mreg::DI),
+            ));
+
+            prog.run();
+
+            assert!(prog
+                .reg_def_used
+                .iter()
+                .any(|fact| fact == &(lea, Mreg::R15, copy)));
+            assert!(prog
+                .reg_holds_slot_addr
+                .iter()
+                .any(|fact| fact == &(func, copy, 16, Mreg::DI)));
+        });
+    }
+
+    #[test]
+    fn stack_address_provenance_crosses_a_spill_before_a_call_argument() {
+        on_large_stack(|| {
+            let [func, lea, spill, reload, call] = synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+            let object_ofs = 144;
+            let spill_ofs = 24;
+
+            prog.ltl_inst.push((
+                lea,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Ainstack(object_ofs)),
+                    Arc::new(vec![]),
+                    Mreg::AX,
+                ),
+            ));
+            prog.ltl_inst.push((
+                spill,
+                LTLInst::Lsetstack(Mreg::AX, Slot::Local, spill_ofs, Typ::Tany64),
+            ));
+            prog.ltl_inst.push((
+                reload,
+                LTLInst::Lgetstack(Slot::Local, spill_ofs, Typ::Tany64, Mreg::DI),
+            ));
+            for node in [lea, spill, reload, call] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.reg_def_used.push((lea, Mreg::AX, spill));
+            prog.stack_def_used
+                .push((spill, "RSP", spill_ofs, reload, "RSP", spill_ofs));
+            prog.arg_setup_candidate.push((reload, Mreg::DI, call));
+
+            prog.run();
+
+            assert!(prog
+                .stack_addr_reload_edge
+                .iter()
+                .any(|fact| { fact == &(func, reload, Mreg::DI, spill, Mreg::AX) }));
+            assert!(prog
+                .reg_holds_slot_addr
+                .iter()
+                .any(|fact| fact == &(func, reload, object_ofs, Mreg::DI)));
+            assert!(prog
+                .slot_addr_escaped
+                .iter()
+                .any(|fact| fact == &(func, lea, object_ofs)));
+        });
+    }
+
+    #[test]
+    fn loop_header_uses_only_the_definition_reaching_through_the_cfg() {
+        on_large_stack(|| {
+            let [func, entry_block, overwrite_block, header_block, latch_block, lea, overwrite, copy, latch] =
+                synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+
+            for (node, block) in [
+                (lea, entry_block),
+                (overwrite, overwrite_block),
+                (copy, header_block),
+                (latch, latch_block),
+            ] {
+                prog.instr_in_function.push((node, func));
+                prog.instr_in_function.push((block, func));
+                prog.code_in_block.push((node, block));
+                prog.block_in_function.push((block, func));
+                prog.block_last_insn.push((block, node));
+            }
+            prog.asm_block_next.extend([
+                (entry_block, overwrite_block),
+                (overwrite_block, header_block),
+                (header_block, latch_block),
+                (latch_block, header_block),
+            ]);
+            prog.reg_def
+                .extend([(lea, Mreg::R15), (overwrite, Mreg::R15), (copy, Mreg::DI)]);
+            prog.reg_use
+                .extend([(overwrite, Mreg::AX), (copy, Mreg::R15)]);
+            prog.ltl_inst.push((
+                lea,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Ainstack(16)),
+                    Arc::new(vec![]),
+                    Mreg::R15,
+                ),
+            ));
+            prog.ltl_inst.push((
+                overwrite,
+                LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::AX]), Mreg::R15),
+            ));
+            prog.ltl_inst.push((
+                copy,
+                LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::R15]), Mreg::DI),
+            ));
+
+            prog.run();
+
+            assert!(prog
+                .reg_def_used
+                .iter()
+                .any(|fact| fact == &(overwrite, Mreg::R15, copy)));
+            assert!(!prog
+                .reg_def_used
+                .iter()
+                .any(|fact| fact == &(lea, Mreg::R15, copy)));
+            assert!(!prog
+                .reg_holds_slot_addr
+                .iter()
+                .any(|fact| fact == &(func, copy, 16, Mreg::DI)));
+        });
+    }
+
+    #[test]
+    fn stack_address_provenance_requires_one_origin_at_a_cfg_join() {
+        on_large_stack(|| {
+            let [func, stack_block, data_block, join_block, lea, data_def, copy] = synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+
+            for (node, block) in [
+                (lea, stack_block),
+                (data_def, data_block),
+                (copy, join_block),
+            ] {
+                prog.instr_in_function.push((node, func));
+                prog.instr_in_function.push((block, func));
+                prog.code_in_block.push((node, block));
+                prog.block_in_function.push((block, func));
+                prog.block_last_insn.push((block, node));
+            }
+            prog.asm_block_next
+                .extend([(stack_block, join_block), (data_block, join_block)]);
+            prog.reg_def
+                .extend([(lea, Mreg::R15), (data_def, Mreg::R15), (copy, Mreg::DI)]);
+            prog.reg_use.push((copy, Mreg::R15));
+            prog.ltl_inst.push((
+                lea,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Ainstack(16)),
+                    Arc::new(vec![]),
+                    Mreg::R15,
+                ),
+            ));
+            prog.ltl_inst.push((
+                data_def,
+                LTLInst::Lop(Operation::Olongconst(0), Arc::new(vec![]), Mreg::R15),
+            ));
+            prog.ltl_inst.push((
+                copy,
+                LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::R15]), Mreg::DI),
+            ));
+
+            prog.run();
+
+            assert!(prog
+                .reg_def_used
+                .iter()
+                .any(|fact| fact == &(lea, Mreg::R15, copy)));
+            assert!(prog
+                .reg_def_used
+                .iter()
+                .any(|fact| fact == &(data_def, Mreg::R15, copy)));
+            assert!(!prog
+                .reg_holds_slot_addr
+                .iter()
+                .any(|fact| fact == &(func, copy, 16, Mreg::DI)));
+        });
+    }
+
+    #[test]
+    fn dropped_stack_reload_uses_structural_reaching_definition() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x1000;
+            let spill = 0x1800;
+            // Keep the use numerically before its def to ensure address order
+            // cannot accidentally justify the recovery.
+            let reload = 0x1200;
+            let successor = 0x1210;
+
+            prog.ltl_inst.push((
+                spill,
+                LTLInst::Lsetstack(Mreg::CX, Slot::Local, 0, Typ::Tany64),
+            ));
+            prog.stack_def_used
+                .push((spill, "RSP", 0, reload, "RSP", 8));
+            // Mach retained only the control-flow fallback at this node.
+            prog.ltl_inst
+                .push((reload, LTLInst::Lbranch(Either::Right(successor))));
+            prog.pmov.push((reload, "reload_dst", "reload_src"));
+            prog.op_register.push(("reload_dst", "RCX"));
+            prog.op_indirect
+                .push(("reload_src", "", "RSP", "NONE", 1, 8, 8));
+            for node in [spill, reload, successor] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            prog.run();
+
+            let stack_rtl = fresh_stack_slot_reg(spill);
+            let dst_rtl = fresh_xtl_reg(reload, Mreg::CX);
+            assert!(prog
+                .raw_stack_reload
+                .iter()
+                .any(|fact| fact == &(func, reload, 8, Mreg::CX)));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    reload,
+                    RTLInst::Iop(Operation::Omove, Arc::new(vec![stack_rtl]), dst_rtl),
+                )
+            }));
+        });
+    }
+
+    #[test]
+    fn bp_stack_store_keeps_register_value_distinct_from_cell() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x40;
+            let source = 0x100;
+            let spill = 0x200;
+            let source_rtl = fresh_xtl_reg(source, Mreg::BP);
+            let stack_rtl = fresh_stack_slot_reg(spill);
+
+            // Lsetstack uses BP as an ordinary source register.  Its storage
+            // identity must therefore not be fresh_xtl_reg(spill, BP), which
+            // is also the source-use identity at this same instruction.
+            prog.reg_xtl.push((source, Mreg::BP, source_rtl));
+            prog.is_def.push((source, source_rtl));
+            prog.reg_def_used.push((source, Mreg::BP, spill));
+            prog.ltl_inst.push((
+                spill,
+                LTLInst::Lsetstack(Mreg::BP, Slot::Local, 24, Typ::Tint),
+            ));
+            prog.instr_in_function.push((source, func));
+            prog.instr_in_function.push((spill, func));
+
+            prog.run();
+
+            assert_ne!(source_rtl, stack_rtl);
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    spill,
+                    RTLInst::Iop(Operation::Omove, Arc::new(vec![source_rtl]), stack_rtl),
+                )
+            }));
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == spill
+                    && matches!(
+                        inst,
+                        RTLInst::Iop(Operation::Omove, args, dst)
+                            if args.as_slice() == [*dst]
+                    )
+            }));
+        });
+    }
+
+    #[test]
+    fn immediate_push_reaches_its_call_as_a_canonical_stack_argument_without_node_order() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let push = 0x900;
+            let call = 0x100;
+            let block = 0x500;
+            let successor = 0xa00;
+
+            prog.instruction
+                .push((push, 1, "", "PUSH", "imm", "", "", "", 0, 0));
+            prog.op_immediate.push(("imm", 7, 8));
+            prog.func_span.push(("caller", push, successor));
+            prog.next.push((push, call));
+            prog.next.push((call, successor));
+            prog.adjusts_stack.push((push, "RSP", -8));
+            prog.code_in_block.push((push, block));
+            prog.code_in_block.push((call, block));
+            for node in [push, call, successor] {
+                prog.instr_in_function.push((node, push));
+            }
+            prog.ltl_inst.push((
+                call,
+                LTLInst::Lcall(Either::Right(Either::Right("variadic"))),
+            ));
+            prog.abi_first_stack_arg_position.push((6,));
+            prog.abi_outgoing_stack_base.push((0,));
+            prog.abi_stack_slot_size.push((8,));
+
+            prog.run();
+
+            assert!(prog
+                .imm_push_call
+                .iter()
+                .any(|fact| fact == &(push, 7, call)));
+            let synth = push | (1u64 << 62);
+            let value = fresh_xtl_reg(push, Mreg::AX);
+            assert!(prog.is_def.iter().any(|fact| fact == &(synth, value)));
+            assert!(prog
+                .raw_call_outgoing_stack_arg
+                .iter()
+                .any(|fact| fact == &(call, 6, value)));
+            assert!(prog
+                .xtl_canonical
+                .iter()
+                .any(|fact| fact == &(value, value)));
+            assert!(prog
+                .call_outgoing_stack_arg
+                .iter()
+                .any(|fact| fact == &(call, 6, value)));
+            assert!(prog
+                .call_arg_mapping
+                .iter()
+                .any(|fact| fact == &(call, 6, value)));
+        });
+    }
+
+    #[test]
+    fn masked_memory_test_materializes_load_condition_and_cfg() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let test = 0x700;
+            let jcc = 0x708;
+            // Keep numeric order deliberately unrelated to branch meaning.
+            let taken = 0x100;
+            let fallthrough = 0x900;
+            let base_rtl = 0x1234;
+
+            prog.ptest.push((test, "tested_mem", "mask"));
+            prog.op_indirect
+                .push(("tested_mem", "", "R12", "NONE", 1, 72, 4));
+            prog.op_immediate.push(("mask", 0x102, 4));
+            prog.pjcc.push((jcc, TestCond::CondE, "taken"));
+            prog.symbol_resolved_addr.push(("taken", taken));
+            prog.next.push((test, jcc));
+            prog.next.push((jcc, fallthrough));
+            for node in [test, jcc, taken, fallthrough] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.reg_xtl.push((test, Mreg::R12, base_rtl));
+
+            prog.run();
+
+            let loaded = fresh_xtl_reg(test, Mreg::x86("RTEMP"));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    test,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt32,
+                        Addressing::Aindexed(72),
+                        Arc::new(vec![base_rtl]),
+                        loaded,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    jcc,
+                    RTLInst::Icond(
+                        Condition::Cmaskzero(0x102),
+                        Arc::new(vec![loaded]),
+                        Either::Right(taken),
+                        Either::Right(fallthrough),
+                    ),
+                )
+            }));
+            for edge in [(test, jcc), (jcc, taken), (jcc, fallthrough)] {
+                assert!(
+                    prog.rtl_succ_candidate.iter().any(|fact| fact == &edge),
+                    "missing structural RTL edge {edge:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn frameless_rbp_masked_test_cmov_loads_the_condition_value() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            // Reverse numeric order deliberately: the compare site is an
+            // exported CFG fact, not an address-order approximation.
+            let test = 0x900;
+            let cmov = 0x100;
+            let prior_errno_def = 0x700;
+            let zero_def = 0x800;
+            let base_rtl = 0x1234;
+            let errno_rtl = 0x2345;
+            let zero_rtl = 0x3456;
+            let result_rtl = fresh_xtl_reg(cmov, Mreg::R13);
+
+            prog.ptest.push((test, "stream_flags", "mask"));
+            prog.op_indirect
+                .push(("stream_flags", "", "RBP", "NONE", 1, 0, 1));
+            prog.op_immediate.push(("mask", 0x20, 1));
+            prog.osel_compare_site.push((cmov, test));
+            prog.ltl_inst.push((
+                cmov,
+                LTLInst::Lop(
+                    Operation::Osel(Condition::Cmasknotzero(0x20), Typ::Tint),
+                    Arc::new(vec![Mreg::R13, Mreg::AX]),
+                    Mreg::R13,
+                ),
+            ));
+            prog.instr_in_function.push((test, func));
+            prog.instr_in_function.push((cmov, func));
+
+            // RBP is an ordinary object pointer because this function has no
+            // structural RSP->RBP frame setup.
+            prog.reg_xtl.push((test, Mreg::BP, base_rtl));
+
+            // Model the two CMOV inputs and its distinct architectural result.
+            prog.reg_xtl.push((prior_errno_def, Mreg::R13, errno_rtl));
+            prog.is_def.push((prior_errno_def, errno_rtl));
+            prog.reg_def_used.push((prior_errno_def, Mreg::R13, cmov));
+            prog.reg_xtl.push((zero_def, Mreg::AX, zero_rtl));
+            prog.is_def.push((zero_def, zero_rtl));
+            prog.reg_def_used.push((zero_def, Mreg::AX, cmov));
+            prog.reg_xtl.push((cmov, Mreg::R13, result_rtl));
+            prog.is_def.push((cmov, result_rtl));
+
+            prog.run();
+
+            let loaded = fresh_xtl_reg(test, Mreg::x86("RTEMP"));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    test,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt8Unsigned,
+                        Addressing::Aindexed(0),
+                        Arc::new(vec![base_rtl]),
+                        loaded,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    cmov,
+                    RTLInst::Iop(
+                        Operation::Osel(Condition::Cmasknotzero(0x20), Typ::Tint),
+                        Arc::new(vec![errno_rtl, zero_rtl, loaded]),
+                        result_rtl,
+                    ),
+                )
+            }));
+        });
+    }
+
+    #[test]
+    fn rsp_compare_uses_the_normalized_stack_slot_after_frame_adjustment() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let frame_adjust = 0x480;
+            let branch = 0x800;
+            // A semantically forward branch lands at a numerically lower
+            // block, ensuring address order cannot drive stack propagation.
+            let cmp = 0x100;
+            let jcc = 0x108;
+            let fallthrough = 0x120;
+            let taken = 0x950;
+            let stack_rtl = fresh_stack_slot_reg(cmp);
+
+            prog.pcmp.push((cmp, "sentinel", "stack_word"));
+            prog.op_immediate.push(("sentinel", 0x43, 2));
+            // The machine operand is 0(%rsp), but CFG stack-offset dataflow
+            // normalizes it against a 280-byte frame to the canonical slot.
+            prog.op_indirect
+                .push(("stack_word", "", "RSP", "NONE", 1, 0, 2));
+            prog.func_span.push(("FUN_400", func, taken));
+            prog.next.push((func, frame_adjust));
+            prog.next.push((frame_adjust, branch));
+            prog.adjusts_stack.push((frame_adjust, "RSP", -280));
+            prog.ddisasm_cfg_edge.push((branch, cmp, "branch"));
+            prog.pjcc.push((jcc, TestCond::CondE, "taken"));
+            prog.symbol_resolved_addr.push(("taken", taken));
+            prog.next.push((cmp, jcc));
+            prog.next.push((jcc, fallthrough));
+            for node in [func, frame_adjust, branch] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, func));
+            }
+            for node in [cmp, jcc, fallthrough] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, cmp));
+            }
+            prog.instr_in_function.push((taken, func));
+            prog.block_in_function.push((func, func));
+            prog.block_in_function.push((cmp, func));
+
+            prog.run();
+
+            assert!(prog
+                .cmp_uses_scalar_stack_slot
+                .iter()
+                .any(|fact| fact == &(cmp,)));
+            assert!(prog
+                .scalar_stack_cmp_slot
+                .iter()
+                .any(|fact| fact == &(func, cmp, -280)));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    cmp,
+                    RTLInst::Icond(
+                        Condition::Ccompimm(Comparison::Ceq, 0x43),
+                        Arc::new(vec![stack_rtl]),
+                        Either::Right(taken),
+                        Either::Right(fallthrough),
+                    ),
+                )
+            }));
+        });
+    }
+
+    #[test]
+    fn rsp_compare_reuses_the_structurally_reaching_spill_identity() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let frame_adjust = 0x404;
+            let spill = 0x410;
+            let branch = 0x900;
+            let cmp = 0x800;
+            let jcc = 0x808;
+            let fallthrough = 0x820;
+            let taken = 0x950;
+            let spill_rtl = fresh_stack_slot_reg(spill);
+
+            prog.ltl_inst.push((
+                spill,
+                LTLInst::Lsetstack(Mreg::R8, Slot::Local, 52, Typ::Tint),
+            ));
+            prog.stack_def_used.push((spill, "RSP", 52, cmp, "RSP", 52));
+            prog.pcmp.push((cmp, "stack_word", "sentinel"));
+            prog.op_indirect
+                .push(("stack_word", "", "RSP", "NONE", 1, 52, 4));
+            prog.op_immediate.push(("sentinel", 10, 4));
+            prog.func_span.push(("FUN_400", func, taken));
+            prog.next.push((func, frame_adjust));
+            prog.next.push((frame_adjust, spill));
+            prog.next.push((spill, branch));
+            prog.adjusts_stack.push((frame_adjust, "RSP", -248));
+            // Exercise CFG propagation across a non-fallthrough edge whose
+            // destination address is smaller than its source address.
+            prog.ddisasm_cfg_edge.push((branch, cmp, "branch"));
+            prog.pjcc.push((jcc, TestCond::CondE, "taken"));
+            prog.symbol_resolved_addr.push(("taken", taken));
+            prog.next.push((cmp, jcc));
+            prog.next.push((jcc, fallthrough));
+            for node in [func, frame_adjust, spill, branch] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, func));
+            }
+            for node in [cmp, jcc, fallthrough] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, cmp));
+            }
+            prog.instr_in_function.push((taken, func));
+            prog.block_in_function.push((func, func));
+            prog.block_in_function.push((cmp, func));
+
+            prog.run();
+
+            assert!(prog
+                .scalar_stack_cmp_slot
+                .iter()
+                .any(|fact| fact == &(func, cmp, -196)));
+            assert!(prog
+                .scalar_stack_cmp_var_slot
+                .iter()
+                .any(|fact| fact == &(func, cmp, 52)));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    cmp,
+                    RTLInst::Icond(
+                        Condition::Ccompimm(Comparison::Ceq, 10),
+                        Arc::new(vec![spill_rtl]),
+                        Either::Right(taken),
+                        Either::Right(fallthrough),
+                    ),
+                )
+            }));
+        });
+    }
+
+    #[test]
+    fn late_frame_anchored_load_is_still_a_stack_parameter() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let frame_setup = 0x404;
+            let late_load = 0x900;
+            let local_load = 0x904;
+
+            prog.emit_function.push((func, "FUN_400", func));
+            prog.abi_incoming_bp_stack_base.push((16,));
+            prog.stack_base_move.push((frame_setup, "RSP", "RBP"));
+
+            // More than the former bounded walk's 256 edges, with node IDs
+            // deliberately zig-zagging so numeric order says nothing about
+            // the CFG path.
+            let chain: Vec<u64> = (0..300)
+                .map(|index| {
+                    if index % 2 == 0 {
+                        0x2000 + index as u64
+                    } else {
+                        0x1fff - index as u64
+                    }
+                })
+                .collect();
+            let mut previous = func;
+            for node in &chain {
+                prog.next.push((previous, *node));
+                prog.instr_in_function.push((*node, func));
+                previous = *node;
+            }
+            prog.next.push((previous, late_load));
+            prog.next.push((late_load, local_load));
+            for node in [func, frame_setup, late_load, local_load] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            prog.ltl_inst.push((
+                late_load,
+                LTLInst::Lload(
+                    MemoryChunk::MInt64,
+                    Addressing::Aindexed(16),
+                    Arc::new(vec![Mreg::BP]),
+                    Mreg::AX,
+                ),
+            ));
+            prog.ltl_inst.push((
+                local_load,
+                LTLInst::Lload(
+                    MemoryChunk::MInt64,
+                    Addressing::Aindexed(8),
+                    Arc::new(vec![Mreg::BP]),
+                    Mreg::BX,
+                ),
+            ));
+
+            prog.run();
+
+            assert!(prog
+                .stack_passed_param
+                .iter()
+                .any(|fact| fact == &(func, 16)));
+            assert!(!prog
+                .stack_passed_param
+                .iter()
+                .any(|fact| fact == &(func, 8)));
+            assert!(prog
+                .emit_function_stack_param_count
+                .iter()
+                .any(|fact| fact == &(func, 1)));
+        });
+    }
+
+    #[test]
+    fn frameless_rbp_object_use_does_not_hide_rsp_stack_parameters() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let frame_adjust = 0x404;
+            let load0 = 0x410;
+            let load1 = 0x418;
+            let load2 = 0x420;
+            let object_load = 0x428;
+
+            prog.emit_function.push((func, "FUN_400", func));
+            prog.func_span.push(("FUN_400", func, object_load));
+            prog.abi_incoming_sp_stack_base.push((8,));
+            prog.adjusts_stack.push((frame_adjust, "RSP", -248));
+            for edge in [
+                (func, frame_adjust),
+                (frame_adjust, load0),
+                (load0, load1),
+                (load1, load2),
+                (load2, object_load),
+            ] {
+                prog.next.push(edge);
+            }
+            for node in [func, frame_adjust, load0, load1, load2, object_load] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, func));
+            }
+
+            for (addr, ofs, sym, dst) in [
+                (load0, 256, "stack_arg_0", Mreg::AX),
+                (load1, 264, "stack_arg_1", Mreg::BX),
+                (load2, 272, "stack_arg_2", Mreg::CX),
+            ] {
+                prog.ltl_inst
+                    .push((addr, LTLInst::Lgetstack(Slot::Local, ofs, Typ::Tany64, dst)));
+                prog.instruction
+                    .push((addr, 8, "", "MOV", sym, "", "", "", 0, 0));
+                prog.op_indirect.push((sym, "", "RSP", "NONE", 1, ofs, 8));
+            }
+
+            // RBP is an ordinary callee-saved object pointer here.  Merely
+            // dereferencing it must not classify the function as framed.
+            prog.ltl_inst.push((
+                object_load,
+                LTLInst::Lload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed(4),
+                    Arc::new(vec![Mreg::BP]),
+                    Mreg::R8,
+                ),
+            ));
+            prog.instruction
+                .push((object_load, 4, "", "MOV", "bp_field", "", "", "", 0, 0));
+            prog.op_indirect
+                .push(("bp_field", "", "RBP", "NONE", 1, 4, 4));
+
+            prog.run();
+
+            assert!(!prog
+                .func_sets_frame_pointer
+                .iter()
+                .any(|fact| fact == &(func,)));
+            for (idx, (addr, ofs, _, dst)) in [
+                (load0, 256, "stack_arg_0", Mreg::AX),
+                (load1, 264, "stack_arg_1", Mreg::BX),
+                (load2, 272, "stack_arg_2", Mreg::CX),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert!(prog
+                    .extending_stack_arg_load
+                    .iter()
+                    .any(|fact| fact == &(addr, func, ofs, MemoryChunk::MAny64)));
+                let dst_rtl = fresh_xtl_reg(addr, dst);
+                let param_rtl = fresh_stack_param_reg(func, idx);
+                assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                    fact == &(
+                        addr,
+                        RTLInst::Iop(Operation::Omove, Arc::new(vec![param_rtl]), dst_rtl),
+                    )
+                }));
+            }
+            assert!(prog
+                .emit_function_stack_param_count
+                .iter()
+                .any(|fact| fact == &(func, 3)));
+        });
+    }
+
+    #[test]
+    fn incoming_stack_tail_lea_loads_bind_distinct_stack_parameters() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x500;
+            let frame_setup = 0x504;
+            let lea = 0x510;
+            let copy = 0x518;
+            let load0 = 0x520;
+            let load1 = 0x528;
+
+            prog.emit_function.push((func, "FUN_500", func));
+            prog.abi_incoming_bp_stack_base.push((16,));
+            prog.stack_base_move.push((frame_setup, "RSP", "RBP"));
+            prog.plea.push((lea, "tail_dst", "tail_src"));
+            prog.op_register.push(("tail_dst", "RAX"));
+            prog.op_indirect
+                .push(("tail_src", "", "RBP", "NONE", 1, 16, 8));
+
+            prog.ltl_inst.push((
+                lea,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Ainstack(16)),
+                    Arc::new(vec![]),
+                    Mreg::AX,
+                ),
+            ));
+            prog.ltl_inst.push((
+                copy,
+                LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::AX]), Mreg::R10),
+            ));
+            prog.ltl_inst.push((
+                load0,
+                LTLInst::Lload(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed(0),
+                    Arc::new(vec![Mreg::AX]),
+                    Mreg::R8,
+                ),
+            ));
+            prog.ltl_inst.push((
+                load1,
+                LTLInst::Lload(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed(8),
+                    Arc::new(vec![Mreg::R10]),
+                    Mreg::R9,
+                ),
+            ));
+
+            for node in [func, frame_setup, lea, copy, load0, load1] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.reg_def_used.push((lea, Mreg::AX, copy));
+            prog.reg_def_used.push((lea, Mreg::AX, load0));
+            prog.reg_def_used.push((copy, Mreg::R10, load1));
+
+            prog.run();
+
+            assert!(prog
+                .incoming_stack_tail_load
+                .iter()
+                .any(|fact| fact == &(load0, func, 16)));
+            assert!(prog
+                .incoming_stack_tail_load
+                .iter()
+                .any(|fact| fact == &(load1, func, 24)));
+            assert!(prog
+                .emit_function_stack_param_count
+                .iter()
+                .any(|fact| fact == &(func, 2)));
+
+            for (idx, (node, dst)) in [(load0, Mreg::R8), (load1, Mreg::R9)]
+                .into_iter()
+                .enumerate()
+            {
+                let dst_rtl = fresh_xtl_reg(node, dst);
+                let param_rtl = fresh_stack_param_reg(func, idx);
+                assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                    fact == &(
+                        node,
+                        RTLInst::Iop(Operation::Omove, Arc::new(vec![param_rtl]), dst_rtl),
+                    )
+                }));
+                assert!(!prog
+                    .rtl_inst_candidate
+                    .iter()
+                    .any(|(candidate_node, inst)| {
+                        *candidate_node == node && matches!(inst, RTLInst::Iload(..))
+                    }));
+            }
+        });
+    }
+
+    #[test]
+    fn variadic_first_unnamed_stack_address_becomes_semantic_builtin() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x580;
+            let frame_setup = 0x584;
+            let next_arg = 0x598;
+            let overflow_store = 0x59c;
+            let save_area_lea = 0x5a0;
+            let save_area_store = 0x5a4;
+            let result = fresh_xtl_reg(next_arg, Mreg::AX);
+
+            prog.emit_function.push((func, "variadic", func));
+            prog.func_has_variadic_xmm_prologue.push((func,));
+            prog.variadic_xmm_block_base.push((func, -128));
+            prog.abi_shared_arg_slots.push((false,));
+            prog.abi_pointer_size.push((8,));
+            prog.abi_incoming_bp_stack_base.push((16,));
+            prog.abi_stack_slot_size.push((8,));
+            prog.stack_base_move.push((frame_setup, "RSP", "RBP"));
+
+            prog.plea.push((next_arg, "next_dst", "next_src"));
+            prog.op_register.push(("next_dst", "RAX"));
+            prog.op_indirect
+                .push(("next_src", "", "RBP", "NONE", 1, 24, 8));
+            prog.ltl_inst.push((
+                next_arg,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Ainstack(24)),
+                    Arc::new(vec![]),
+                    Mreg::AX,
+                ),
+            ));
+            prog.reg_rtl.push((next_arg, Mreg::AX, result));
+            prog.reg_def_used.push((next_arg, Mreg::AX, overflow_store));
+            prog.ltl_inst.push((
+                overflow_store,
+                LTLInst::Lsetstack(Mreg::AX, Slot::Local, -32, Typ::Tany64),
+            ));
+
+            prog.ltl_inst.push((
+                save_area_lea,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Ainstack(-176)),
+                    Arc::new(vec![]),
+                    Mreg::CX,
+                ),
+            ));
+            prog.reg_def_used
+                .push((save_area_lea, Mreg::CX, save_area_store));
+            prog.ltl_inst.push((
+                save_area_store,
+                LTLInst::Lsetstack(Mreg::CX, Slot::Local, -24, Typ::Tany64),
+            ));
+
+            for node in [
+                func,
+                frame_setup,
+                next_arg,
+                overflow_store,
+                save_area_lea,
+                save_area_store,
+            ] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            prog.run();
+
+            assert!(prog
+                .variadic_next_arg_site
+                .iter()
+                .any(|fact| fact == &(func, next_arg, Mreg::AX)));
+            assert!(prog
+                .variadic_fixed_stack_prefix_count
+                .iter()
+                .any(|fact| fact == &(func, 1)));
+            assert!(prog
+                .emit_function_stack_param_count
+                .iter()
+                .any(|fact| fact == &(func, 0)));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    next_arg,
+                    RTLInst::Ibuiltin(
+                        "__builtin_next_arg".to_string(),
+                        vec![],
+                        BuiltinArg::BA(result),
+                    ),
+                )
+            }));
+            assert!(!prog
+                .rtl_inst_candidate
+                .iter()
+                .any(|(node, inst)| *node == next_arg && matches!(inst, RTLInst::Iop(..))));
+        });
+    }
+
+    #[test]
+    fn escaped_stack_pointer_protects_exact_callee_observed_fields() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [preserve, load16, load8, load0, callee, param_rtl, preserved_rtl, local0, local1, local2, result0, result8, result16, stack_node0, stack_node1, stack_node2, caller, lea, call] =
+                synthetic_ids();
+            // Callee access nodes deliberately sort before the caller to make
+            // clear that no address-order relation supplies this evidence.
+            let base_ofs = 32;
+            let locals = [local0, local1, local2];
+
+            prog.reg_holds_slot_addr
+                .push((caller, lea, base_ofs, Mreg::R8));
+            prog.arg_setup_candidate.push((lea, Mreg::R8, call));
+            prog.abi_int_arg_position.push((Mreg::R8, 4));
+            prog.call_target_func.push((call, callee));
+            prog.func_param_validated.push((callee, Mreg::R8));
+            prog.reg_rtl.push((callee, Mreg::R8, param_rtl));
+            prog.instr_in_function.push((preserve, callee));
+            prog.rtl_inst_candidate.push((
+                preserve,
+                RTLInst::Iop(Operation::Omove, Arc::new(vec![param_rtl]), preserved_rtl),
+            ));
+
+            for (node, field_ofs, result) in [
+                (load0, 0, result0),
+                (load8, 8, result8),
+                (load16, 16, result16),
+            ] {
+                prog.instr_in_function.push((node, callee));
+                prog.rtl_inst_candidate.push((
+                    node,
+                    RTLInst::Iload(
+                        MemoryChunk::MAny64,
+                        Addressing::Aindexed(field_ofs),
+                        Arc::new(vec![preserved_rtl]),
+                        result,
+                    ),
+                ));
+            }
+            for (idx, (stack_node, local)) in [stack_node0, stack_node1, stack_node2]
+                .into_iter()
+                .zip(locals)
+                .enumerate()
+            {
+                prog.stack_var
+                    .push((caller, stack_node, base_ofs + (idx as i64 * 8), local));
+            }
+
+            prog.run();
+
+            for (idx, local) in locals.into_iter().enumerate() {
+                let field_ofs = idx as i64 * 8;
+                assert!(prog
+                    .escaped_stack_region_field
+                    .iter()
+                    .any(|fact| { fact == &(caller, base_ofs, field_ofs, MemoryChunk::MAny64) }));
+                assert!(prog
+                    .slot_escaped_region_canonical
+                    .iter()
+                    .any(|fact| fact == &(caller, base_ofs + field_ofs, local)));
+            }
+        });
+    }
+
+    #[test]
+    fn out_param_extent_derives_from_the_pointee_table_without_a_signature_row() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let caller = 0x500;
+            let lea = 0x510;
+            let call = 0x520;
+            let plt = 0x3bf0;
+            let base_ofs = 16_i64;
+
+            prog.reg_holds_slot_addr
+                .push((caller, lea, base_ofs, Mreg::SI));
+            prog.arg_setup_candidate.push((lea, Mreg::SI, call));
+            prog.abi_int_arg_position.push((Mreg::SI, 1));
+            // fstatfs has a pointee-size row but NO known_extern_signature row;
+            // the extent must derive from the call site's own resolution.
+            prog.ltl_inst
+                .push((call, LTLInst::Lcall(Either::Right(Either::Left(plt)))));
+            prog.plt_function.push((plt, "fstatfs"));
+            prog.known_func_param_pointee_size.push(("fstatfs", 1, 120));
+
+            prog.run();
+
+            assert!(prog
+                .escaped_stack_region_extent
+                .iter()
+                .any(|fact| fact == &(caller, base_ofs, 120)));
+            // The extent also makes the region visible to the layout builder:
+            // its base cell publishes a caller field even with no reload.
+            assert!(prog.escaped_stack_region_caller_field.iter().any(
+                |(func, base, field_ofs, _)| {
+                    *func == caller && *base == base_ofs && *field_ofs == 0
+                }
+            ));
+        });
+    }
+
+    #[test]
+    fn escaped_stack_region_follows_pointer_through_internal_wrapper_call() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [nested_load, nested, nested_param, wrapper_param, wrapper_param_raw_alias, forwarded_value, nested_call, wrapper_copy, wrapper, field_local, caller, lea, wrapper_call, load_result, stack_node] =
+                synthetic_ids();
+            let base_ofs = 16;
+
+            prog.reg_holds_slot_addr
+                .push((caller, lea, base_ofs, Mreg::R8));
+            prog.arg_setup_candidate.push((lea, Mreg::R8, wrapper_call));
+            prog.abi_int_arg_position.push((Mreg::R8, 4));
+            prog.abi_int_arg_position.push((Mreg::DI, 0));
+            prog.call_target_func.push((wrapper_call, wrapper));
+            prog.func_param_validated.push((wrapper, Mreg::R8));
+            prog.reg_rtl.push((wrapper, Mreg::R8, wrapper_param));
+
+            // The wrapper's candidate move retains a raw alias-web id while
+            // its entry parameter is canonical.  Provenance must cross that
+            // existing alias and then follow the explicit value copy before
+            // the call; address order supplies none of these links.
+            prog.alias_edge
+                .push((wrapper_param, wrapper_param_raw_alias));
+            prog.instr_in_function.push((wrapper_copy, wrapper));
+            prog.rtl_inst_candidate.push((
+                wrapper_copy,
+                RTLInst::Iop(
+                    Operation::Omove,
+                    Arc::new(vec![wrapper_param_raw_alias]),
+                    forwarded_value,
+                ),
+            ));
+            prog.instr_in_function.push((nested_call, wrapper));
+            prog.call_arg_mapping
+                .push((nested_call, 0, forwarded_value));
+            prog.call_target_func.push((nested_call, nested));
+            prog.func_param_validated.push((nested, Mreg::DI));
+            prog.reg_rtl.push((nested, Mreg::DI, nested_param));
+
+            prog.instr_in_function.push((nested_load, nested));
+            prog.rtl_inst_candidate.push((
+                nested_load,
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed(4),
+                    Arc::new(vec![nested_param]),
+                    load_result,
+                ),
+            ));
+            prog.stack_var
+                .push((caller, stack_node, base_ofs + 4, field_local));
+
+            prog.run();
+
+            assert!(prog
+                .escaped_stack_region_field
+                .iter()
+                .any(|fact| { fact == &(caller, base_ofs, 4, MemoryChunk::MInt32) }));
+            assert!(prog
+                .slot_escaped_region_canonical
+                .iter()
+                .any(|fact| fact == &(caller, base_ofs + 4, field_local)));
+        });
+    }
+
+    #[test]
+    fn internal_capacity_parameter_sizes_escaped_buffer_through_wrapper() {
+        on_large_stack(|| {
+            assert!(indexed_store_ends_at_extent(
+                &Addressing::Aindexed2(-1),
+                &MemoryChunk::MInt8Unsigned
+            ));
+            assert!(!indexed_store_ends_at_extent(
+                &Addressing::Aindexed2(0),
+                &MemoryChunk::MInt8Unsigned
+            ));
+            assert!(!indexed_store_ends_at_extent(
+                &Addressing::Aindexed2scaled(2, -1),
+                &MemoryChunk::MInt8Unsigned
+            ));
+
+            let mut prog = RTLPassProgram::default();
+            let caller = 0x9000;
+            let lea = 0x9010;
+            let capacity_def = 0x9020;
+            let wrapper_call = 0x9030;
+            let wrapper = 0x7000;
+            let nested_call = 0x7010;
+            let nested = 0x3000;
+            let boundary_store = 0x3010;
+            let wrapper_buffer = fresh_xtl_reg(wrapper, Mreg::SI);
+            let wrapper_capacity = fresh_xtl_reg(wrapper, Mreg::DX);
+            let nested_buffer = fresh_xtl_reg(nested, Mreg::SI);
+            let nested_capacity = fresh_xtl_reg(nested, Mreg::DX);
+            let caller_capacity = fresh_xtl_reg(capacity_def, Mreg::DX);
+            let stored_value = fresh_xtl_reg(boundary_store, Mreg::DI);
+
+            for (reg, pos) in [(Mreg::SI, 1), (Mreg::DX, 2)] {
+                prog.abi_int_arg_position.push((reg, pos));
+            }
+
+            prog.func_param_validated.push((wrapper, Mreg::SI));
+            prog.func_param_validated.push((wrapper, Mreg::DX));
+            prog.reg_rtl.push((wrapper, Mreg::SI, wrapper_buffer));
+            prog.reg_rtl.push((wrapper, Mreg::DX, wrapper_capacity));
+            prog.instr_in_function.push((nested_call, wrapper));
+            prog.call_target_func.push((nested_call, nested));
+            prog.call_arg_mapping.push((nested_call, 1, wrapper_buffer));
+            prog.call_arg_mapping
+                .push((nested_call, 2, wrapper_capacity));
+
+            prog.func_param_validated.push((nested, Mreg::SI));
+            prog.func_param_validated.push((nested, Mreg::DX));
+            prog.reg_rtl.push((nested, Mreg::SI, nested_buffer));
+            prog.reg_rtl.push((nested, Mreg::DX, nested_capacity));
+            prog.instr_in_function.push((boundary_store, nested));
+            prog.rtl_inst_candidate.push((
+                boundary_store,
+                RTLInst::Istore(
+                    MemoryChunk::MInt8Unsigned,
+                    Addressing::Aindexed2(-1),
+                    Arc::new(vec![nested_buffer, nested_capacity]),
+                    stored_value,
+                ),
+            ));
+
+            prog.reg_holds_slot_addr.push((caller, lea, 0, Mreg::SI));
+            prog.arg_setup_candidate.push((lea, Mreg::SI, wrapper_call));
+            prog.call_target_func.push((wrapper_call, wrapper));
+            prog.call_arg_mapping
+                .push((wrapper_call, 2, caller_capacity));
+            prog.instr_in_function.push((capacity_def, caller));
+            prog.rtl_inst_candidate.push((
+                capacity_def,
+                RTLInst::Iop(
+                    Operation::Olongconst(257),
+                    Arc::new(vec![]),
+                    caller_capacity,
+                ),
+            ));
+            prog.func_stacksz.push((caller, 0x9100, "caller", 280));
+
+            prog.run();
+
+            assert!(prog
+                .param_byte_capacity_position
+                .iter()
+                .any(|fact| fact == &(wrapper, 1, 2)));
+            assert!(prog
+                .escaped_stack_region_extent
+                .iter()
+                .any(|fact| fact == &(caller, 0, 257)));
+            assert!(prog.escaped_stack_region_caller_field.iter().any(
+                |(func, base, field_ofs, chunk)| {
+                    *func == caller
+                        && *base == 0
+                        && *field_ofs == 0
+                        && *chunk == MemoryChunk::MInt8Unsigned
+                }
+            ));
+        });
+    }
+
+    #[test]
+    fn escaped_frame_compare_loads_from_the_buffer_without_scalarizing_it() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x1000;
+            let frame_adjust = 0x1004;
+            let lea = 0x1010;
+            let cmp = 0x1020;
+            let jcc = 0x1028;
+            let taken = 0x1100;
+            let fallthrough = 0x1030;
+            let address_rtl = fresh_xtl_reg(lea, Mreg::SI);
+            let loaded_rtl = fresh_xtl_reg(cmp, Mreg::x86("RTEMP"));
+
+            prog.func_span.push(("FUN_1000", func, taken));
+            prog.func_stacksz.push((func, taken, "FUN_1000", 280));
+            prog.next.push((func, frame_adjust));
+            prog.next.push((frame_adjust, lea));
+            prog.next.push((lea, cmp));
+            prog.next.push((cmp, jcc));
+            prog.next.push((jcc, fallthrough));
+            prog.adjusts_stack.push((frame_adjust, "RSP", -280));
+            prog.ltl_inst.push((
+                lea,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Ainstack(-280)),
+                    Arc::new(vec![]),
+                    Mreg::SI,
+                ),
+            ));
+            prog.slot_addr_escaped.push((func, lea, -280));
+            prog.pcmp.push((cmp, "stack_word", "sentinel"));
+            prog.op_indirect
+                .push(("stack_word", "", "RSP", "NONE", 1, 4, 2));
+            prog.op_immediate.push(("sentinel", 0x58, 2));
+            prog.pjcc.push((jcc, TestCond::CondNe, "taken"));
+            prog.symbol_resolved_addr.push(("taken", taken));
+            for node in [func, frame_adjust, lea, cmp, jcc, taken, fallthrough] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, func));
+            }
+            prog.block_in_function.push((func, func));
+
+            prog.run();
+
+            assert!(prog
+                .escaped_frame_cmp_mem
+                .iter()
+                .any(|fact| fact == &(func, cmp, -276, 2, address_rtl, 4, loaded_rtl)));
+            assert!(!prog
+                .stack_xtl
+                .iter()
+                .any(|(f, node, _, _)| *f == func && *node == cmp));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    cmp,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt16Unsigned,
+                        Addressing::Aindexed(4),
+                        Arc::new(vec![address_rtl]),
+                        loaded_rtl,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    jcc,
+                    RTLInst::Icond(
+                        Condition::Ccompimm(Comparison::Cne, 0x58),
+                        Arc::new(vec![loaded_rtl]),
+                        Either::Right(taken),
+                        Either::Right(fallthrough),
+                    ),
+                )
+            }));
+            for edge in [(cmp, jcc), (jcc, taken), (jcc, fallthrough)] {
+                assert!(
+                    prog.rtl_succ_candidate.iter().any(|fact| fact == &edge),
+                    "missing escaped-buffer compare edge {edge:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn escaped_scalar_compare_reads_the_address_taken_local() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x1000;
+            let lea = 0x1010;
+            let cmp = 0x1020;
+            let jcc = 0x1028;
+            let fallthrough = 0x1030;
+            let taken = 0x1100;
+            let slot = 172;
+            let loaded_rtl = fresh_xtl_reg(cmp, Mreg::x86("RTEMP"));
+
+            prog.func_span.push(("FUN_1000", func, taken));
+            prog.ltl_inst.push((
+                lea,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Ainstack(slot)),
+                    Arc::new(vec![]),
+                    Mreg::DI,
+                ),
+            ));
+            prog.slot_addr_escaped.push((func, lea, slot));
+            prog.pcmp.push((cmp, "written_local", "sentinel"));
+            prog.op_indirect
+                .push(("written_local", "", "RSP", "NONE", 1, slot, 4));
+            prog.op_immediate.push(("sentinel", 0x2018, 4));
+            prog.pjcc.push((jcc, TestCond::CondNe, "taken"));
+            prog.symbol_resolved_addr.push(("taken", taken));
+            prog.next.push((cmp, jcc));
+            prog.next.push((jcc, fallthrough));
+            for node in [func, lea, cmp, jcc, fallthrough, taken] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, func));
+            }
+            prog.block_in_function.push((func, func));
+
+            prog.run();
+
+            assert!(prog
+                .escaped_scalar_cmp_mem
+                .iter()
+                .any(|fact| fact == &(func, cmp, slot, 4, loaded_rtl)));
+            assert!(!prog
+                .escaped_frame_cmp_mem
+                .iter()
+                .any(|(_, node, _, _, _, _, _)| *node == cmp));
+            assert!(!prog
+                .stack_xtl
+                .iter()
+                .any(|(f, node, _, _)| *f == func && *node == cmp));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    cmp,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt32,
+                        Addressing::Ainstack(slot),
+                        Arc::new(vec![]),
+                        loaded_rtl,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    jcc,
+                    RTLInst::Icond(
+                        Condition::Ccompimm(Comparison::Cne, 0x2018),
+                        Arc::new(vec![loaded_rtl]),
+                        Either::Right(taken),
+                        Either::Right(fallthrough),
+                    ),
+                )
+            }));
+        });
+    }
+
+    // An escaped buffer at displacement 16, one settled store at that displacement, and one
+    // store at displacement 0 that a later SP adjustment makes readable at displacement 16.
+    fn rebased_slot_program() -> (RTLPassProgram, u64, u64, u64, u64, u64) {
+        let func = 0x1000;
+        let lea = 0x1010;
+        let low_store = 0x1020;
+        let rebased_read = 0x1030;
+        let settled_store = 0x1040;
+        let mut prog = RTLPassProgram::default();
+
+        prog.func_span.push(("FUN_1000", func, 0x1100));
+        prog.ltl_inst.push((
+            lea,
+            LTLInst::Lop(
+                Operation::Olea(Addressing::Ainstack(16)),
+                Arc::new(vec![]),
+                Mreg::DI,
+            ),
+        ));
+        prog.slot_addr_escaped.push((func, lea, 16));
+        prog.ltl_inst.push((
+            low_store,
+            LTLInst::Lsetstack(Mreg::AX, Slot::Local, 0, Typ::Tint),
+        ));
+        prog.ltl_inst.push((
+            settled_store,
+            LTLInst::Lsetstack(Mreg::BX, Slot::Local, 16, Typ::Tint),
+        ));
+        // The pushes between the two make displacement 16 name the cell stored at 0.
+        prog.stack_def_used
+            .push((low_store, "RSP", 0, rebased_read, "RSP", 16));
+        for node in [func, lea, low_store, rebased_read, settled_store] {
+            prog.instr_in_function.push((node, func));
+            prog.code_in_block.push((node, func));
+        }
+        prog.block_in_function.push((func, func));
+        (prog, func, lea, low_store, rebased_read, settled_store)
+    }
+
+    fn slot_name(
+        prog: &RTLPassProgram,
+        func: u64,
+        node: u64,
+        ofs: i64,
+    ) -> crate::x86::types::RTLReg {
+        prog.stack_var
+            .iter()
+            .find(|(f, n, o, _)| *f == func && *n == node && *o == ofs)
+            .map(|(_, _, _, reg)| *reg)
+            .unwrap_or_else(|| panic!("no stack_var at {node:#x} offset {ofs}"))
+    }
+
+    // A displacement names a frame cell only together with the SP state it was taken in.
+    // The escaped buffer must not absorb a name that merely borrowed its displacement from
+    // another SP state, or the whole frame collapses onto one local.
+    #[test]
+    fn an_escaped_slot_does_not_absorb_a_rebased_name() {
+        on_large_stack(|| {
+            let (mut prog, func, lea, low_store, rebased_read, _) = rebased_slot_program();
+            prog.run();
+
+            assert!(
+                prog.stack_xtl_rebased
+                    .iter()
+                    .any(|fact| fact == &(func, rebased_read, 16)),
+                "the re-based publication was not recognized"
+            );
+            assert_ne!(
+                slot_name(&prog, func, rebased_read, 16),
+                slot_name(&prog, func, lea, 16),
+                "the escaped buffer absorbed a different cell"
+            );
+            assert_eq!(
+                slot_name(&prog, func, rebased_read, 16),
+                slot_name(&prog, func, low_store, 0),
+                "the re-based read lost the store it reads"
+            );
+        });
+    }
+
+    // The unification itself still has to happen for every access actually taken in the
+    // frame the escaping LEA was taken in.
+    #[test]
+    fn an_escaped_slot_still_unifies_its_settled_accesses() {
+        on_large_stack(|| {
+            let (mut prog, func, lea, _, _, settled_store) = rebased_slot_program();
+            prog.run();
+
+            assert_eq!(
+                slot_name(&prog, func, settled_store, 16),
+                slot_name(&prog, func, lea, 16),
+                "a settled access to the escaped slot got its own local"
+            );
+        });
+    }
+
+    #[test]
+    fn rip_relative_memory_register_compare_materializes_global_load() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let cmp = 0x700;
+            let jcc = 0x706;
+            // Deliberately make branch meaning unrelated to numeric order.
+            let taken = 0x100;
+            let fallthrough = 0x900;
+            let disp = 0x20;
+            let argc_rtl = 0x1234;
+
+            prog.pcmp.push((cmp, "optind_mem", "argc_reg"));
+            prog.op_indirect
+                .push(("optind_mem", "", "RIP", "NONE", 1, disp, 4));
+            prog.op_register.push(("argc_reg", "EBP"));
+            prog.instruction
+                .push((cmp, 6, "", "CMP", "optind_mem", "argc_reg", "", "", 0, 0));
+            prog.pjcc.push((jcc, TestCond::CondE, "taken"));
+            prog.symbol_resolved_addr.push(("taken", taken));
+            prog.next.push((cmp, jcc));
+            prog.next.push((jcc, fallthrough));
+            for node in [cmp, jcc, taken, fallthrough] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.reg_xtl.push((cmp, Mreg::BP, argc_rtl));
+
+            prog.run();
+
+            let loaded = fresh_xtl_reg(cmp, Mreg::x86("RTEMP"));
+            let global = (cmp as i64 + 6 + disp) as usize;
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    cmp,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt32,
+                        Addressing::Aglobal(global, 0),
+                        Arc::new(vec![]),
+                        loaded,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    jcc,
+                    RTLInst::Icond(
+                        Condition::Ccomp(Comparison::Ceq),
+                        Arc::new(vec![loaded, argc_rtl]),
+                        Either::Right(taken),
+                        Either::Right(fallthrough),
+                    ),
+                )
+            }));
+            for edge in [(cmp, jcc), (jcc, taken), (jcc, fallthrough)] {
+                assert!(
+                    prog.rtl_succ_candidate.iter().any(|fact| fact == &edge),
+                    "missing structural RTL edge {edge:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn rip_relative_byte_immediate_compare_survives_flag_neutral_gap() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let cmp = 0x700;
+            let move_addr = 0x707;
+            let jcc = 0x70d;
+            // Keep branch semantics independent of address order.
+            let taken = 0x180;
+            let fallthrough = 0x900;
+            let disp = 0x20;
+
+            // The decoder stores x86 operands source-first, so Intel
+            // `cmp byte ptr [rip + disp], 0` is immediate then memory here.
+            prog.instruction.push((
+                cmp,
+                7,
+                "",
+                "CMP",
+                "zero_imm",
+                "verbose_global",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.pcmp.push((cmp, "verbose_global", "zero_imm"));
+            prog.op_immediate.push(("zero_imm", 0, 1));
+            prog.op_indirect
+                .push(("verbose_global", "", "RIP", "NONE", 1, disp, 1));
+            prog.flags_and_jump_pair.push((cmp, jcc, "E"));
+            prog.pjcc.push((jcc, TestCond::CondE, "taken"));
+            prog.symbol_resolved_addr.push(("taken", taken));
+            prog.next.push((cmp, move_addr));
+            prog.next.push((move_addr, jcc));
+            prog.next.push((jcc, fallthrough));
+            for node in [cmp, move_addr, jcc, taken, fallthrough] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            prog.run();
+
+            let loaded = fresh_xtl_reg(cmp, Mreg::x86("RTEMP"));
+            let global = (cmp as i64 + 7 + disp) as usize;
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    cmp,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt8Unsigned,
+                        Addressing::Aglobal(global, 0),
+                        Arc::new(vec![]),
+                        loaded,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    jcc,
+                    RTLInst::Icond(
+                        Condition::Ccompimm(Comparison::Ceq, 0),
+                        Arc::new(vec![loaded]),
+                        Either::Right(taken),
+                        Either::Right(fallthrough),
+                    ),
+                )
+            }));
+            assert!(!prog
+                .rtl_inst_candidate
+                .iter()
+                .any(|(node, inst)| { *node == move_addr && matches!(inst, RTLInst::Icond(..)) }));
+        });
+    }
+
+    #[test]
+    fn arithmetic_flags_cmov_keeps_result_condition_when_register_is_reused() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            // Reverse the numeric order deliberately: provenance comes from
+            // the exported flags-result site, never address magnitude.
+            let arithmetic = 0x900;
+            let replacement = 0x700;
+            let preserve_def = 0x500;
+            let cmov = 0x100;
+            let sub_input_def = 0xb00;
+            let sub_input = 0x40;
+            let sub_result = fresh_xtl_reg(arithmetic, Mreg::AX);
+            let replacement_value = 0x10;
+            let preserve_value = 0x20;
+            let selected_result = fresh_xtl_reg(cmov, Mreg::BX);
+
+            // Semantically: sub $1,%eax; lea replacement,%rax;
+            // cmovne %rax,%rbx.  Position 1 must read the replacement while
+            // position 2 must still test the post-SUB result.  The explicit
+            // input/replacement alias models a branch-join value web created
+            // by a later PUSH of AX: it may coalesce the pre-SUB value with
+            // the replacement, but must never absorb the still-live result.
+            prog.osel_flags_result_site.push((cmov, arithmetic));
+            prog.ltl_inst.push((
+                arithmetic,
+                LTLInst::Lop(Operation::Oaddimm(-1), Arc::new(vec![Mreg::AX]), Mreg::AX),
+            ));
+            prog.ltl_inst.push((
+                cmov,
+                LTLInst::Lop(
+                    Operation::Osel(Condition::Ccompimm(Comparison::Ceq, 0), Typ::Tint),
+                    Arc::new(vec![Mreg::BX, Mreg::AX, Mreg::AX]),
+                    Mreg::BX,
+                ),
+            ));
+
+            prog.reg_xtl.push((sub_input_def, Mreg::AX, sub_input));
+            prog.is_def.push((sub_input_def, sub_input));
+            prog.reg_def_used
+                .push((sub_input_def, Mreg::AX, arithmetic));
+            prog.reg_xtl.push((arithmetic, Mreg::AX, sub_input));
+            prog.reg_def.push((arithmetic, Mreg::AX));
+            prog.reg_xtl
+                .push((replacement, Mreg::AX, replacement_value));
+            prog.is_def.push((replacement, replacement_value));
+            prog.alias_edge.push((sub_input, replacement_value));
+            prog.reg_def_used.push((replacement, Mreg::AX, cmov));
+            prog.reg_xtl.push((preserve_def, Mreg::BX, preserve_value));
+            prog.is_def.push((preserve_def, preserve_value));
+            prog.reg_def_used.push((preserve_def, Mreg::BX, cmov));
+            prog.reg_xtl.push((cmov, Mreg::BX, selected_result));
+            prog.is_def.push((cmov, selected_result));
+
+            prog.run();
+
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    arithmetic,
+                    RTLInst::Iop(
+                        Operation::Oaddimm(-1),
+                        Arc::new(vec![replacement_value]),
+                        sub_result,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    cmov,
+                    RTLInst::Iop(
+                        Operation::Osel(Condition::Ccompimm(Comparison::Ceq, 0), Typ::Tint),
+                        Arc::new(vec![preserve_value, replacement_value, sub_result]),
+                        selected_result,
+                    ),
+                )
+            }));
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == cmov
+                    && matches!(
+                        inst,
+                        RTLInst::Iop(Operation::Osel(_, _), args, _)
+                            if args.as_slice()
+                                == [preserve_value, replacement_value, replacement_value]
+                    )
+            }));
+        });
+    }
+
+    #[test]
+    fn rip_relative_immediate_compare_feeds_cmov_condition() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let cmp = 0x900;
+            let cmov = 0x500;
+            let disp = 0x40;
+            let source = 0x1234;
+            let destination = fresh_xtl_reg(cmov, Mreg::SI);
+            let preserve = fresh_xtl_reg(cmov, Mreg::SI) | (1_u64 << 62);
+
+            // The decoder stores Intel `cmp dword ptr [rip + disp], 0`
+            // source-first.  The CMOV address is deliberately below the CMP
+            // address so no node-order relation can participate.
+            prog.instruction
+                .push((cmp, 7, "", "CMP", "zero_imm", "mode_global", "", "", 0, 0));
+            prog.pcmp.push((cmp, "mode_global", "zero_imm"));
+            prog.op_immediate.push(("zero_imm", 0, 1));
+            prog.op_indirect
+                .push(("mode_global", "", "RIP", "NONE", 1, disp, 4));
+            prog.osel_compare_site.push((cmov, cmp));
+            prog.ltl_inst.push((
+                cmov,
+                LTLInst::Lop(
+                    Operation::Osel(Condition::Ccompl(Comparison::Ceq), Typ::Tany64),
+                    Arc::new(vec![Mreg::SI, Mreg::AX]),
+                    Mreg::SI,
+                ),
+            ));
+            prog.reg_xtl.push((cmov, Mreg::AX, source));
+            prog.reg_xtl.push((cmov, Mreg::SI, destination));
+            prog.is_def.push((cmov, destination));
+            for node in [cmp, cmov] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            prog.run();
+
+            let loaded = fresh_xtl_reg(cmp, Mreg::x86("RTEMP"));
+            let global = (cmp as i64 + 7 + disp) as usize;
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    cmp,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt32,
+                        Addressing::Aglobal(global, 0),
+                        Arc::new(vec![]),
+                        loaded,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    cmov,
+                    RTLInst::Iop(
+                        Operation::Osel(Condition::Ccompimm(Comparison::Ceq, 0), Typ::Tany64),
+                        Arc::new(vec![preserve, source, loaded]),
+                        destination,
+                    ),
+                )
+            }));
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == cmov
+                    && matches!(
+                        inst,
+                        RTLInst::Iop(Operation::Osel(Condition::Ccompl(Comparison::Ceq), _), _, _)
+                    )
+            }));
+        });
+    }
+
+    // Builds `cmp byte [rsp+8], 0` / <gap> / `je taken`, with the caller choosing which block each
+    // of the three instructions belongs to.
+    fn stack_slot_gap_program(cmp_block: Option<u64>, jcc_block: Option<u64>) -> RTLPassProgram {
+        let mut prog = RTLPassProgram::default();
+        let func = 0x400;
+        let cmp = 0x700;
+        let move_addr = 0x705;
+        let jcc = 0x70b;
+        let taken = 0x180;
+        let fallthrough = 0x900;
+
+        prog.instruction
+            .push((cmp, 5, "", "CMP", "zero_imm", "slot_mem", "", "", 0, 0));
+        prog.pcmp.push((cmp, "slot_mem", "zero_imm"));
+        prog.op_immediate.push(("zero_imm", 0, 1));
+        prog.op_indirect
+            .push(("slot_mem", "", "RSP", "NONE", 1, 8, 1));
+        prog.flags_and_jump_pair.push((cmp, jcc, "E"));
+        prog.pjcc.push((jcc, TestCond::CondE, "taken"));
+        prog.symbol_resolved_addr.push(("taken", taken));
+        prog.next.push((cmp, move_addr));
+        prog.next.push((move_addr, jcc));
+        prog.next.push((jcc, fallthrough));
+        for node in [cmp, move_addr, jcc, taken, fallthrough] {
+            prog.instr_in_function.push((node, func));
+        }
+        prog.stack_var.push((func, cmp, 8, 0x2222));
+        if let Some(b) = cmp_block {
+            prog.code_in_block.push((cmp, b));
+        }
+        if let Some(b) = jcc_block {
+            prog.code_in_block.push((jcc, b));
+        }
+        prog
+    }
+
+    fn stack_slot_gap_cond(taken: u64, fallthrough: u64) -> RTLInst {
+        RTLInst::Icond(
+            Condition::Ccompimm(Comparison::Ceq, 0),
+            Arc::new(vec![0x2222]),
+            Either::Right(taken),
+            Either::Right(fallthrough),
+        )
+    }
+
+    // A flag-transparent instruction scheduled between a stack-slot compare and its JCC used to
+    // drop BOTH halves, deleting the branch from the program. The condition belongs at the JCC, so
+    // the intervening instruction still runs on both paths.
+    #[test]
+    fn stack_slot_compare_survives_flag_neutral_gap() {
+        on_large_stack(|| {
+            let mut prog = stack_slot_gap_program(Some(0x700), Some(0x700));
+            prog.run();
+
+            let cond = stack_slot_gap_cond(0x180, 0x900);
+            assert!(
+                prog.rtl_inst_candidate
+                    .iter()
+                    .any(|fact| fact == &(0x70b, cond.clone())),
+                "the branch is missing from the JCC"
+            );
+            // Folding it onto the compare would make the branch skip the gap instruction.
+            assert!(!prog
+                .rtl_inst_candidate
+                .iter()
+                .any(|(node, inst)| *node != 0x70b && matches!(inst, RTLInst::Icond(..))));
+        });
+    }
+
+    // cfg.rs resolves a pairing exactly only within one block; across blocks it deliberately keeps
+    // every reaching compare rather than guessing one, and an Icond built from a guess would be a
+    // wrong branch rather than a missing one.
+    #[test]
+    fn stack_slot_compare_across_blocks_emits_no_condition() {
+        on_large_stack(|| {
+            let mut prog = stack_slot_gap_program(Some(0x700), Some(0x70b));
+            prog.run();
+
+            assert!(!prog
+                .rtl_inst_candidate
+                .iter()
+                .any(|(_, inst)| matches!(inst, RTLInst::Icond(..))));
+        });
+    }
+
+    // The adjacent case keeps folding the condition onto the compare itself, exactly as before.
+    #[test]
+    fn adjacent_stack_slot_compare_still_folds_onto_the_compare() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let cmp = 0x700;
+            let jcc = 0x705;
+            let taken = 0x180;
+            let fallthrough = 0x900;
+
+            prog.instruction
+                .push((cmp, 5, "", "CMP", "zero_imm", "slot_mem", "", "", 0, 0));
+            prog.pcmp.push((cmp, "slot_mem", "zero_imm"));
+            prog.op_immediate.push(("zero_imm", 0, 1));
+            prog.op_indirect
+                .push(("slot_mem", "", "RSP", "NONE", 1, 8, 1));
+            prog.pjcc.push((jcc, TestCond::CondE, "taken"));
+            prog.symbol_resolved_addr.push(("taken", taken));
+            prog.next.push((cmp, jcc));
+            prog.next.push((jcc, fallthrough));
+            for node in [cmp, jcc, taken, fallthrough] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.stack_var.push((func, cmp, 8, 0x2222));
+
+            prog.run();
+
+            assert!(prog
+                .rtl_inst_candidate
+                .iter()
+                .any(|fact| fact == &(cmp, stack_slot_gap_cond(taken, fallthrough))));
+        });
+    }
+
+    #[test]
+    fn movhps_materializes_high_loads_without_clobbering_the_low_lane() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let general = 0x180;
+            let sp_plain = 0x280;
+            let sp_indexed = 0x380;
+            let rip = 0x480;
+            let store = 0x580;
+            let exit = 0x680;
+            let base_rtl = 0x1234;
+            let index_rtl = 0x2345;
+            let dst_cell = 0x3456;
+
+            prog.movhps_hi_load
+                .push((general, Mreg::X0, "RAX", "NONE", 1, 32, false));
+            prog.movhps_hi_load
+                .push((sp_plain, Mreg::X1, "RSP", "NONE", 1, 40, true));
+            prog.movhps_hi_load
+                .push((sp_indexed, Mreg::X2, "RSP", "R12", 4, 48, true));
+            prog.movhps_hi_load
+                .push((rip, Mreg::X3, "RIP", "NONE", 1, 0, false));
+            prog.rip_target_addr.push((rip, 0x9000));
+            prog.resolved_addr_to_symbol.push((0x9000, 0x8f00, 0x100));
+            prog.reg_rtl.push((general, Mreg::AX, base_rtl));
+            prog.reg_rtl.push((sp_indexed, Mreg::R12, index_rtl));
+
+            for (node, dst) in [
+                (general, Mreg::X0),
+                (sp_plain, Mreg::X1),
+                (sp_indexed, Mreg::X2),
+                (rip, Mreg::X3),
+            ] {
+                prog.ltl_inst.push((
+                    node,
+                    LTLInst::Lop(Operation::Omove, Arc::new(vec![dst]), dst),
+                ));
+                // Model the incoming low-lane web explicitly. MOVHPS must
+                // reuse it for both sides of the identity move rather than
+                // creating a full-register definition.
+                prog.reg_rtl.push((node, dst, node + 0x10000));
+                prog.reg_def.push((node, dst));
+                prog.ltl_succ.push((node, exit));
+                prog.instr_in_function.push((node, func));
+            }
+            prog.ltl_inst.push((exit, LTLInst::Lreturn));
+            prog.instr_in_function.push((exit, func));
+
+            // A later wide frame store must read the explicit high pseudo made
+            // at the MOVHPS site, not the low-lane XMM pseudo.
+            prog.xmm_hi_frame_store
+                .push((store, 64, 4, Mreg::Unknown, general as i64, general));
+            prog.stack_var.push((func, store, 64, dst_cell));
+            prog.instr_in_function.push((store, func));
+
+            prog.run();
+
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    general | (1u64 << 62),
+                    RTLInst::Iload(
+                        MemoryChunk::MAny64,
+                        Addressing::Aindexed(32),
+                        Arc::new(vec![base_rtl]),
+                        fresh_xmm_hi_value_reg(general),
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    sp_plain | (1u64 << 62),
+                    RTLInst::Iload(
+                        MemoryChunk::MAny64,
+                        Addressing::Ainstack(40),
+                        Arc::new(vec![]),
+                        fresh_xmm_hi_value_reg(sp_plain),
+                    ),
+                )
+            }));
+            let stack_base = fresh_xtl_reg(sp_indexed, Mreg::SP) | FRESH_NS_SP_BASE;
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    sp_indexed | (1u64 << 62),
+                    RTLInst::Iop(
+                        Operation::Olea(Addressing::Ainstack(48)),
+                        Arc::new(vec![]),
+                        stack_base,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    sp_indexed | (1u64 << 63),
+                    RTLInst::Iload(
+                        MemoryChunk::MAny64,
+                        Addressing::Aindexed2scaled(4, 0),
+                        Arc::new(vec![stack_base, index_rtl]),
+                        fresh_xmm_hi_value_reg(sp_indexed),
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    rip | (1u64 << 62),
+                    RTLInst::Iload(
+                        MemoryChunk::MAny64,
+                        Addressing::Aglobal(0x8f00, 0x100),
+                        Arc::new(vec![]),
+                        fresh_xmm_hi_value_reg(rip),
+                    ),
+                )
+            }));
+
+            for (node, tail, low_dst) in [
+                (general, general | (1u64 << 62), Mreg::X0),
+                (sp_plain, sp_plain | (1u64 << 62), Mreg::X1),
+                (sp_indexed, sp_indexed | (1u64 << 63), Mreg::X2),
+                (rip, rip | (1u64 << 62), Mreg::X3),
+            ] {
+                let low_rtl = node + 0x10000;
+                assert!(prog.reg_use.iter().any(|f| f == &(node, low_dst)));
+                assert!(!prog.reg_def_site.iter().any(|f| f == &(node, low_dst)));
+                assert!(!prog.asm_def_kill.iter().any(|f| f == &(node, low_dst)));
+                assert!(prog.rtl_inst_candidate.iter().any(|f| {
+                    f == &(
+                        node,
+                        RTLInst::Iop(Operation::Omove, Arc::new(vec![low_rtl]), low_rtl),
+                    )
+                }));
+                assert!(prog.rtl_succ_candidate.iter().any(|f| f == &(tail, exit)));
+                assert!(prog.rtl_edge_negated.iter().any(|f| f == &(node, exit)));
+            }
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    xmm_hi_lane_node(store),
+                    RTLInst::Iop(
+                        Operation::Omove,
+                        Arc::new(vec![fresh_xmm_hi_value_reg(general)]),
+                        dst_cell,
+                    ),
+                )
+            }));
+        });
+    }
+
+    #[test]
+    fn frameless_rbp_compare_uses_the_pointer_value_as_its_base() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let cmp = 0x520;
+            let jcc = 0x524;
+            let taken = 0x180;
+            let fallthrough = 0x540;
+            let object_rtl = 0x1234;
+            let lhs_rtl = 0x5678;
+
+            // Intel `cmp rax, [rbp + 16]`: pcmp keeps the semantic
+            // destination/lhs first even though the instruction relation uses
+            // ddisasm's source-first operand convention.
+            prog.pcmp.push((cmp, "lhs_reg", "object_field"));
+            prog.op_register.push(("lhs_reg", "RAX"));
+            prog.op_indirect
+                .push(("object_field", "", "RBP", "NONE", 1, 16, 8));
+            prog.pjcc.push((jcc, TestCond::CondAe, "taken"));
+            prog.symbol_resolved_addr.push(("taken", taken));
+            prog.next.push((cmp, jcc));
+            prog.next.push((jcc, fallthrough));
+            for node in [cmp, jcc, taken, fallthrough] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.reg_xtl.push((cmp, Mreg::BP, object_rtl));
+            prog.reg_xtl.push((cmp, Mreg::AX, lhs_rtl));
+
+            prog.run();
+
+            let loaded = fresh_xtl_reg(cmp, Mreg::x86("RTEMP"));
+            assert!(prog
+                .frameless_bp_cmp_mem
+                .iter()
+                .any(|fact| fact == &(func, cmp, 16, 8)));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    cmp,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt64,
+                        Addressing::Aindexed(16),
+                        Arc::new(vec![object_rtl]),
+                        loaded,
+                    ),
+                )
+            }));
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == cmp && matches!(inst, RTLInst::Iload(_, Addressing::Ainstack(16), _, _))
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    jcc,
+                    RTLInst::Icond(
+                        Condition::Ccomplu(Comparison::Cge),
+                        Arc::new(vec![lhs_rtl, loaded]),
+                        Either::Right(taken),
+                        Either::Right(fallthrough),
+                    ),
+                )
+            }));
+        });
+    }
+
+    #[test]
+    fn wide_simd_store_through_general_base_emits_its_upper_half() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let store = 0x180;
+            let next = 0x90;
+            let base_rtl = 0x3456;
+
+            prog.sse_wide_mem_store
+                .push((store, Mreg::X0, "RAX", "NONE", 1, 0x20));
+            prog.xmm_hi_mem_store
+                .push((store, 0, Mreg::Unknown, 0, store));
+            prog.ltl_inst.push((
+                store,
+                LTLInst::Lstore(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed(0x20),
+                    Arc::new(vec![Mreg::AX]),
+                    Mreg::X0,
+                ),
+            ));
+            prog.ltl_succ.push((store, next));
+            for node in [store, next] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.reg_xtl.push((store, Mreg::AX, base_rtl));
+
+            prog.run();
+
+            let value_node = xmm_hi_lane_node(store);
+            let store_node = xmm_hi_store_node(store);
+            let value_rtl = fresh_xmm_hi_value_reg(store);
+
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    value_node,
+                    RTLInst::Iop(Operation::Ointconst(0), Arc::new(vec![]), value_rtl),
+                )
+            }));
+            // The upper half lands one quadword past the low half's own cell.
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    store_node,
+                    RTLInst::Istore(
+                        MemoryChunk::MAny64,
+                        Addressing::Aindexed(0x28),
+                        Arc::new(vec![base_rtl]),
+                        value_rtl,
+                    ),
+                )
+            }));
+            for edge in [
+                (store, value_node),
+                (value_node, store_node),
+                (store_node, next),
+            ] {
+                assert!(
+                    prog.rtl_succ_candidate.iter().any(|fact| fact == &edge),
+                    "missing structural high-lane edge {edge:?}"
+                );
+            }
+            assert!(prog
+                .rtl_edge_negated
+                .iter()
+                .any(|fact| fact == &(store, next)));
+            // The low half keeps its own node and its own instruction.
+            assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == store
+                    && matches!(inst, RTLInst::Istore(_, Addressing::Aindexed(0x20), _, _))
+            }));
+        });
+    }
+
+    #[test]
+    fn wide_simd_all_ones_lane_emits_a_64_bit_constant() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let store = 0x980;
+            let next = 0x90;
+            let base_rtl = 0x3456;
+
+            prog.sse_wide_mem_store
+                .push((store, Mreg::X0, "RAX", "NONE", 1, -0x10));
+            prog.xmm_hi_mem_store
+                .push((store, 5, Mreg::Unknown, 0, 0x900));
+            prog.ltl_inst.push((
+                store,
+                LTLInst::Lstore(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed(-0x10),
+                    Arc::new(vec![Mreg::AX]),
+                    Mreg::X0,
+                ),
+            ));
+            prog.ltl_succ.push((store, next));
+            for node in [store, next] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.reg_xtl.push((store, Mreg::AX, base_rtl));
+
+            prog.run();
+
+            let value_node = xmm_hi_lane_node(store);
+            let store_node = xmm_hi_store_node(store);
+            let value_rtl = fresh_xmm_hi_value_reg(store);
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    value_node,
+                    RTLInst::Iop(Operation::Olongconst(-1), Arc::new(vec![]), value_rtl),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    store_node,
+                    RTLInst::Istore(
+                        MemoryChunk::MAny64,
+                        Addressing::Aindexed(-8),
+                        Arc::new(vec![base_rtl]),
+                        value_rtl,
+                    ),
+                )
+            }));
+        });
+    }
+
+    #[test]
+    fn wide_simd_store_through_rip_base_emits_its_upper_half() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let store = 0x180;
+            let next = 0x90;
+            let target: u64 = 0x19120;
+            let ident: usize = 0x19100;
+            let sym_ofs: i64 = 0x20;
+
+            prog.sse_wide_global_store.push((store, Mreg::X0, target));
+            prog.xmm_hi_mem_store
+                .push((store, 0, Mreg::Unknown, 0, store));
+            prog.resolved_addr_to_symbol.push((target, ident, sym_ofs));
+            prog.ltl_inst.push((
+                store,
+                LTLInst::Lstore(
+                    MemoryChunk::MAny64,
+                    Addressing::Aglobal(ident, sym_ofs),
+                    Arc::new(vec![]),
+                    Mreg::X0,
+                ),
+            ));
+            prog.ltl_succ.push((store, next));
+            for node in [store, next] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.reg_xtl.push((store, Mreg::X0, 0x2345));
+
+            prog.run();
+
+            let value_node = xmm_hi_lane_node(store);
+            let store_node = xmm_hi_store_node(store);
+            let value_rtl = fresh_xmm_hi_value_reg(store);
+
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    value_node,
+                    RTLInst::Iop(Operation::Ointconst(0), Arc::new(vec![]), value_rtl),
+                )
+            }));
+            // The upper half lands one quadword past the low half inside the
+            // same destination symbol, with no register arguments.
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    store_node,
+                    RTLInst::Istore(
+                        MemoryChunk::MAny64,
+                        Addressing::Aglobal(ident, sym_ofs + 8),
+                        Arc::new(vec![]),
+                        value_rtl,
+                    ),
+                )
+            }));
+            for edge in [
+                (store, value_node),
+                (value_node, store_node),
+                (store_node, next),
+            ] {
+                assert!(
+                    prog.rtl_succ_candidate.iter().any(|fact| fact == &edge),
+                    "missing structural high-lane edge {edge:?}"
+                );
+            }
+            assert!(prog
+                .rtl_edge_negated
+                .iter()
+                .any(|fact| fact == &(store, next)));
+            // The low half keeps its own node and its own instruction.
+            assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == store
+                    && matches!(
+                        inst,
+                        RTLInst::Istore(_, Addressing::Aglobal(_, ofs), _, _) if *ofs == sym_ofs
+                    )
+            }));
+        });
+    }
+
+    #[test]
+    fn takeover_chain_exits_into_a_materialized_branch() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let store = 0x180;
+            let jcc = 0x190;
+            let stale = 0x1a0;
+            let true_target = 0x300;
+
+            prog.sse_wide_mem_store
+                .push((store, Mreg::X0, "RAX", "NONE", 1, 0x20));
+            prog.xmm_hi_mem_store
+                .push((store, 0, Mreg::Unknown, 0, store));
+            prog.ltl_inst.push((
+                store,
+                LTLInst::Lstore(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed(0x20),
+                    Arc::new(vec![Mreg::AX]),
+                    Mreg::X0,
+                ),
+            ));
+            prog.reg_xtl.push((store, Mreg::AX, 0x3456));
+            // A cmp+jcc pair with the store scheduled between them: the Icond
+            // is materialized AT the jcc, while the LTL fallthrough (rtl_next)
+            // still names the node PAST the branch.  The jcc itself carries no
+            // ltl_inst, so the padding-skip walk would step over it too.
+            prog.ltl_succ.push((store, stale));
+            prog.next.push((store, jcc));
+            prog.next.push((jcc, stale));
+            prog.ltl_inst.push((
+                stale,
+                LTLInst::Lload(
+                    MemoryChunk::MInt64,
+                    Addressing::Aindexed(0),
+                    Arc::new(vec![Mreg::AX]),
+                    Mreg::BX,
+                ),
+            ));
+            prog.pjcc.push((jcc, TestCond::CondE, "cond_target"));
+            prog.rtl_inst_candidate.push((
+                jcc,
+                RTLInst::Icond(
+                    Condition::Ccomplimm(Comparison::Ceq, 0),
+                    Arc::new(vec![0x7777]),
+                    Either::Right(true_target),
+                    Either::Right(stale),
+                ),
+            ));
+            for node in [store, jcc, stale, true_target] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            prog.run();
+
+            let store_node = xmm_hi_store_node(store);
+            // The chain exits INTO the branch, never past it.
+            assert!(prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(store_node, jcc)));
+            assert!(!prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(store_node, stale)));
+            // Both the stale fallthrough and the direct branch edge of the
+            // taken-over store are re-pointed through the chain.
+            assert!(prog
+                .rtl_edge_negated
+                .iter()
+                .any(|fact| fact == &(store, stale)));
+            assert!(prog
+                .rtl_edge_negated
+                .iter()
+                .any(|fact| fact == &(store, jcc)));
+        });
+    }
+
+    #[test]
+    fn broadcast_chain_exits_into_a_materialized_branch() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let (func, value, store, jcc, stale, taken) =
+                (0x400, 0x170, 0x180, 0x190, 0x1a0, 0x300);
+
+            prog.simd_dword_broadcast_store
+                .push((store, value, "RDI", "NONE", 1, 0, Mreg::SI));
+            prog.ltl_succ.push((store, stale));
+            prog.instr_in_function.push((value, func));
+            seed_materialized_branch(&mut prog, func, store, jcc, stale, taken);
+            prog.run();
+
+            let tail = simd_broadcast_lane_node(store, 3);
+            assert!(prog.rtl_succ_candidate.iter().any(|f| f == &(tail, jcc)));
+            assert!(!prog.rtl_succ_candidate.iter().any(|f| f == &(tail, stale)));
+            for edge in [(store, stale), (store, jcc)] {
+                assert!(prog.rtl_edge_negated.iter().any(|f| f == &edge));
+            }
+        });
+    }
+
+    #[test]
+    fn carry_synth_tails_do_not_bypass_a_materialized_branch() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let (adc, adc_jcc, adc_stale) = (0x180, 0x190, 0x1a0);
+            let (sbb, sbb_jcc, sbb_stale) = (0x280, 0x290, 0x2a0);
+            let taken = 0x300;
+
+            // Residual ADC ends at bit 63; SBB ends at bit 62. Together they
+            // exercise both generic synth-only tail bridges.
+            prog.adc_carry_op.push((
+                adc,
+                0x170,
+                Condition::Ccompuimm(Comparison::Clt, 0),
+                false,
+                7,
+                true,
+                Mreg::AX,
+                Mreg::BX,
+            ));
+            prog.sbb_self_carry_op.push((
+                sbb,
+                0x270,
+                Condition::Ccompuimm(Comparison::Clt, 0),
+                true,
+                Mreg::CX,
+                Mreg::DX,
+                Mreg::Unknown,
+            ));
+            seed_materialized_branch(&mut prog, func, adc, adc_jcc, adc_stale, taken);
+            seed_materialized_branch(&mut prog, func, sbb, sbb_jcc, sbb_stale, taken);
+            prog.run();
+
+            for (source, tail, jcc, stale) in [
+                (adc, adc | (1u64 << 63), adc_jcc, adc_stale),
+                (sbb, sbb | (1u64 << 62), sbb_jcc, sbb_stale),
+            ] {
+                assert!(prog.rtl_succ_candidate.iter().any(|f| f == &(tail, jcc)));
+                assert!(!prog.rtl_succ_candidate.iter().any(|f| f == &(tail, stale)));
+                assert!(prog.rtl_edge_negated.iter().any(|f| f == &(source, jcc)));
+            }
+        });
+    }
+
+    #[test]
+    fn memory_rmw_tail_cannot_be_bypassed_before_a_materialized_branch() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let (func, store, jcc, stale, taken) = (0x400, 0x180, 0x190, 0x1a0, 0x300);
+
+            prog.arith_store_reg.push((
+                store,
+                Operation::Oadd,
+                MemoryChunk::MInt32,
+                Mreg::DI,
+                8,
+                Mreg::AX,
+            ));
+            prog.reg_rtl.push((store, Mreg::DI, 0x1111));
+            prog.reg_rtl.push((store, Mreg::AX, 0x2222));
+            // Deliberately omit pjcc: the already-materialized Icond is the
+            // structural truth, even when the raw branch-class row was lost
+            // during compare/JCC relocation.
+            prog.next.push((store, jcc));
+            prog.next.push((jcc, stale));
+            prog.ltl_inst.push((stale, LTLInst::Lreturn));
+            prog.rtl_inst_candidate.push((
+                jcc,
+                RTLInst::Icond(
+                    Condition::Ccompimm(Comparison::Ceq, 0),
+                    Arc::new(vec![0x7777]),
+                    Either::Right(taken),
+                    Either::Right(stale),
+                ),
+            ));
+            for node in [store, jcc, stale, taken] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.run();
+
+            let op_node = store | (1u64 << 62);
+            let store_node = store | (1u64 << 63);
+            for edge in [(store, op_node), (op_node, store_node), (store_node, jcc)] {
+                assert!(
+                    prog.rtl_succ_candidate.iter().any(|fact| fact == &edge),
+                    "missing memory-RMW chain edge {edge:?}"
+                );
+            }
+            assert!(!prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(op_node, jcc)));
+            assert!(!prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(op_node, stale)));
+            assert!(!prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(store_node, stale)));
+        });
+    }
+
+    #[test]
+    fn sp_relative_immediate_rmw_updates_the_canonical_stack_slot() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let (func, rmw, next, slot) = (0x400, 0x180, 0x190, 0x3333);
+
+            prog.arith_store_imm.push((
+                rmw,
+                Operation::Oaddlimm(8),
+                MemoryChunk::MInt64,
+                Mreg::SP,
+                8,
+            ));
+            prog.stack_var.push((func, rmw, 8, slot));
+            prog.instr_in_function.push((rmw, func));
+            prog.instr_in_function.push((next, func));
+            prog.next.push((rmw, next));
+            prog.ltl_inst
+                .push((rmw, LTLInst::Lbranch(Either::Right(next))));
+            prog.ltl_inst.push((next, LTLInst::Lreturn));
+
+            prog.run();
+
+            assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == rmw
+                    && matches!(
+                        inst,
+                        RTLInst::Iop(Operation::Oaddlimm(8), args, dst)
+                            if args.as_slice() == [slot] && *dst == slot
+                    )
+            }));
+            assert!(!prog
+                .rtl_inst_candidate
+                .iter()
+                .any(|(node, inst)| { *node == rmw && matches!(inst, RTLInst::Iload(..)) }));
+        });
+    }
+
+    #[test]
+    fn stack_indexed_chain_exits_into_a_materialized_branch() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let (func, load, jcc, stale, taken) = (0x400, 0x180, 0x190, 0x1a0, 0x300);
+
+            prog.ltl_inst.push((
+                load,
+                LTLInst::Lload(
+                    MemoryChunk::MInt64,
+                    Addressing::Aindexed2scaled(4, 32),
+                    Arc::new(vec![Mreg::SP, Mreg::R12]),
+                    Mreg::AX,
+                ),
+            ));
+            prog.ltl_succ.push((load, stale));
+            seed_materialized_branch(&mut prog, func, load, jcc, stale, taken);
+            prog.run();
+
+            let tail = load | (1u64 << 62);
+            assert!(prog.rtl_succ_candidate.iter().any(|f| f == &(tail, jcc)));
+            assert!(!prog.rtl_succ_candidate.iter().any(|f| f == &(tail, stale)));
+            for edge in [(load, stale), (load, jcc)] {
+                assert!(prog.rtl_edge_negated.iter().any(|f| f == &edge));
+            }
+        });
+    }
+
+    #[test]
+    fn sp_indexed_store_binds_synthetic_base_to_frame_local() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let store = 0x900;
+            let next = 0x100;
+            let prior_stack_site = 0x700;
+            let index_rtl = 0x1111;
+            let source_rtl = 0x2222;
+            let local_rtl = 0x3333;
+
+            prog.ltl_inst.push((
+                store,
+                LTLInst::Lstore(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed2scaled(8, 0),
+                    Arc::new(vec![Mreg::SP, Mreg::AX]),
+                    Mreg::R9,
+                ),
+            ));
+            prog.ltl_inst.push((next, LTLInst::Lreturn));
+            prog.ltl_succ.push((store, next));
+            for node in [store, next, prior_stack_site] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.reg_rtl.push((store, Mreg::AX, index_rtl));
+            prog.reg_rtl.push((store, Mreg::R9, source_rtl));
+            prog.stack_xtl.push((func, prior_stack_site, 0, local_rtl));
+
+            prog.run();
+
+            let base_rtl = fresh_xtl_reg(store, Mreg::SP) | FRESH_NS_SP_BASE;
+            let synth = store | (1u64 << 62);
+            assert!(prog
+                .indexed_synth_stack_base
+                .iter()
+                .any(|fact| fact == &(func, store, 0, base_rtl)));
+            assert!(prog
+                .stack_xtl
+                .iter()
+                .any(|fact| fact == &(func, store, 0, base_rtl)));
+            assert!(prog
+                .alias_edge
+                .iter()
+                .any(|fact| fact == &(base_rtl, local_rtl)));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    synth,
+                    RTLInst::Istore(
+                        MemoryChunk::MAny64,
+                        Addressing::Aindexed2scaled(8, 0),
+                        Arc::new(vec![base_rtl, index_rtl]),
+                        source_rtl,
+                    ),
+                )
+            }));
+        });
+    }
+
+    #[test]
+    fn simd_dword_broadcast_store_expands_to_four_structural_stores() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let value_addr = 0x710;
+            let store = 0x180;
+            let next = 0x90;
+            let value_rtl = 0x2345;
+            let base_rtl = 0x3456;
+
+            prog.simd_dword_broadcast_store.push((
+                store,
+                value_addr,
+                "RDI",
+                "NONE",
+                1,
+                0,
+                Mreg::SI,
+            ));
+            // This is the lossy generic lift that the complete expansion must
+            // replace, not coexist with as another candidate.
+            prog.ltl_inst.push((
+                store,
+                LTLInst::Lstore(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed(0),
+                    Arc::new(vec![Mreg::DI]),
+                    Mreg::X0,
+                ),
+            ));
+            prog.ltl_succ.push((store, next));
+            for node in [value_addr, store, next] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.reg_xtl.push((value_addr, Mreg::SI, value_rtl));
+            prog.reg_xtl.push((store, Mreg::DI, base_rtl));
+
+            prog.run();
+
+            for (lane, offset) in [0, 4, 8, 12].into_iter().enumerate() {
+                let node = simd_broadcast_lane_node(store, lane);
+                assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                    fact == &(
+                        node,
+                        RTLInst::Istore(
+                            MemoryChunk::MInt32,
+                            Addressing::Aindexed(offset),
+                            Arc::new(vec![base_rtl]),
+                            value_rtl,
+                        ),
+                    )
+                }));
+            }
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == store && matches!(inst, RTLInst::Istore(MemoryChunk::MAny64, _, _, _))
+            }));
+
+            let lane1 = simd_broadcast_lane_node(store, 1);
+            let lane2 = simd_broadcast_lane_node(store, 2);
+            let lane3 = simd_broadcast_lane_node(store, 3);
+            for edge in [
+                (store, lane1),
+                (lane1, lane2),
+                (lane2, lane3),
+                (lane3, next),
+            ] {
+                assert!(
+                    prog.rtl_succ_candidate.iter().any(|fact| fact == &edge),
+                    "missing structural broadcast edge {edge:?}"
+                );
+            }
+            assert!(prog
+                .rtl_edge_negated
+                .iter()
+                .any(|fact| fact == &(store, next)));
+        });
+    }
+
+    #[test]
+    fn sp_indexed_lea_splits_width_scale_cfg_and_collision_structurally() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x40;
+            let terminal = 0x10;
+            let skipped = 0x20;
+
+            let scaled64 = 0x900;
+            let collision64 = 0x800;
+            let scaled32 = 0x700;
+            let unscaled32 = 0x600;
+            let no_index = 0x500;
+
+            prog.ltl_inst.push((
+                scaled64,
+                LTLInst::Lop(
+                    Operation::Oleal(Addressing::Aindexed2scaled(4, 96)),
+                    Arc::new(vec![Mreg::SP, Mreg::R12]),
+                    Mreg::AX,
+                ),
+            ));
+            prog.ltl_inst.push((
+                collision64,
+                LTLInst::Lop(
+                    Operation::Oleal(Addressing::Aindexed2(40)),
+                    Arc::new(vec![Mreg::SP, Mreg::R13]),
+                    Mreg::R13,
+                ),
+            ));
+            prog.ltl_inst.push((
+                scaled32,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Aindexed2scaled(8, 24)),
+                    Arc::new(vec![Mreg::SP, Mreg::R14]),
+                    Mreg::CX,
+                ),
+            ));
+            prog.ltl_inst.push((
+                unscaled32,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Aindexed2(-16)),
+                    Arc::new(vec![Mreg::SP, Mreg::R15]),
+                    Mreg::DX,
+                ),
+            ));
+            prog.ltl_inst.push((
+                no_index,
+                LTLInst::Lop(
+                    Operation::Oleal(Addressing::Ainstack(32)),
+                    Arc::new(vec![]),
+                    Mreg::R10,
+                ),
+            ));
+            prog.ltl_inst.push((terminal, LTLInst::Lreturn));
+
+            for node in [
+                scaled64,
+                collision64,
+                scaled32,
+                unscaled32,
+                no_index,
+                skipped,
+                terminal,
+            ] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            // Direct structural successors deliberately descend numerically.
+            for node in [scaled64, scaled32, unscaled32, no_index] {
+                prog.ltl_succ.push((node, terminal));
+            }
+
+            // The collision case has a fused raw successor with no ltl_inst;
+            // only the function-bounded skip fallback can connect its synth.
+            prog.next.push((collision64, skipped));
+            prog.next.push((skipped, terminal));
+
+            // Ordinary index uses get distinct incoming value IDs.
+            let scaled64_idx = 0x1200;
+            let scaled32_idx = 0x1400;
+            let unscaled32_idx = 0x1500;
+            prog.reg_xtl.push((scaled64, Mreg::R12, scaled64_idx));
+            prog.reg_xtl.push((scaled32, Mreg::R14, scaled32_idx));
+            prog.reg_xtl.push((unscaled32, Mreg::R15, unscaled32_idx));
+
+            // The destination=index case must read the prior R13 value even
+            // though its defining node has a numerically larger address.
+            let prior_index_def = 0xa00;
+            let prior_index_rtl = 0x1300;
+            prog.instr_in_function.push((prior_index_def, func));
+            prog.reg_xtl
+                .push((prior_index_def, Mreg::R13, prior_index_rtl));
+            prog.is_def.push((prior_index_def, prior_index_rtl));
+            prog.reg_def_used
+                .push((prior_index_def, Mreg::R13, collision64));
+
+            prog.run();
+
+            let cases = [
+                (
+                    scaled64,
+                    96,
+                    Operation::Oleal(Addressing::Ainstack(96)),
+                    Operation::Oleal(Addressing::Aindexed2scaled(4, 0)),
+                    scaled64_idx,
+                    Mreg::AX,
+                ),
+                (
+                    collision64,
+                    40,
+                    Operation::Oleal(Addressing::Ainstack(40)),
+                    Operation::Oleal(Addressing::Aindexed2(0)),
+                    prior_index_rtl,
+                    Mreg::R13,
+                ),
+                (
+                    scaled32,
+                    24,
+                    Operation::Olea(Addressing::Ainstack(24)),
+                    Operation::Olea(Addressing::Aindexed2scaled(8, 0)),
+                    scaled32_idx,
+                    Mreg::CX,
+                ),
+                (
+                    unscaled32,
+                    -16,
+                    Operation::Olea(Addressing::Ainstack(-16)),
+                    Operation::Olea(Addressing::Aindexed2(0)),
+                    unscaled32_idx,
+                    Mreg::DX,
+                ),
+            ];
+
+            for (node, ofs, base_op, indexed_op, index_rtl, dst_mreg) in cases {
+                let synth = node | (1u64 << 62);
+                let base_rtl = fresh_xtl_reg(node, Mreg::SP) | FRESH_NS_SP_BASE;
+                let dst_rtl = fresh_xtl_reg(node, dst_mreg);
+
+                assert!(
+                    prog.rtl_inst_candidate.iter().any(|fact| {
+                        fact == &(
+                            node,
+                            RTLInst::Iop(base_op.clone(), Arc::new(vec![]), base_rtl),
+                        )
+                    }),
+                    "missing stack-base half at {node:#x}"
+                );
+                assert!(
+                    prog.rtl_inst_candidate.iter().any(|fact| {
+                        fact == &(
+                            synth,
+                            RTLInst::Iop(
+                                indexed_op.clone(),
+                                Arc::new(vec![base_rtl, index_rtl]),
+                                dst_rtl,
+                            ),
+                        )
+                    }),
+                    "missing indexed half at {node:#x}; synth facts: {:?}",
+                    prog.rtl_inst_candidate
+                        .iter()
+                        .filter(|(candidate_node, _)| *candidate_node == synth)
+                        .collect::<Vec<_>>()
+                );
+                assert!(prog
+                    .indexed_synth_stack_base
+                    .iter()
+                    .any(|fact| fact == &(func, node, ofs, base_rtl)));
+                assert!(prog
+                    .op_produces_ptr
+                    .iter()
+                    .any(|fact| fact == &(synth, dst_rtl)));
+                assert!(prog
+                    .rtl_succ_candidate
+                    .iter()
+                    .any(|fact| fact == &(node, synth)));
+                assert!(prog
+                    .instr_in_function
+                    .iter()
+                    .any(|fact| fact == &(synth, func)));
+                assert!(!prog
+                    .rtl_inst_candidate
+                    .iter()
+                    .any(|(candidate_node, inst)| {
+                        *candidate_node == node
+                            && matches!(
+                                inst,
+                                RTLInst::Iop(
+                                    Operation::Olea(Addressing::Aindexed2(_))
+                                        | Operation::Olea(Addressing::Aindexed2scaled(_, _))
+                                        | Operation::Oleal(Addressing::Aindexed2(_))
+                                        | Operation::Oleal(Addressing::Aindexed2scaled(_, _)),
+                                    _,
+                                    _
+                                )
+                            )
+                    }));
+            }
+
+            // Direct cases replace their original edge; the non-LTL case
+            // reaches the same terminal through the bounded skip walk.
+            for node in [scaled64, scaled32, unscaled32] {
+                let synth = node | (1u64 << 62);
+                assert!(prog
+                    .rtl_edge_negated
+                    .iter()
+                    .any(|fact| fact == &(node, terminal)));
+                assert!(prog
+                    .rtl_succ_candidate
+                    .iter()
+                    .any(|fact| fact == &(synth, terminal)));
+            }
+            assert!(prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| { fact == &(collision64 | (1u64 << 62), terminal) }));
+
+            // The prior R13 value, not the new destination definition, is the
+            // second input of the collision's synthetic indexed operation.
+            let collision_dst = fresh_xtl_reg(collision64, Mreg::R13);
+            assert_ne!(prior_index_rtl, collision_dst);
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    collision64 | (1u64 << 62),
+                    RTLInst::Iop(
+                        Operation::Oleal(Addressing::Aindexed2(0)),
+                        Arc::new(vec![
+                            fresh_xtl_reg(collision64, Mreg::SP) | FRESH_NS_SP_BASE,
+                            prior_index_rtl,
+                        ]),
+                        collision_dst,
+                    ),
+                )
+            }));
+
+            // A plain Ainstack LEA is unchanged and has no synthetic node.
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    no_index,
+                    RTLInst::Iop(
+                        Operation::Oleal(Addressing::Ainstack(32)),
+                        Arc::new(vec![]),
+                        fresh_xtl_reg(no_index, Mreg::R10),
+                    ),
+                )
+            }));
+            assert!(!prog.sp_indexed_lea.iter().any(|fact| fact == &(no_index,)));
+            assert!(!prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| { fact == &(no_index, no_index | (1u64 << 62)) }));
+        });
+    }
+
+    #[test]
+    fn immediate_stack_initializers_follow_structural_semantic_successors() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [second_init, empty_raw, exit, func, first_init, pred, block] = synthetic_ids();
+
+            // Execution order deliberately disagrees with numeric address
+            // order.  The only authority is the structural intra-block CFG.
+            for node in [pred, first_init, empty_raw, second_init, exit] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, block));
+            }
+            prog.next.push((pred, first_init));
+            prog.next.push((first_init, empty_raw));
+            prog.next.push((empty_raw, second_init));
+            prog.next.push((second_init, exit));
+
+            prog.ltl_inst.push((
+                pred,
+                LTLInst::Lop(Operation::Ointconst(7), Arc::new(vec![]), Mreg::AX),
+            ));
+            prog.ltl_inst.push((exit, LTLInst::Lreturn));
+            prog.mach_imm_stack_init
+                .push((first_init, -32, 1, Typ::Tint));
+            prog.mach_imm_stack_init
+                .push((second_init, -24, 2, Typ::Tint));
+
+            prog.run();
+
+            for init in [first_init, second_init] {
+                assert!(prog
+                    .rtl_inst_candidate
+                    .iter()
+                    .any(|(node, _)| *node == init));
+            }
+            assert!(prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(pred, first_init)));
+            assert!(prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(first_init, second_init)));
+            assert!(prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(second_init, exit)));
+            assert!(!prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(first_init, exit)));
+        });
+    }
+
+    #[test]
+    fn natural_fallthrough_crosses_dropped_raw_instructions_structurally() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [exit, dropped, source, func, block] = synthetic_ids();
+
+            // Numeric order deliberately disagrees with execution order.  A
+            // frame-setup instruction can be present in the raw CFG while
+            // lifting to no LTL node, as with `mov ebp, edi; push rbx`.
+            for node in [source, dropped, exit] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, block));
+            }
+            prog.next.push((source, dropped));
+            prog.next.push((dropped, exit));
+            prog.ltl_inst.push((
+                source,
+                LTLInst::Lop(Operation::Ointconst(7), Arc::new(vec![]), Mreg::BP),
+            ));
+            prog.ltl_inst.push((exit, LTLInst::Lreturn));
+
+            prog.run();
+
+            assert!(prog.rtl_next.iter().any(|fact| fact == &(source, exit)));
+            assert!(prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(source, exit)));
+            assert!(!prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(source, dropped)));
+        });
+    }
+
+    #[test]
+    fn immediate_stack_initializer_suppresses_the_linear_fallback_branch() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [successor, func, raw_trampoline, init, block] = synthetic_ids();
+
+            for node in [init, raw_trampoline, successor] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, block));
+            }
+            prog.mach_imm_stack_init.push((init, -32, 1, Typ::Tint));
+            prog.ltl_inst
+                .push((init, LTLInst::Lbranch(Either::Right(raw_trampoline))));
+            prog.ltl_inst
+                .push((raw_trampoline, LTLInst::Lbranch(Either::Right(successor))));
+            prog.next.push((init, raw_trampoline));
+            // Linear has already canonicalized the raw trampoline.
+            prog.ltl_succ.push((init, successor));
+
+            prog.run();
+
+            assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == init && matches!(inst, RTLInst::Iop(Operation::Ointconst(1), _, _))
+            }));
+            assert!(!prog
+                .rtl_inst_candidate
+                .iter()
+                .any(|(node, inst)| *node == init && matches!(inst, RTLInst::Ibranch(_))));
+            assert!(prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(init, successor)));
+            assert!(!prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(init, raw_trampoline)));
+        });
+    }
+
+    #[test]
+    fn asm_block_next_drops_only_noreturn_fallthrough() {
+        // RTLPassProgram is intentionally very large. Construct it on a sized
+        // worker stack so this focused rule test does not depend on libtest's
+        // comparatively small default thread stack.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let mut prog = RTLPassProgram::default();
+
+                prog.ddisasm_cfg_edge.push((0x10, 0x20, "fallthrough"));
+                prog.ddisasm_cfg_edge.push((0x30, 0x40, "fallthrough"));
+                prog.code_in_block.push((0x10, 0x10));
+                prog.code_in_block.push((0x30, 0x30));
+                prog.call_targets_noreturn.push((0x10,));
+
+                prog.run();
+
+                assert!(!prog.asm_block_next.iter().any(|fact| fact == &(0x10, 0x20)));
+                assert!(prog.asm_block_next.iter().any(|fact| fact == &(0x30, 0x40)));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn call_argument_join_coalesces_preheader_and_backedge_defs() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x1000;
+            let preheader_def = 0x900;
+            let backedge_def = 0x100;
+            let call = 0x500;
+            let preheader_id = fresh_xtl_reg(preheader_def, Mreg::DI);
+            let backedge_id = fresh_xtl_reg(backedge_def, Mreg::DI);
+
+            for node in [preheader_def, backedge_def, call] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.reg_xtl.push((preheader_def, Mreg::DI, preheader_id));
+            prog.reg_xtl.push((backedge_def, Mreg::DI, backedge_id));
+            prog.is_def.push((preheader_def, preheader_id));
+            prog.is_def.push((backedge_def, backedge_id));
+
+            // These are the two MAY-reaching definitions at a loop-header
+            // call: the preheader value is used on iteration zero and the
+            // back-edge value thereafter.  Their numeric order is deliberately
+            // unrelated to execution order.
+            prog.arg_setup_candidate
+                .push((preheader_def, Mreg::DI, call));
+            prog.arg_setup_candidate
+                .push((backedge_def, Mreg::DI, call));
+            prog.abi_int_arg_position.push((Mreg::DI, 0));
+            prog.ltl_inst
+                .push((call, LTLInst::Lcall(Either::Right(Either::Right("strlen")))));
+
+            prog.run();
+
+            let preheader_canonical = prog
+                .reg_rtl
+                .iter()
+                .find_map(|(node, mreg, reg)| {
+                    (*node == preheader_def && *mreg == Mreg::DI).then_some(*reg)
+                })
+                .expect("preheader definition has a canonical RTL register");
+            let backedge_canonical = prog
+                .reg_rtl
+                .iter()
+                .find_map(|(node, mreg, reg)| {
+                    (*node == backedge_def && *mreg == Mreg::DI).then_some(*reg)
+                })
+                .expect("back-edge definition has a canonical RTL register");
+            assert_eq!(preheader_canonical, backedge_canonical);
+
+            let mappings: Vec<_> = prog
+                .call_arg_mapping
+                .iter()
+                .filter(|(node, pos, _)| *node == call && *pos == 0)
+                .cloned()
+                .collect();
+            assert_eq!(mappings, vec![(call, 0, preheader_canonical)]);
+            assert!(prog
+                .call_arg_setup_detected
+                .iter()
+                .any(|fact| fact == &(preheader_def, Mreg::DI, call)));
+            assert!(prog
+                .call_arg_setup_detected
+                .iter()
+                .any(|fact| fact == &(backedge_def, Mreg::DI, call)));
+        });
+    }
+
+    #[test]
+    fn call_inputs_are_distinct_from_caller_saved_outputs() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            prog.abi_ret_int_reg.push((Mreg::AX,));
+            prog.abi_pointer_size.push((8,));
+
+            // Direct call: DI is an outgoing argument before the call and a
+            // caller-saved definition after it.  The argument must remain the
+            // setup definition even though both events share the call node.
+            let direct_func = 0x1000;
+            let direct_setup = 0x1008;
+            let direct_call = 0x1010;
+            let direct_use = 0x1018;
+            prog.ltl_inst.push((
+                direct_setup,
+                LTLInst::Lop(Operation::Olongconst(7), Arc::new(vec![]), Mreg::DI),
+            ));
+            prog.ltl_inst.push((
+                direct_call,
+                LTLInst::Lcall(Either::Right(Either::Right("sink"))),
+            ));
+            prog.arg_setup_candidate
+                .push((direct_setup, Mreg::DI, direct_call));
+            prog.abi_int_arg_position.push((Mreg::DI, 0));
+            prog.is_caller_saved.push((Mreg::DI,));
+            // This future use makes the call's post-call DI clobber a real RTL
+            // definition, reproducing the collision that used to poison every
+            // call argument.
+            prog.reg_def_used.push((direct_call, Mreg::DI, direct_use));
+            prog.next.push((direct_call, direct_use));
+            for node in [direct_setup, direct_call, direct_use] {
+                prog.instr_in_function.push((node, direct_func));
+            }
+
+            // Register-indirect call through AX returning in AX.  The incoming
+            // load is the callee; the call node's AX definition is the result.
+            let indirect_func = 0x2000;
+            let target_load = 0x2008;
+            let indirect_call = 0x2014;
+            let indirect_use = 0x201c;
+            prog.ltl_inst.push((
+                target_load,
+                LTLInst::Lload(
+                    MemoryChunk::MInt64,
+                    Addressing::Aglobal(0x5000, 0),
+                    Arc::new(vec![]),
+                    Mreg::AX,
+                ),
+            ));
+            prog.ltl_inst
+                .push((indirect_call, LTLInst::Lcall(Either::Left(Mreg::AX))));
+            prog.reg_def_used
+                .push((target_load, Mreg::AX, indirect_call));
+            prog.reg_def_used
+                .push((indirect_call, Mreg::AX, indirect_use));
+            prog.is_caller_saved.push((Mreg::AX,));
+            prog.next.push((indirect_call, indirect_use));
+            for node in [target_load, indirect_call, indirect_use] {
+                prog.instr_in_function.push((node, indirect_func));
+            }
+
+            // Tailcalls consume the same pre-transfer input relation even
+            // though they have no local result.
+            let tail_func = 0x3000;
+            let tail_setup = 0x3008;
+            let tail_call = 0x3010;
+            prog.ltl_inst.push((
+                tail_setup,
+                LTLInst::Lop(Operation::Olongconst(9), Arc::new(vec![]), Mreg::R12),
+            ));
+            prog.ltl_inst
+                .push((tail_call, LTLInst::Ltailcall(Either::Left(Mreg::R12))));
+            prog.reg_def_used.push((tail_setup, Mreg::R12, tail_call));
+            for node in [tail_setup, tail_call] {
+                prog.instr_in_function.push((node, tail_func));
+            }
+
+            // A memory-indirect call consumes the loaded memory value, not the
+            // address-base register as a direct callee.
+            let memory_func = 0x4000;
+            let memory_base = 0x4008;
+            let memory_call = 0x4010;
+            let memory_next = 0x4018;
+            prog.ltl_inst.push((
+                memory_base,
+                LTLInst::Lop(Operation::Olongconst(11), Arc::new(vec![]), Mreg::AX),
+            ));
+            prog.ltl_inst
+                .push((memory_call, LTLInst::Lcall(Either::Left(Mreg::AX))));
+            prog.reg_def_used.push((memory_base, Mreg::AX, memory_call));
+            prog.reg_def_used.push((memory_call, Mreg::AX, memory_next));
+            prog.call_through_memory
+                .push((memory_call, "RAX", "NONE", 1, 8));
+            prog.next.push((memory_call, memory_next));
+            for node in [memory_base, memory_call, memory_next] {
+                prog.instr_in_function.push((node, memory_func));
+            }
+
+            // Even when no pre-call target reaches an indirect call, its
+            // fallback callee must not collide with an AX result at the same
+            // node.
+            let fallback_func = 0x5000;
+            let fallback_call = 0x5010;
+            let fallback_use = 0x5018;
+            prog.ltl_inst
+                .push((fallback_call, LTLInst::Lcall(Either::Left(Mreg::AX))));
+            prog.reg_def_used
+                .push((fallback_call, Mreg::AX, fallback_use));
+            prog.next.push((fallback_call, fallback_use));
+            for node in [fallback_call, fallback_use] {
+                prog.instr_in_function.push((node, fallback_func));
+            }
+
+            prog.run();
+
+            let direct_setup_value = prog
+                .reg_rtl
+                .iter()
+                .find_map(|(node, mreg, value)| {
+                    (*node == direct_setup && *mreg == Mreg::DI).then_some(*value)
+                })
+                .expect("direct argument setup has a value");
+            let direct_output = fresh_xtl_reg(direct_call, Mreg::DI);
+            assert_ne!(fresh_call_input_reg(direct_call, Mreg::DI), direct_output);
+            assert!(prog
+                .is_def
+                .iter()
+                .any(|fact| fact == &(direct_call, direct_output)));
+            assert!(prog
+                .call_arg_mapping
+                .iter()
+                .any(|fact| fact == &(direct_call, 0, direct_setup_value)));
+            assert!(!prog
+                .call_arg_mapping
+                .iter()
+                .any(|fact| fact == &(direct_call, 0, direct_output)));
+
+            let target_value = prog
+                .reg_rtl
+                .iter()
+                .find_map(|(node, mreg, value)| {
+                    (*node == target_load && *mreg == Mreg::AX).then_some(*value)
+                })
+                .expect("indirect target load has a value");
+            let result_value = prog
+                .call_result_rtl
+                .iter()
+                .find_map(|(node, value)| (*node == indirect_call).then_some(*value))
+                .expect("used AX call result has a value");
+            assert_ne!(target_value, result_value);
+            assert!(prog
+                .call_input_rtl
+                .iter()
+                .any(|fact| fact == &(indirect_call, Mreg::AX, target_value)));
+
+            let indirect_candidates: Vec<_> = prog
+                .rtl_inst_candidate
+                .iter()
+                .filter_map(|(node, inst)| (*node == indirect_call).then_some(inst))
+                .collect();
+            assert_eq!(indirect_candidates.len(), 1);
+            match indirect_candidates[0] {
+                RTLInst::Icall(_, Either::Left(callee), args, Some(result), next) => {
+                    assert_eq!(*callee, target_value);
+                    assert!(args.is_empty());
+                    assert_eq!(*result, result_value);
+                    assert_eq!(*next, indirect_use);
+                }
+                other => panic!("unexpected indirect call candidate: {other:?}"),
+            }
+
+            let tail_value = prog
+                .reg_rtl
+                .iter()
+                .find_map(|(node, mreg, value)| {
+                    (*node == tail_setup && *mreg == Mreg::R12).then_some(*value)
+                })
+                .expect("tailcall target setup has a value");
+            assert!(prog
+                .call_input_rtl
+                .iter()
+                .any(|fact| fact == &(tail_call, Mreg::R12, tail_value)));
+            assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == tail_call
+                    && matches!(
+                        inst,
+                        RTLInst::Itailcall(_, Either::Left(callee), args)
+                            if *callee == tail_value && args.is_empty()
+                    )
+            }));
+
+            let memory_base_value = prog
+                .reg_rtl
+                .iter()
+                .find_map(|(node, mreg, value)| {
+                    (*node == memory_base && *mreg == Mreg::AX).then_some(*value)
+                })
+                .expect("memory-call base setup has a value");
+            let memory_result = prog
+                .call_result_rtl
+                .iter()
+                .find_map(|(node, value)| (*node == memory_call).then_some(*value))
+                .expect("memory call's used AX result has a value");
+            assert_ne!(memory_base_value, memory_result);
+            assert!(prog
+                .call_input_rtl
+                .iter()
+                .any(|fact| fact == &(memory_call, Mreg::AX, memory_base_value)));
+            assert!(!prog
+                .call_input_rtl
+                .iter()
+                .any(|fact| fact == &(memory_call, Mreg::AX, memory_result)));
+            let memory_loads: Vec<_> = prog
+                .call_through_memory_load
+                .iter()
+                .filter(|(node, _, _, _, _)| *node == memory_call)
+                .collect();
+            assert_eq!(memory_loads.len(), 1);
+            assert_eq!(memory_loads[0].2, MemoryChunk::MInt64);
+            assert_eq!(memory_loads[0].4.as_slice(), &[memory_base_value]);
+            assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == memory_call
+                    && matches!(
+                        inst,
+                        RTLInst::Icall(_, Either::Left(callee), args, Some(result), next)
+                            if *callee == fresh_xtl_reg(memory_call, Mreg::x86("RCALL_TGT"))
+                                && args.is_empty()
+                                && *result == memory_result
+                                && *next == memory_next
+                    )
+            }));
+
+            let fallback_result = prog
+                .call_result_rtl
+                .iter()
+                .find_map(|(node, value)| (*node == fallback_call).then_some(*value))
+                .expect("fallback call's used AX result has a value");
+            let fallback_target = fresh_call_input_reg(fallback_call, Mreg::AX);
+            assert_ne!(fallback_target, fallback_result);
+            assert!(prog
+                .call_input_rtl
+                .iter()
+                .any(|fact| fact == &(fallback_call, Mreg::AX, fallback_target)));
+            assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == fallback_call
+                    && matches!(
+                        inst,
+                        RTLInst::Icall(_, Either::Left(callee), args, Some(result), next)
+                            if *callee == fallback_target
+                                && args.is_empty()
+                                && *result == fallback_result
+                                && *next == fallback_use
+                    )
+            }));
+        });
+    }
+
+    #[test]
+    fn memory_indirect_tailcall_keeps_its_loaded_target_expression() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x5800;
+            let base_def = 0x5808;
+            let tail = 0x5810;
+            let operand = "tail_slot";
+
+            prog.abi_pointer_size.push((8,));
+            prog.ltl_inst.push((
+                base_def,
+                LTLInst::Lop(Operation::Olongconst(7), Arc::new(vec![]), Mreg::R12),
+            ));
+            prog.ltl_inst
+                .push((tail, LTLInst::Ltailcall(Either::Left(Mreg::Unknown))));
+            prog.instruction
+                .push((tail, 6, "", "JMP", operand, "", "", "", 0, 0));
+            prog.op_indirect
+                .push((operand, "", "R12", "NONE", 1, 24, 8));
+            prog.reg_def_used.push((base_def, Mreg::R12, tail));
+            for node in [base_def, tail] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            prog.run();
+
+            let base_value = prog
+                .reg_rtl
+                .iter()
+                .find_map(|(node, mreg, value)| {
+                    (*node == base_def && *mreg == Mreg::R12).then_some(*value)
+                })
+                .expect("tailcall address base has a value");
+            let target = fresh_xtl_reg(tail, Mreg::x86("RCALL_TGT"));
+
+            assert!(prog
+                .call_through_memory
+                .iter()
+                .any(|fact| fact == &(tail, "R12", "NONE", 1, 24)));
+            assert!(prog.call_through_memory_load.iter().any(
+                |(node, temp, chunk, addressing, args)| {
+                    *node == tail
+                        && *temp == target
+                        && *chunk == MemoryChunk::MInt64
+                        && *addressing == Addressing::Aindexed(24)
+                        && args.as_slice() == [base_value]
+                }
+            ));
+
+            let candidates: Vec<_> = prog
+                .rtl_inst_candidate
+                .iter()
+                .filter_map(|(node, inst)| (*node == tail).then_some(inst))
+                .collect();
+            assert_eq!(candidates.len(), 1);
+            assert!(matches!(
+                candidates[0],
+                RTLInst::Itailcall(_, Either::Left(callee), args)
+                    if *callee == target && args.is_empty()
+            ));
+        });
+    }
+
+    #[test]
+    fn memory_indirect_calls_normalize_rip_absolute_and_index_only_addresses() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let rip_call = 0x6100;
+            let absolute_call = 0x6200;
+            let index_def = 0x62f0;
+            let indexed_call = 0x6300;
+
+            prog.abi_pointer_size.push((8,));
+            for (call, operand) in [
+                (rip_call, "rip_slot"),
+                (absolute_call, "absolute_slot"),
+                (indexed_call, "indexed_slot"),
+            ] {
+                prog.ltl_inst
+                    .push((call, LTLInst::Lcall(Either::Left(Mreg::Unknown))));
+                prog.instruction
+                    .push((call, 6, "", "CALL", operand, "", "", "", 0, 0));
+                prog.next.push((call, call + 1));
+            }
+            prog.op_indirect
+                .push(("rip_slot", "", "RIP", "NONE", 1, 0x20, 8));
+            prog.op_indirect
+                .push(("absolute_slot", "", "NONE", "NONE", 1, 0x404000, 8));
+            prog.op_indirect
+                .push(("indexed_slot", "", "NONE", "RAX", 8, 0x405000, 8));
+            prog.rip_target_addr.push((rip_call, 0x500000));
+            prog.resolved_addr_to_symbol.push((0x500000, 0x500000, 16));
+            prog.resolved_addr_to_symbol.push((0x404000, 0x404000, 0));
+            prog.resolved_addr_to_symbol.push((0x405000, 0x405000, 0));
+            prog.ltl_inst.push((
+                index_def,
+                LTLInst::Lop(Operation::Olongconst(3), Arc::new(vec![]), Mreg::AX),
+            ));
+            prog.reg_def_used.push((index_def, Mreg::AX, indexed_call));
+
+            prog.run();
+
+            let index_value = prog
+                .def_value_rtl
+                .iter()
+                .find_map(|(node, mreg, value)| {
+                    (*node == index_def && *mreg == Mreg::AX).then_some(*value)
+                })
+                .expect("index definition has a canonical value");
+            let expected = [
+                (
+                    rip_call,
+                    Addressing::Aglobal(0x500000, 16),
+                    Vec::<u64>::new(),
+                ),
+                (
+                    absolute_call,
+                    Addressing::Aglobal(0x404000, 0),
+                    Vec::<u64>::new(),
+                ),
+                (
+                    indexed_call,
+                    Addressing::Abasedscaled(8, 0x405000, 0),
+                    vec![index_value],
+                ),
+            ];
+            for (call, addressing, args) in expected {
+                let loads: Vec<_> = prog
+                    .call_through_memory_load
+                    .iter()
+                    .filter(|(node, _, _, _, _)| *node == call)
+                    .collect();
+                assert_eq!(loads.len(), 1, "call {call:#x}: {loads:?}");
+                assert_eq!(loads[0].2, MemoryChunk::MInt64);
+                assert_eq!(loads[0].3, addressing);
+                assert_eq!(loads[0].4.as_slice(), args.as_slice());
+
+                let calls: Vec<_> = prog
+                    .rtl_inst_candidate
+                    .iter()
+                    .filter(|(node, inst)| *node == call && matches!(inst, RTLInst::Icall(..)))
+                    .collect();
+                assert_eq!(calls.len(), 1, "call {call:#x}: {calls:?}");
+            }
+            assert!(!prog
+                .call_input_rtl
+                .iter()
+                .any(|(node, _, _)| *node == rip_call || *node == absolute_call));
+            assert!(prog
+                .call_input_rtl
+                .iter()
+                .any(|fact| fact == &(indexed_call, Mreg::AX, index_value)));
+
+            let mut ptr32 = RTLPassProgram::default();
+            let call32 = 0x6400;
+            ptr32.abi_pointer_size.push((4,));
+            ptr32
+                .ltl_inst
+                .push((call32, LTLInst::Lcall(Either::Left(Mreg::Unknown))));
+            ptr32
+                .instruction
+                .push((call32, 6, "", "CALL", "slot32", "", "", "", 0, 0));
+            ptr32
+                .op_indirect
+                .push(("slot32", "", "NONE", "NONE", 1, 0x406000, 4));
+            ptr32.resolved_addr_to_symbol.push((0x406000, 0x406000, 0));
+            ptr32.next.push((call32, call32 + 1));
+            ptr32.run();
+
+            let loads32: Vec<_> = ptr32
+                .call_through_memory_load
+                .iter()
+                .filter(|(node, _, _, _, _)| *node == call32)
+                .collect();
+            assert_eq!(loads32.len(), 1, "{loads32:?}");
+            assert_eq!(loads32[0].2, MemoryChunk::MInt32);
+            assert_eq!(loads32[0].3, Addressing::Aglobal(0x406000, 0));
+            assert!(loads32[0].4.is_empty());
+        });
+    }
+
+    #[test]
+    fn call_result_register_selection_is_singleton() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let float_call = 0x7100;
+            let void_call = 0x7200;
+            let generic_int_call = 0x7300;
+            let generic_float_call = 0x7400;
+            let float_reg = Mreg::X0;
+
+            prog.abi_ret_int_reg.push((Mreg::AX,));
+            prog.abi_ret_float_reg.push((float_reg,));
+            prog.is_caller_saved.push((Mreg::AX,));
+            prog.is_caller_saved.push((float_reg,));
+
+            for (call, name) in [
+                (float_call, "known_float"),
+                (void_call, "known_void"),
+                (generic_int_call, "generic_int"),
+                (generic_float_call, "generic_float"),
+            ] {
+                prog.ltl_inst
+                    .push((call, LTLInst::Lcall(Either::Right(Either::Right(name)))));
+                prog.next.push((call, call + 1));
+                prog.instr_in_function.push((call, 0x7000));
+                prog.instr_in_function.push((call + 1, 0x7000));
+            }
+            prog.call_has_known_signature
+                .push((float_call, "known_float", 0, XType::Xfloat));
+            prog.call_has_known_signature
+                .push((void_call, "known_void", 0, XType::Xvoid));
+
+            // Contradictory downstream clobber uses must not override a known
+            // signature's result class.
+            for call in [float_call, void_call, generic_int_call] {
+                prog.reg_def_used.push((call, Mreg::AX, call + 1));
+                prog.reg_def_used.push((call, float_reg, call + 1));
+                prog.ltl_inst_uses_mreg.push((call + 1, float_reg));
+            }
+            prog.reg_def_used
+                .push((generic_float_call, float_reg, generic_float_call + 1));
+            prog.ltl_inst_uses_mreg
+                .push((generic_float_call + 1, float_reg));
+
+            prog.run();
+
+            let output_mregs = |call| {
+                prog.call_output_rtl
+                    .iter()
+                    .filter_map(|(node, mreg, _)| (*node == call).then_some(*mreg))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(output_mregs(float_call), vec![float_reg]);
+            assert!(output_mregs(void_call).is_empty());
+            assert_eq!(output_mregs(generic_int_call), vec![Mreg::AX]);
+            assert_eq!(output_mregs(generic_float_call), vec![float_reg]);
+
+            for call in [float_call, generic_int_call, generic_float_call] {
+                assert_eq!(
+                    prog.call_return_reg
+                        .iter()
+                        .filter(|(node, _)| *node == call)
+                        .count(),
+                    1
+                );
+            }
+            assert!(!prog
+                .call_return_reg
+                .iter()
+                .any(|(node, _)| *node == void_call));
+        });
+    }
+
+    #[test]
+    fn aarch64_indirect_target_and_result_use_distinct_call_values() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let x0 = Mreg::a64(A64Mreg::X0);
+            let func = 0x6000;
+            let target_def = 0x6008;
+            let call = 0x6010;
+            let result_use = 0x6018;
+
+            prog.abi_ret_int_reg.push((x0,));
+            prog.is_caller_saved.push((x0,));
+            prog.ltl_inst.push((
+                target_def,
+                LTLInst::Lload(
+                    MemoryChunk::MInt64,
+                    Addressing::Aglobal(0x7000, 0),
+                    Arc::new(vec![]),
+                    x0,
+                ),
+            ));
+            prog.ltl_inst.push((call, LTLInst::Lcall(Either::Left(x0))));
+            prog.reg_def_used.push((target_def, x0, call));
+            prog.reg_def_used.push((call, x0, result_use));
+            prog.next.push((call, result_use));
+            for node in [target_def, call, result_use] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            prog.run();
+
+            let target = prog
+                .def_value_rtl
+                .iter()
+                .find_map(|(node, mreg, value)| {
+                    (*node == target_def && *mreg == x0).then_some(*value)
+                })
+                .expect("AArch64 target definition has a value");
+            let result = prog
+                .call_output_rtl
+                .iter()
+                .find_map(|(node, mreg, value)| (*node == call && *mreg == x0).then_some(*value))
+                .expect("AArch64 call has an X0 result");
+
+            assert_ne!(target, result);
+            assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == call
+                    && matches!(
+                        inst,
+                        RTLInst::Icall(_, Either::Left(callee), args, Some(dst), next)
+                            if *callee == target
+                                && args.is_empty()
+                                && *dst == result
+                                && *next == result_use
+                    )
+            }));
+        });
+    }
+
+    #[test]
+    fn aarch64_float_return_uses_configured_v0_chain() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let int_ret = Mreg::a64(A64Mreg::X0);
+            let float_ret = Mreg::a64(A64Mreg::V0);
+            let func = 0x8000;
+            let value_def = 0x8008;
+            let ret = 0x8010;
+
+            prog.abi_ret_int_reg.push((int_ret,));
+            prog.abi_ret_float_reg.push((float_ret,));
+            prog.emit_function.push((func, "a64_float", func));
+            prog.ltl_inst.push((
+                value_def,
+                LTLInst::Lload(
+                    MemoryChunk::MFloat64,
+                    Addressing::Aglobal(0x9000, 0),
+                    Arc::new(vec![]),
+                    float_ret,
+                ),
+            ));
+            prog.ltl_inst.push((ret, LTLInst::Lreturn));
+            prog.reg_def_used.push((value_def, float_ret, ret));
+            prog.def_reaches_return.push((ret, value_def, float_ret));
+            prog.instr_in_function.push((value_def, func));
+            prog.instr_in_function.push((ret, func));
+
+            prog.run();
+
+            let value = prog
+                .def_value_rtl
+                .iter()
+                .find_map(|(node, mreg, value)| {
+                    (*node == value_def && *mreg == float_ret).then_some(*value)
+                })
+                .expect("AArch64 V0 definition has a value");
+            assert!(prog.func_returns_float.iter().any(|row| row == &(func,)));
+            assert!(prog.reg_use.iter().any(|row| row == &(ret, float_ret)));
+            assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == ret && matches!(inst, RTLInst::Ireturn(reg) if *reg == value)
+            }));
+            assert!(prog
+                .function_return_point_reg
+                .iter()
+                .any(|row| row == &(func, ret, value)));
+        });
+    }
+
+    #[test]
+    fn forwarded_stale_register_is_vetoed_by_callee_body() {
+        on_large_stack(|| {
+            let caller = 0x1000;
+            let callee = 0x2000;
+            let call = 0x1100;
+            let mut prog = RTLPassProgram::default();
+            prog.forwarded_param_candidate
+                .push((caller, Mreg::SI, call));
+            prog.forwarding_corroborated.push((call, Mreg::SI));
+            prog.call_target_func.push((call, callee));
+            prog.func_stacksz.push((callee, 0x2100, "callee", 0));
+            prog.abi_int_arg_position.push((Mreg::SI, 1));
+
+            prog.run();
+
+            assert!(prog
+                .callee_takes_no_arg_at
+                .iter()
+                .any(|fact| fact == &(call, Mreg::SI)));
+            assert!(!prog
+                .arg_setup_candidate
+                .iter()
+                .any(|fact| fact == &(caller, Mreg::SI, call)));
+        });
+    }
+
+    #[test]
+    fn pass_through_param_completes_a_position_committed_by_real_evidence() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x100;
+            let def_node = 0x110;
+            let call = 0x120;
+
+            prog.abi_int_arg_position.push((Mreg::DI, 0));
+            prog.abi_int_arg_position.push((Mreg::SI, 1));
+            prog.abi_int_arg_position.push((Mreg::DX, 2));
+            prog.instr_in_function.push((call, func));
+            // Real setup evidence at position 1 commits positions 0..=1.
+            prog.arg_setup_candidate_real
+                .push((def_node, Mreg::SI, call));
+            // The position-0 register still holds the caller's own incoming
+            // parameter on every path to the call; no local def exists.
+            prog.arg_reg_param_live_at.push((func, call, Mreg::DI));
+            // A still-live register ABOVE the committed maximum must not be
+            // pulled in: liveness alone is not an argument.
+            prog.arg_reg_param_live_at.push((func, call, Mreg::DX));
+
+            prog.run();
+
+            assert!(prog
+                .arg_setup_candidate
+                .iter()
+                .any(|fact| fact == &(func, Mreg::DI, call)));
+            assert!(!prog
+                .arg_setup_candidate
+                .iter()
+                .any(|fact| fact == &(func, Mreg::DX, call)));
+        });
+    }
+
+    #[test]
+    fn pass_through_position_binding_honors_the_callee_body_veto() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x100;
+            let def_node = 0x110;
+            let call = 0x120;
+            let callee = 0x2000;
+
+            prog.abi_int_arg_position.push((Mreg::DI, 0));
+            prog.abi_int_arg_position.push((Mreg::SI, 1));
+            prog.instr_in_function.push((call, func));
+            prog.arg_setup_candidate_real
+                .push((def_node, Mreg::SI, call));
+            prog.arg_reg_param_live_at.push((func, call, Mreg::DI));
+            // The callee's analysed body validates only SI; crediting DI is
+            // vetoed exactly as it is for real setup candidates.
+            prog.call_target_func.push((call, callee));
+            prog.func_stacksz.push((callee, callee, "callee", 0));
+            prog.func_param_validated.push((callee, Mreg::SI));
+
+            prog.run();
+
+            assert!(!prog
+                .arg_setup_candidate
+                .iter()
+                .any(|fact| fact == &(func, Mreg::DI, call)));
+            assert!(prog
+                .arg_setup_candidate
+                .iter()
+                .any(|fact| fact == &(def_node, Mreg::SI, call)));
+        });
+    }
+
+    #[test]
+    fn direct_internal_pointer_slot_types_a_forwarded_parameter() {
+        on_large_stack(|| {
+            let [caller, callee, call, incoming, canonical] = synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+
+            prog.func_param_validated.push((caller, Mreg::DI));
+            prog.func_has_param_at_position.push((caller, 0));
+            prog.reg_xtl.push((caller, Mreg::DI, incoming));
+            prog.xtl_canonical.push((incoming, canonical));
+            prog.instr_in_function.push((call, caller));
+            prog.call_arg.push((call, 0, incoming));
+            prog.call_target_func.push((call, callee));
+
+            // The callee owns the seed: its first parameter was independently
+            // recovered as a pointer.  The caller contributes only an exact
+            // direct-call edge and an exact forwarded value web.
+            prog.func_param_validated.push((callee, Mreg::DI));
+            prog.abi_int_arg_position.push((Mreg::DI, 0));
+            prog.param_inferred_type_is_pointer.push((callee, Mreg::DI));
+
+            prog.run();
+
+            assert!(prog
+                .callee_ptr_param_at
+                .iter()
+                .any(|fact| fact == &(call, 0)));
+            assert!(prog
+                .param_inferred_type_is_pointer
+                .iter()
+                .any(|fact| fact == &(caller, Mreg::DI)));
+            assert!(prog
+                .func_param_position_type
+                .iter()
+                .any(|fact| fact == &(caller, 0, crate::x86::types::XType::Xptr)));
+        });
+    }
+
+    #[test]
+    fn known_pointer_slot_follows_parameter_through_register_copies() {
+        on_large_stack(|| {
+            let [func, preserve, restore, call, incoming, saved, forwarded] = synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+
+            prog.func_param_validated.push((func, Mreg::DI));
+            prog.func_has_param_at_position.push((func, 0));
+            prog.reg_xtl.push((func, Mreg::DI, incoming));
+            for node in [preserve, restore, call] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.ltl_inst.push((
+                preserve,
+                LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::DI]), Mreg::R12),
+            ));
+            prog.ltl_inst.push((
+                restore,
+                LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::R12]), Mreg::DI),
+            ));
+            prog.reg_xtl.push((preserve, Mreg::DI, incoming));
+            prog.reg_xtl.push((preserve, Mreg::R12, saved));
+            prog.reg_xtl.push((restore, Mreg::R12, saved));
+            prog.reg_xtl.push((restore, Mreg::DI, forwarded));
+            prog.is_def.push((preserve, saved));
+            prog.is_def.push((restore, forwarded));
+            prog.call_arg.push((call, 0, forwarded));
+            prog.callee_ptr_param_at.push((call, 0));
+
+            prog.run();
+
+            assert!(prog
+                .param_value_canon
+                .iter()
+                .any(|fact| fact == &(func, Mreg::DI, forwarded)));
+            assert!(prog
+                .param_inferred_type_is_pointer
+                .iter()
+                .any(|fact| fact == &(func, Mreg::DI)));
+            assert!(prog
+                .func_param_position_type
+                .iter()
+                .any(|fact| fact == &(func, 0, crate::x86::types::XType::Xptr)));
+        });
+    }
+}

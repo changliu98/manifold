@@ -1,0 +1,149 @@
+{
+  "_comment": "SINGLE SOURCE OF TRUTH for system-header knowledge, parsed once in c_pass/header_db.rs and consumed by two sides so they can never drift. (A) The C EMITTER (from_relations.rs): for every name under 'groups' it SUPPRESSES its own reconstructed prototype (ours would only yield 'conflicting types'); a locally-DEFINED function carrying such a name (glibc static atexit shim, gnulib replacements) is renamed <name>_local TU-wide since a definition cannot be suppressed (see 'local_definitions'); 'globals' drives how libc/header-declared GLOBAL VARIABLES are named, typed, and link-bound. (B) print.rs's INCLUDE selection: it emits the group's #include whenever one of the group's names is CALLED, so a suppressed name is always backed by a real declaration (gcc>=14 makes implicit declarations a hard error). GROUP FIELDS: 'header' = the angle-bracket header that declares these names (null = suppress the prototype but emit NO include, used when pulling the header would surface 'conflicting types' for sibling symbols the decompiler emits its OWN prototype for and that are not yet covered here -- e.g. <locale.h> declares localeconv/newlocale/uselocale and <libintl.h> the gettext family, so the locale_gettext group stays suppress-only). 'protos' (optional) = name -> the exact C prototype to EMIT for that name, and it is REQUIRED for every name the emitted file would otherwise call with no declaration in scope: a header-less group, or a name its header gates behind a 'feature' macro. An implicit declaration is NOT benign on x86-64 -- it returns int, so a pointer result is truncated to 32 bits and sign-extended, and the first use of setlocale/mempcpy/memrchr's result segfaults. The prototype must match glibc's exactly (a repeated identical declaration is legal C, so listing a name the default feature level already declares is harmless). 'feature' (optional, ADVISORY/documentation only -- NOT consumed): records that these names are declared only under that feature-test macro (verified empirically with gcc on glibc 2.35). We do NOT emit '#define _GNU_SOURCE': turning it on declares ALL GNU symbols, which then conflict with the decompiler's reconstructed prototypes for any GNU function it cannot suppress (e.g. statx), a worse failure than the benign implicit-declaration warning a GNU-gated name gets without it on a gnu11/_DEFAULT_SOURCE toolchain. So a 'feature':'_GNU_SOURCE' name is still suppressed + its header included, and carries its own 'protos' entry instead. RULE for a name with NO 'feature': it must be DECLARED by its group's header under the default gnu11/_DEFAULT_SOURCE level -- a name under the wrong header reintroduces an implicit-declaration / conflicting-types bug. GLOBALS: each entry has a 'kind' that derives every per-global policy the emitter needs -- 'stdio_file' (stdin/stdout/stderr: keep real name, emit NO definition, <stdio.h> binds them to libc), 'libc_extern' (optind/optarg/.../environ: keep real name, emit as extern, bind to libc), 'reserved_rename' (errno/program_invocation_*: rename <name>_sym to avoid colliding with the libc symbol), 'canonical_type' (__environ: keep name, just pin the type) -- plus an optional 'type' giving the canonical C spelling the emitter must use for the variable's declaration (a variable declaration cannot be suppressed: a non-matching type is a hard 'conflicting types' error). 'prefixes': any name starting with one of these is compiler-provided.",
+  "groups": {
+    "stdio": {
+      "header": "<stdio.h>",
+      "names": ["printf", "fprintf", "sprintf", "snprintf", "puts", "putchar", "getchar", "fopen", "fclose", "fread", "fwrite", "fgets", "fputs", "fflush", "fseek", "ftell", "rewind", "sscanf", "fscanf", "perror", "remove", "rename", "tmpfile", "setbuf", "setvbuf", "fileno", "clearerr", "feof", "ferror", "fdopen", "getc", "putc", "fputc", "fgetc", "ungetc", "vsnprintf", "vfprintf", "vprintf", "vsprintf", "vscanf", "vsscanf", "vfscanf", "fseeko", "ftello", "getline", "getdelim", "freopen", "renameat", "fgetpos", "fsetpos", "popen", "pclose", "dprintf", "vdprintf", "ctermid", "__overflow", "__uflow", "__getdelim"]
+    },
+    "stdio_unlocked": {
+      "header": "<stdio.h>",
+      "names": ["fwrite_unlocked", "fread_unlocked", "clearerr_unlocked", "feof_unlocked", "ferror_unlocked", "fileno_unlocked", "fputc_unlocked", "fgetc_unlocked", "getc_unlocked", "putc_unlocked", "fflush_unlocked", "getchar_unlocked", "putchar_unlocked"]
+    },
+    "stdio_gnu": {
+      "header": "<stdio.h>",
+      "feature": "_GNU_SOURCE",
+      "names": ["fputs_unlocked", "fgets_unlocked"],
+      "protos": {
+        "fputs_unlocked": "int fputs_unlocked(const char *, FILE *);",
+        "fgets_unlocked": "char *fgets_unlocked(char *, int, FILE *);"
+      }
+    },
+    "stdlib": {
+      "header": "<stdlib.h>",
+      "names": ["malloc", "calloc", "realloc", "free", "exit", "abort", "atoi", "atol", "atof", "strtol", "strtoul", "strtod", "strtof", "strtold", "strtoll", "strtoull", "qsort", "bsearch", "abs", "labs", "llabs", "div", "ldiv", "lldiv", "getenv", "system", "rand", "srand", "random", "srandom", "initstate", "setstate", "drand48", "lrand48", "mrand48", "srand48", "seed48", "atexit", "at_quick_exit", "quick_exit", "_Exit", "realpath", "posix_memalign", "aligned_alloc", "valloc", "setenv", "unsetenv", "putenv", "clearenv", "mkstemp", "mkstemps", "mkdtemp", "getsubopt", "rpmatch", "mblen", "mbtowc", "wctomb", "mbstowcs", "wcstombs", "__ctype_get_mb_cur_max"]
+    },
+    "stdlib_gnu": {
+      "header": "<stdlib.h>",
+      "feature": "_GNU_SOURCE",
+      "names": ["mkostemp", "ptsname", "grantpt", "unlockpt", "posix_openpt"],
+      "protos": {
+        "mkostemp": "int mkostemp(char *, int);",
+        "ptsname": "char *ptsname(int);",
+        "grantpt": "int grantpt(int);",
+        "unlockpt": "int unlockpt(int);",
+        "posix_openpt": "int posix_openpt(int);"
+      }
+    },
+    "string": {
+      "header": "<string.h>",
+      "names": ["strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat", "strncat", "memcpy", "memmove", "memset", "memcmp", "strstr", "strchr", "strrchr", "strtok", "strtok_r", "strerror", "strdup", "strndup", "stpcpy", "stpncpy", "strcoll", "strxfrm", "strspn", "strcspn", "strnlen", "strpbrk", "strerror_r", "strsignal", "memchr", "memccpy", "strsep", "strcasecmp", "strncasecmp"]
+    },
+    "string_gnu": {
+      "header": "<string.h>",
+      "feature": "_GNU_SOURCE",
+      "names": ["memrchr", "mempcpy"],
+      "protos": {
+        "memrchr": "void *memrchr(const void *, int, unsigned long);",
+        "mempcpy": "void *mempcpy(void *, const void *, unsigned long);"
+      }
+    },
+    "ctype": {
+      "header": "<ctype.h>",
+      "names": ["isalpha", "isdigit", "isalnum", "isspace", "isupper", "islower", "toupper", "tolower", "isprint", "ispunct", "isxdigit", "iscntrl", "isgraph", "__ctype_b_loc", "__ctype_tolower_loc", "__ctype_toupper_loc"]
+    },
+    "math": {
+      "header": "<math.h>",
+      "names": ["sin", "sinf", "sinl", "cos", "cosf", "cosl", "tan", "tanf", "tanl", "sqrt", "sqrtf", "sqrtl", "pow", "powf", "powl", "log", "logf", "logl", "log10", "log10f", "log10l", "exp", "expf", "expl", "fabs", "fabsf", "fabsl", "ceil", "ceilf", "ceill", "floor", "floorf", "floorl", "round", "roundf", "roundl", "fmod", "fmodf", "fmodl", "atan2", "atan2f", "atan2l", "asin", "asinf", "asinl", "acos", "acosf", "acosl", "atan", "atanf", "atanl", "sinh", "sinhf", "sinhl", "cosh", "coshf", "coshl", "tanh", "tanhf", "tanhl"]
+    },
+    "unistd": {
+      "header": "<unistd.h>",
+      "names": ["close", "read", "write", "lseek", "access", "unlink", "getpid", "getppid", "getcwd", "chdir", "fchdir", "isatty", "dup", "dup2", "pipe", "fork", "execv", "execve", "execvp", "execl", "execlp", "execle", "fexecve", "ftruncate", "truncate", "link", "symlink", "readlink", "rmdir", "faccessat", "fchownat", "readlinkat", "symlinkat", "unlinkat", "linkat", "chown", "fchown", "lchown", "getuid", "geteuid", "getgid", "getegid", "setuid", "seteuid", "setgid", "setegid", "setpgid", "getpgid", "getpgrp", "setsid", "getsid", "gethostname", "sethostname", "gethostid", "getlogin", "sync", "fsync", "fdatasync", "alarm", "pause", "sleep", "usleep", "ttyname", "ttyname_r", "pathconf", "fpathconf", "sysconf", "confstr", "pread", "pwrite", "getopt", "nice", "chroot", "daemon", "syscall", "lockf", "tcgetpgrp", "tcsetpgrp", "getdtablesize"]
+    },
+    "fcntl": {
+      "header": "<fcntl.h>",
+      "names": ["open", "openat", "creat", "fcntl", "posix_fadvise", "posix_fallocate"]
+    },
+    "sys_select": {
+      "header": "<sys/select.h>",
+      "names": ["select", "FD_SET", "FD_CLR", "FD_ISSET", "FD_ZERO"]
+    },
+    "sys_stat": {
+      "header": "<sys/stat.h>",
+      "names": ["stat", "fstat", "lstat", "mkdir", "chmod", "fchmod", "lchmod", "fstatat", "umask", "mkdirat", "fchmodat", "mknod", "mknodat", "mkfifo", "mkfifoat", "futimens", "utimensat"]
+    },
+    "sys_ioctl": {
+      "header": "<sys/ioctl.h>",
+      "names": ["ioctl"]
+    },
+    "time": {
+      "header": "<time.h>",
+      "names": ["time", "clock", "difftime", "mktime", "localtime", "gmtime", "strftime", "asctime", "ctime", "clock_gettime", "clock_settime", "clock_getres", "clock_nanosleep", "localtime_r", "gmtime_r", "ctime_r", "asctime_r", "nanosleep", "gettimeofday", "timespec_get", "timegm", "tzset"]
+    },
+    "assert": {
+      "header": "<assert.h>",
+      "names": ["assert", "__assert_fail"]
+    },
+    "stdarg": {
+      "header": "<stdarg.h>",
+      "names": ["va_start", "va_end", "va_arg", "va_copy"]
+    },
+    "setjmp": {
+      "header": "<setjmp.h>",
+      "names": ["setjmp", "longjmp"]
+    },
+    "signal": {
+      "header": "<signal.h>",
+      "names": ["signal", "raise", "sigaction", "sigprocmask", "sigemptyset", "sigaddset", "sigdelset", "sigfillset", "sigismember", "sigsuspend", "sigpending", "sigwait", "sigwaitinfo", "sigtimedwait", "sigaltstack", "sigqueue", "siginterrupt", "kill", "killpg", "psignal", "pthread_sigmask", "pthread_kill", "__libc_current_sigrtmin", "__libc_current_sigrtmax"]
+    },
+    "sched": {
+      "header": "<sched.h>",
+      "names": ["sched_yield", "sched_getscheduler", "sched_setscheduler", "sched_getparam", "sched_setparam", "sched_get_priority_max", "sched_get_priority_min", "sched_rr_get_interval", "__sched_cpualloc", "__sched_cpufree", "__sched_cpucount"]
+    },
+    "mman": {
+      "header": "<sys/mman.h>",
+      "names": ["mmap", "munmap", "mprotect"]
+    },
+    "sys_socket": {
+      "header": "<sys/socket.h>",
+      "names": ["socket", "bind", "listen", "accept", "connect", "send", "recv", "setsockopt", "getsockopt"]
+    },
+    "arpa_inet": {
+      "header": "<arpa/inet.h>",
+      "names": ["htons", "htonl", "ntohs", "ntohl", "inet_addr", "inet_ntoa"]
+    },
+    "locale_gettext": {
+      "header": null,
+      "names": ["setlocale", "bindtextdomain", "textdomain"],
+      "protos": {
+        "setlocale": "char *setlocale(int, const char *);",
+        "bindtextdomain": "char *bindtextdomain(const char *, const char *);",
+        "textdomain": "char *textdomain(const char *);"
+      }
+    },
+    "pthread": {
+      "header": "<pthread.h>",
+      "names": ["pthread_create", "pthread_join", "pthread_detach", "pthread_self", "pthread_equal", "pthread_exit", "pthread_cancel", "pthread_once", "pthread_mutex_lock", "pthread_mutex_unlock", "pthread_mutex_trylock", "pthread_mutex_init", "pthread_mutex_destroy", "pthread_mutexattr_init", "pthread_mutexattr_destroy", "pthread_mutexattr_settype", "pthread_cond_init", "pthread_cond_destroy", "pthread_cond_wait", "pthread_cond_timedwait", "pthread_cond_signal", "pthread_cond_broadcast", "pthread_attr_init", "pthread_attr_destroy", "pthread_attr_setdetachstate", "pthread_attr_setstacksize", "pthread_key_create", "pthread_key_delete", "pthread_getspecific", "pthread_setspecific", "pthread_rwlock_init", "pthread_rwlock_destroy", "pthread_rwlock_rdlock", "pthread_rwlock_wrlock", "pthread_rwlock_unlock"]
+    }
+  },
+  "globals": {
+    "_comment": "Header-declared / libc global VARIABLES. 'kind' derives the emitter's per-global policy sets: stdio_file (keep real name, emit no definition -- <stdio.h> binds to libc), libc_extern (keep real name, emit extern -- binds to libc), reserved_rename (rename <name>_sym -- the recovered global is a program copy that must not collide with the libc symbol). 'type' (optional) is the canonical C spelling the emitter must use for the declaration, so our extern matches the header/libc.",
+    "stdin": { "kind": "stdio_file" },
+    "stdout": { "kind": "stdio_file" },
+    "stderr": { "kind": "stdio_file" },
+    "optind": { "kind": "libc_extern", "type": "int" },
+    "optarg": { "kind": "libc_extern", "type": "char *" },
+    "opterr": { "kind": "libc_extern", "type": "int" },
+    "optopt": { "kind": "libc_extern", "type": "int" },
+    "environ": { "kind": "libc_extern", "type": "char **" },
+    "__environ": { "kind": "canonical_type", "type": "char **" },
+    "errno": { "kind": "reserved_rename" },
+    "program_invocation_name": { "kind": "reserved_rename" },
+    "program_invocation_short_name": { "kind": "reserved_rename" }
+  },
+  "local_definitions": {
+    "_comment": "Policy for functions the binary DEFINES under a header-declared name (glibc static shims from libc_nonshared.a, gnulib replacements compiled in under the libc name). The definition itself would be a 'conflicting types' error, so each name is classified: 'filter' = do NOT emit the definition; call sites bind to the system header's declaration (correct when the local body IS the libc behavior, e.g. the atexit shim that just forwards to __cxa_atexit). 'decompile' = emit the definition renamed to <name>_local with all TU-internal references following (correct when the local body may genuinely differ from libc). A header-colliding definition listed in NEITHER set defaults to 'decompile' -- code is never silently dropped without a curated decision here.",
+    "filter": ["atexit"],
+    "decompile": []
+  },
+  "prefixes": ["__builtin_"]
+}
