@@ -695,7 +695,14 @@ fn order_globals_for_aggregate_initializers<'a>(
     for (consumer, global) in nodes.iter().enumerate() {
         let mut dependencies = HashSet::new();
         for expr in &global.pointer_init {
-            collect_expr_vars(expr, &mut dependencies);
+            let rewritten =
+                crate::decompile::passes::c_pass::helpers::map_expr(expr, &|candidate| {
+                    let CExpr::Var(name) = candidate else {
+                        return None;
+                    };
+                    coalescing.member_exprs.get(name).cloned()
+                });
+            collect_expr_vars(&rewritten, &mut dependencies);
         }
         if let Some(init) = coalescing.owner_initializers.get(&global.id) {
             collect_init_vars(init, &mut dependencies);
