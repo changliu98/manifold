@@ -635,6 +635,10 @@ impl IRPass for StructRecoveryPass {
             "is_global_array",
             "interior_to_base_ident",
             "global_access_ev",
+            // Exact initialized pointer slots override narrower field-type
+            // votes in post_process_structs.
+            "pointer_in_data",
+            "code_pointer_in_data",
             "emit_function_param_candidate",
             "func_has_param_at_position",
             "emit_function_return",
@@ -680,6 +684,61 @@ struct InferredField {
 struct CandidateStruct {
     ptr_regs: Vec<(Address, RTLReg)>,
     fields: Vec<InferredField>,
+}
+
+/// Canonical struct fields whose exact image slot carries a relocation.
+/// Relocations are object-layout authority: whatever access/type votes said,
+/// that field must hold at least one target pointer's bits.
+fn relocated_global_struct_fields(
+    global_layouts: &[(Ident, Vec<InferredField>)],
+    hash_to_canonical: &HashMap<u64, usize>,
+    relocation_slots: &HashSet<Address>,
+    pointer_size: usize,
+) -> HashSet<(usize, i64)> {
+    let mut result = HashSet::new();
+    for (ident, fields) in global_layouts {
+        let Some(&struct_id) = hash_to_canonical.get(&compute_layout_hash(fields)) else {
+            continue;
+        };
+        let Ok(base) = Address::try_from(*ident) else {
+            continue;
+        };
+        for (index, field) in fields.iter().enumerate() {
+            let Ok(offset) = u64::try_from(field.offset) else {
+                continue;
+            };
+            let pointer_end = field.offset.saturating_add(pointer_size as i64);
+            if fields
+                .get(index + 1)
+                .is_some_and(|next| next.offset < pointer_end)
+            {
+                continue;
+            }
+            if base
+                .checked_add(offset)
+                .is_some_and(|slot| relocation_slots.contains(&slot))
+            {
+                result.insert((struct_id, field.offset));
+            }
+        }
+    }
+    result
+}
+
+fn enforce_relocation_field_width(
+    inferred: FieldType,
+    has_relocation: bool,
+    pointer_size: usize,
+) -> FieldType {
+    if !has_relocation || inferred.size(pointer_size) >= pointer_size {
+        return inferred;
+    }
+    let chunk = if pointer_size == 4 {
+        MemoryChunk::MInt32
+    } else {
+        MemoryChunk::MInt64
+    };
+    FieldType::Scalar(chunk)
 }
 
 fn post_process_structs(db: &mut DecompileDB) {
@@ -731,6 +790,12 @@ fn post_process_structs(db: &mut DecompileDB) {
     let global_derefs: Vec<(Ident, i64, MemoryChunk, RTLReg)> = db
         .rel_iter::<(Ident, i64, MemoryChunk, RTLReg)>("global_deref")
         .cloned()
+        .collect();
+
+    let relocation_slots: HashSet<Address> = db
+        .rel_iter::<(Address, Address)>("pointer_in_data")
+        .chain(db.rel_iter::<(Address, Address)>("code_pointer_in_data"))
+        .map(|(slot, _)| *slot)
         .collect();
 
     let mut field_xtype_map: HashMap<(RTLReg, i64), Vec<XType>> = HashMap::new();
@@ -953,6 +1018,14 @@ fn post_process_structs(db: &mut DecompileDB) {
         }
     }
 
+    let pointer_size = db.abi().pointer_size;
+    let relocated_fields = relocated_global_struct_fields(
+        &global_layouts,
+        &hash_to_canonical,
+        &relocation_slots,
+        pointer_size,
+    );
+
     let mut field_type_info: HashMap<(usize, i64), Vec<XType>> = HashMap::new();
 
     for candidate in &candidates {
@@ -991,12 +1064,17 @@ fn post_process_structs(db: &mut DecompileDB) {
     for struct_id in sorted_struct_ids {
         let fields = &struct_fields_map[&struct_id];
         for (field_idx, field) in fields.iter().enumerate() {
-            let field_type =
-                if let Some(&best) = selected_field_types.get(&(struct_id, field.offset)) {
-                    xtype_to_field_type(best)
-                } else {
-                    FieldType::Scalar(field.chunk)
-                };
+            let inferred = if let Some(&best) = selected_field_types.get(&(struct_id, field.offset))
+            {
+                xtype_to_field_type(best)
+            } else {
+                FieldType::Scalar(field.chunk)
+            };
+            let field_type = enforce_relocation_field_width(
+                inferred,
+                relocated_fields.contains(&(struct_id, field.offset)),
+                pointer_size,
+            );
             let field_name = make_field_ident(field.offset, field.chunk);
             emit_struct_field.push((struct_id, field_idx, field.offset, field_type, field_name));
         }
@@ -1337,6 +1415,85 @@ mod tests {
             .selected_field_type
             .iter()
             .any(|row| row == &(1, 8, XType::Xint)));
+    }
+
+    #[test]
+    fn exact_global_relocation_widens_a_narrow_field_to_pointer_width() {
+        let base = 0xe090_usize;
+        let fields = vec![
+            InferredField {
+                offset: 0,
+                chunk: MemoryChunk::MAny64,
+            },
+            InferredField {
+                offset: 8,
+                chunk: MemoryChunk::MAny64,
+            },
+        ];
+        let layout_hash = compute_layout_hash(&fields);
+        let struct_id = layout_hash_to_struct_id(layout_hash);
+        let authorities = relocated_global_struct_fields(
+            &[(base, fields)],
+            &HashMap::from([(layout_hash, struct_id)]),
+            &HashSet::from([base as Address + 8]),
+            8,
+        );
+
+        assert_eq!(authorities, HashSet::from([(struct_id, 8_i64)]));
+        assert_eq!(
+            enforce_relocation_field_width(
+                FieldType::Scalar(MemoryChunk::MInt32),
+                authorities.contains(&(struct_id, 8)),
+                8,
+            ),
+            FieldType::Scalar(MemoryChunk::MInt64),
+        );
+    }
+
+    #[test]
+    fn relocation_width_authority_does_not_change_unrelated_or_wide_fields() {
+        let base = 0xe090_usize;
+        let fields = vec![
+            InferredField {
+                offset: 0,
+                chunk: MemoryChunk::MAny64,
+            },
+            InferredField {
+                offset: 8,
+                chunk: MemoryChunk::MAny64,
+            },
+        ];
+        let layout_hash = compute_layout_hash(&fields);
+        let struct_id = layout_hash_to_struct_id(layout_hash);
+        // A relocation in padding/not at a selected field cannot type either
+        // declaration member.
+        let authorities = relocated_global_struct_fields(
+            &[(base, fields)],
+            &HashMap::from([(layout_hash, struct_id)]),
+            &HashSet::from([base as Address + 4]),
+            8,
+        );
+        assert!(authorities.is_empty());
+
+        let narrow = FieldType::Scalar(MemoryChunk::MInt32);
+        assert_eq!(
+            enforce_relocation_field_width(narrow.clone(), false, 8),
+            narrow,
+        );
+        let already_wide = FieldType::Scalar(MemoryChunk::MInt64);
+        assert_eq!(
+            enforce_relocation_field_width(already_wide.clone(), true, 8),
+            already_wide,
+        );
+        let already_pointer = FieldType::Pointer(Box::new(FieldType::Unknown));
+        assert_eq!(
+            enforce_relocation_field_width(already_pointer.clone(), true, 8),
+            already_pointer,
+        );
+
+        let pass = StructRecoveryPass;
+        assert!(pass.inputs().contains(&"pointer_in_data"));
+        assert!(pass.inputs().contains(&"code_pointer_in_data"));
     }
 
     #[test]
