@@ -419,7 +419,7 @@ fn derive_global_aggregate_coalescing(
     }
 
     let initialized_ranges: Vec<(Address, Arc<Vec<u8>>)> = db
-        .rel_iter::<(Address, Arc<Vec<u8>>)>("initialized_data_range")
+        .rel_iter::<(Address, Arc<Vec<u8>>)>("retained_initialized_data_range")
         .map(|(start, bytes)| (*start, bytes.clone()))
         .collect();
     let bytes_at = |addr: Address, len: usize| -> Option<Vec<u8>> {
@@ -7449,7 +7449,7 @@ mod escaped_stack_array_tests {
         bytes[..8].copy_from_slice(&256_u64.to_le_bytes());
         let mut db = DecompileDB::default();
         db.rel_push(
-            "initialized_data_range",
+            "retained_initialized_data_range",
             (owner_id as Address, Arc::new(bytes)),
         );
         db.rel_push("symbol_size", (member_id as Address, 8_usize, "L_e098"));

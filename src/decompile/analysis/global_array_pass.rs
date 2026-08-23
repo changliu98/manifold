@@ -29,7 +29,15 @@ ascent_par! {
     relation abi_pointer_size(i64);
     // EDB lifted from the object image immediately before this pass runs.
     relation initialized_data_range(Address, Arc<Vec<u8>>);
+    // Persist the image bytes as a declared pass output. The scheduler does
+    // not merge imperative writes to input-only relations from a parallel
+    // sub-DB, while later emission needs these exact bytes for aggregate
+    // initializers.
+    relation retained_initialized_data_range(Address, Arc<Vec<u8>>);
     relation global_addr_access(Ident, i64, Node, MemoryChunk);
+
+    retained_initialized_data_range(*start, bytes.clone()) <--
+        initialized_data_range(start, bytes);
 
     global_addr_access(ident, offset, node, chunk) <--
         rtl_inst(node, ?RTLInst::Iload(chunk, Addressing::Aglobal(ident, offset), _, _));
@@ -992,6 +1000,7 @@ mod relocated_string_array_tests {
         assert!(pass.inputs().contains(&"pointer_in_data"));
         assert!(pass.inputs().contains(&"global_var_ref"));
         assert!(pass.inputs().contains(&"initialized_data_range"));
+        assert!(pass.outputs().contains(&"retained_initialized_data_range"));
         assert!(pass.outputs().contains(&"is_global_array"));
     }
 }
