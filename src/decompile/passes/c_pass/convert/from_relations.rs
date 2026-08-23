@@ -633,6 +633,108 @@ fn rewrite_global_interior_initializer(
     }
 }
 
+fn order_globals_for_aggregate_initializers<'a>(
+    globals: &'a [GlobalData],
+    coalescing: &GlobalAggregateCoalescing,
+) -> Vec<&'a GlobalData> {
+    use crate::decompile::passes::c_pass::types::Initializer;
+
+    fn collect_expr_vars(expr: &CExpr, out: &mut HashSet<String>) {
+        match expr {
+            CExpr::Var(name) => {
+                out.insert(name.clone());
+            }
+            CExpr::Unary(_, inner)
+            | CExpr::Cast(_, inner)
+            | CExpr::SizeofExpr(inner)
+            | CExpr::Paren(inner)
+            | CExpr::Member(inner, _)
+            | CExpr::MemberPtr(inner, _) => collect_expr_vars(inner, out),
+            CExpr::Binary(_, lhs, rhs) | CExpr::Assign(_, lhs, rhs) | CExpr::Index(lhs, rhs) => {
+                collect_expr_vars(lhs, out);
+                collect_expr_vars(rhs, out);
+            }
+            CExpr::Ternary(cond, then_expr, else_expr) => {
+                collect_expr_vars(cond, out);
+                collect_expr_vars(then_expr, out);
+                collect_expr_vars(else_expr, out);
+            }
+            CExpr::Call(callee, args) => {
+                collect_expr_vars(callee, out);
+                for arg in args {
+                    collect_expr_vars(arg, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_init_vars(init: &Initializer, out: &mut HashSet<String>) {
+        match init {
+            Initializer::Expr(expr) => collect_expr_vars(expr, out),
+            Initializer::List(items) => {
+                for item in items {
+                    collect_init_vars(&item.init, out);
+                }
+            }
+            Initializer::String(_) => {}
+        }
+    }
+
+    let nodes: Vec<&GlobalData> = globals
+        .iter()
+        .filter(|global| !coalescing.member_ids.contains(&global.id))
+        .collect();
+    let index_by_name: HashMap<String, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, global)| (sanitize_c_symbol_name(&global.name), index))
+        .collect();
+    let mut successors = vec![BTreeSet::new(); nodes.len()];
+    let mut indegree = vec![0_usize; nodes.len()];
+    for (consumer, global) in nodes.iter().enumerate() {
+        let mut dependencies = HashSet::new();
+        for expr in &global.pointer_init {
+            collect_expr_vars(expr, &mut dependencies);
+        }
+        if let Some(init) = coalescing.owner_initializers.get(&global.id) {
+            collect_init_vars(init, &mut dependencies);
+        }
+        for name in dependencies {
+            let Some(&dependency) = index_by_name.get(&name) else {
+                continue;
+            };
+            if dependency != consumer && successors[dependency].insert(consumer) {
+                indegree[consumer] += 1;
+            }
+        }
+    }
+
+    let mut ready: BTreeSet<usize> = indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+        .collect();
+    let mut order = Vec::with_capacity(nodes.len());
+    while let Some(index) = ready.pop_first() {
+        order.push(index);
+        for successor in successors[index].iter().copied() {
+            indegree[successor] -= 1;
+            if indegree[successor] == 0 {
+                ready.insert(successor);
+            }
+        }
+    }
+    // Preserve deterministic declarations even for an unexpected dependency
+    // cycle; the existing C emitter will diagnose that cycle rather than this
+    // layout pass silently dropping definitions.
+    if order.len() != nodes.len() {
+        let emitted: HashSet<usize> = order.iter().copied().collect();
+        order.extend((0..nodes.len()).filter(|index| !emitted.contains(index)));
+    }
+    order.into_iter().map(|index| nodes[index]).collect()
+}
+
 /// Read exact frame-layout aliases published by the Clight field pass.
 ///
 /// A conflicting row is not a choice to make here: it means the producer did
@@ -1776,10 +1878,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         m
     };
 
-    for global in globals {
-        if global_aggregate_coalescing.member_ids.contains(&global.id) {
-            continue;
-        }
+    for global in order_globals_for_aggregate_initializers(globals, &global_aggregate_coalescing) {
         // String literals emit separately and read-only scalars are constant-folded, but a writable .data scalar keeps its storage and must be a real initialized declaration.
         if global.is_string || (global.scalar_value.is_some() && !global.scalar_writable) {
             continue;
@@ -7359,7 +7458,22 @@ mod escaped_stack_array_tests {
             UnaryOp::AddrOf,
             Box::new(CExpr::Var(format!("L_{target_id:x}"))),
         );
+        let owner_ref_id = owner_id - 16;
+        let owner_ref_expr = CExpr::Unary(
+            UnaryOp::AddrOf,
+            Box::new(CExpr::Var(format!("L_{owner_id:x}"))),
+        );
         let globals = vec![
+            GlobalData {
+                id: owner_ref_id,
+                name: format!("L_{owner_ref_id:x}"),
+                is_string: false,
+                content: Vec::new(),
+                is_pointer: true,
+                scalar_value: None,
+                scalar_writable: true,
+                pointer_init: vec![owner_ref_expr],
+            },
             GlobalData {
                 id: owner_id,
                 name: format!("L_{owner_id:x}"),
@@ -7382,6 +7496,16 @@ mod escaped_stack_array_tests {
                 scalar_writable: true,
                 pointer_init: vec![target_expr.clone()],
             },
+            GlobalData {
+                id: target_id,
+                name: format!("L_{target_id:x}"),
+                is_string: false,
+                content: Vec::new(),
+                is_pointer: false,
+                scalar_value: None,
+                scalar_writable: true,
+                pointer_init: Vec::new(),
+            },
         ];
         let layouts = HashMap::from([(
             owner_id,
@@ -7398,6 +7522,11 @@ mod escaped_stack_array_tests {
 
         assert!(coalesced.owner_ids.contains(&owner_id));
         assert!(coalesced.member_ids.contains(&member_id));
+        let ordered_ids: Vec<_> = order_globals_for_aggregate_initializers(&globals, &coalesced)
+            .into_iter()
+            .map(|global| global.id)
+            .collect();
+        assert_eq!(ordered_ids, vec![target_id, owner_id, owner_ref_id]);
         assert_eq!(
             coalesced.member_exprs.get(&format!("L_{member_id:x}")),
             Some(&CExpr::Member(
