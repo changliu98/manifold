@@ -7199,6 +7199,17 @@ ascent_par! {
         reg_stack_addr_origins(func_start, def_addr, reg, origins),
         if let Some(ofs) = sole_stack_slot(origins);
 
+    // A may-projection is intentionally separate from the must-alias fact
+    // above. At a CMOV/phi join, {Slot(base), NonStack} is not permission to
+    // redirect the value or unify alias webs, but an exact external ABI write
+    // still has to fit whenever the Slot arm is selected. Consumers are kept
+    // narrow below: only tabled, fixed-size external pointees use this fact.
+    #[local] relation reg_may_hold_slot_addr(Address, Address, i64, Mreg);
+    reg_may_hold_slot_addr(*func_start, *def_addr, *ofs, *reg) <--
+        reg_stack_addr_origins(func_start, def_addr, reg, origins),
+        for origin in origins.0.iter(),
+        if let StackAddrOrigin::Slot(ofs) = origin;
+
     slot_addr_escaped(func_start, lea_addr, *ofs) <--
         ltl_inst(lea_addr, ?LTLInst::Lop(Operation::Olea(Addressing::Ainstack(ofs)), _, _)),
         instr_in_function(lea_addr, func_start),
@@ -7600,11 +7611,26 @@ ascent_par! {
         known_func_param_pointee_size(name, pos, bytes);
 
     known_extern_out_param_slot(caller, *base, *bytes) <--
+        reg_may_hold_slot_addr(caller, def_addr, base, arg_mreg),
+        arg_setup_candidate(def_addr, arg_mreg, call_addr),
+        abi_int_arg_position(arg_mreg, pos),
+        external_call_site(call_addr, _, name),
+        known_func_param_pointee_size(name, pos, bytes);
+
+    known_extern_out_param_slot(caller, *base, *bytes) <--
         reg_holds_slot_addr(caller, def_addr, base, arg_mreg),
         arg_setup_candidate(def_addr, arg_mreg, call_addr),
         abi_int_arg_position(arg_mreg, pos),
         ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Right(name)))),
         // A local definition sharing a tabled libc name is not that libc call.
+        !emit_function(_, name, _),
+        known_func_param_pointee_size(name, pos, bytes);
+
+    known_extern_out_param_slot(caller, *base, *bytes) <--
+        reg_may_hold_slot_addr(caller, def_addr, base, arg_mreg),
+        arg_setup_candidate(def_addr, arg_mreg, call_addr),
+        abi_int_arg_position(arg_mreg, pos),
+        ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Right(name)))),
         !emit_function(_, name, _),
         known_func_param_pointee_size(name, pos, bytes);
 
@@ -12180,6 +12206,86 @@ mod tests {
                 .reg_holds_slot_addr
                 .iter()
                 .any(|fact| fact == &(func, copy, 16, Mreg::DI)));
+        });
+    }
+
+    #[test]
+    fn exact_external_extent_keeps_each_stack_may_origin_at_a_cfg_join() {
+        on_large_stack(|| {
+            let [func, stack_block, data_block, join_block, lea, data_def, copy, call] =
+                synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+            let base_ofs = 16_i64;
+
+            for (node, block) in [
+                (lea, stack_block),
+                (data_def, data_block),
+                (copy, join_block),
+                (call, join_block),
+            ] {
+                prog.instr_in_function.push((node, func));
+                prog.instr_in_function.push((block, func));
+                prog.code_in_block.push((node, block));
+                prog.block_in_function.push((block, func));
+            }
+            prog.block_last_insn.extend([
+                (stack_block, lea),
+                (data_block, data_def),
+                (join_block, call),
+            ]);
+            prog.asm_block_next
+                .extend([(stack_block, join_block), (data_block, join_block)]);
+            prog.next.push((copy, call));
+            prog.reg_def
+                .extend([(lea, Mreg::R15), (data_def, Mreg::R15), (copy, Mreg::SI)]);
+            prog.reg_use.push((copy, Mreg::R15));
+            prog.ltl_inst.push((
+                lea,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Ainstack(base_ofs)),
+                    Arc::new(vec![]),
+                    Mreg::R15,
+                ),
+            ));
+            prog.ltl_inst.push((
+                data_def,
+                LTLInst::Lop(Operation::Olongconst(0), Arc::new(vec![]), Mreg::R15),
+            ));
+            prog.ltl_inst.push((
+                copy,
+                LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::R15]), Mreg::SI),
+            ));
+            prog.ltl_inst.push((
+                call,
+                LTLInst::Lcall(Either::Right(Either::Right("fixed_writer"))),
+            ));
+            prog.arg_setup_candidate.push((copy, Mreg::SI, call));
+            prog.abi_int_arg_position.push((Mreg::SI, 1));
+            prog.known_func_param_pointee_size
+                .push(("fixed_writer", 1, 8));
+
+            prog.run();
+
+            assert!(prog
+                .reg_def_used
+                .iter()
+                .any(|fact| { fact == &(lea, Mreg::R15, copy) }));
+            assert!(prog
+                .reg_def_used
+                .iter()
+                .any(|fact| { fact == &(data_def, Mreg::R15, copy) }));
+            assert!(!prog
+                .reg_holds_slot_addr
+                .iter()
+                .any(|fact| fact == &(func, copy, base_ofs, Mreg::SI)));
+            assert!(prog
+                .reg_may_hold_slot_addr
+                .iter()
+                .any(|fact| fact == &(func, copy, base_ofs, Mreg::SI)));
+            assert!(prog
+                .escaped_stack_region_extent
+                .iter()
+                .any(|fact| fact == &(func, base_ofs, 8)));
         });
     }
 
