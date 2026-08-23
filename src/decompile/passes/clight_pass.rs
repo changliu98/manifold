@@ -1378,6 +1378,49 @@ mod tests {
     }
 
     #[test]
+    fn nonzero_global_coordinates_are_byte_annotated_on_every_lowering_route() {
+        fn assert_byte_coordinate(expr: &ClightExpr, ident: Ident, offset: i64) {
+            assert!(
+                matches!(
+                    expr,
+                    ClightExpr::Ebinop(
+                        ClightBinaryOp::Oadd,
+                        lhs,
+                        rhs,
+                        ClightType::Tpointer(result_pointee, _),
+                    ) if matches!(
+                        lhs.as_ref(),
+                        ClightExpr::Eaddrof(
+                            inner,
+                            ClightType::Tpointer(base_pointee, _),
+                        ) if matches!(inner.as_ref(), ClightExpr::Evar(got, _ ) if *got == ident)
+                            && matches!(base_pointee.as_ref(), ClightType::Tvoid)
+                    )
+                        && matches!(rhs.as_ref(), ClightExpr::EconstLong(got, _) if *got == offset)
+                        && matches!(result_pointee.as_ref(), ClightType::Tvoid)
+                ),
+                "global byte coordinate lost its void-pointer marker: {expr:#?}"
+            );
+        }
+
+        let ident = 0xe090_usize;
+        let offset = 8_i64;
+        let ordinary = clight_expr_from_csharp(
+            &CsharpminorExpr::Econst(Constant::Oaddrsymbol(ident, offset)),
+            8,
+        );
+        assert_byte_coordinate(&ordinary, ident, offset);
+
+        for builtin in [
+            BuiltinArg::BAAddrGlobal(ident, offset),
+            BuiltinArg::BALoadGlobal(MemoryChunk::MAny64, ident, offset),
+        ] {
+            let lowered = clight_expr_from_builtin_arg_with_types(&builtin, &VarTypeMap::new(), 8);
+            assert_byte_coordinate(&lowered, ident, offset);
+        }
+    }
+
+    #[test]
     fn clight_function_ownership_is_cfg_structural_and_multivalued() {
         let mut prog = ClightPassProgram::default();
         let func_a = 0x9000;
@@ -2394,6 +2437,36 @@ pub(crate) fn extract_vars_from_builtin_args(args: &[BuiltinArg<CsharpminorExpr>
 
 pub(crate) fn default_void_ptr_type() -> ClightType {
     pointer_to(ClightType::Tvoid)
+}
+
+/// Lower an image-symbol coordinate without changing its byte unit.
+///
+/// `Oaddrsymbol(_, ofs)` records a byte displacement in Mach/Cminor. Giving
+/// the address expression an `int *` annotation makes C reinterpret that same
+/// number as an element count (`&global + ofs`), and the error grows when the
+/// final declaration is widened to a struct or vector-shaped object. A
+/// `void *` annotation is the byte-address marker already consumed by the C
+/// emitter: it materializes the arithmetic through `char *`, while the load or
+/// store surrounding this expression still supplies the eventual access type.
+fn clight_global_byte_address(ident: Ident, ofs: i64) -> ClightExpr {
+    let byte_ptr = default_void_ptr_type();
+    let base = ClightExpr::Eaddrof(
+        Box::new(ClightExpr::Evar(ident, default_int_type())),
+        byte_ptr.clone(),
+    );
+    if ofs == 0 {
+        base
+    } else {
+        ClightExpr::Ebinop(
+            ClightBinaryOp::Oadd,
+            Box::new(base),
+            Box::new(normalize_const_expr(ClightExpr::EconstLong(
+                ofs,
+                default_long_type(),
+            ))),
+            byte_ptr,
+        )
+    }
 }
 
 fn extract_vars_from_csharp_expr(expr: &CsharpminorExpr, vars: &mut Vec<RTLReg>) {
@@ -3920,22 +3993,7 @@ fn clight_expr_from_csharp_inner(
                         Err(_) => ClightExpr::EconstLong(offset_val, default_long_type()),
                     }
                 } else {
-                    let base = ClightExpr::Eaddrof(
-                        Box::new(ClightExpr::Evar(*ident, default_int_type())),
-                        pointer_to(default_int_type()),
-                    );
-                    if *ofs == 0 {
-                        base
-                    } else {
-                        let offset_expr =
-                            normalize_const_expr(ClightExpr::EconstLong(*ofs, default_long_type()));
-                        ClightExpr::Ebinop(
-                            ClightBinaryOp::Oadd,
-                            Box::new(base),
-                            Box::new(offset_expr),
-                            pointer_to(default_int_type()),
-                        )
-                    }
+                    clight_global_byte_address(*ident, *ofs)
                 }
             }
             Constant::Oaddrstack(ofs) => {
@@ -4333,24 +4391,7 @@ pub(crate) fn clight_expr_from_builtin_arg_with_types(
                     Err(_) => ClightExpr::EconstLong(addr_val, default_long_type()),
                 }
             } else {
-                let base = ClightExpr::Eaddrof(
-                    Box::new(ClightExpr::Evar(*ident, default_int_type())),
-                    pointer_to(default_int_type()),
-                );
-                if *ofs == 0 {
-                    base
-                } else {
-                    let offset = *ofs;
-                    ClightExpr::Ebinop(
-                        ClightBinaryOp::Oadd,
-                        Box::new(base),
-                        Box::new(normalize_const_expr(ClightExpr::EconstLong(
-                            offset,
-                            default_long_type(),
-                        ))),
-                        pointer_to(default_int_type()),
-                    )
-                }
+                clight_global_byte_address(*ident, *ofs)
             }
         }
         BuiltinArg::BASplitLong(lo, hi) | BuiltinArg::BAAddPtr(lo, hi) => {
