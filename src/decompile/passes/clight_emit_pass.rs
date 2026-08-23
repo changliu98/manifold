@@ -1534,6 +1534,7 @@ const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
     "slot_escaped_canonical",
     "slot_escaped_region_canonical",
     "stack_buffer_alias",
+    "stack_buffer_end_alias",
     "stack_var",
     // Exact initialized bytes back designated initializers when a synthetic
     // interior global is coalesced into a recovered aggregate owner.

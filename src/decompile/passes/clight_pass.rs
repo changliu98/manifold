@@ -1795,6 +1795,170 @@ mod tests {
     }
 
     #[test]
+    fn subtracted_address_only_boundary_aliases_the_array_one_past_end() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x4000;
+        let base_lea: Node = 0x4010;
+        let end_lea: Node = 0x4020;
+        let indexed_load: Node = 0x4030;
+        let base_copy: Node = 0x4040;
+        let end_copy: Node = 0x4050;
+        let subtract: Node = 0x4060;
+        let base_addr: RTLReg = 0x9100;
+        let end_addr: RTLReg = 0x9200;
+        let copied_base: RTLReg = 0x9300;
+        let copied_end: RTLReg = 0x9400;
+        let base_local: RTLReg = 0xa100;
+        let end_local: RTLReg = 0xa200;
+
+        db.rel_push("func_stacksz", (func, 0x4100_u64, "indexed", 64_u64));
+        for node in [
+            base_lea,
+            end_lea,
+            indexed_load,
+            base_copy,
+            end_copy,
+            subtract,
+        ] {
+            db.rel_push("instr_in_function", (node, func));
+        }
+        db.rel_push(
+            "rtl_inst",
+            (
+                base_lea,
+                RTLInst::Iop(
+                    Operation::Olea(Addressing::Ainstack(16)),
+                    Arc::new(Vec::new()),
+                    base_addr,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                end_lea,
+                RTLInst::Iop(
+                    Operation::Olea(Addressing::Ainstack(48)),
+                    Arc::new(Vec::new()),
+                    end_addr,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                indexed_load,
+                RTLInst::Iload(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed2(0),
+                    Arc::new(vec![base_addr, 0x9500]),
+                    0x9600,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                base_copy,
+                RTLInst::Iop(Operation::Omove, Arc::new(vec![base_addr]), copied_base),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                end_copy,
+                RTLInst::Iop(Operation::Omove, Arc::new(vec![end_addr]), copied_end),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                subtract,
+                RTLInst::Iop(
+                    Operation::Osubl,
+                    Arc::new(vec![copied_end, copied_base]),
+                    0x9700,
+                ),
+            ),
+        );
+        db.rel_push("stack_var", (func, base_lea, 16_i64, base_local));
+        db.rel_push("stack_var", (func, end_lea, 48_i64, end_local));
+
+        size_indexed_stack_arrays(&mut db);
+
+        assert_eq!(
+            db.stack_array_buffers
+                .get(&func)
+                .and_then(|arrays| arrays.get(&base_local)),
+            Some(&(MemoryChunk::MAny64, 4)),
+        );
+        assert!(db
+            .rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_end_alias")
+            .any(|alias| alias == &(func, end_local, base_local, 32)));
+    }
+
+    #[test]
+    fn adjacent_address_only_boundary_without_pointer_difference_stays_separate() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x5000;
+        let base_lea: Node = 0x5010;
+        let end_lea: Node = 0x5020;
+        let indexed_load: Node = 0x5030;
+        let base_addr: RTLReg = 0x9100;
+        let base_local: RTLReg = 0xa100;
+        let end_local: RTLReg = 0xa200;
+
+        db.rel_push("func_stacksz", (func, 0x5100_u64, "indexed", 64_u64));
+        for node in [base_lea, end_lea, indexed_load] {
+            db.rel_push("instr_in_function", (node, func));
+        }
+        db.rel_push(
+            "rtl_inst",
+            (
+                base_lea,
+                RTLInst::Iop(
+                    Operation::Olea(Addressing::Ainstack(16)),
+                    Arc::new(Vec::new()),
+                    base_addr,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                end_lea,
+                RTLInst::Iop(
+                    Operation::Olea(Addressing::Ainstack(48)),
+                    Arc::new(Vec::new()),
+                    0x9200,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                indexed_load,
+                RTLInst::Iload(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed2(0),
+                    Arc::new(vec![base_addr, 0x9300]),
+                    0x9400,
+                ),
+            ),
+        );
+        db.rel_push("stack_var", (func, base_lea, 16_i64, base_local));
+        db.rel_push("stack_var", (func, end_lea, 48_i64, end_local));
+
+        size_indexed_stack_arrays(&mut db);
+
+        assert_eq!(
+            db.rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_end_alias")
+                .count(),
+            0,
+        );
+    }
+
+    #[test]
     fn field_pass_sizes_opaque_storage_without_struct_fields() {
         let mut db = DecompileDB::default();
         db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
@@ -2201,6 +2365,7 @@ impl IRPass for ClightFieldPass {
             "reg_to_struct_id",
             "emit_struct_fields",
             "stack_buffer_alias",
+            "stack_buffer_end_alias",
         ]
     }
 }
@@ -6305,10 +6470,15 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
     // two addresses is an ambiguous layout, not alias evidence.
     let mut slot_locals: BTreeMap<(Address, i64), BTreeSet<RTLReg>> = BTreeMap::new();
     let mut local_offsets: BTreeMap<(Address, RTLReg), BTreeSet<i64>> = BTreeMap::new();
+    let mut stack_vars_at_node: BTreeMap<(Address, Node, i64), BTreeSet<RTLReg>> = BTreeMap::new();
     let mut boundaries: BTreeMap<Address, BTreeSet<i64>> = BTreeMap::new();
-    for (func, _node, ofs, reg) in db.rel_iter::<(Address, Address, i64, RTLReg)>("stack_var") {
+    for (func, node, ofs, reg) in db.rel_iter::<(Address, Address, i64, RTLReg)>("stack_var") {
         slot_locals.entry((*func, *ofs)).or_default().insert(*reg);
         local_offsets.entry((*func, *reg)).or_default().insert(*ofs);
+        stack_vars_at_node
+            .entry((*func, *node, *ofs))
+            .or_default()
+            .insert(*reg);
         boundaries.entry(*func).or_default().insert(*ofs);
     }
 
@@ -6408,6 +6578,118 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         } else if *chunk == e.2 && count > e.3 {
             e.3 = count;
         }
+    }
+
+    // Point-keyed address-origin lattice over exact stack LEAs and explicit
+    // RTL copies. It is used only to prove that an address-only boundary is
+    // subtracted from the indexed range's base -- the machine shape of a
+    // one-past endpoint. Keeping this separate from storage aliases prevents a
+    // merely adjacent local from being absorbed into the array.
+    let mut address_origins: BTreeMap<(Address, RTLReg), BTreeSet<i64>> = BTreeMap::new();
+    let mut move_edges = Vec::new();
+    let mut subtract_operands = Vec::new();
+    let mut endpoint_locals: BTreeMap<(Address, i64), BTreeSet<RTLReg>> = BTreeMap::new();
+    for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+        let Some(funcs) = node_funcs.get(node) else {
+            continue;
+        };
+        let mut funcs = funcs.iter();
+        let Some(&func) = funcs.next() else {
+            continue;
+        };
+        if funcs.next().is_some() {
+            continue;
+        }
+        match inst {
+            RTLInst::Iop(
+                Operation::Olea(Addressing::Ainstack(ofs))
+                | Operation::Oleal(Addressing::Ainstack(ofs)),
+                args,
+                dst,
+            ) if args.is_empty() => {
+                address_origins
+                    .entry((func, *dst))
+                    .or_default()
+                    .insert(*ofs);
+                if let Some(locals) = stack_vars_at_node.get(&(func, *node, *ofs)) {
+                    endpoint_locals
+                        .entry((func, *ofs))
+                        .or_default()
+                        .extend(locals.iter().copied());
+                }
+            }
+            RTLInst::Iop(Operation::Omove, args, dst) if args.len() == 1 => {
+                move_edges.push((func, args[0], *dst));
+            }
+            RTLInst::Iop(Operation::Osub | Operation::Osubl, args, _) if args.len() == 2 => {
+                subtract_operands.push((func, args[0], args[1]));
+            }
+            _ => {}
+        }
+    }
+    loop {
+        let mut changed = false;
+        for (func, src, dst) in &move_edges {
+            let Some(origins) = address_origins.get(&(*func, *src)).cloned() else {
+                continue;
+            };
+            let target = address_origins.entry((*func, *dst)).or_default();
+            let old_len = target.len();
+            target.extend(origins);
+            changed |= target.len() != old_len;
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut subtracted_stack_roots = BTreeSet::new();
+    for (func, lhs, rhs) in subtract_operands {
+        let (Some(lhs_origins), Some(rhs_origins)) = (
+            address_origins.get(&(func, lhs)),
+            address_origins.get(&(func, rhs)),
+        ) else {
+            continue;
+        };
+        if lhs_origins.len() == 1 && rhs_origins.len() == 1 {
+            subtracted_stack_roots.insert((
+                func,
+                *lhs_origins.iter().next().unwrap(),
+                *rhs_origins.iter().next().unwrap(),
+            ));
+        }
+    }
+    let mut pending_end_aliases = Vec::new();
+    for (&(func, base_local), &(start, end, _, _)) in &sized {
+        let roots_are_subtracted = subtracted_stack_roots.contains(&(func, end, start))
+            || subtracted_stack_roots.contains(&(func, start, end));
+        if !roots_are_subtracted || directly_accessed.contains(&(func, end)) {
+            continue;
+        }
+        let Some(locals) = endpoint_locals.get(&(func, end)) else {
+            continue;
+        };
+        let mut locals = locals.iter();
+        let Some(&endpoint_local) = locals.next() else {
+            continue;
+        };
+        if locals.next().is_some()
+            || local_offsets
+                .get(&(func, endpoint_local))
+                .is_none_or(|offsets| offsets.len() != 1)
+            || db
+                .stack_struct_buffers
+                .get(&func)
+                .is_some_and(|buffers| buffers.contains_key(&endpoint_local))
+        {
+            continue;
+        }
+        let Some(byte_offset) = end
+            .checked_sub(start)
+            .and_then(|offset| usize::try_from(offset).ok())
+        else {
+            continue;
+        };
+        pending_end_aliases.push((func, endpoint_local, base_local, byte_offset));
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6624,6 +6906,11 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         .retain(|_, buffers| !buffers.is_empty());
     for alias in aliases {
         db.rel_push("stack_buffer_alias", alias);
+    }
+    for (func, endpoint, base, offset) in pending_end_aliases {
+        if !coalesced_indexed.contains(&(func, base)) {
+            db.rel_push("stack_buffer_end_alias", (func, endpoint, base, offset));
+        }
     }
 
     for ((func, local), (_, _, chunk, count)) in sized {

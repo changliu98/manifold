@@ -675,6 +675,64 @@ fn derive_stack_buffer_aliases(db: &DecompileDB) -> StackBufferAliases {
     result
 }
 
+fn derive_stack_buffer_end_aliases(db: &DecompileDB) -> StackBufferEndAliases {
+    let mut candidates: BTreeMap<(Address, RTLReg), BTreeSet<(RTLReg, usize)>> = BTreeMap::new();
+    for &(func, endpoint, base, offset) in
+        db.rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_end_alias")
+    {
+        candidates
+            .entry((func, endpoint))
+            .or_default()
+            .insert((base, offset));
+    }
+    let mut result = StackBufferEndAliases::default();
+    for ((func, endpoint), choices) in candidates {
+        let mut choices = choices.into_iter();
+        let Some(choice) = choices.next() else {
+            continue;
+        };
+        if choices.next().is_none() {
+            result.entry(func).or_default().insert(endpoint, choice);
+        }
+    }
+    result
+}
+
+fn rewrite_stack_buffer_end_aliases(
+    body: &CStmt,
+    aliases: &HashMap<RTLReg, (RTLReg, usize)>,
+) -> CStmt {
+    let names: HashMap<String, (String, usize)> = aliases
+        .iter()
+        .map(|(endpoint, (base, offset))| {
+            (
+                crate::decompile::passes::c_pass::helpers::param_name_for_reg(*endpoint),
+                (
+                    crate::decompile::passes::c_pass::helpers::param_name_for_reg(*base),
+                    *offset,
+                ),
+            )
+        })
+        .collect();
+    crate::decompile::passes::c_pass::helpers::map_stmt_exprs(body, &|expr| {
+        let CExpr::Unary(UnaryOp::AddrOf, inner) = expr else {
+            return None;
+        };
+        let CExpr::Var(endpoint) = inner.as_ref() else {
+            return None;
+        };
+        let (base, offset) = names.get(endpoint)?;
+        Some(CExpr::Binary(
+            BinaryOp::Add,
+            Box::new(CExpr::Cast(
+                CType::ptr(CType::char_unsigned()),
+                Box::new(CExpr::Var(base.clone())),
+            )),
+            Box::new(CExpr::int(*offset as i64)),
+        ))
+    })
+}
+
 fn rewrite_stack_buffer_aliases(
     body: &CStmt,
     aliases: &HashMap<RTLReg, (RTLReg, usize)>,
@@ -1896,6 +1954,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     let local_def_policy = header_collision_policy(selected_functions);
     let func_renames = &local_def_policy.renames;
     let stack_buffer_aliases = derive_stack_buffer_aliases(db);
+    let stack_buffer_end_aliases = derive_stack_buffer_end_aliases(db);
     let mut escaped_stack_arrays = derive_escaped_stack_array_layouts(db);
     let escaped_stack_buffers = derive_escaped_stack_buffer_layouts(db, &escaped_stack_arrays);
     remove_buffer_owned_array_layouts(&mut escaped_stack_arrays, &escaped_stack_buffers);
@@ -2298,6 +2357,9 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         // access retains the selected local's scalar width at that offset.
         if let Some(aliases) = function_stack_buffer_aliases {
             body = rewrite_stack_buffer_aliases(&body, aliases, &local_var_types);
+        }
+        if let Some(aliases) = stack_buffer_end_aliases.get(&func.address) {
+            body = rewrite_stack_buffer_end_aliases(&body, aliases);
         }
 
         body = strip_trivial_casts(&body, &local_var_types);
@@ -7199,6 +7261,248 @@ mod escaped_stack_array_tests {
                     )),
                 )),
             )
+        );
+    }
+
+    #[test]
+    fn array_backing_under_pointer_cast_uses_its_address_not_first_byte_value() {
+        let base: RTLReg = 0x7400;
+        let base_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(base);
+        let target_ty = CType::ptr(CType::long());
+        let body = CStmt::Expr(CExpr::Cast(
+            target_ty.clone(),
+            Box::new(CExpr::Var(base_name.clone())),
+        ));
+
+        let rewritten = rewrite_stack_buffer_aliases(
+            &body,
+            &HashMap::from([(base, (base, 0_usize))]),
+            &HashMap::from([(
+                base_name.clone(),
+                CType::Array(Box::new(CType::char_unsigned()), Some(24)),
+            )]),
+        );
+
+        assert_eq!(
+            rewritten,
+            CStmt::Expr(CExpr::Cast(
+                target_ty,
+                Box::new(CExpr::Unary(
+                    UnaryOp::AddrOf,
+                    Box::new(CExpr::Index(
+                        Box::new(CExpr::Var(base_name)),
+                        Box::new(CExpr::int(0)),
+                    )),
+                )),
+            )),
+            "an array alias in pointer context must decay to its backing address",
+        );
+    }
+
+    #[test]
+    fn scalar_backing_under_pointer_cast_keeps_scalar_value_semantics() {
+        let base: RTLReg = 0x7500;
+        let member: RTLReg = 0x7600;
+        let base_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(base);
+        let member_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(member);
+        let target_ty = CType::ptr(CType::char_unsigned());
+        let body = CStmt::Expr(CExpr::Cast(
+            target_ty.clone(),
+            Box::new(CExpr::Var(member_name.clone())),
+        ));
+
+        let rewritten = rewrite_stack_buffer_aliases(
+            &body,
+            &HashMap::from([(member, (base, 8_usize))]),
+            &HashMap::from([(member_name, CType::long())]),
+        );
+
+        assert_eq!(
+            rewritten,
+            CStmt::Expr(CExpr::Cast(
+                target_ty,
+                Box::new(CExpr::Unary(
+                    UnaryOp::Deref,
+                    Box::new(CExpr::Cast(
+                        CType::ptr(CType::long()),
+                        Box::new(CExpr::Unary(
+                            UnaryOp::AddrOf,
+                            Box::new(CExpr::Index(
+                                Box::new(CExpr::Var(base_name)),
+                                Box::new(CExpr::int(8)),
+                            )),
+                        )),
+                    )),
+                )),
+            )),
+            "a true scalar-to-pointer cast must still convert the stored value",
+        );
+    }
+
+    #[test]
+    fn exact_interior_global_field_keeps_one_owner_and_relocation_initializer() {
+        use crate::decompile::passes::c_pass::types::{Designator, Initializer};
+
+        let owner_id = 0xe090_usize;
+        let member_id = owner_id + 8;
+        let target_id = 0xe120_usize;
+        let mut bytes = vec![0_u8; 16];
+        bytes[..8].copy_from_slice(&256_u64.to_le_bytes());
+        let mut db = DecompileDB::default();
+        db.rel_push(
+            "initialized_data_range",
+            (owner_id as Address, Arc::new(bytes)),
+        );
+        db.rel_push("symbol_size", (member_id as Address, 8_usize, "L_e098"));
+
+        let target_expr = CExpr::Unary(
+            UnaryOp::AddrOf,
+            Box::new(CExpr::Var(format!("L_{target_id:x}"))),
+        );
+        let globals = vec![
+            GlobalData {
+                id: owner_id,
+                name: format!("L_{owner_id:x}"),
+                is_string: false,
+                content: Vec::new(),
+                // Deliberately pointer-shaped evidence: accepted aggregate
+                // ownership must override a scalar pointer declaration.
+                is_pointer: true,
+                scalar_value: None,
+                scalar_writable: true,
+                pointer_init: Vec::new(),
+            },
+            GlobalData {
+                id: member_id,
+                name: format!("L_{member_id:x}"),
+                is_string: false,
+                content: Vec::new(),
+                is_pointer: true,
+                scalar_value: None,
+                scalar_writable: true,
+                pointer_init: vec![target_expr.clone()],
+            },
+        ];
+        let layouts = HashMap::from([(
+            owner_id,
+            (
+                0x5937_usize,
+                vec![
+                    (0_i64, 0_usize, MemoryChunk::MAny64),
+                    (8_i64, 8_usize, MemoryChunk::MAny64),
+                ],
+            ),
+        )]);
+
+        let coalesced = derive_global_aggregate_coalescing(&db, &globals, &layouts);
+
+        assert!(coalesced.owner_ids.contains(&owner_id));
+        assert!(coalesced.member_ids.contains(&member_id));
+        assert_eq!(
+            coalesced.member_exprs.get(&format!("L_{member_id:x}")),
+            Some(&CExpr::Member(
+                Box::new(CExpr::Var(format!("L_{owner_id:x}"))),
+                "ofs_8".to_string(),
+            )),
+        );
+        let Some(Initializer::List(items)) = coalesced.owner_initializers.get(&owner_id) else {
+            panic!("aggregate owner lost its initialized fields")
+        };
+        assert!(items.iter().any(|item| {
+            item.designator == Some(Designator::Field("ofs_0".to_string()))
+                && item.init
+                    == Initializer::Expr(CExpr::IntLit(IntLiteral {
+                        value: 256,
+                        suffix: IntLiteralSuffix::L,
+                        base: IntLiteralBase::Decimal,
+                    }))
+        }));
+        assert!(items.iter().any(|item| {
+            item.designator == Some(Designator::Field("ofs_8".to_string()))
+                && item.init
+                    == Initializer::Expr(CExpr::Cast(CType::long(), Box::new(target_expr.clone())))
+        }));
+
+        let address_use = CStmt::Expr(CExpr::Unary(
+            UnaryOp::AddrOf,
+            Box::new(CExpr::Var(format!("L_{member_id:x}"))),
+        ));
+        let rewritten =
+            crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&address_use, &|expr| {
+                let CExpr::Var(name) = expr else {
+                    return None;
+                };
+                coalesced.member_exprs.get(name).cloned()
+            });
+        assert_eq!(
+            rewritten,
+            CStmt::Expr(CExpr::Unary(
+                UnaryOp::AddrOf,
+                Box::new(CExpr::Member(
+                    Box::new(CExpr::Var(format!("L_{owner_id:x}"))),
+                    "ofs_8".to_string(),
+                )),
+            )),
+        );
+    }
+
+    #[test]
+    fn aggregate_global_nonzero_offset_emits_char_pointer_arithmetic() {
+        let ident = 0xe090_usize;
+        let lowered = crate::decompile::passes::clight_pass::clight_expr_from_csharp(
+            &CsharpminorExpr::Econst(Constant::Oaddrsymbol(ident, 8)),
+            8,
+        );
+        let mut ctx = ConversionContext::new(
+            HashMap::from([(ident, "L_e090".to_string())]),
+            crate::abi::DataModel::Lp64,
+        );
+        // Conversion is intentionally independent of the final declaration:
+        // even when L_e090 is emitted as a recovered struct, its machine
+        // coordinate must retain the eight-byte displacement.
+        let converted = convert_expr(&lowered, &mut ctx);
+
+        assert!(matches!(
+            converted,
+            CExpr::Binary(
+                BinaryOp::Add,
+                lhs,
+                rhs,
+            ) if matches!(
+                lhs.as_ref(),
+                CExpr::Cast(CType::Pointer(pointee, _), inner)
+                    if matches!(pointee.as_ref(), CType::Int(IntSize::Char, _))
+                        && matches!(inner.as_ref(), CExpr::Unary(UnaryOp::AddrOf, _))
+            ) && matches!(rhs.as_ref(), CExpr::IntLit(literal) if literal.value == 8)
+        ));
+    }
+
+    #[test]
+    fn stack_one_past_address_uses_the_array_owners_byte_coordinate() {
+        let base: RTLReg = 0x7700;
+        let endpoint: RTLReg = 0x7800;
+        let base_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(base);
+        let endpoint_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(endpoint);
+        let body = CStmt::Expr(CExpr::Unary(
+            UnaryOp::AddrOf,
+            Box::new(CExpr::Var(endpoint_name)),
+        ));
+
+        let rewritten = rewrite_stack_buffer_end_aliases(
+            &body,
+            &HashMap::from([(endpoint, (base, 8192_usize))]),
+        );
+
+        assert_eq!(
+            rewritten,
+            CStmt::Expr(CExpr::Binary(
+                BinaryOp::Add,
+                Box::new(CExpr::Cast(
+                    CType::ptr(CType::char_unsigned()),
+                    Box::new(CExpr::Var(base_name)),
+                )),
+                Box::new(CExpr::int(8192)),
+            )),
         );
     }
 
