@@ -1535,6 +1535,9 @@ const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
     "slot_escaped_region_canonical",
     "stack_buffer_alias",
     "stack_var",
+    // Exact initialized bytes back designated initializers when a synthetic
+    // interior global is coalesced into a recovered aggregate owner.
+    "initialized_data_range",
 ];
 
 // Front half of codegen: CEGAR selection + tree assembly, kept separate so goto-reduction can rewrite the typed trees before emission with types frozen.

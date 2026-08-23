@@ -350,6 +350,288 @@ struct EscapedStackBufferLayouts {
 }
 
 type StackBufferAliases = HashMap<Address, HashMap<RTLReg, (RTLReg, usize)>>;
+type StackBufferEndAliases = HashMap<Address, HashMap<RTLReg, (RTLReg, usize)>>;
+
+#[derive(Default)]
+struct GlobalAggregateCoalescing {
+    owner_ids: HashSet<Ident>,
+    member_ids: HashSet<Ident>,
+    member_exprs: HashMap<String, CExpr>,
+    owner_initializers: HashMap<Ident, crate::decompile::passes::c_pass::types::Initializer>,
+}
+
+/// Coalesce synthetic labels that name exact fields inside one recovered
+/// global aggregate.
+///
+/// Machine globals occupy byte ranges; C globals do not overlap. Emitting a
+/// struct at `base` and an independent pointer at `base + 8` therefore loses
+/// both aliasing and the relocation initializer. This accepts only the bounded
+/// case for which recovery has already supplied an exact, non-overlapping
+/// aggregate layout and every interior declaration starts on a field boundary.
+/// Real ELF names are left alone because their externally visible identity may
+/// matter. Nonzero padding also rejects the candidate: there is no field that
+/// can carry those bytes without changing the recovered type.
+fn derive_global_aggregate_coalescing(
+    db: &DecompileDB,
+    globals: &[GlobalData],
+    layouts: &HashMap<Ident, (usize, Vec<(i64, Ident, MemoryChunk)>)>,
+) -> GlobalAggregateCoalescing {
+    use crate::decompile::analysis::struct_recovery_pass::chunk_byte_size;
+    use crate::decompile::passes::c_pass::types::{Designator, InitItem, Initializer};
+
+    fn synthetic_label_matches(global: &GlobalData) -> bool {
+        global
+            .name
+            .strip_prefix("L_")
+            .and_then(|hex| usize::from_str_radix(hex, 16).ok())
+            == Some(global.id)
+    }
+
+    fn int_expr(raw: u64, width: usize, chunk: MemoryChunk) -> CExpr {
+        let signed = matches!(
+            chunk,
+            MemoryChunk::MInt8Signed
+                | MemoryChunk::MInt16Signed
+                | MemoryChunk::MInt32
+                | MemoryChunk::MInt64
+                | MemoryChunk::MAny32
+                | MemoryChunk::MAny64
+        );
+        let value = if signed {
+            match width {
+                1 => raw as u8 as i8 as i128,
+                2 => raw as u16 as i16 as i128,
+                4 => raw as u32 as i32 as i128,
+                _ => raw as i64 as i128,
+            }
+        } else {
+            raw as i128
+        };
+        CExpr::IntLit(IntLiteral {
+            value,
+            suffix: if width == 8 {
+                IntLiteralSuffix::L
+            } else {
+                IntLiteralSuffix::None
+            },
+            base: IntLiteralBase::Decimal,
+        })
+    }
+
+    let initialized_ranges: Vec<(Address, Arc<Vec<u8>>)> = db
+        .rel_iter::<(Address, Arc<Vec<u8>>)>("initialized_data_range")
+        .map(|(start, bytes)| (*start, bytes.clone()))
+        .collect();
+    let bytes_at = |addr: Address, len: usize| -> Option<Vec<u8>> {
+        let end = addr.checked_add(u64::try_from(len).ok()?)?;
+        let mut matches = initialized_ranges.iter().filter(|(start, bytes)| {
+            addr >= *start
+                && end <= start.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+        });
+        let (start, bytes) = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        let offset = usize::try_from(addr - *start).ok()?;
+        Some(bytes.get(offset..offset.checked_add(len)?)?.to_vec())
+    };
+
+    let globals_by_id: HashMap<Ident, &GlobalData> =
+        globals.iter().map(|global| (global.id, global)).collect();
+    let symbol_sizes: HashMap<Ident, BTreeSet<usize>> = {
+        let mut result: HashMap<Ident, BTreeSet<usize>> = HashMap::new();
+        for (addr, size, _) in db.rel_iter::<(Address, usize, Symbol)>("symbol_size") {
+            if *size > 0 {
+                result.entry(*addr as Ident).or_default().insert(*size);
+            }
+        }
+        result
+    };
+
+    let mut result = GlobalAggregateCoalescing::default();
+    let mut owners: Vec<_> = layouts.keys().copied().collect();
+    owners.sort_unstable();
+    for owner_id in owners {
+        let Some(owner) = globals_by_id.get(&owner_id).copied() else {
+            continue;
+        };
+        if !synthetic_label_matches(owner) {
+            continue;
+        }
+        let Some((_, fields)) = layouts.get(&owner_id) else {
+            continue;
+        };
+        let mut fields = fields.clone();
+        fields.sort_by_key(|(offset, name, chunk)| (*offset, *name, *chunk));
+        if fields.is_empty() || fields[0].0 != 0 {
+            continue;
+        }
+
+        let mut field_ranges = Vec::new();
+        let mut valid = true;
+        for (offset, field_name, chunk) in &fields {
+            let width = chunk_byte_size(chunk);
+            let Some(end) = offset
+                .checked_add(i64::try_from(width).unwrap_or(i64::MAX))
+                .filter(|_| *offset >= 0 && width > 0)
+            else {
+                valid = false;
+                break;
+            };
+            if field_ranges
+                .last()
+                .is_some_and(|(_, previous_end, _): &(i64, i64, Ident)| *previous_end > *offset)
+            {
+                valid = false;
+                break;
+            }
+            field_ranges.push((*offset, end, *field_name));
+        }
+        let Some(extent) = field_ranges.last().map(|(_, end, _)| *end) else {
+            continue;
+        };
+        let Ok(extent_usize) = usize::try_from(extent) else {
+            continue;
+        };
+        let Some(owner_bytes) = bytes_at(owner_id as Address, extent_usize) else {
+            continue;
+        };
+
+        // No recovered field can preserve initialized padding bytes.
+        for (index, byte) in owner_bytes.iter().copied().enumerate() {
+            let covered = field_ranges
+                .iter()
+                .any(|(start, end, _)| (index as i64) >= *start && (index as i64) < *end);
+            if !covered && byte != 0 {
+                valid = false;
+                break;
+            }
+        }
+        if !valid {
+            continue;
+        }
+
+        let field_by_offset: HashMap<i64, (Ident, MemoryChunk)> = fields
+            .iter()
+            .map(|(offset, name, chunk)| (*offset, (*name, *chunk)))
+            .collect();
+        let mut member_rows = Vec::new();
+        for member in globals.iter().filter(|global| {
+            global.id > owner_id
+                && i64::try_from(global.id - owner_id).is_ok_and(|offset| offset < extent)
+        }) {
+            let offset = i64::try_from(member.id - owner_id).unwrap();
+            let Some((field_name, chunk)) = field_by_offset.get(&offset).copied() else {
+                valid = false;
+                break;
+            };
+            if !synthetic_label_matches(member) || member.is_string {
+                valid = false;
+                break;
+            }
+            let width = chunk_byte_size(&chunk);
+            if symbol_sizes
+                .get(&member.id)
+                .is_some_and(|sizes| sizes.len() != 1 || !sizes.contains(&width))
+            {
+                valid = false;
+                break;
+            }
+            if member.pointer_init.len() > 1 {
+                valid = false;
+                break;
+            }
+            member_rows.push((member, offset, field_name, chunk));
+        }
+        if !valid || member_rows.is_empty() {
+            continue;
+        }
+
+        let member_at_offset: HashMap<i64, &GlobalData> = member_rows
+            .iter()
+            .map(|(member, offset, _, _)| (*offset, *member))
+            .collect();
+        let mut items = Vec::new();
+        for (offset, field_name, chunk) in &fields {
+            let width = chunk_byte_size(chunk);
+            let value = if let Some(member) = member_at_offset.get(offset).copied() {
+                if let Some(pointer) = member.pointer_init.first() {
+                    Some(CExpr::Cast(
+                        ctype_from_memchunk(chunk),
+                        Box::new(pointer.clone()),
+                    ))
+                } else {
+                    member.scalar_value.as_ref().map(|scalar| {
+                        CExpr::Cast(ctype_from_memchunk(chunk), Box::new(scalar.to_cexpr()))
+                    })
+                }
+            } else {
+                None
+            };
+            let value = value.or_else(|| {
+                let start = usize::try_from(*offset).ok()?;
+                let bytes = owner_bytes.get(start..start.checked_add(width)?)?;
+                let raw = bytes.iter().enumerate().fold(0_u64, |word, (index, byte)| {
+                    word | ((*byte as u64) << (index * 8))
+                });
+                (raw != 0).then(|| int_expr(raw, width, *chunk))
+            });
+            if let Some(value) = value {
+                items.push(InitItem {
+                    designator: Some(Designator::Field(
+                        crate::decompile::passes::csh_pass::field_ident_to_name(*field_name),
+                    )),
+                    init: Initializer::Expr(value),
+                });
+            }
+        }
+
+        for (member, _offset, field_name, _) in member_rows {
+            result.member_ids.insert(member.id);
+            result.member_exprs.insert(
+                sanitize_c_symbol_name(&member.name),
+                CExpr::Member(
+                    Box::new(CExpr::Var(sanitize_c_symbol_name(&owner.name))),
+                    crate::decompile::passes::csh_pass::field_ident_to_name(field_name),
+                ),
+            );
+        }
+        result.owner_ids.insert(owner_id);
+        if !items.is_empty() {
+            result
+                .owner_initializers
+                .insert(owner_id, Initializer::List(items));
+        }
+    }
+    result
+}
+
+fn rewrite_global_interior_initializer(
+    init: &crate::decompile::passes::c_pass::types::Initializer,
+    members: &HashMap<String, CExpr>,
+) -> crate::decompile::passes::c_pass::types::Initializer {
+    use crate::decompile::passes::c_pass::types::{InitItem, Initializer};
+    match init {
+        Initializer::Expr(expr) => Initializer::Expr(
+            crate::decompile::passes::c_pass::helpers::map_expr(expr, &|candidate| {
+                let CExpr::Var(name) = candidate else {
+                    return None;
+                };
+                members.get(name).cloned()
+            }),
+        ),
+        Initializer::List(items) => Initializer::List(
+            items
+                .iter()
+                .map(|item| InitItem {
+                    designator: item.designator.clone(),
+                    init: rewrite_global_interior_initializer(&item.init, members),
+                })
+                .collect(),
+        ),
+        Initializer::String(literal) => Initializer::String(literal.clone()),
+    }
+}
 
 /// Read exact frame-layout aliases published by the Clight field pass.
 ///
@@ -1194,6 +1476,38 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         }
         m
     };
+    // The coalescer below consumes only a unique field vector belonging to the
+    // same deterministic struct id chosen for the declaration. Multiple
+    // layouts are ambiguity, not a reason to pick by relation arrival order.
+    let global_struct_decl_layouts: HashMap<Ident, (usize, Vec<(i64, Ident, MemoryChunk)>)> = {
+        let mut candidates: BTreeMap<Ident, BTreeSet<Vec<(i64, Ident, MemoryChunk)>>> =
+            BTreeMap::new();
+        for (ident, sid, fields) in db
+            .rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>(
+                "emit_global_struct_fields",
+            )
+        {
+            if global_struct_decl_ids.get(ident) == Some(sid) {
+                candidates
+                    .entry(*ident)
+                    .or_default()
+                    .insert(fields.as_ref().clone());
+            }
+        }
+        candidates
+            .into_iter()
+            .filter_map(|(ident, layouts)| {
+                let mut layouts = layouts.into_iter();
+                let layout = layouts.next()?;
+                if layouts.next().is_some() {
+                    return None;
+                }
+                Some((ident, (global_struct_decl_ids[&ident], layout)))
+            })
+            .collect()
+    };
+    let global_aggregate_coalescing =
+        derive_global_aggregate_coalescing(db, globals, &global_struct_decl_layouts);
     // Same for recovered global arrays: smallest (elem_size, count) per ident -- weakest claim, deterministic across the multi-valued relation.
     let global_array_decl: HashMap<usize, (usize, usize)> = {
         let mut m: HashMap<usize, (usize, usize)> = HashMap::new();
@@ -1337,6 +1651,9 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     };
 
     for global in globals {
+        if global_aggregate_coalescing.member_ids.contains(&global.id) {
+            continue;
+        }
         // String literals emit separately and read-only scalars are constant-folded, but a writable .data scalar keeps its storage and must be a real initialized declaration.
         if global.is_string || (global.scalar_value.is_some() && !global.scalar_writable) {
             continue;
@@ -1361,7 +1678,18 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         if is_libc_stdio_global(&global.name) {
             continue;
         }
-        let (ty, init) = if !global.pointer_init.is_empty() {
+        let (ty, init) = if global_aggregate_coalescing.owner_ids.contains(&global.id) {
+            let Some((sid, _)) = global_struct_decl_layouts.get(&global.id) else {
+                continue;
+            };
+            (
+                CType::Struct(format!("struct_{:x}", sid)),
+                global_aggregate_coalescing
+                    .owner_initializers
+                    .get(&global.id)
+                    .cloned(),
+            )
+        } else if !global.pointer_init.is_empty() {
             // Relocated pointer-valued global from ELF ground truth: a single slot is a scalar void*, a run is a pointer table emitted as long name[N] = {...} so the runtime bytes are reconstructed.
             use crate::decompile::passes::c_pass::types::{InitItem, Initializer};
             if global.pointer_init.len() == 1 {
@@ -1466,6 +1794,12 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         } else {
             (StorageClass::default(), init)
         };
+        let init = init.map(|initializer| {
+            rewrite_global_interior_initializer(
+                &initializer,
+                &global_aggregate_coalescing.member_exprs,
+            )
+        });
         tu.add_global_var(VarDecl {
             name: sanitized_name,
             ty,
@@ -1757,6 +2091,19 @@ pub fn build_translation_unit_from_stmt_map_with_types(
 
         simplify_xor_self_in_stmt(&mut body);
         strip_dead_expr_stmts(&mut body);
+
+        // Interior image labels admitted by the exact aggregate coalescer are
+        // coordinates in their owner's storage, not independent C variables.
+        // Rewrite value and address uses before local inference so `L_base.f`
+        // participates with its real field type throughout later cleanup.
+        if !global_aggregate_coalescing.member_exprs.is_empty() {
+            body = crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&body, &|expr| {
+                let CExpr::Var(name) = expr else {
+                    return None;
+                };
+                global_aggregate_coalescing.member_exprs.get(name).cloned()
+            });
+        }
 
         // Per-function local variable types seeded from clight_select's refined candidates, built BEFORE strip_trivial_casts so a (long)float_var is not reduced to a bare float under a pointer cast.
         let mut local_var_types = func_var_types.clone();
