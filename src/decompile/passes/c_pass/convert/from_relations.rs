@@ -695,38 +695,106 @@ fn rewrite_stack_buffer_aliases(
             )
         })
         .collect();
-    crate::decompile::passes::c_pass::helpers::map_stmt_exprs(body, &|expr| {
-        let CExpr::Var(name) = expr else {
-            return None;
-        };
-        let (base, offset, value_ty) = alias_names.get(name)?;
-        let byte = CExpr::Index(
-            Box::new(CExpr::Var(base.clone())),
-            Box::new(CExpr::int(*offset as i64)),
-        );
-        let Some(value_ty) = value_ty else {
-            // Keep the exact backing alias even if type selection omitted the
-            // local.  The normal path has a selected declaration type and uses
-            // the width-preserving arm below.
-            return Some(byte);
-        };
-        if matches!(
-            value_ty,
-            CType::Void | CType::Function(..) | CType::Array(..)
-        ) {
-            return Some(byte);
+
+    fn byte_lvalue(base: &str, offset: usize) -> CExpr {
+        CExpr::Index(
+            Box::new(CExpr::Var(base.to_string())),
+            Box::new(CExpr::int(offset as i64)),
+        )
+    }
+
+    // This walk is deliberately context-aware. The generic bottom-up mapper
+    // replaced an array alias `buffer` with `buffer[0]` before seeing an
+    // enclosing pointer cast, turning `(T *)buffer` into `(T *)buffer[0]` and
+    // treating the first byte's VALUE as an address. Only an alias whose final
+    // declaration is an array receives decay/address semantics in pointer-cast
+    // position. A scalar-to-pointer cast remains a scalar value conversion.
+    fn rewrite_expr(
+        expr: &CExpr,
+        alias_names: &HashMap<String, (String, usize, Option<CType>)>,
+        pointer_cast_operand: bool,
+    ) -> CExpr {
+        if let CExpr::Var(name) = expr {
+            let Some((base, offset, value_ty)) = alias_names.get(name) else {
+                return expr.clone();
+            };
+            let byte = byte_lvalue(base, *offset);
+            if pointer_cast_operand && matches!(value_ty, Some(CType::Array(..))) {
+                return CExpr::Unary(UnaryOp::AddrOf, Box::new(byte));
+            }
+            let Some(value_ty) = value_ty else {
+                return byte;
+            };
+            if matches!(
+                value_ty,
+                CType::Void | CType::Function(..) | CType::Array(..)
+            ) {
+                return byte;
+            }
+            return CExpr::Unary(
+                UnaryOp::Deref,
+                Box::new(CExpr::Cast(
+                    CType::ptr(value_ty.clone()),
+                    Box::new(CExpr::Unary(UnaryOp::AddrOf, Box::new(byte))),
+                )),
+            );
         }
-        // A canonical local denotes the value stored at this physical byte
-        // coordinate, while `&local` denotes its address.  Spell the former as
-        // a typed lvalue; an enclosing address-of naturally becomes
-        // `&*(T *)&backing[offset]` and therefore names the same storage.
-        Some(CExpr::Unary(
-            UnaryOp::Deref,
-            Box::new(CExpr::Cast(
-                CType::ptr(value_ty.clone()),
-                Box::new(CExpr::Unary(UnaryOp::AddrOf, Box::new(byte))),
-            )),
-        ))
+
+        match expr {
+            CExpr::Unary(op, inner) => {
+                CExpr::Unary(*op, Box::new(rewrite_expr(inner, alias_names, false)))
+            }
+            CExpr::Binary(op, lhs, rhs) => CExpr::Binary(
+                *op,
+                Box::new(rewrite_expr(lhs, alias_names, false)),
+                Box::new(rewrite_expr(rhs, alias_names, false)),
+            ),
+            CExpr::Assign(op, lhs, rhs) => CExpr::Assign(
+                *op,
+                Box::new(rewrite_expr(lhs, alias_names, false)),
+                Box::new(rewrite_expr(rhs, alias_names, false)),
+            ),
+            CExpr::Ternary(cond, then_expr, else_expr) => CExpr::Ternary(
+                Box::new(rewrite_expr(cond, alias_names, false)),
+                Box::new(rewrite_expr(then_expr, alias_names, false)),
+                Box::new(rewrite_expr(else_expr, alias_names, false)),
+            ),
+            CExpr::Call(callee, args) => CExpr::Call(
+                Box::new(rewrite_expr(callee, alias_names, false)),
+                args.iter()
+                    .map(|arg| rewrite_expr(arg, alias_names, false))
+                    .collect(),
+            ),
+            CExpr::Cast(ty, inner) => CExpr::Cast(
+                ty.clone(),
+                Box::new(rewrite_expr(inner, alias_names, ty.is_pointer())),
+            ),
+            CExpr::Member(inner, field) => CExpr::Member(
+                Box::new(rewrite_expr(inner, alias_names, false)),
+                field.clone(),
+            ),
+            CExpr::MemberPtr(inner, field) => CExpr::MemberPtr(
+                Box::new(rewrite_expr(inner, alias_names, false)),
+                field.clone(),
+            ),
+            CExpr::Index(base, index) => CExpr::Index(
+                Box::new(rewrite_expr(base, alias_names, false)),
+                Box::new(rewrite_expr(index, alias_names, false)),
+            ),
+            CExpr::SizeofExpr(inner) => {
+                CExpr::SizeofExpr(Box::new(rewrite_expr(inner, alias_names, false)))
+            }
+            CExpr::Paren(inner) => CExpr::Paren(Box::new(rewrite_expr(
+                inner,
+                alias_names,
+                pointer_cast_operand,
+            ))),
+            _ => expr.clone(),
+        }
+    }
+
+    crate::decompile::passes::c_pass::helpers::map_stmt_exprs_total(body, &|expr| {
+        rewrite_expr(expr, &alias_names, false)
     })
 }
 
