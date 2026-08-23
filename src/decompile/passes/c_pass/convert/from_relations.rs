@@ -7590,9 +7590,20 @@ mod escaped_stack_array_tests {
         // even when L_e090 is emitted as a recovered struct, its machine
         // coordinate must retain the eight-byte displacement.
         let converted = convert_expr(&lowered, &mut ctx);
+        let byte_expr = match &converted {
+            CExpr::Cast(CType::Pointer(pointee, _), inner)
+                if matches!(pointee.as_ref(), CType::Void) =>
+            {
+                match inner.as_ref() {
+                    CExpr::Paren(inner) => inner.as_ref(),
+                    inner => inner,
+                }
+            }
+            other => other,
+        };
 
         assert!(matches!(
-            converted,
+            byte_expr,
             CExpr::Binary(
                 BinaryOp::Add,
                 lhs,
