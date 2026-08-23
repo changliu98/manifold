@@ -541,6 +541,14 @@ fn rewrite_recovered_global_expr(
             ty.clone(),
             Box::new(rewrite_recovered_global_expr(inner, arrays, structs)),
         ),
+        // An explicit member already presents the recovered aggregate at the
+        // right field coordinate. Rewriting its direct owner Var as the
+        // aggregate's first-field scalar would compose `g.ofs_0.ofs_N`.
+        // This is the shape produced when an interior synthetic global has
+        // already been coalesced to its owner's exact field.
+        CExpr::Member(base, f) if matches!(base.as_ref(), CExpr::Var(name) if structs.contains_key(name)) => {
+            CExpr::Member(base.clone(), f.clone())
+        }
         CExpr::Member(base, f) => CExpr::Member(
             Box::new(rewrite_recovered_global_expr(base, arrays, structs)),
             f.clone(),
@@ -2486,9 +2494,38 @@ impl IRPass for ClightEmitPass {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClightEmitPass, ClightSelectPass};
+    use super::{rewrite_recovered_global_expr, ClightEmitPass, ClightSelectPass};
+    use crate::decompile::passes::c_pass::types::CExpr;
     use crate::decompile::passes::clight_pass::ClightPass;
     use crate::decompile::passes::pass::IRPass;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn explicit_recovered_global_member_is_not_prefixed_by_first_field() {
+        let owner = "L_e090".to_string();
+        let expr = CExpr::Member(Box::new(CExpr::Var(owner.clone())), "ofs_8".to_string());
+        let structs = HashMap::from([(owner.clone(), "ofs_0".to_string())]);
+
+        let rewritten = rewrite_recovered_global_expr(&expr, &HashSet::new(), &structs);
+
+        assert_eq!(rewritten, expr);
+        assert_eq!(
+            rewrite_recovered_global_expr(&CExpr::Var(owner.clone()), &HashSet::new(), &structs,),
+            CExpr::Member(Box::new(CExpr::Var(owner.clone())), "ofs_0".to_string(),),
+            "a genuinely bare aggregate use must still select its scalar first field",
+        );
+        assert_ne!(
+            rewritten,
+            CExpr::Member(
+                Box::new(CExpr::Member(
+                    Box::new(CExpr::Var(owner)),
+                    "ofs_0".to_string(),
+                )),
+                "ofs_8".to_string(),
+            ),
+            "an interior field already rewritten to its owner was composed twice",
+        );
+    }
 
     #[test]
     fn clight_sseq_relations_are_scheduler_isolated() {
