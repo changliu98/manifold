@@ -48,10 +48,14 @@ fn is_x86_frame_pointer_name(name: &str) -> bool {
 
 fn x86_gpr_view_width(reg: &str) -> Option<i64> {
     match reg {
-        "RSP" | "RBP" => Some(8),
-        "ESP" | "EBP" => Some(4),
-        "SP" | "BP" => Some(2),
-        "SPL" | "BPL" => Some(1),
+        "RAX" | "RBX" | "RCX" | "RDX" | "RSI" | "RDI" | "RBP" | "RSP" | "R8" | "R9" | "R10"
+        | "R11" | "R12" | "R13" | "R14" | "R15" => Some(8),
+        "EAX" | "EBX" | "ECX" | "EDX" | "ESI" | "EDI" | "EBP" | "ESP" | "R8D" | "R9D" | "R10D"
+        | "R11D" | "R12D" | "R13D" | "R14D" | "R15D" => Some(4),
+        "AX" | "BX" | "CX" | "DX" | "SI" | "DI" | "BP" | "SP" | "R8W" | "R9W" | "R10W" | "R11W"
+        | "R12W" | "R13W" | "R14W" | "R15W" => Some(2),
+        "AL" | "BL" | "CL" | "DL" | "AH" | "BH" | "CH" | "DH" | "SIL" | "DIL" | "BPL" | "SPL"
+        | "R8B" | "R9B" | "R10B" | "R11B" | "R12B" | "R13B" | "R14B" | "R15B" => Some(1),
         _ => None,
     }
 }
@@ -95,7 +99,9 @@ ascent_par! {
     relation instr_in_function(Node, Address);
     relation next(Address, Address);
     relation op_indirect(Symbol, &'static str, &'static str, &'static str, i64, i64, usize);
+    relation op_register(Symbol, &'static str);
     relation plea(Address, Symbol, Symbol);
+    relation pmov(Address, Symbol, Symbol);
     relation settled_block_dom_set(Address, Address, Set<Address>);
     relation settled_sp_frame_shift(Address, Address, i64);
 
@@ -202,6 +208,23 @@ ascent_par! {
         instr_in_function(addr, func),
         settled_sp_frame_shift(func, addr, depth),
         if let Some(ofs) = raw_ofs.checked_sub(*depth);
+
+    // Compilers commonly materialize the current frame base with a plain
+    // full-width `mov %sp, %gpr`.  AsmPass intentionally raises that machine
+    // move to the same Ainstack(0) address expression as an LEA; publish the
+    // matching exact frame coordinate here so RTL can retain its stack-object
+    // identity.  Partial-register moves are not pointer materializations.
+    exact_frame_stack_lea_member(*func, *addr, ofs) <--
+        pmov(addr, dst, src),
+        op_register(dst, dst_name),
+        op_register(src, src_name),
+        if is_x86_stack_pointer_name(src_name),
+        abi_pointer_size(pointer_width),
+        if x86_gpr_view_width(src_name) == Some(*pointer_width),
+        if x86_gpr_view_width(dst_name) == Some(*pointer_width),
+        instr_in_function(addr, func),
+        settled_sp_frame_shift(func, addr, depth),
+        if let Some(ofs) = 0_i64.checked_sub(*depth);
     #[local] relation exact_frame_stack_lea_conflict(Address, Address);
     exact_frame_stack_lea_conflict(*func, *addr) <--
         exact_frame_stack_lea_member(func, addr, left),
@@ -531,6 +554,9 @@ mod tests {
         let bp_write = 0x3070_u64;
         let esp_write = 0x3080_u64;
         let esp_lea = 0x3090_u64;
+        let known_mov = 0x30a0_u64;
+        let missing_mov = 0x30b0_u64;
+        let narrow_mov = 0x30c0_u64;
         let mut db = DecompileDB::default();
 
         db.rel_push("abi_pointer_size", (8_i64,));
@@ -545,12 +571,15 @@ mod tests {
             bp_write,
             esp_write,
             esp_lea,
+            known_mov,
+            missing_mov,
+            narrow_mov,
         ] {
             db.rel_push("instr_in_function", (node, func));
             db.rel_push("code_in_block", (node, node));
             db.rel_push("settled_block_dom_set", (func, node, Set::singleton(node)));
         }
-        for node in [known_write, indexed_write, known_lea] {
+        for node in [known_write, indexed_write, known_lea, known_mov, narrow_mov] {
             db.rel_push("settled_sp_frame_shift", (func, node, 8_i64));
         }
         db.rel_push("settled_sp_frame_shift", (func, esp_write, 8_i64));
@@ -594,6 +623,21 @@ mod tests {
                 ),
             );
         }
+        for (node, dst, dst_name, src, src_name) in [
+            (known_mov, "known_mov_dst", "RDI", "known_mov_src", "RSP"),
+            (
+                missing_mov,
+                "missing_mov_dst",
+                "RDI",
+                "missing_mov_src",
+                "RSP",
+            ),
+            (narrow_mov, "narrow_mov_dst", "EDI", "narrow_mov_src", "ESP"),
+        ] {
+            db.rel_push("pmov", (node, dst, src));
+            db.rel_push("op_register", (dst, dst_name));
+            db.rel_push("op_register", (src, src_name));
+        }
 
         FrameWritePass.run(&mut db);
 
@@ -618,7 +662,10 @@ mod tests {
             .copied()
             .collect();
         assert!(exact_leas.contains(&(func, known_lea, 16)));
+        assert!(exact_leas.contains(&(func, known_mov, -8)));
         assert!(!exact_leas.iter().any(|(_, node, _)| *node == missing_lea));
         assert!(!exact_leas.iter().any(|(_, node, _)| *node == esp_lea));
+        assert!(!exact_leas.iter().any(|(_, node, _)| *node == missing_mov));
+        assert!(!exact_leas.iter().any(|(_, node, _)| *node == narrow_mov));
     }
 }
