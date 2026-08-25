@@ -6,7 +6,9 @@ use crate::decompile::passes::c_pass::types::{
     UnaryOp, VarDecl,
 };
 use crate::decompile::passes::c_pass::TranslationUnit;
-use crate::decompile::passes::clight_select::query::GlobalData;
+use crate::decompile::passes::clight_select::query::{
+    extract_global_struct_decl_layouts, GlobalData,
+};
 use crate::decompile::passes::clight_select::select::SelectedFunction;
 use crate::util::{exec_order_key, semantic_node_address};
 use crate::x86::types as clight;
@@ -423,6 +425,11 @@ fn derive_global_aggregate_coalescing(
         .rel_iter::<(Address, Arc<Vec<u8>>)>("retained_initialized_data_range")
         .map(|(start, bytes)| (*start, bytes.clone()))
         .collect();
+    let relocation_slots: BTreeSet<Address> = db
+        .rel_iter::<(Address, Address)>("pointer_in_data")
+        .chain(db.rel_iter::<(Address, Address)>("code_pointer_in_data"))
+        .map(|(slot, _)| *slot)
+        .collect();
     let bytes_at = |addr: Address, len: usize| -> Option<Vec<u8>> {
         let end = addr.checked_add(u64::try_from(len).ok()?)?;
         let mut matches = initialized_ranges.iter().filter(|(start, bytes)| {
@@ -516,6 +523,38 @@ fn derive_global_aggregate_coalescing(
             .iter()
             .map(|(offset, name, chunk)| (*offset, (*name, *chunk)))
             .collect();
+
+        // Every relocation in the recovered byte range must coincide with an
+        // exact pointer-width integer field and have a relocatable expression
+        // supplied by extraction.  Falling back to the pre-relocation raw word
+        // would bake an obsolete link address into the regenerated program.
+        let pointer_size = db.abi().pointer_size;
+        let Some(owner_end) = (owner_id as Address).checked_add(extent as u64) else {
+            continue;
+        };
+        for slot in relocation_slots.range(owner_id as Address..owner_end) {
+            let Ok(offset) = i64::try_from(*slot - owner_id as Address) else {
+                valid = false;
+                break;
+            };
+            let Some((_, chunk)) = field_by_offset.get(&offset) else {
+                valid = false;
+                break;
+            };
+            let pointer_integer_chunk = match pointer_size {
+                4 => matches!(chunk, MemoryChunk::MInt32 | MemoryChunk::MAny32),
+                8 => matches!(chunk, MemoryChunk::MInt64 | MemoryChunk::MAny64),
+                _ => false,
+            };
+            if !pointer_integer_chunk || !owner.aggregate_relocation_init.contains_key(&offset) {
+                valid = false;
+                break;
+            }
+        }
+        if !valid {
+            continue;
+        }
+
         let mut member_rows = Vec::new();
         for member in globals.iter().filter(|global| {
             global.id > owner_id
@@ -544,7 +583,7 @@ fn derive_global_aggregate_coalescing(
             }
             member_rows.push((member, offset, field_name, chunk));
         }
-        if !valid || member_rows.is_empty() {
+        if !valid || (member_rows.is_empty() && owner.aggregate_relocation_init.is_empty()) {
             continue;
         }
 
@@ -555,7 +594,12 @@ fn derive_global_aggregate_coalescing(
         let mut items = Vec::new();
         for (offset, field_name, chunk) in &fields {
             let width = chunk_byte_size(chunk);
-            let value = if let Some(member) = member_at_offset.get(offset).copied() {
+            let value = if let Some(pointer) = owner.aggregate_relocation_init.get(offset) {
+                Some(CExpr::Cast(
+                    ctype_from_memchunk(chunk),
+                    Box::new(pointer.clone()),
+                ))
+            } else if let Some(member) = member_at_offset.get(offset).copied() {
                 if let Some(pointer) = member.pointer_init.first() {
                     Some(CExpr::Cast(
                         ctype_from_memchunk(chunk),
@@ -1699,61 +1743,8 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         .collect();
 
     // SR-1: type global declarations from recovered layouts so emit_global_struct_fields keeps the struct definition alive through clight_emit's referenced-filter; catalog guard prevents naming a struct that extract_struct_definitions won't emit (incomplete type at TU end).
-    let global_struct_decl_ids: HashMap<usize, usize> = {
-        let catalog_ids: HashSet<usize> = db
-            .rel_iter::<(u64, usize, usize, usize)>("global_struct_catalog")
-            .map(|(_, id, _, _)| *id)
-            .collect();
-        let mut m: HashMap<usize, usize> = HashMap::new();
-        for (ident, sid, _fields) in db
-            .rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>(
-                "emit_global_struct_fields",
-            )
-        {
-            if !catalog_ids.contains(sid) {
-                continue;
-            }
-            // Min-sid per ident: relation is set-semantics and may carry several rows; arrival order must not pick the winner.
-            m.entry(*ident)
-                .and_modify(|e| {
-                    if *sid < *e {
-                        *e = *sid;
-                    }
-                })
-                .or_insert(*sid);
-        }
-        m
-    };
-    // The coalescer below consumes only a unique field vector belonging to the
-    // same deterministic struct id chosen for the declaration. Multiple
-    // layouts are ambiguity, not a reason to pick by relation arrival order.
-    let global_struct_decl_layouts: HashMap<Ident, (usize, Vec<(i64, Ident, MemoryChunk)>)> = {
-        let mut candidates: BTreeMap<Ident, BTreeSet<Vec<(i64, Ident, MemoryChunk)>>> =
-            BTreeMap::new();
-        for (ident, sid, fields) in db
-            .rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>(
-                "emit_global_struct_fields",
-            )
-        {
-            if global_struct_decl_ids.get(ident) == Some(sid) {
-                candidates
-                    .entry(*ident)
-                    .or_default()
-                    .insert(fields.as_ref().clone());
-            }
-        }
-        candidates
-            .into_iter()
-            .filter_map(|(ident, layouts)| {
-                let mut layouts = layouts.into_iter();
-                let layout = layouts.next()?;
-                if layouts.next().is_some() {
-                    return None;
-                }
-                Some((ident, (global_struct_decl_ids[&ident], layout)))
-            })
-            .collect()
-    };
+    let (global_struct_decl_ids, global_struct_decl_layouts) =
+        extract_global_struct_decl_layouts(db);
     let global_aggregate_coalescing =
         derive_global_aggregate_coalescing(db, globals, &global_struct_decl_layouts);
     let global_array_decl = recovered_global_array_declarations(db);
@@ -7674,6 +7665,7 @@ mod escaped_stack_array_tests {
         let mut bytes = vec![0_u8; 16];
         bytes[..8].copy_from_slice(&256_u64.to_le_bytes());
         let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
         db.rel_push(
             "retained_initialized_data_range",
             (owner_id as Address, Arc::new(bytes)),
@@ -7699,6 +7691,7 @@ mod escaped_stack_array_tests {
                 scalar_value: None,
                 scalar_writable: true,
                 pointer_init: vec![owner_ref_expr],
+                aggregate_relocation_init: BTreeMap::new(),
             },
             GlobalData {
                 id: owner_id,
@@ -7711,6 +7704,7 @@ mod escaped_stack_array_tests {
                 scalar_value: None,
                 scalar_writable: true,
                 pointer_init: Vec::new(),
+                aggregate_relocation_init: BTreeMap::new(),
             },
             GlobalData {
                 id: member_id,
@@ -7721,6 +7715,7 @@ mod escaped_stack_array_tests {
                 scalar_value: None,
                 scalar_writable: true,
                 pointer_init: vec![target_expr.clone()],
+                aggregate_relocation_init: BTreeMap::new(),
             },
             GlobalData {
                 id: target_id,
@@ -7731,6 +7726,7 @@ mod escaped_stack_array_tests {
                 scalar_value: None,
                 scalar_writable: true,
                 pointer_init: Vec::new(),
+                aggregate_relocation_init: BTreeMap::new(),
             },
         ];
         let layouts = HashMap::from([(
@@ -7799,6 +7795,145 @@ mod escaped_stack_array_tests {
                 )),
             )),
         );
+    }
+
+    #[test]
+    fn aggregate_owner_carries_relocation_without_a_synthetic_member_global() {
+        use crate::decompile::passes::c_pass::types::{Designator, Initializer};
+
+        let owner_id = 0xe090_usize;
+        let target_id = 0xe120_usize;
+        let target_expr = CExpr::Unary(
+            UnaryOp::AddrOf,
+            Box::new(CExpr::Var(format!("L_{target_id:x}"))),
+        );
+        let mut bytes = vec![0_u8; 16];
+        bytes[..8].copy_from_slice(&256_u64.to_le_bytes());
+        bytes[8..].copy_from_slice(&(target_id as u64).to_le_bytes());
+
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
+        db.rel_push(
+            "retained_initialized_data_range",
+            (owner_id as Address, Arc::new(bytes)),
+        );
+        db.rel_push(
+            "pointer_in_data",
+            ((owner_id + 8) as Address, target_id as Address),
+        );
+
+        let globals = vec![
+            GlobalData {
+                id: owner_id,
+                name: format!("L_{owner_id:x}"),
+                is_string: false,
+                content: Vec::new(),
+                is_pointer: false,
+                scalar_value: None,
+                scalar_writable: false,
+                pointer_init: Vec::new(),
+                aggregate_relocation_init: BTreeMap::from([(8, target_expr.clone())]),
+            },
+            GlobalData {
+                id: target_id,
+                name: format!("L_{target_id:x}"),
+                is_string: false,
+                content: Vec::new(),
+                is_pointer: false,
+                scalar_value: None,
+                scalar_writable: true,
+                pointer_init: Vec::new(),
+                aggregate_relocation_init: BTreeMap::new(),
+            },
+        ];
+        let layouts = HashMap::from([(
+            owner_id,
+            (
+                0x5937_usize,
+                vec![
+                    (0_i64, 0_usize, MemoryChunk::MAny64),
+                    (8_i64, 8_usize, MemoryChunk::MAny64),
+                ],
+            ),
+        )]);
+
+        let coalesced = derive_global_aggregate_coalescing(&db, &globals, &layouts);
+
+        assert!(coalesced.owner_ids.contains(&owner_id));
+        assert!(coalesced.member_ids.is_empty());
+        assert_eq!(
+            order_globals_for_aggregate_initializers(&globals, &coalesced)
+                .into_iter()
+                .map(|global| global.id)
+                .collect::<Vec<_>>(),
+            vec![target_id, owner_id]
+        );
+        let Some(Initializer::List(items)) = coalesced.owner_initializers.get(&owner_id) else {
+            panic!("aggregate owner lost its relocation initializer")
+        };
+        assert!(items.iter().any(|item| {
+            item.designator == Some(Designator::Field("ofs_8".to_string()))
+                && item.init
+                    == Initializer::Expr(CExpr::Cast(CType::long(), Box::new(target_expr.clone())))
+        }));
+    }
+
+    #[test]
+    fn relocation_without_a_relocatable_owner_field_rejects_the_whole_image() {
+        let owner_id = 0xe090_usize;
+        let member_id = owner_id + 8;
+        let target_id = 0xe120_usize;
+        let mut bytes = vec![0_u8; 16];
+        bytes[8..].copy_from_slice(&(target_id as u64).to_le_bytes());
+
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
+        db.rel_push(
+            "retained_initialized_data_range",
+            (owner_id as Address, Arc::new(bytes)),
+        );
+        db.rel_push(
+            "pointer_in_data",
+            (member_id as Address, target_id as Address),
+        );
+        let globals = vec![
+            GlobalData {
+                id: owner_id,
+                name: format!("L_{owner_id:x}"),
+                is_string: false,
+                content: Vec::new(),
+                is_pointer: false,
+                scalar_value: None,
+                scalar_writable: false,
+                pointer_init: Vec::new(),
+                aggregate_relocation_init: BTreeMap::new(),
+            },
+            GlobalData {
+                id: member_id,
+                name: format!("L_{member_id:x}"),
+                is_string: false,
+                content: Vec::new(),
+                is_pointer: false,
+                scalar_value: None,
+                scalar_writable: false,
+                pointer_init: Vec::new(),
+                aggregate_relocation_init: BTreeMap::new(),
+            },
+        ];
+        let layouts = HashMap::from([(
+            owner_id,
+            (
+                0x5937_usize,
+                vec![
+                    (0_i64, 0_usize, MemoryChunk::MAny64),
+                    (8_i64, 8_usize, MemoryChunk::MAny64),
+                ],
+            ),
+        )]);
+
+        let coalesced = derive_global_aggregate_coalescing(&db, &globals, &layouts);
+        assert!(!coalesced.owner_ids.contains(&owner_id));
+        assert!(coalesced.owner_initializers.get(&owner_id).is_none());
     }
 
     #[test]

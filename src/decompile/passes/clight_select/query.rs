@@ -430,6 +430,12 @@ pub struct GlobalData {
     /// stays scalar; an is_global_array extent may expand it into pointer-sized
     /// slots when the complete extent is aligned and present in the image.
     pub pointer_init: Vec<crate::decompile::passes::c_pass::types::CExpr>,
+    /// Exact relocation-backed fields owned by a recovered aggregate, keyed by
+    /// byte offset from the aggregate base.  These are not standalone globals:
+    /// the C backend consumes them as designated fields in the owner's single
+    /// initializer so overlapping machine storage never becomes overlapping C
+    /// declarations.
+    pub aggregate_relocation_init: BTreeMap<i64, crate::decompile::passes::c_pass::types::CExpr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2846,6 +2852,58 @@ fn resolve_rodata_scalar(
     value.map(|v| (v, writable))
 }
 
+pub(crate) type GlobalStructDeclLayouts = HashMap<Ident, (usize, Vec<(i64, Ident, MemoryChunk)>)>;
+
+/// Recover the same deterministic global-struct declaration choice for every
+/// consumer.  A declaration uses the smallest catalogued struct id, while an
+/// initialized aggregate image is available only when that id has one unique
+/// field vector.  Keeping this selection shared prevents extraction and C
+/// emission from disagreeing about which object owns an interior relocation.
+pub(crate) fn extract_global_struct_decl_layouts(
+    db: &DecompileDB,
+) -> (HashMap<Ident, usize>, GlobalStructDeclLayouts) {
+    let catalog_ids: HashSet<usize> = db
+        .rel_iter::<(u64, usize, usize, usize)>("global_struct_catalog")
+        .map(|(_, id, _, _)| *id)
+        .collect();
+    let mut decl_ids: HashMap<Ident, usize> = HashMap::new();
+    for (ident, sid, _fields) in db.rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>(
+        "emit_global_struct_fields",
+    ) {
+        if !catalog_ids.contains(sid) {
+            continue;
+        }
+        decl_ids
+            .entry(*ident)
+            .and_modify(|selected| *selected = (*selected).min(*sid))
+            .or_insert(*sid);
+    }
+
+    let mut candidates: BTreeMap<Ident, BTreeSet<Vec<(i64, Ident, MemoryChunk)>>> = BTreeMap::new();
+    for (ident, sid, fields) in db.rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>(
+        "emit_global_struct_fields",
+    ) {
+        if decl_ids.get(ident) == Some(sid) {
+            candidates
+                .entry(*ident)
+                .or_default()
+                .insert(fields.as_ref().clone());
+        }
+    }
+    let layouts = candidates
+        .into_iter()
+        .filter_map(|(ident, layouts)| {
+            let mut layouts = layouts.into_iter();
+            let layout = layouts.next()?;
+            if layouts.next().is_some() {
+                return None;
+            }
+            Some((ident, (decl_ids[&ident], layout)))
+        })
+        .collect();
+    (decl_ids, layouts)
+}
+
 pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<GlobalData>, String> {
     let mut globals = Vec::new();
 
@@ -2886,6 +2944,9 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
         .rel_iter::<(Ident,)>("emit_global_is_ptr")
         .map(|(id,)| *id)
         .collect();
+
+    let (global_struct_decl_ids, global_struct_decl_layouts) =
+        extract_global_struct_decl_layouts(db);
 
     let bin_data = fs::read(binary_path).map_err(|e| format!("Failed to read binary: {}", e))?;
     let obj_file =
@@ -3079,16 +3140,7 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
         db.rel_iter::<(Ident, usize)>("global_storage_extent")
             .map(|(ident, _)| *ident),
     );
-    let struct_catalog_ids: HashSet<usize> = db
-        .rel_iter::<(u64, usize, usize, usize)>("global_struct_catalog")
-        .map(|(_, id, _, _)| *id)
-        .collect();
-    recovered_owner_ids.extend(
-        db.rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>(
-            "emit_global_struct_fields",
-        )
-        .filter_map(|(ident, sid, _)| struct_catalog_ids.contains(sid).then_some(*ident)),
-    );
+    recovered_owner_ids.extend(global_struct_decl_ids.keys().copied());
     let mut owner_ids_by_symbol: HashMap<Symbol, BTreeSet<usize>> = HashMap::new();
     for (addr, _, name) in db.rel_iter::<(Address, usize, Symbol)>("symbol_size") {
         let ident = *addr as usize;
@@ -3350,6 +3402,39 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
             })
             .collect();
 
+        // A relocation at an exact pointer-width integer field belongs to the
+        // recovered aggregate, even when no instruction names that interior
+        // slot as a standalone global.  Preserve only a uniquely selected
+        // layout and only targets with a relocatable C spelling; the C backend
+        // performs the final whole-image/non-overlap validation atomically.
+        let mut aggregate_relocation_init = BTreeMap::new();
+        if let Some((_, fields)) = global_struct_decl_layouts.get(id) {
+            let mut offset_counts: HashMap<i64, usize> = HashMap::new();
+            for (offset, _, _) in fields {
+                *offset_counts.entry(*offset).or_default() += 1;
+            }
+            for (offset, _, chunk) in fields {
+                let pointer_integer_chunk = match db.abi().pointer_size {
+                    4 => matches!(chunk, MemoryChunk::MInt32 | MemoryChunk::MAny32),
+                    8 => matches!(chunk, MemoryChunk::MInt64 | MemoryChunk::MAny64),
+                    _ => false,
+                };
+                if *offset < 0 || !pointer_integer_chunk || offset_counts.get(offset) != Some(&1) {
+                    continue;
+                }
+                let Some(slot) = addr.checked_add(*offset as u64) else {
+                    continue;
+                };
+                let Some(target) = reloc_targets.get(&slot) else {
+                    continue;
+                };
+                let Some(expr) = target_expr(*target) else {
+                    continue;
+                };
+                aggregate_relocation_init.insert(*offset, expr);
+            }
+        }
+
         // is_pointer from relocation ground truth or the access-derived signal.
         let is_pointer = !pointer_init.is_empty() || global_ptr_ids.contains(id);
 
@@ -3460,6 +3545,7 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
             scalar_value,
             scalar_writable,
             pointer_init,
+            aggregate_relocation_init,
         });
         if introduces_named_declaration {
             named_globals_in_scope.insert(addr);
