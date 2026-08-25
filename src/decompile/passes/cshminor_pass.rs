@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::mreg::Mreg;
-use crate::x86::op::{Addressing, Condition, Operation};
+use crate::x86::op::{Addressing, Comparison, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
 use ascent::lattice::set::Set;
@@ -82,6 +82,41 @@ fn cond_subst_exprs(args: &[CsharpminorExpr], old: RTLReg, new: RTLReg) -> Vec<C
         .collect()
 }
 
+/// Split an immediate equality comparison into the register/register
+/// condition and Cminor binary operator that preserve its width/signedness.
+/// Only equality is admitted: ordering unrelated C objects is not a portable
+/// reconstruction of the linked image's numeric address order.
+fn symbolic_pointer_comparison(
+    condition: &Condition,
+) -> Option<(Condition, CminorBinop, i64)> {
+    let equality = |comparison: &Comparison| {
+        matches!(comparison, Comparison::Ceq | Comparison::Cne)
+    };
+    match condition {
+        Condition::Ccompimm(comparison, immediate) if equality(comparison) => Some((
+            Condition::Ccomp(*comparison),
+            CminorBinop::Ocmp(*comparison),
+            *immediate,
+        )),
+        Condition::Ccompuimm(comparison, immediate) if equality(comparison) => Some((
+            Condition::Ccompu(*comparison),
+            CminorBinop::Ocmpu(*comparison),
+            *immediate,
+        )),
+        Condition::Ccomplimm(comparison, immediate) if equality(comparison) => Some((
+            Condition::Ccompl(*comparison),
+            CminorBinop::Ocmpl(*comparison),
+            *immediate,
+        )),
+        Condition::Ccompluimm(comparison, immediate) if equality(comparison) => Some((
+            Condition::Ccomplu(*comparison),
+            CminorBinop::Ocmplu(*comparison),
+            *immediate,
+        )),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Copy)]
 pub enum LoopType {
     PreTested,
@@ -111,6 +146,14 @@ ascent_par! {
         if matches!(stmt, CminorStmt::Sjumptable(_, _));
 
     relation instr_in_function(Node, Address);
+    // Exact evidence needed to reinterpret a linked absolute immediate as an
+    // address constant after Cminor has embedded it in a Condition.
+    relation raw_image_addresses_are_absolute(bool);
+    relation data_section_range(Address, Address);
+    relation base_ident_to_symbol(Ident, Symbol);
+    relation interior_to_base_ident(Ident, Ident, i64);
+    relation must_be_ptr(RTLReg);
+    relation global_var_ref(Ident);
     relation rtl_succ(Node, Node);
     relation rtl_expansion_edge(Node, Node);
     #[local] relation rtl_expansion_member(Node);
@@ -379,6 +422,93 @@ ascent_par! {
 
     relation csharp_stmt_candidate(Node, CsharpminorStmt);
 
+    #[local] relation absolute_data_immediate(i64);
+    absolute_data_immediate(immediate) <--
+        raw_image_addresses_are_absolute(raw_absolute),
+        if *raw_absolute,
+        if *immediate > 0,
+        let address = *immediate as Address,
+        data_section_range(start, end),
+        if address >= *start && address < *end;
+
+    // Prefer the exact physical owner of an interior coordinate.  The exact
+    // synthetic name is only a fallback when no owner relation exists.
+    #[local] relation symbolic_data_address_candidate(i64, Ident, i64);
+    symbolic_data_address_candidate(immediate, *owner, *offset) <--
+        absolute_data_immediate(immediate),
+        let interior = *immediate as Ident,
+        interior_to_base_ident(interior, owner, offset);
+    symbolic_data_address_candidate(immediate, exact, 0) <--
+        absolute_data_immediate(immediate),
+        let exact = *immediate as Ident,
+        base_ident_to_symbol(exact, _),
+        !interior_to_base_ident(exact, _, _);
+
+    #[local] relation symbolic_data_address_conflict(i64);
+    symbolic_data_address_conflict(immediate) <--
+        symbolic_data_address_candidate(immediate, owner_a, offset_a),
+        symbolic_data_address_candidate(immediate, owner_b, offset_b),
+        if owner_a != owner_b || offset_a != offset_b;
+
+    #[local] relation symbolic_data_address(i64, Ident, i64);
+    symbolic_data_address(immediate, owner, offset) <--
+        symbolic_data_address_candidate(immediate, owner, offset),
+        !symbolic_data_address_conflict(immediate);
+
+    // Cminor's immediate Condition cannot itself carry Oaddrsymbol.  Once the
+    // compared value is a hard pointer and the immediate has one exact image
+    // owner, replace only that numeric expression with an address expression.
+    // The marker suppresses the generic numeric conversion of this same
+    // candidate; unrelated supersets at the node remain available.
+    #[local] relation symbolic_pointer_assign(Node, CminorExpr, CsharpminorExpr);
+    symbolic_pointer_assign(node, expr.clone(), converted) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(_, expr)),
+        if let CminorExpr::Eop(Operation::Ocmp(condition), args) = expr,
+        if args.len() == 1,
+        let source = args[0],
+        must_be_ptr(source),
+        if let Some((_register_condition, binop, immediate)) = symbolic_pointer_comparison(condition),
+        symbolic_data_address(immediate, owner, offset),
+        let converted = CsharpminorExpr::Ebinop(
+            binop,
+            Box::new(CsharpminorExpr::Evar(source)),
+            Box::new(CsharpminorExpr::Econst(Constant::Oaddrsymbol(*owner, *offset))),
+        );
+
+    #[local] relation symbolic_pointer_branch(Node, Condition, Args, Condition, Arc<Vec<CsharpminorExpr>>);
+    symbolic_pointer_branch(node, condition.clone(), regs.clone(), register_condition, converted_args) <--
+        active_cminor_stmt(node, ?CminorStmt::Sifthenelse(condition, regs, _, _)),
+        if regs.len() == 1,
+        let source = regs[0],
+        must_be_ptr(source),
+        if let Some((register_condition, _binop, immediate)) = symbolic_pointer_comparison(condition),
+        symbolic_data_address(immediate, owner, offset),
+        let converted_args = Arc::new(vec![
+            CsharpminorExpr::Evar(source),
+            CsharpminorExpr::Econst(Constant::Oaddrsymbol(*owner, *offset)),
+        ]);
+
+    // A symbolic compare can be the only reference to the target object.  Its
+    // owner still needs one file-scope declaration for Oaddrsymbol to name.
+    global_var_ref(*owner) <--
+        symbolic_pointer_assign(_, _, converted),
+        if let CsharpminorExpr::Ebinop(_, _, right) = converted,
+        if let CsharpminorExpr::Econst(Constant::Oaddrsymbol(owner, _)) = right.as_ref();
+    global_var_ref(*owner) <--
+        symbolic_pointer_branch(_, _, _, _, converted_args),
+        if let Some(CsharpminorExpr::Econst(Constant::Oaddrsymbol(owner, _))) = converted_args.get(1);
+    symbolic_pointer_branch(node, condition.clone(), regs.clone(), register_condition, converted_args) <--
+        active_cminor_stmt(node, ?CminorStmt::Sbranch(condition, regs, _, _)),
+        if regs.len() == 1,
+        let source = regs[0],
+        must_be_ptr(source),
+        if let Some((register_condition, _binop, immediate)) = symbolic_pointer_comparison(condition),
+        symbolic_data_address(immediate, owner, offset),
+        let converted_args = Arc::new(vec![
+            CsharpminorExpr::Evar(source),
+            CsharpminorExpr::Econst(Constant::Oaddrsymbol(*owner, *offset)),
+        ]);
+
     // Track nodes where a stack address was resolved to Eaddrof via stack_var.
     #[local] relation stack_addr_resolved(Node);
 
@@ -443,22 +573,30 @@ ascent_par! {
         stack_local_at(func_start, *ofs - 8, stack_rtl),
         let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Evar(*stack_rtl));
 
-    // Generic Sassign -> Sset conversion (skipped when stack_addr_resolved handles the node).
+    csharp_stmt_candidate(node, CsharpminorStmt::Sset(*dst, converted.clone())) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, expr)),
+        symbolic_pointer_assign(node, expr, converted);
+
+    // Generic Sassign -> Sset conversion (skipped when stack_addr_resolved or
+    // an exact symbolic pointer immediate handles this same expression).
     csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, expr)),
         !stack_addr_resolved(node),
+        !symbolic_pointer_assign(node, expr, _),
         if let Some(converted) = csharp_expr_from_cminor(expr),
         let stmt = CsharpminorStmt::Sset(*dst, converted);
 
     csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, expr)),
         !stack_addr_resolved(node),
+        !symbolic_pointer_assign(node, expr, _),
         if let Some(converted) = csharp_expr_from_cminor_sized(expr, true),
         let stmt = CsharpminorStmt::Sset(*dst, converted);
 
     csharp_stmt_candidate(node, CsharpminorStmt::Snop) <--
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, expr)),
         !stack_addr_resolved(node),
+        !symbolic_pointer_assign(node, expr, _),
         if csharp_expr_from_cminor(expr).is_none();
 
     csharp_stmt_candidate(node, stmt) <--
@@ -523,6 +661,7 @@ ascent_par! {
 
     csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Sbranch(cond, regs, ifso, ifnot)),
+        !symbolic_pointer_branch(node, cond, regs, _, _),
         resolved_control_target(ifso, live_ifso),
         resolved_control_target(ifnot, live_ifnot),
         let converted_args = regs
@@ -532,11 +671,26 @@ ascent_par! {
         let stmt = CsharpminorStmt::Scond(cond.clone(), converted_args, *live_ifso, *live_ifnot);
 
     csharp_stmt_candidate(node, stmt) <--
+        active_cminor_stmt(node, ?CminorStmt::Sbranch(cond, regs, ifso, ifnot)),
+        symbolic_pointer_branch(node, cond, regs, register_condition, converted_args),
+        resolved_control_target(ifso, live_ifso),
+        resolved_control_target(ifnot, live_ifnot),
+        let stmt = CsharpminorStmt::Scond(register_condition.clone(), converted_args.as_ref().clone(), *live_ifso, *live_ifnot);
+
+    csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Sifthenelse(cond, regs, ifso, ifnot)),
+        !symbolic_pointer_branch(node, cond, regs, _, _),
         resolved_control_target(ifso, live_ifso),
         resolved_control_target(ifnot, live_ifnot),
         let converted_args = regs.iter().map(|r| CsharpminorExpr::Evar(*r)).collect(),
         let stmt = CsharpminorStmt::Scond(cond.clone(), converted_args, *live_ifso, *live_ifnot);
+
+    csharp_stmt_candidate(node, stmt) <--
+        active_cminor_stmt(node, ?CminorStmt::Sifthenelse(cond, regs, ifso, ifnot)),
+        symbolic_pointer_branch(node, cond, regs, register_condition, converted_args),
+        resolved_control_target(ifso, live_ifso),
+        resolved_control_target(ifnot, live_ifnot),
+        let stmt = CsharpminorStmt::Scond(register_condition.clone(), converted_args.as_ref().clone(), *live_ifso, *live_ifnot);
 
     csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Sjumptable(reg, _)),
@@ -1216,14 +1370,242 @@ impl IRPass for CshminorPass {
 #[cfg(test)]
 mod tests {
     use super::{unique_external_cfg_entry, CshminorPassProgram};
-    use crate::x86::op::{Addressing, Comparison, Condition};
-    use crate::x86::types::{CminorStmt, CsharpminorExpr, CsharpminorStmt, MemoryChunk};
+    use crate::x86::op::{Addressing, Comparison, Condition, Operation};
+    use crate::x86::types::{
+        CminorBinop, CminorExpr, CminorStmt, Constant, CsharpminorExpr, CsharpminorStmt,
+        MemoryChunk,
+    };
     use either::Either;
     use std::collections::HashSet;
     use std::sync::Arc;
 
     fn synthetic_ids<const N: usize>() -> [u64; N] {
         std::array::from_fn(|index| index as u64 + 1)
+    }
+
+    fn seed_interior_pointer_address(
+        prog: &mut CshminorPassProgram,
+        pointer_reg: u64,
+        owner: u64,
+        interior: u64,
+        hard_pointer: bool,
+        raw_absolute: bool,
+    ) {
+        prog.raw_image_addresses_are_absolute.push((raw_absolute,));
+        prog.data_section_range.push((owner, owner + 0x100));
+        prog.base_ident_to_symbol.push((owner as usize, "global_words"));
+        prog.base_ident_to_symbol
+            .push((interior as usize, "SUB_interior"));
+        prog.interior_to_base_ident
+            .push((interior as usize, owner as usize, (interior - owner) as i64));
+        if hard_pointer {
+            prog.must_be_ptr.push((pointer_reg,));
+        }
+    }
+
+    #[test]
+    fn hard_pointer_equality_uses_the_interior_owners_symbolic_address() {
+        let [node, pointer, result] = synthetic_ids();
+        let owner = 0x4000;
+        let interior = owner + 8;
+        let mut prog = CshminorPassProgram::default();
+        prog.cminor_stmt.push((
+            node,
+            CminorStmt::Sassign(
+                result,
+                CminorExpr::Eop(
+                    Operation::Ocmp(Condition::Ccomplimm(
+                        Comparison::Ceq,
+                        interior as i64,
+                    )),
+                    Arc::new(vec![pointer]),
+                ),
+            ),
+        ));
+        seed_interior_pointer_address(&mut prog, pointer, owner, interior, true, true);
+
+        prog.run();
+
+        let candidates: Vec<_> = prog
+            .csharp_stmt_candidate
+            .iter()
+            .filter_map(|(candidate_node, stmt)| (*candidate_node == node).then_some(stmt))
+            .collect();
+        assert_eq!(candidates.len(), 1);
+        assert!(matches!(
+            candidates[0],
+            CsharpminorStmt::Sset(
+                dst,
+                CsharpminorExpr::Ebinop(
+                    CminorBinop::Ocmpl(Comparison::Ceq),
+                    left,
+                    right,
+                ),
+            ) if *dst == result
+                && matches!(left.as_ref(), CsharpminorExpr::Evar(reg) if *reg == pointer)
+                && matches!(
+                    right.as_ref(),
+                    CsharpminorExpr::Econst(Constant::Oaddrsymbol(ident, 8))
+                        if *ident == owner as usize
+                )
+        ));
+        assert!(prog
+            .global_var_ref
+            .iter()
+            .any(|(ident,)| *ident == owner as usize));
+    }
+
+    #[test]
+    fn integer_equality_that_matches_an_address_stays_numeric() {
+        let [node, integer, result] = synthetic_ids();
+        let owner = 0x4000;
+        let interior = owner + 8;
+        let mut prog = CshminorPassProgram::default();
+        prog.cminor_stmt.push((
+            node,
+            CminorStmt::Sassign(
+                result,
+                CminorExpr::Eop(
+                    Operation::Ocmp(Condition::Ccomplimm(
+                        Comparison::Ceq,
+                        interior as i64,
+                    )),
+                    Arc::new(vec![integer]),
+                ),
+            ),
+        ));
+        seed_interior_pointer_address(&mut prog, integer, owner, interior, false, true);
+
+        prog.run();
+
+        assert!(prog.csharp_stmt_candidate.iter().any(|(candidate_node, stmt)| {
+            *candidate_node == node
+                && matches!(
+                    stmt,
+                    CsharpminorStmt::Sset(
+                        _,
+                        CsharpminorExpr::Ebinop(_, _, right),
+                    ) if matches!(
+                        right.as_ref(),
+                        CsharpminorExpr::Econst(Constant::Olongconst(value))
+                            if *value == interior as i64
+                    )
+                )
+        }));
+        assert!(!prog.csharp_stmt_candidate.iter().any(|(candidate_node, stmt)| {
+            *candidate_node == node
+                && matches!(
+                    stmt,
+                    CsharpminorStmt::Sset(
+                        _,
+                        CsharpminorExpr::Ebinop(
+                            _,
+                            _,
+                            right,
+                        ),
+                    ) if matches!(right.as_ref(), CsharpminorExpr::Econst(Constant::Oaddrsymbol(..)))
+                )
+        }));
+        assert!(!prog
+            .global_var_ref
+            .iter()
+            .any(|(ident,)| *ident == owner as usize));
+    }
+
+    #[test]
+    fn relocatable_image_offset_cannot_masquerade_as_an_absolute_pointer() {
+        let [node, pointer, result] = synthetic_ids();
+        let owner = 0x4000;
+        let interior = owner + 8;
+        let mut prog = CshminorPassProgram::default();
+        prog.cminor_stmt.push((
+            node,
+            CminorStmt::Sassign(
+                result,
+                CminorExpr::Eop(
+                    Operation::Ocmp(Condition::Ccomplimm(
+                        Comparison::Ceq,
+                        interior as i64,
+                    )),
+                    Arc::new(vec![pointer]),
+                ),
+            ),
+        ));
+        seed_interior_pointer_address(&mut prog, pointer, owner, interior, true, false);
+
+        prog.run();
+
+        assert!(!prog.csharp_stmt_candidate.iter().any(|(candidate_node, stmt)| {
+            *candidate_node == node
+                && matches!(
+                    stmt,
+                    CsharpminorStmt::Sset(
+                        _,
+                        CsharpminorExpr::Ebinop(_, _, right),
+                    ) if matches!(right.as_ref(), CsharpminorExpr::Econst(Constant::Oaddrsymbol(..)))
+                )
+        }));
+        assert!(prog.csharp_stmt_candidate.iter().any(|(candidate_node, stmt)| {
+            *candidate_node == node
+                && matches!(
+                    stmt,
+                    CsharpminorStmt::Sset(
+                        _,
+                        CsharpminorExpr::Ebinop(_, _, right),
+                    ) if matches!(
+                        right.as_ref(),
+                        CsharpminorExpr::Econst(Constant::Olongconst(value))
+                            if *value == interior as i64
+                    )
+                )
+        }));
+    }
+
+    #[test]
+    fn symbolic_pointer_branch_keeps_both_cfg_targets() {
+        let [branch, pointer, ifso, ifnot] = synthetic_ids();
+        let owner = 0x4000;
+        let interior = owner + 8;
+        let mut prog = CshminorPassProgram::default();
+        prog.cminor_stmt.push((
+            branch,
+            CminorStmt::Sifthenelse(
+                Condition::Ccompluimm(Comparison::Cne, interior as i64),
+                Arc::new(vec![pointer]),
+                ifso,
+                ifnot,
+            ),
+        ));
+        prog.cminor_stmt.push((ifso, CminorStmt::Snop));
+        prog.cminor_stmt.push((ifnot, CminorStmt::Snop));
+        seed_interior_pointer_address(&mut prog, pointer, owner, interior, true, true);
+
+        prog.run();
+
+        assert!(prog.csharp_stmt_candidate.iter().any(|(candidate_node, stmt)| {
+            *candidate_node == branch
+                && matches!(
+                    stmt,
+                    CsharpminorStmt::Scond(
+                        Condition::Ccomplu(Comparison::Cne),
+                        args,
+                        live_ifso,
+                        live_ifnot,
+                    ) if *live_ifso == ifso
+                        && *live_ifnot == ifnot
+                        && matches!(
+                            args.as_slice(),
+                            [
+                                CsharpminorExpr::Evar(reg),
+                                CsharpminorExpr::Econst(Constant::Oaddrsymbol(ident, 8)),
+                            ] if *reg == pointer && *ident == owner as usize
+                        )
+                )
+        }));
+        assert!(prog
+            .global_var_ref
+            .iter()
+            .any(|(ident,)| *ident == owner as usize));
     }
 
     const FUNC: u64 = 0x1000;

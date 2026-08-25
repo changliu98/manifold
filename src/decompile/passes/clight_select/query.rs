@@ -438,6 +438,44 @@ enum RelocatedPointerWord {
     Raw(u64),
 }
 
+/// Exact byte coordinate of an address that the disassembly first named as a
+/// standalone interior global.  The declaration owner, rather than the
+/// synthetic interior name, is the only C object that may own those bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelocationTargetCoordinate {
+    owner: u64,
+    offset: i64,
+}
+
+fn relocation_declaration_target(
+    target: u64,
+    target_coordinates: &HashMap<u64, RelocationTargetCoordinate>,
+) -> u64 {
+    target_coordinates
+        .get(&target)
+        .map_or(target, |coordinate| coordinate.owner)
+}
+
+fn relocation_target_coordinate_expr(
+    owner_name: &str,
+    coordinate: RelocationTargetCoordinate,
+) -> crate::decompile::passes::c_pass::types::CExpr {
+    use crate::decompile::passes::c_pass::types::{BinaryOp, CExpr, CType, UnaryOp};
+    let owner = CExpr::Var(
+        crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(
+            owner_name,
+        ),
+    );
+    CExpr::Binary(
+        BinaryOp::Add,
+        Box::new(CExpr::Cast(
+            CType::ptr(CType::char_unsigned()),
+            Box::new(CExpr::Unary(UnaryOp::AddrOf, Box::new(owner))),
+        )),
+        Box::new(CExpr::int(coordinate.offset)),
+    )
+}
+
 /// Whether a relocation target has a valid C spelling at the point where the
 /// current global is declared. Globals are emitted in extraction order, so a
 /// name is usable only after its declaration has entered `named_globals_in_scope`;
@@ -589,6 +627,7 @@ fn order_globals_for_pointer_initializers(
     global_ids: &[usize],
     array_layouts: &HashMap<usize, Vec<(usize, usize)>>,
     pointer_targets: &BTreeMap<u64, u64>,
+    target_coordinates: &HashMap<u64, RelocationTargetCoordinate>,
 ) -> Vec<usize> {
     let ids: BTreeSet<usize> = global_ids.iter().copied().collect();
     let mut outgoing: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
@@ -608,10 +647,11 @@ fn order_globals_for_pointer_initializers(
             continue;
         };
 
-        for (&slot, &target) in pointer_targets.range(base..end) {
+        for (&slot, &raw_target) in pointer_targets.range(base..end) {
             if slot != base && !array_layouts.contains_key(&source) {
                 continue;
             }
+            let target = relocation_declaration_target(raw_target, target_coordinates);
             let Ok(target) = usize::try_from(target) else {
                 continue;
             };
@@ -3055,6 +3095,7 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
             owner_ids_by_symbol.entry(*name).or_default().insert(ident);
         }
     }
+    let mut target_coordinate_candidates: HashMap<u64, BTreeSet<(u64, i64)>> = HashMap::new();
     for (interior, owner_name, offset) in
         db.rel_iter::<(Ident, Symbol, i64)>("emit_address_as_offset")
     {
@@ -3065,9 +3106,27 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
             continue;
         };
         if candidates.len() == 1 {
-            global_var_ids.push(*candidates.first().unwrap());
+            let owner = *candidates.first().unwrap();
+            global_var_ids.push(owner);
+            target_coordinate_candidates
+                .entry(*interior as u64)
+                .or_default()
+                .insert((owner as u64, *offset));
         }
     }
+    // A duplicated local-static spelling can map one interior coordinate to
+    // several owners.  Such an address has no unambiguous C spelling and must
+    // retain the conservative unrepresentable behavior below.
+    let target_coordinates: HashMap<u64, RelocationTargetCoordinate> =
+        target_coordinate_candidates
+            .into_iter()
+            .filter_map(|(target, coordinates)| {
+                (coordinates.len() == 1).then(|| {
+                    let (owner, offset) = *coordinates.first().unwrap();
+                    (target, RelocationTargetCoordinate { owner, offset })
+                })
+            })
+            .collect();
     global_var_ids.sort_unstable();
     global_var_ids.dedup();
 
@@ -3078,6 +3137,7 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
         &global_var_ids,
         &global_array_layouts,
         &reloc_targets,
+        &target_coordinates,
     );
 
     // Address -> relocatable C name, for naming a pointer target that is
@@ -3184,16 +3244,23 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
     // a named data object that this translation unit can declare. Absolute
     // numeric addresses would become stale when the generated C is linked.
     let target_expr = |target: u64| -> Option<crate::decompile::passes::c_pass::types::CExpr> {
-        use crate::decompile::passes::c_pass::types::{CExpr, StringLiteral};
+        use crate::decompile::passes::c_pass::types::{CExpr, StringLiteral, UnaryOp};
         if let Some(s) = read_cstr(target) {
             return Some(CExpr::StringLit(StringLiteral {
                 value: s,
                 is_wide: false,
             }));
         }
+        if let Some(coordinate) = target_coordinates.get(&target) {
+            let owner_name = addr_to_data_symbol.get(&coordinate.owner)?;
+            // Machine offsets are byte coordinates.  Cast &owner to unsigned
+            // char * before adding the offset so a later recovered array or
+            // struct declaration cannot silently rescale it.
+            return Some(relocation_target_coordinate_expr(owner_name, *coordinate));
+        }
         if let Some(sym) = addr_to_data_symbol.get(&target) {
             return Some(CExpr::Unary(
-                crate::decompile::passes::c_pass::types::UnaryOp::AddrOf,
+                UnaryOp::AddrOf,
                 Box::new(CExpr::Var(
                     crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(sym),
                 )),
@@ -3244,8 +3311,10 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
             readable_bytes,
             &reloc_targets,
             |target| {
+                let declaration_target =
+                    relocation_declaration_target(target, &target_coordinates);
                 relocation_target_is_representable(
-                    target,
+                    declaration_target,
                     addr,
                     read_cstr(target).is_some(),
                     &addr_to_data_symbol,
@@ -5342,7 +5411,12 @@ mod relocated_pointer_tests {
         ]);
         let layouts = HashMap::from([(0x2000, vec![(8, 2)])]);
 
-        let ordered = order_globals_for_pointer_initializers(&ids, &layouts, &pointer_targets);
+        let ordered = order_globals_for_pointer_initializers(
+            &ids,
+            &layouts,
+            &pointer_targets,
+            &HashMap::new(),
+        );
         let position: HashMap<usize, usize> = ordered
             .iter()
             .enumerate()
@@ -5360,16 +5434,72 @@ mod relocated_pointer_tests {
         let ids = vec![0x3000, 0x1000, 0x2000];
         let pointer_targets = BTreeMap::from([(0x1000, 0x2000), (0x2000, 0x1000)]);
 
-        let forward =
-            order_globals_for_pointer_initializers(&ids, &HashMap::new(), &pointer_targets);
+        let forward = order_globals_for_pointer_initializers(
+            &ids,
+            &HashMap::new(),
+            &pointer_targets,
+            &HashMap::new(),
+        );
         let reversed = order_globals_for_pointer_initializers(
             &ids.iter().rev().copied().collect::<Vec<_>>(),
             &HashMap::new(),
             &pointer_targets,
+            &HashMap::new(),
         );
 
         assert_eq!(forward, reversed);
         assert_eq!(forward, vec![0x3000, 0x1000, 0x2000]);
+    }
+
+    #[test]
+    fn interior_pointer_dependency_is_owned_by_the_base_declaration() {
+        let source = 0x1000_usize;
+        let owner = 0x3000_usize;
+        let interior = 0x3008_u64;
+        let ids = vec![source, interior as usize, owner];
+        let pointer_targets = BTreeMap::from([(source as u64, interior)]);
+        let coordinates = HashMap::from([(
+            interior,
+            RelocationTargetCoordinate {
+                owner: owner as u64,
+                offset: 8,
+            },
+        )]);
+
+        let ordered = order_globals_for_pointer_initializers(
+            &ids,
+            &HashMap::new(),
+            &pointer_targets,
+            &coordinates,
+        );
+        let position: HashMap<usize, usize> = ordered
+            .iter()
+            .enumerate()
+            .map(|(index, &id)| (id, index))
+            .collect();
+
+        assert!(position[&owner] < position[&source]);
+        assert_eq!(
+            relocation_declaration_target(interior, &coordinates),
+            owner as u64
+        );
+
+        use crate::decompile::passes::c_pass::types::{BinaryOp, CExpr, CType, UnaryOp};
+        assert_eq!(
+            relocation_target_coordinate_expr("global.words", coordinates[&interior]),
+            CExpr::Binary(
+                BinaryOp::Add,
+                Box::new(CExpr::Cast(
+                    CType::ptr(CType::char_unsigned()),
+                    Box::new(CExpr::Unary(
+                        UnaryOp::AddrOf,
+                        Box::new(CExpr::Var("global_words".to_string())),
+                    )),
+                )),
+                Box::new(CExpr::int(8)),
+            ),
+            "the interior offset must stay byte-scaled regardless of the owner's final type",
+        );
     }
 
     #[test]
