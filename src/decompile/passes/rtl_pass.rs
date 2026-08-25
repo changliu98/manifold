@@ -10372,6 +10372,15 @@ ascent_par! {
         for arg in args.iter(),
         if *arg == Mreg::DX;
 
+    // Immediate stores are expanded directly from Mach into a synthetic RTL
+    // const+Istore chain, so their address register has no LTL load/store row.
+    // A live incoming DX used as that exact base is nevertheless an ordinary
+    // value/address use, not IDIV's implicit high half.
+    dx_has_non_div_use(func_start) <--
+        arg_reg_param_live_at(func_start, addr, ?&Mreg::DX),
+        mach_imm_indirect_store(addr, _, _, base_mreg, _),
+        if *base_mreg == Mreg::DX;
+
     dx_has_non_div_use(func_start) <--
         arg_reg_copied_early(func_start, ?&Mreg::DX, _);
 
@@ -17484,6 +17493,113 @@ mod tests {
                 .arg_setup_candidate
                 .iter()
                 .any(|fact| fact == &(func, Mreg::DX, call)));
+        });
+    }
+
+    #[test]
+    fn immediate_store_base_preserves_dx_param_across_division_and_call_mapping() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [callee, callee_end, store, div, caller, call, def_di, def_si, def_dx] =
+                synthetic_ids();
+
+            for (mreg, pos) in [(Mreg::DI, 0), (Mreg::SI, 1), (Mreg::DX, 2)] {
+                prog.is_arg_reg.push((mreg,));
+                prog.abi_int_arg_position.push((mreg, pos));
+            }
+
+            prog.func_stacksz
+                .push((callee, callee_end, "store_and_divide", 0));
+            for node in [store, div] {
+                prog.instr_in_function.push((node, callee));
+            }
+            prog.arg_reg_param_live_at.push((callee, store, Mreg::DX));
+            prog.reg_use.push((store, Mreg::DX));
+            prog.mach_imm_indirect_store
+                .push((store, 0, MemoryChunk::MInt8Unsigned, Mreg::DX, 0));
+            prog.pdiv.push((div, "dividend", "divisor"));
+
+            prog.instr_in_function.push((call, caller));
+            prog.ltl_inst
+                .push((call, LTLInst::Lcall(Either::Right(Either::Left(callee)))));
+            for (def, mreg) in [(def_di, Mreg::DI), (def_si, Mreg::SI), (def_dx, Mreg::DX)] {
+                let value = fresh_xtl_reg(def, mreg);
+                prog.arg_setup_candidate_real.push((def, mreg, call));
+                prog.reg_xtl.push((def, mreg, value));
+                prog.is_def.push((def, value));
+            }
+
+            prog.run();
+
+            assert!(prog
+                .dx_has_non_div_use
+                .iter()
+                .any(|fact| fact == &(callee,)));
+            assert!(!prog
+                .dx_used_only_in_div
+                .iter()
+                .any(|fact| fact == &(callee,)));
+            for mreg in [Mreg::DI, Mreg::SI, Mreg::DX] {
+                assert!(prog
+                    .func_param_validated
+                    .iter()
+                    .any(|fact| fact == &(callee, mreg)));
+            }
+            assert!(prog
+                .emit_function_param_count_candidate
+                .iter()
+                .any(|fact| fact == &(callee, 3)));
+
+            let incoming_dx = fresh_xtl_reg(callee, Mreg::DX);
+            let synthetic_store = store | (1u64 << 62);
+            assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == synthetic_store
+                    && matches!(
+                        inst,
+                        RTLInst::Istore(
+                            MemoryChunk::MInt8Unsigned,
+                            Addressing::Aindexed(0),
+                            args,
+                            _
+                        ) if args.as_slice() == [incoming_dx]
+                    )
+            }));
+            assert!(prog
+                .call_arg_mapping
+                .iter()
+                .any(|(node, pos, _)| *node == call && *pos == 2));
+        });
+    }
+
+    #[test]
+    fn implicit_div_high_half_does_not_fabricate_dx_param() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [func, div] = synthetic_ids();
+
+            prog.is_arg_reg.push((Mreg::DX,));
+            prog.abi_int_arg_position.push((Mreg::DX, 2));
+            prog.instr_in_function.push((div, func));
+            prog.arg_reg_param_live_at.push((func, div, Mreg::DX));
+            prog.reg_use.push((div, Mreg::DX));
+            prog.pdiv.push((div, "dividend", "divisor"));
+
+            prog.run();
+
+            assert!(prog
+                .func_arg_reg_used
+                .iter()
+                .any(|fact| fact == &(func, Mreg::DX)));
+            assert!(prog.dx_used_only_in_div.iter().any(|fact| fact == &(func,)));
+            assert!(!prog.dx_has_non_div_use.iter().any(|fact| fact == &(func,)));
+            assert!(!prog
+                .func_has_param_evidence
+                .iter()
+                .any(|fact| fact == &(func, 2)));
+            assert!(!prog
+                .func_param_validated
+                .iter()
+                .any(|fact| fact == &(func, Mreg::DX)));
         });
     }
 
