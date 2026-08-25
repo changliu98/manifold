@@ -312,6 +312,11 @@ ascent_par! {
     relation rtl_next(Node, Node);
     relation mach_imm_indirect_store(Address, i64, MemoryChunk, Mreg, i64);
     relation mach_imm_stack_init(Address, i64, i64, Typ);
+    // SETcc materialized directly into a scalar frame cell.  The x86 frontend
+    // carries both the structural flags origin and normalized condition args,
+    // because no single Mach instruction can both compute the boolean and
+    // store it. (setcc addr, frame offset, origin, operation, machine args)
+    relation mach_stack_setcc(Address, i64, Address, Operation, Arc<Vec<Mreg>>);
     relation simd_dword_broadcast_store(Address, Address, &'static str, &'static str, i64, i64, Mreg);
     relation simd_dword_lane_event(Address, i64, Address, Address);
     relation simd_dword_lane_frame_store(Address, i64, Address);
@@ -1201,6 +1206,25 @@ ascent_par! {
             _ => Operation::Ointconst(*imm_val),
         },
         let inst = RTLInst::Iop(op, Arc::new(vec![]), rtl_reg);
+
+    // SETcc reads the machine values at the earlier flags-producing node, but
+    // defines the frame cell at its own execution point.  Resolving arguments
+    // at `origin` prevents scheduled flag-transparent register writes from
+    // replacing the values whose flags are still live.
+    rtl_inst_candidate(addr, RTLInst::Iop(op.clone(), Arc::new(vec![*arg0]), *dst_rtl)) <--
+        mach_stack_setcc(addr, ofs, origin, op, mregs),
+        if mregs.len() == 1,
+        reg_rtl(origin, mregs[0], arg0),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, ofs, dst_rtl);
+
+    rtl_inst_candidate(addr, RTLInst::Iop(op.clone(), Arc::new(vec![*arg0, *arg1]), *dst_rtl)) <--
+        mach_stack_setcc(addr, ofs, origin, op, mregs),
+        if mregs.len() == 2,
+        reg_rtl(origin, mregs[0], arg0),
+        reg_rtl(origin, mregs[1], arg1),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, ofs, dst_rtl);
 
     reg_xtl(addr, base_mreg, arg_id) <--
         mach_imm_indirect_store(addr, _, _, base_mreg, _),
@@ -3302,6 +3326,7 @@ ascent_par! {
     synth_only_addr(addr) <-- arith_store_abs_imm(addr, _, _, _, _), !has_ltl_op(addr);
     synth_only_addr(addr) <-- mach_imm_indirect_store(addr, _, _, _, _);
     synth_only_addr(addr) <-- mach_imm_stack_init(addr, _, _, _);
+    synth_only_addr(addr) <-- mach_stack_setcc(addr, _, _, _, _);
 
     rtl_semantic_node(addr) <-- ltl_inst(addr, _);
     rtl_semantic_node(addr) <-- synth_only_addr(addr);
@@ -3334,13 +3359,18 @@ ascent_par! {
         !rtl_semantic_node(*mid),
         rtl_next_semantic(func, mid, successors);
 
-    // mach_imm_stack_init is a one-node semantic producer.  Unlike the other
-    // synth-only classes it has no synthetic tail with a producer-specific
-    // edge, so connect it to the first semantic node on each structural CFG
-    // arm.  This preserves consecutive initializers and crosses only genuinely
-    // empty raw instructions; it cannot skip another semantic producer.
+    // Immediate frame stores and memory-destination SETcc are one-node semantic
+    // producers.  Unlike the other synth-only classes they have no synthetic
+    // tail with a producer-specific edge, so connect them to the first semantic
+    // node on each structural CFG arm.  This preserves consecutive producers
+    // and crosses only genuinely empty raw instructions; it cannot skip another
+    // semantic producer.
+    #[local] relation one_node_stack_producer(Address);
+    one_node_stack_producer(addr) <-- mach_imm_stack_init(addr, _, _, _);
+    one_node_stack_producer(addr) <-- mach_stack_setcc(addr, _, _, _, _);
+
     rtl_succ_candidate(*addr, *dst) <--
-        mach_imm_stack_init(addr, _, _, _),
+        one_node_stack_producer(addr),
         // Prefer Linear's canonical successor whenever it exists.  Adding the
         // raw trampoline as a second edge makes Clight emit `goto raw` before
         // the initializer and renders the store unreachable.
@@ -7542,6 +7572,11 @@ ascent_par! {
         instr_in_function(addr, func_start),
         let rtlreg = fresh_stack_slot_reg(*addr);
 
+    stack_xtl(func_start, addr, ofs, rtlreg) <--
+        mach_stack_setcc(addr, ofs, _, _, _),
+        instr_in_function(addr, func_start),
+        let rtlreg = fresh_stack_slot_reg(*addr);
+
     // Propagate stack_xtl through def-use chains, joining on def offset and emitting use offset.
     stack_xtl(func_start, use_addr, use_ofs, rtlreg) <--
         stack_xtl(func_start, def_addr, def_ofs, rtlreg),
@@ -8226,6 +8261,12 @@ ascent_par! {
         mach_imm_stack_init(addr, ofs, _, typ),
         instr_in_function(addr, func),
         let chunk = typ_to_chunk(*typ);
+
+    // SETcc always writes exactly one byte.  Keep that physical width instead
+    // of routing through Typ::Tint, which would overstate the cell as 4 bytes.
+    stack_var_chunk(*func, ofs, MemoryChunk::MInt8Unsigned) <--
+        mach_stack_setcc(addr, ofs, _, _, _),
+        instr_in_function(addr, func);
 
 
     relation plt_function(Address, Symbol);
@@ -11055,6 +11096,12 @@ ascent_par! {
         if is_boolean_operation(op),
         reg_rtl(node, *dst_mreg, rtl_reg);
 
+    op_produces_bool(node, *rtl_reg) <--
+        mach_stack_setcc(node, ofs, _, op, _),
+        if is_boolean_operation(op),
+        instr_in_function(node, func),
+        stack_var(func, node, ofs, rtl_reg);
+
     // cmov/Olea un-pointerize: a LEA result is a pointer ONLY from use-based evidence, since gcc emits LEA for plain integer arithmetic; Oindirectsymbol stays unconditionally a pointer.
     op_produces_ptr(node, rtl_reg) <--
         ltl_inst(node, ?LTLInst::Lop(Operation::Oindirectsymbol(_), _, dst_mreg)),
@@ -12029,6 +12076,99 @@ mod tests {
                             if args.as_slice() == [boolean_value]
                     )
             }));
+        });
+    }
+
+    #[test]
+    fn stack_setcc_defines_the_reloads_cell_from_the_flags_origin_value() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let flags_origin = 0x900;
+            let setcc = 0x100;
+            let reload = 0x700;
+            let block = 0x550;
+            let compared_value = 0x5000;
+            let later_register_value = 0x6000;
+
+            prog.mach_stack_setcc.push((
+                setcc,
+                50,
+                flags_origin,
+                Operation::Ocmp(Condition::Ccompimm(Comparison::Cne, 0)),
+                Arc::new(vec![Mreg::BX]),
+            ));
+            // EBX has a different value by the time SETcc executes.  The
+            // boolean must still consume the value TEST saw at flags_origin.
+            prog.reg_xtl.push((flags_origin, Mreg::BX, compared_value));
+            prog.reg_xtl.push((setcc, Mreg::BX, later_register_value));
+
+            prog.stack_def_used
+                .push((setcc, "RSP", 50, reload, "RSP", 50));
+            prog.ltl_inst.push((
+                reload,
+                LTLInst::Lgetstack(Slot::Local, 50, Typ::Tint, Mreg::SI),
+            ));
+            for node in [flags_origin, setcc, reload] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, block));
+            }
+            prog.next.push((setcc, reload));
+
+            prog.run();
+
+            let setcc_cells: BTreeSet<_> = prog
+                .stack_var
+                .iter()
+                .filter_map(|(f, node, ofs, local)| {
+                    (*f == func && *node == setcc && *ofs == 50).then_some(*local)
+                })
+                .collect();
+            let reload_cells: BTreeSet<_> = prog
+                .stack_var
+                .iter()
+                .filter_map(|(f, node, ofs, local)| {
+                    (*f == func && *node == reload && *ofs == 50).then_some(*local)
+                })
+                .collect();
+            let cell = *setcc_cells
+                .intersection(&reload_cells)
+                .next()
+                .expect("SETcc and its reaching reload must share one frame-cell identity");
+
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    setcc,
+                    RTLInst::Iop(
+                        Operation::Ocmp(Condition::Ccompimm(Comparison::Cne, 0)),
+                        Arc::new(vec![compared_value]),
+                        cell,
+                    ),
+                )
+            }));
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == setcc
+                    && matches!(inst, RTLInst::Iop(Operation::Ocmp(_), args, _)
+                        if args.as_slice() == [later_register_value])
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == reload
+                    && matches!(inst, RTLInst::Iop(Operation::Omove, args, _)
+                        if args.as_slice() == [cell])
+            }));
+            assert!(prog
+                .stack_var_chunk
+                .iter()
+                .any(|fact| fact == &(func, 50, MemoryChunk::MInt8Unsigned)));
+            assert!(prog
+                .op_produces_bool
+                .iter()
+                .any(|fact| fact == &(setcc, cell)));
+            assert!(prog.synth_only_addr.iter().any(|fact| fact == &(setcc,)));
+            assert!(prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(setcc, reload)));
         });
     }
 

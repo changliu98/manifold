@@ -1126,6 +1126,12 @@ ascent_par! {
     relation addrmode_needs_resolution(Addrmode, Address);
     relation addr_requiring_symbol(Address);
     relation mach_imm_stack_init(Address, i64, i64, Typ);
+    // A SETcc whose destination is a scalar frame cell cannot be represented
+    // as one Mach instruction: Ocmp produces a register while Mstore consumes
+    // one.  Preserve the complete value operation and its exact frame cell for
+    // RTL, where the condition can define the cell's canonical SSA identity
+    // directly.  (setcc addr, frame offset, flags origin, operation, operands)
+    relation mach_stack_setcc(Address, i64, Address, Operation, Arc<Vec<Mreg>>);
     // Carries the size-narrowed MemoryChunk, not a Typ: Typ cannot represent MInt8/MInt16, so an immediate byte store over-widened to 4 bytes and mis-scaled its pointer arithmetic.
     relation mach_imm_indirect_store(Address, i64, MemoryChunk, Mreg, i64);
     // Memory-source arithmetic: load from [base+disp], then apply op with dst_reg.
@@ -1150,6 +1156,7 @@ ascent_par! {
     node_unlowered_side_effect(addr) <-- arith_store_abs_imm(addr, _, _, _, _);
     node_unlowered_side_effect(addr) <-- float_load_op(addr, _, _, _, _, _, _);
     node_unlowered_side_effect(addr) <-- float_arith_stack_op(addr, _, _, _, _);
+    node_unlowered_side_effect(addr) <-- mach_stack_setcc(addr, _, _, _, _);
     // A memory CMP/TEST is split in RTL into a load at the flag-setting point
     // and a condition at its structurally linked consumer.  It has no Linear
     // instruction of its own, so treating its bare Lbranch as a trampoline
@@ -5009,6 +5016,115 @@ ascent_par! {
 
     setcc_compare_site(addr_set, addr0) <-- cmp_setcc_link(addr0, addr_set);
     setcc_compare_site(addr_set, addr0) <-- test_setcc_link(addr0, addr_set);
+
+    // The boolean value materialized by a SETcc, independent of where that
+    // byte is written.  Register destinations consume the equivalent Mop
+    // rules below.  Frame-memory destinations consume this normalized fact so
+    // they do not disappear merely because op_register cannot match them.
+    // Keeping the flags origin explicit is essential when flag-transparent
+    // instructions overwrite one of the compared registers before SETcc.
+    #[local] relation setcc_materialized_value(Address, Address, Operation, Arc<Vec<Mreg>>);
+
+    setcc_materialized_value(addr_set, addr0, Operation::Ocmp(condition), Arc::new(vec![*arg1])) <--
+        pcmp(addr0, r1, r2),
+        op_register(r1, reg_str1),
+        op_immediate(r2, imm_val, _),
+        ireg_of(preg_of_r1, Ireg::from(reg_str1)),
+        preg_of(arg1, preg_of_r1),
+        cmp_setcc_link(addr0, addr_set),
+        psetcc(addr_set, test_cond, _),
+        reg_is_64(reg_str1, is_64),
+        let base_cond = condition_for_testcond_sized(*test_cond, *is_64),
+        let condition = match base_cond {
+            Condition::Ccomp(cmp) => Condition::Ccompimm(cmp, *imm_val),
+            Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, *imm_val),
+            Condition::Ccompl(cmp) => Condition::Ccomplimm(cmp, *imm_val),
+            Condition::Ccomplu(cmp) => Condition::Ccompluimm(cmp, *imm_val),
+            other => other,
+        };
+
+    setcc_materialized_value(addr_set, addr0, Operation::Ocmp(condition), Arc::new(vec![*arg1, *arg2])) <--
+        pcmp(addr0, r1, r2),
+        op_register(r1, reg_str1),
+        op_register(r2, reg_str2),
+        ireg_of(preg_of_r1, Ireg::from(reg_str1)),
+        ireg_of(preg_of_r2, Ireg::from(reg_str2)),
+        preg_of(arg1, preg_of_r1),
+        preg_of(arg2, preg_of_r2),
+        cmp_setcc_link(addr0, addr_set),
+        psetcc(addr_set, test_cond, _),
+        reg_is_64(reg_str1, is_64),
+        let condition = condition_for_testcond_sized(*test_cond, *is_64);
+
+    setcc_materialized_value(addr_set, addr0, Operation::Ocmp(condition), Arc::new(vec![*arg1])) <--
+        ptest(addr0, r1, r2),
+        op_register(r1, reg_str1),
+        op_register(r2, reg_str2),
+        if reg_str1 == reg_str2,
+        ireg_of(preg_of_r1, Ireg::from(reg_str1)),
+        preg_of(arg1, preg_of_r1),
+        test_setcc_link(addr0, addr_set),
+        psetcc(addr_set, test_cond, _),
+        reg_is_64(reg_str1, is_64),
+        let base_cond = condition_for_testcond_sized(*test_cond, *is_64),
+        let condition = match base_cond {
+            Condition::Ccomp(cmp) => Condition::Ccompimm(cmp, 0),
+            Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, 0),
+            Condition::Ccompl(cmp) => Condition::Ccomplimm(cmp, 0),
+            Condition::Ccomplu(cmp) => Condition::Ccompluimm(cmp, 0),
+            other => other,
+        };
+
+    setcc_materialized_value(
+        addr_set,
+        addr0,
+        Operation::Ocmp(Condition::Cmaskzero(high8_mask_adjust(reg_str1, *mask_val))),
+        Arc::new(vec![*arg1])
+    ) <--
+        ptest(addr0, r1, r2),
+        op_register(r1, reg_str1),
+        op_immediate(r2, mask_val, _),
+        ireg_of(preg_of_r1, Ireg::from(reg_str1)),
+        preg_of(arg1, preg_of_r1),
+        test_setcc_link(addr0, addr_set),
+        psetcc(addr_set, TestCond::CondE, _);
+
+    setcc_materialized_value(
+        addr_set,
+        addr0,
+        Operation::Ocmp(Condition::Cmasknotzero(high8_mask_adjust(reg_str1, *mask_val))),
+        Arc::new(vec![*arg1])
+    ) <--
+        ptest(addr0, r1, r2),
+        op_register(r1, reg_str1),
+        op_immediate(r2, mask_val, _),
+        ireg_of(preg_of_r1, Ireg::from(reg_str1)),
+        preg_of(arg1, preg_of_r1),
+        test_setcc_link(addr0, addr_set),
+        psetcc(addr_set, TestCond::CondNe, _);
+
+    // Scalar BP/SP destinations name frame cells.  The physical byte width is
+    // checked rather than inferred from Typ (which has no byte variant), and
+    // SP displacements use the same frame coordinate as every other stack
+    // access relation.
+    mach_stack_setcc(addr_set, *disp, addr0, op.clone(), args.clone()) <--
+        setcc_materialized_value(addr_set, addr0, op, args),
+        psetcc(addr_set, _, dst_sym),
+        op_indirect(dst_sym, _, base, idx, _, disp, sz),
+        if Mreg::x86(*base) == Mreg::BP,
+        if *idx == "NONE" || idx.is_empty(),
+        if *sz == 1,
+        instr_in_function(addr_set, func),
+        func_has_frame_pointer(func);
+
+    mach_stack_setcc(addr_set, disp - depth, addr0, op.clone(), args.clone()) <--
+        setcc_materialized_value(addr_set, addr0, op, args),
+        psetcc(addr_set, _, dst_sym),
+        op_indirect(dst_sym, _, base, idx, _, disp, sz),
+        if Mreg::x86(*base) == Mreg::SP,
+        if *idx == "NONE" || idx.is_empty(),
+        if *sz == 1,
+        sp_frame_shift(addr_set, depth);
 
     mach_inst(addr_set, MachInst::Mop(
         Operation::Ocmp(condition),
@@ -9799,6 +9915,49 @@ ascent_par! {
         next(addr0, addr1),
         psetcc(addr1, _, _);
 
+    setcc_materialized_value(
+        addr_set,
+        addr0,
+        Operation::Ocmp(condition.clone()),
+        Arc::new(vec![arg1, arg2])
+    ) <--
+        pucomisd(addr0, r1, r2),
+        op_register(r1, r1_str),
+        op_register(r2, r2_str),
+        reg_xmm(r1_str),
+        let arg1 = Mreg::x86(r1_str),
+        let arg2 = Mreg::x86(r2_str),
+        fcmp_setcc_link(addr0, addr_set),
+        psetcc(addr_set, test_cond, _),
+        if let Some(condition) = fcmp_setcc_condition(*test_cond, true);
+
+    setcc_materialized_value(
+        addr_set,
+        addr0,
+        Operation::Ocmp(condition.clone()),
+        Arc::new(vec![arg1, arg2])
+    ) <--
+        pucomiss(addr0, r1, r2),
+        op_register(r1, r1_str),
+        op_register(r2, r2_str),
+        reg_xmm(r1_str),
+        let arg1 = Mreg::x86(r1_str),
+        let arg2 = Mreg::x86(r2_str),
+        fcmp_setcc_link(addr0, addr_set),
+        psetcc(addr_set, test_cond, _),
+        if let Some(condition) = fcmp_setcc_condition(*test_cond, false);
+
+    setcc_materialized_value(
+        addr_set,
+        addr0,
+        Operation::Ocmp(condition.clone()),
+        Arc::new(vec![*arg1, Mreg::FP0])
+    ) <--
+        fcmp_mem_arg(addr0, is_double, arg1),
+        fcmp_setcc_link(addr0, addr_set),
+        psetcc(addr_set, test_cond, _),
+        if let Some(condition) = fcmp_setcc_condition(*test_cond, *is_double);
+
     // Reg-reg Ocmp keyed at compare's address: int cmp_setcc design parity; setcc node bridges via linear's branch-to-next default.
     mach_inst(addr0, MachInst::Mop(Operation::Ocmp(condition.clone()), Arc::new(vec![arg1, arg2]), *dst_mreg)) <--
         pucomisd(addr0, r1, r2),
@@ -11371,6 +11530,69 @@ mod structural_dataflow_tests {
             assert!(!prog.mach_inst.iter().any(|(node, inst)| {
                 *node == compare && matches!(inst, MachInst::Mop(Operation::Ocmp(_), _, _))
             }));
+        });
+    }
+
+    #[test]
+    fn scheduled_setcc_to_stack_preserves_flags_origin_and_exact_cell() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let func = 0x500;
+            let test = 0x900;
+            let first_gap = 0x100;
+            let second_gap = 0x800;
+            let setcc = 0x200;
+            let block = 0x777;
+
+            // Execution order is intentionally unrelated to numeric order.
+            // The two intervening MOVs may replace EBX while TEST's flags stay
+            // live; the SETcc condition must therefore retain `test` as its
+            // operand-resolution point.
+            prog.func_span.push(("f", func, 0xa00));
+            for node in [func, test, first_gap, second_gap, setcc] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, block));
+            }
+            prog.next.extend([
+                (func, test),
+                (test, first_gap),
+                (first_gap, second_gap),
+                (second_gap, setcc),
+            ]);
+
+            prog.ptest.push((test, "tested_ebx", "tested_ebx_2"));
+            prog.op_register
+                .extend([("tested_ebx", "EBX"), ("tested_ebx_2", "EBX")]);
+            for (node, src, dst) in [
+                (first_gap, "gap1_src", "gap1_dst"),
+                (second_gap, "gap2_src", "gap2_dst"),
+            ] {
+                prog.instruction
+                    .push((node, 3, "", "MOV", src, dst, "", "", 0, 0));
+            }
+            prog.psetcc.push((setcc, TestCond::CondNe, "frame_boolean"));
+            prog.op_indirect
+                .push(("frame_boolean", "", "RSP", "NONE", 1, 50, 1));
+
+            prog.run();
+
+            let expected = (
+                setcc,
+                50,
+                test,
+                Operation::Ocmp(Condition::Ccompimm(Comparison::Cne, 0)),
+                Arc::new(vec![Mreg::BX]),
+            );
+            assert!(prog.mach_stack_setcc.iter().any(|fact| fact == &expected));
+            assert!(prog
+                .setcc_compare_site
+                .iter()
+                .any(|fact| fact == &(setcc, test)));
+            assert!(prog
+                .node_unlowered_side_effect
+                .iter()
+                .any(|fact| fact == &(setcc,)));
+            assert!(!prog.mach_inst.iter().any(|(node, _)| *node == setcc));
         });
     }
 
