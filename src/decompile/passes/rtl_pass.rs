@@ -272,6 +272,14 @@ ascent_par! {
     relation emit_switch_chain(Address, Node, RTLReg);
     relation func_param_struct_type_candidate(Address, usize, usize);
     relation func_span(Symbol, Address, Address);
+    // Linear's closed-body witnesses are the completeness contract for any
+    // interprocedural machine-state summary.  A visible body alone is not
+    // enough: an uncovered block or unresolved terminal may contain arbitrary
+    // writes, so callers of such a function must retain the ABI fallback.
+    relation function_has_ltl_body(Address);
+    relation function_has_uncovered_block(Address);
+    relation function_unknown_terminal(Address, Node);
+    relation function_unresolved_control(Address, Node);
     relation global_struct_catalog(u64, usize, usize, usize);
     relation instr_in_function(Node, Address);
     relation is_external_function(Address);
@@ -459,6 +467,12 @@ ascent_par! {
     relation ltl_inst_reads_addr_base(Node, Mreg);
     relation ltl_builtin_unconverted(Node, Symbol, Arc<Vec<BuiltinArg<Mreg>>>, BuiltinArg<Mreg>);
     relation is_call_or_tailcall(Node);
+    #[local] relation call_clobber_summary_complete(Address);
+    #[local] relation direct_transfer_target(Node, Address);
+    #[local] relation call_transfer_site(Node);
+    #[local] relation precise_internal_transfer(Node, Address);
+    #[local] relation opaque_transfer(Node);
+    #[local] relation func_may_clobber(Address, Mreg);
     relation is_call_clobbered(Node, Mreg);
     relation call_args_collected_candidate(Node, Args);
     relation op_arg_mapping(Node, usize, RTLReg);
@@ -628,7 +642,80 @@ ascent_par! {
         ltl_inst(addr, ?LTLInst::Lbranch(Either::Right(target))),
         emit_function(_, _, target);
 
-    is_call_clobbered(n, r) <-- is_call_or_tailcall(n), is_caller_saved(r);
+    // A local body is safe to summarize only when Linear proved that its LTL
+    // coverage is closed.  PLT/init/fini entries remain ABI-opaque even if
+    // incidental function facts overlap them.
+    call_clobber_summary_complete(*func) <--
+        func_span(_, func, _),
+        function_has_ltl_body(func),
+        !function_has_uncovered_block(func),
+        !function_unknown_terminal(func, _),
+        !function_unresolved_control(func, _),
+        !is_external_function(func),
+        !plt_entry(func, _),
+        !plt_block(func, _);
+
+    direct_transfer_target(*site, *callee) <--
+        ltl_inst(site, ?LTLInst::Lcall(Either::Right(Either::Left(callee))));
+    direct_transfer_target(*site, *callee) <--
+        ltl_inst(site, ?LTLInst::Ltailcall(Either::Right(Either::Left(callee))));
+
+    call_transfer_site(*site) <-- ltl_inst(site, ?LTLInst::Lcall(_));
+    call_transfer_site(*site) <-- ltl_inst(site, ?LTLInst::Ltailcall(_));
+
+    precise_internal_transfer(site, callee) <--
+        direct_transfer_target(site, callee),
+        call_clobber_summary_complete(callee);
+
+    // Derive opacity positively for each interpretation.  Multiple LTL facts
+    // may deliberately coexist at one site: one precise local alternative
+    // must never suppress a simultaneous symbolic/indirect/incomplete one.
+    // Multiple precise local targets are safe and naturally union their
+    // may-clobber summaries.  Recovered may-target sets are not exhaustive and
+    // therefore do not weaken any of these fallbacks.
+    opaque_transfer(*site) <--
+        ltl_inst(site, ?LTLInst::Lcall(Either::Left(_)));
+    opaque_transfer(*site) <--
+        ltl_inst(site, ?LTLInst::Ltailcall(Either::Left(_)));
+    opaque_transfer(*site) <--
+        ltl_inst(site, ?LTLInst::Lcall(Either::Right(Either::Right(_))));
+    opaque_transfer(*site) <--
+        ltl_inst(site, ?LTLInst::Ltailcall(Either::Right(Either::Right(_))));
+    opaque_transfer(site) <--
+        direct_transfer_target(site, callee),
+        !call_clobber_summary_complete(callee);
+
+    // Direct machine writes seed each function's may-clobber summary.  Raw
+    // call instruction defs are excluded: nested effects enter only through a
+    // precise callee summary or the opaque fallback below.
+    func_may_clobber(*func, *reg) <--
+        instr_in_function(site, func),
+        reg_def(site, reg),
+        is_caller_saved(reg),
+        !call_transfer_site(site);
+
+    // Positive recursion computes the least fixed point across arbitrary call
+    // graph SCCs.  Keeping the relation caller-saved-only avoids mistaking a
+    // callee's temporary save/restore of a preserved register for a clobber.
+    func_may_clobber(*caller, *reg) <--
+        instr_in_function(site, caller),
+        precise_internal_transfer(site, callee),
+        func_may_clobber(callee, reg),
+        is_caller_saved(reg);
+    func_may_clobber(*caller, *reg) <--
+        instr_in_function(site, caller),
+        opaque_transfer(site),
+        is_caller_saved(reg);
+
+    is_call_clobbered(site, reg) <--
+        precise_internal_transfer(site, callee),
+        func_may_clobber(callee, reg);
+    is_call_clobbered(site, reg) <-- opaque_transfer(site), is_caller_saved(reg);
+
+    // This relation describes destruction of an incoming machine value, not a
+    // semantic return result; call_selected_result_mreg/call_return_mreg remain
+    // independent below.  Flags are not Mregs and keep their existing
+    // conservative origin/scheduling model.
 
 
     call_args_collected_candidate(call_addr, args) <--
@@ -5396,7 +5483,7 @@ ascent_par! {
 
     reg_def_site(*call_addr, *reg) <--
         ltl_inst(call_addr, ?LTLInst::Lcall(_)),
-        is_caller_saved(reg),
+        is_call_clobbered(call_addr, reg),
         reg_def_used(*call_addr, *reg, _);
 
 
@@ -6529,7 +6616,7 @@ ascent_par! {
         !movhps_partial_def(addr, reg);
     asm_effective_def(addr, reg) <--
         ltl_inst(addr, ?LTLInst::Lcall(_)),
-        is_caller_saved(reg);
+        is_call_clobbered(addr, reg);
 
     // Lbuiltin results are effective defs even at trimmed addresses (e.g. VLA alloca replaces trimmed MOV RSP)
     asm_effective_def(addr, *dst_reg) <--
@@ -12072,6 +12159,16 @@ mod tests {
         }
     }
 
+    fn seed_complete_local_function(
+        prog: &mut RTLPassProgram,
+        name: &'static str,
+        start: u64,
+        end: u64,
+    ) {
+        prog.func_span.push((name, start, end));
+        prog.function_has_ltl_body.push((start,));
+    }
+
     #[test]
     fn scheduled_setcc_reads_compare_value_and_defines_at_setcc() {
         on_large_stack(|| {
@@ -16311,6 +16408,399 @@ mod tests {
                 .call_arg_setup_detected
                 .iter()
                 .any(|fact| fact == &(backedge_def, Mreg::DI, call)));
+        });
+    }
+
+    #[test]
+    fn internal_call_clobber_preserves_registers_absent_from_complete_callee_summary() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let caller = 0x1000;
+            let pre_ax = 0x1008;
+            let pre_dx = 0x1010;
+            let call = 0x1018;
+            let use_site = 0x1020;
+            let caller_block = 0x1000;
+            let leaf = 0x2000;
+            let leaf_write = 0x2008;
+            let leaf_preserved_write = 0x2010;
+            let leaf_return = 0x2018;
+
+            prog.is_caller_saved.push((Mreg::AX,));
+            prog.is_caller_saved.push((Mreg::DX,));
+
+            seed_complete_local_function(&mut prog, "leaf", leaf, 0x2020);
+            prog.ltl_inst.push((
+                leaf_write,
+                LTLInst::Lop(Operation::Olongconst(1), Arc::new(vec![]), Mreg::AX),
+            ));
+            prog.reg_def.push((leaf_write, Mreg::AX));
+            prog.ltl_inst.push((
+                leaf_preserved_write,
+                LTLInst::Lop(Operation::Olongconst(9), Arc::new(vec![]), Mreg::R12),
+            ));
+            prog.reg_def.push((leaf_preserved_write, Mreg::R12));
+            prog.ltl_inst.push((leaf_return, LTLInst::Lreturn));
+            for node in [leaf_write, leaf_preserved_write, leaf_return] {
+                prog.instr_in_function.push((node, leaf));
+            }
+
+            prog.ltl_inst.push((
+                pre_ax,
+                LTLInst::Lop(Operation::Olongconst(2), Arc::new(vec![]), Mreg::AX),
+            ));
+            prog.reg_def.push((pre_ax, Mreg::AX));
+            prog.ltl_inst.push((
+                pre_dx,
+                LTLInst::Lop(Operation::Olongconst(3), Arc::new(vec![]), Mreg::DX),
+            ));
+            prog.reg_def.push((pre_dx, Mreg::DX));
+            prog.ltl_inst
+                .push((call, LTLInst::Lcall(Either::Right(Either::Left(leaf)))));
+            prog.ltl_inst.push((use_site, LTLInst::Lreturn));
+            prog.reg_use.push((use_site, Mreg::AX));
+            prog.reg_use.push((use_site, Mreg::DX));
+            prog.next.push((pre_ax, pre_dx));
+            prog.next.push((pre_dx, call));
+            prog.next.push((call, use_site));
+            for node in [pre_ax, pre_dx, call, use_site] {
+                prog.instr_in_function.push((node, caller));
+                prog.code_in_block.push((node, caller_block));
+            }
+
+            prog.run();
+
+            assert!(prog
+                .call_clobber_summary_complete
+                .iter()
+                .any(|fact| fact == &(leaf,)));
+            assert!(prog
+                .func_may_clobber
+                .iter()
+                .any(|fact| fact == &(leaf, Mreg::AX)));
+            assert!(!prog
+                .func_may_clobber
+                .iter()
+                .any(|fact| fact == &(leaf, Mreg::DX)));
+            assert!(!prog
+                .func_may_clobber
+                .iter()
+                .any(|fact| fact == &(leaf, Mreg::R12)));
+            assert!(prog
+                .is_call_clobbered
+                .iter()
+                .any(|fact| fact == &(call, Mreg::AX)));
+            assert!(!prog
+                .is_call_clobbered
+                .iter()
+                .any(|fact| fact == &(call, Mreg::DX)));
+            assert!(!prog
+                .is_call_clobbered
+                .iter()
+                .any(|fact| fact == &(call, Mreg::R12)));
+            assert!(prog
+                .asm_effective_def
+                .iter()
+                .any(|fact| fact == &(call, Mreg::AX)));
+            assert!(!prog
+                .asm_effective_def
+                .iter()
+                .any(|fact| fact == &(call, Mreg::DX)));
+
+            // The call is the new AX definition, while the pre-call DX
+            // definition flows through it to the same post-call use.
+            assert!(prog
+                .reg_def_used
+                .iter()
+                .any(|fact| fact == &(call, Mreg::AX, use_site)));
+            assert!(prog
+                .reg_def_used
+                .iter()
+                .any(|fact| fact == &(pre_dx, Mreg::DX, use_site)));
+            assert!(!prog
+                .reg_def_used
+                .iter()
+                .any(|fact| fact == &(call, Mreg::DX, use_site)));
+            assert!(prog
+                .reg_def_site
+                .iter()
+                .any(|fact| fact == &(call, Mreg::AX)));
+            assert!(!prog
+                .reg_def_site
+                .iter()
+                .any(|fact| fact == &(call, Mreg::DX)));
+        });
+    }
+
+    #[test]
+    fn internal_call_clobber_fallback_covers_incomplete_external_and_indirect_targets() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let caller = 0x3000;
+            let bodyless = 0x4000;
+            let uncovered = 0x4100;
+            let unknown_terminal = 0x4200;
+            let unresolved = 0x4300;
+            let external = 0x5000;
+            let coexisting_complete = 0x6000;
+            let bodyless_call = 0x3010;
+            let uncovered_call = 0x3020;
+            let unknown_terminal_call = 0x3030;
+            let unresolved_call = 0x3040;
+            let external_call = 0x3050;
+            let indirect_call = 0x3060;
+            let symbolic_call = 0x3070;
+            let mixed_call = 0x3080;
+
+            prog.is_caller_saved.push((Mreg::AX,));
+            prog.is_caller_saved.push((Mreg::DX,));
+
+            prog.func_span.push(("bodyless", bodyless, bodyless + 0x20));
+            seed_complete_local_function(&mut prog, "uncovered", uncovered, uncovered + 0x20);
+            prog.function_has_uncovered_block.push((uncovered,));
+            seed_complete_local_function(
+                &mut prog,
+                "unknown_terminal",
+                unknown_terminal,
+                unknown_terminal + 0x20,
+            );
+            prog.function_unknown_terminal
+                .push((unknown_terminal, unknown_terminal + 8));
+            seed_complete_local_function(&mut prog, "unresolved", unresolved, unresolved + 0x20);
+            prog.function_unresolved_control
+                .push((unresolved, unresolved + 8));
+            seed_complete_local_function(&mut prog, "external", external, 0x5020);
+            prog.is_external_function.push((external,));
+            seed_complete_local_function(
+                &mut prog,
+                "coexisting_complete",
+                coexisting_complete,
+                0x6020,
+            );
+            prog.ltl_inst
+                .push((coexisting_complete + 8, LTLInst::Lreturn));
+            prog.instr_in_function
+                .push((coexisting_complete + 8, coexisting_complete));
+
+            prog.ltl_inst.push((
+                bodyless_call,
+                LTLInst::Lcall(Either::Right(Either::Left(bodyless))),
+            ));
+            prog.ltl_inst.push((
+                uncovered_call,
+                LTLInst::Lcall(Either::Right(Either::Left(uncovered))),
+            ));
+            prog.ltl_inst.push((
+                unknown_terminal_call,
+                LTLInst::Lcall(Either::Right(Either::Left(unknown_terminal))),
+            ));
+            prog.ltl_inst.push((
+                unresolved_call,
+                LTLInst::Lcall(Either::Right(Either::Left(unresolved))),
+            ));
+            prog.ltl_inst.push((
+                external_call,
+                LTLInst::Lcall(Either::Right(Either::Left(external))),
+            ));
+            prog.ltl_inst
+                .push((indirect_call, LTLInst::Lcall(Either::Left(Mreg::R12))));
+            prog.ltl_inst.push((
+                symbolic_call,
+                LTLInst::Lcall(Either::Right(Either::Right("unknown_external"))),
+            ));
+            // Superset interpretations coexist at this site.  The complete
+            // local alternative must not hide the symbolic alternative's ABI
+            // fallback.
+            prog.ltl_inst.push((
+                mixed_call,
+                LTLInst::Lcall(Either::Right(Either::Left(coexisting_complete))),
+            ));
+            prog.ltl_inst.push((
+                mixed_call,
+                LTLInst::Lcall(Either::Right(Either::Right("possible_external"))),
+            ));
+            let opaque_sites = [
+                bodyless_call,
+                uncovered_call,
+                unknown_terminal_call,
+                unresolved_call,
+                external_call,
+                indirect_call,
+                symbolic_call,
+                mixed_call,
+            ];
+            for node in opaque_sites {
+                prog.instr_in_function.push((node, caller));
+            }
+
+            prog.run();
+
+            for target in [bodyless, uncovered, unknown_terminal, unresolved, external] {
+                assert!(!prog
+                    .call_clobber_summary_complete
+                    .iter()
+                    .any(|fact| fact == &(target,)));
+            }
+            assert!(prog
+                .call_clobber_summary_complete
+                .iter()
+                .any(|fact| fact == &(coexisting_complete,)));
+            assert!(prog
+                .opaque_transfer
+                .iter()
+                .any(|fact| fact == &(mixed_call,)));
+            for site in opaque_sites {
+                for reg in [Mreg::AX, Mreg::DX] {
+                    assert!(
+                        prog.is_call_clobbered
+                            .iter()
+                            .any(|fact| fact == &(site, reg)),
+                        "opaque call {site:#x} must conservatively clobber {reg:?}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn internal_call_clobber_positive_scc_reaches_a_fixed_point() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func_a = 0x6000;
+            let a_call = 0x6008;
+            let a_return = 0x6010;
+            let func_b = 0x7000;
+            let b_write = 0x7008;
+            let b_call = 0x7010;
+            let b_return = 0x7018;
+
+            prog.is_caller_saved.push((Mreg::CX,));
+            prog.is_caller_saved.push((Mreg::DX,));
+            seed_complete_local_function(&mut prog, "recursive_a", func_a, 0x6020);
+            seed_complete_local_function(&mut prog, "recursive_b", func_b, 0x7020);
+
+            prog.ltl_inst
+                .push((a_call, LTLInst::Lcall(Either::Right(Either::Left(func_b)))));
+            prog.ltl_inst.push((a_return, LTLInst::Lreturn));
+            for node in [a_call, a_return] {
+                prog.instr_in_function.push((node, func_a));
+            }
+
+            prog.ltl_inst.push((
+                b_write,
+                LTLInst::Lop(Operation::Olongconst(4), Arc::new(vec![]), Mreg::CX),
+            ));
+            prog.reg_def.push((b_write, Mreg::CX));
+            prog.ltl_inst
+                .push((b_call, LTLInst::Lcall(Either::Right(Either::Left(func_a)))));
+            prog.ltl_inst.push((b_return, LTLInst::Lreturn));
+            for node in [b_write, b_call, b_return] {
+                prog.instr_in_function.push((node, func_b));
+            }
+
+            prog.run();
+
+            for func in [func_a, func_b] {
+                assert!(prog
+                    .func_may_clobber
+                    .iter()
+                    .any(|fact| fact == &(func, Mreg::CX)));
+                assert!(!prog
+                    .func_may_clobber
+                    .iter()
+                    .any(|fact| fact == &(func, Mreg::DX)));
+            }
+            assert!(prog
+                .is_call_clobbered
+                .iter()
+                .any(|fact| fact == &(a_call, Mreg::CX)));
+            assert!(prog
+                .is_call_clobbered
+                .iter()
+                .any(|fact| fact == &(b_call, Mreg::CX)));
+        });
+    }
+
+    #[test]
+    fn internal_call_clobber_tailcall_wrappers_propagate_precise_and_opaque_effects() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let leaf = 0x8000;
+            let leaf_write = 0x8008;
+            let leaf_return = 0x8010;
+            let tail_wrapper = 0x9000;
+            let tail = 0x9008;
+            let opaque_tail_wrapper = 0xa000;
+            let opaque_tail = 0xa008;
+            let observer = 0xb000;
+            let call_tail_wrapper = 0xb008;
+
+            prog.is_caller_saved.push((Mreg::R8,));
+            prog.is_caller_saved.push((Mreg::AX,));
+
+            seed_complete_local_function(&mut prog, "tail_leaf", leaf, 0x8020);
+            prog.ltl_inst.push((
+                leaf_write,
+                LTLInst::Lop(Operation::Olongconst(5), Arc::new(vec![]), Mreg::R8),
+            ));
+            prog.reg_def.push((leaf_write, Mreg::R8));
+            prog.ltl_inst.push((leaf_return, LTLInst::Lreturn));
+            for node in [leaf_write, leaf_return] {
+                prog.instr_in_function.push((node, leaf));
+            }
+
+            seed_complete_local_function(&mut prog, "tail_wrapper", tail_wrapper, 0x9020);
+            prog.ltl_inst
+                .push((tail, LTLInst::Ltailcall(Either::Right(Either::Left(leaf)))));
+            prog.instr_in_function.push((tail, tail_wrapper));
+
+            seed_complete_local_function(
+                &mut prog,
+                "opaque_tail_wrapper",
+                opaque_tail_wrapper,
+                0xa020,
+            );
+            prog.ltl_inst
+                .push((opaque_tail, LTLInst::Ltailcall(Either::Left(Mreg::R12))));
+            prog.instr_in_function
+                .push((opaque_tail, opaque_tail_wrapper));
+
+            prog.ltl_inst.push((
+                call_tail_wrapper,
+                LTLInst::Lcall(Either::Right(Either::Left(tail_wrapper))),
+            ));
+            prog.instr_in_function.push((call_tail_wrapper, observer));
+
+            prog.run();
+
+            assert!(prog
+                .func_may_clobber
+                .iter()
+                .any(|fact| fact == &(tail_wrapper, Mreg::R8)));
+            assert!(!prog
+                .func_may_clobber
+                .iter()
+                .any(|fact| fact == &(tail_wrapper, Mreg::AX)));
+            for reg in [Mreg::R8, Mreg::AX] {
+                assert!(prog
+                    .func_may_clobber
+                    .iter()
+                    .any(|fact| fact == &(opaque_tail_wrapper, reg)));
+                assert!(prog
+                    .is_call_clobbered
+                    .iter()
+                    .any(|fact| fact == &(opaque_tail, reg)));
+            }
+            for site in [tail, call_tail_wrapper] {
+                assert!(prog
+                    .is_call_clobbered
+                    .iter()
+                    .any(|fact| fact == &(site, Mreg::R8)));
+                assert!(!prog
+                    .is_call_clobbered
+                    .iter()
+                    .any(|fact| fact == &(site, Mreg::AX)));
+            }
         });
     }
 
