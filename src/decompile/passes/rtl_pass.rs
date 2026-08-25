@@ -1207,19 +1207,53 @@ ascent_par! {
         },
         let inst = RTLInst::Iop(op, Arc::new(vec![]), rtl_reg);
 
+    // Stack identities currently name a frame offset, not a byte interval.  A
+    // SETcc therefore cannot safely define that identity when one of its
+    // reaching uses reads more than the byte it actually wrote: doing so would
+    // fabricate the other bytes.  Keep the high-recall machine fact, but only
+    // promote it to RTL when every width we can prove is byte-compatible.
+    #[local] relation stack_setcc_incompatible_use(Address);
+
+    stack_setcc_incompatible_use(*def_addr) <--
+        mach_stack_setcc(def_addr, _, _, _, _),
+        stack_def_used(def_addr, _, _, use_addr, _, _),
+        ltl_inst(use_addr, ?LTLInst::Lload(chunk, _, _, _)),
+        if crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk) > 1;
+
+    stack_setcc_incompatible_use(*def_addr) <--
+        mach_stack_setcc(def_addr, _, _, _, _),
+        stack_def_used(def_addr, _, _, use_addr, _, _),
+        ltl_inst(use_addr, ?LTLInst::Lgetstack(_, _, typ, _)),
+        if matches!(typ, Typ::Tlong | Typ::Tfloat | Typ::Tsingle | Typ::Tany32 | Typ::Tany64);
+
+    // Direct frame reloads normally lower to Lgetstack, whose Typ::Tint does
+    // not distinguish byte/word/dword accesses.  The decoded source operand
+    // still carries the physical width, so use that exact evidence as well.
+    stack_setcc_incompatible_use(*def_addr) <--
+        mach_stack_setcc(def_addr, _, _, _, _),
+        stack_def_used(def_addr, _, _, use_addr, _, _),
+        pmov(use_addr, _, memory),
+        op_indirect(memory, _, _, _, _, _, width),
+        if *width > 1;
+
+    #[local] relation usable_stack_setcc(Address, i64, Address, Operation, Arc<Vec<Mreg>>);
+    usable_stack_setcc(*addr, *ofs, *origin, op.clone(), mregs.clone()) <--
+        mach_stack_setcc(addr, ofs, origin, op, mregs),
+        !stack_setcc_incompatible_use(*addr);
+
     // SETcc reads the machine values at the earlier flags-producing node, but
     // defines the frame cell at its own execution point.  Resolving arguments
     // at `origin` prevents scheduled flag-transparent register writes from
     // replacing the values whose flags are still live.
     rtl_inst_candidate(addr, RTLInst::Iop(op.clone(), Arc::new(vec![*arg0]), *dst_rtl)) <--
-        mach_stack_setcc(addr, ofs, origin, op, mregs),
+        usable_stack_setcc(addr, ofs, origin, op, mregs),
         if mregs.len() == 1,
         reg_rtl(origin, mregs[0], arg0),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, ofs, dst_rtl);
 
     rtl_inst_candidate(addr, RTLInst::Iop(op.clone(), Arc::new(vec![*arg0, *arg1]), *dst_rtl)) <--
-        mach_stack_setcc(addr, ofs, origin, op, mregs),
+        usable_stack_setcc(addr, ofs, origin, op, mregs),
         if mregs.len() == 2,
         reg_rtl(origin, mregs[0], arg0),
         reg_rtl(origin, mregs[1], arg1),
@@ -3326,7 +3360,7 @@ ascent_par! {
     synth_only_addr(addr) <-- arith_store_abs_imm(addr, _, _, _, _), !has_ltl_op(addr);
     synth_only_addr(addr) <-- mach_imm_indirect_store(addr, _, _, _, _);
     synth_only_addr(addr) <-- mach_imm_stack_init(addr, _, _, _);
-    synth_only_addr(addr) <-- mach_stack_setcc(addr, _, _, _, _);
+    synth_only_addr(addr) <-- usable_stack_setcc(addr, _, _, _, _);
 
     rtl_semantic_node(addr) <-- ltl_inst(addr, _);
     rtl_semantic_node(addr) <-- synth_only_addr(addr);
@@ -3367,7 +3401,7 @@ ascent_par! {
     // semantic producer.
     #[local] relation one_node_stack_producer(Address);
     one_node_stack_producer(addr) <-- mach_imm_stack_init(addr, _, _, _);
-    one_node_stack_producer(addr) <-- mach_stack_setcc(addr, _, _, _, _);
+    one_node_stack_producer(addr) <-- usable_stack_setcc(addr, _, _, _, _);
 
     rtl_succ_candidate(*addr, *dst) <--
         one_node_stack_producer(addr),
@@ -7573,7 +7607,7 @@ ascent_par! {
         let rtlreg = fresh_stack_slot_reg(*addr);
 
     stack_xtl(func_start, addr, ofs, rtlreg) <--
-        mach_stack_setcc(addr, ofs, _, _, _),
+        usable_stack_setcc(addr, ofs, _, _, _),
         instr_in_function(addr, func_start),
         let rtlreg = fresh_stack_slot_reg(*addr);
 
@@ -8265,7 +8299,7 @@ ascent_par! {
     // SETcc always writes exactly one byte.  Keep that physical width instead
     // of routing through Typ::Tint, which would overstate the cell as 4 bytes.
     stack_var_chunk(*func, ofs, MemoryChunk::MInt8Unsigned) <--
-        mach_stack_setcc(addr, ofs, _, _, _),
+        usable_stack_setcc(addr, ofs, _, _, _),
         instr_in_function(addr, func);
 
 
@@ -11097,7 +11131,7 @@ ascent_par! {
         reg_rtl(node, *dst_mreg, rtl_reg);
 
     op_produces_bool(node, *rtl_reg) <--
-        mach_stack_setcc(node, ofs, _, op, _),
+        usable_stack_setcc(node, ofs, _, op, _),
         if is_boolean_operation(op),
         instr_in_function(node, func),
         stack_var(func, node, ofs, rtl_reg);
@@ -12169,6 +12203,79 @@ mod tests {
                 .rtl_succ_candidate
                 .iter()
                 .any(|fact| fact == &(setcc, reload)));
+        });
+    }
+
+    #[test]
+    fn stack_setcc_does_not_define_wider_same_offset_reloads() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let flags_origin = 0x410;
+            let explicit_setcc = 0x420;
+            let explicit_reload = 0x430;
+            let decoded_setcc = 0x440;
+            let decoded_reload = 0x450;
+            let compared_value = 0x5000;
+            let condition = Operation::Ocmp(Condition::Ccompimm(Comparison::Cne, 0));
+
+            for setcc in [explicit_setcc, decoded_setcc] {
+                prog.mach_stack_setcc.push((
+                    setcc,
+                    50,
+                    flags_origin,
+                    condition.clone(),
+                    Arc::new(vec![Mreg::BX]),
+                ));
+                prog.stack_def_used
+                    .push((setcc, "RSP", 50, setcc + 0x10, "RSP", 50));
+            }
+            prog.reg_xtl.push((flags_origin, Mreg::BX, compared_value));
+
+            // A definite four-byte RTL load must not inherit a one-byte SETcc
+            // definition merely because both accesses start at offset 50.
+            prog.ltl_inst.push((
+                explicit_reload,
+                LTLInst::Lload(
+                    MemoryChunk::MInt32,
+                    Addressing::Ainstack(50),
+                    Arc::new(vec![]),
+                    Mreg::SI,
+                ),
+            ));
+
+            // Ordinary direct stack MOVs become Lgetstack(Tint), which loses
+            // their byte width.  Retain the decoder's exact dword source width
+            // as counterevidence instead of treating Tint as byte-compatible.
+            prog.ltl_inst.push((
+                decoded_reload,
+                LTLInst::Lgetstack(Slot::Local, 50, Typ::Tint, Mreg::DI),
+            ));
+            prog.pmov
+                .push((decoded_reload, "decoded_dst", "decoded_stack_src"));
+            prog.op_indirect
+                .push(("decoded_stack_src", "", "RSP", "NONE", 1, 50, 4));
+
+            for node in [
+                flags_origin,
+                explicit_setcc,
+                explicit_reload,
+                decoded_setcc,
+                decoded_reload,
+            ] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            prog.run();
+
+            for setcc in [explicit_setcc, decoded_setcc] {
+                assert!(!prog
+                    .rtl_inst_candidate
+                    .iter()
+                    .any(|(node, _)| *node == setcc));
+                assert!(!prog.synth_only_addr.iter().any(|fact| fact == &(setcc,)));
+                assert!(!prog.op_produces_bool.iter().any(|(node, _)| *node == setcc));
+            }
         });
     }
 
