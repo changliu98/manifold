@@ -13102,12 +13102,11 @@ impl IRPass for RTLPass {
 mod tests {
     use super::{
         direct_pointer_after_step_access_fits_stride, direct_pointer_interval_within_local_frame,
-        direct_pointer_loop_continues_toward_endpoint,
-        fresh_call_input_reg, fresh_simd_dword_lane_reg, fresh_simd_dword_operand_reg,
-        fresh_stack_param_reg, fresh_stack_slot_reg, fresh_xmm_hi_value_reg, fresh_xtl_reg,
-        indexed_store_ends_at_extent, simd_broadcast_lane_node, simd_dword_event_stage_node,
-        simd_dword_reg_event, xmm_hi_lane_node, xmm_hi_store_node, RTLPassProgram,
-        StackAddrOrigin, FRESH_NS_SP_BASE,
+        direct_pointer_loop_continues_toward_endpoint, fresh_call_input_reg,
+        fresh_simd_dword_lane_reg, fresh_simd_dword_operand_reg, fresh_stack_param_reg,
+        fresh_stack_slot_reg, fresh_xmm_hi_value_reg, fresh_xtl_reg, indexed_store_ends_at_extent,
+        simd_broadcast_lane_node, simd_dword_event_stage_node, simd_dword_reg_event,
+        xmm_hi_lane_node, xmm_hi_store_node, RTLPassProgram, StackAddrOrigin, FRESH_NS_SP_BASE,
     };
     use crate::aarch64::mach::A64Mreg;
     use crate::mreg::Mreg;
@@ -13445,6 +13444,81 @@ mod tests {
             let mut incoming = RTLPassProgram::default();
             seed_direct_pointer_fixture(&mut incoming, 40, 48, 1, -1, 40);
             incoming.run();
+            assert!(incoming.stack_pointer_walk_region.is_empty());
+        });
+    }
+
+    #[test]
+    fn direct_pointer_walk_requires_decoded_width_local_frame_endpoints() {
+        on_large_stack(|| {
+            // The LTL superset can retain a 64-bit alternative for a decoded
+            // 32-bit LEA.  Neither endpoint is a machine pointer on LP64, so
+            // the otherwise-valid loop contract must not publish an object.
+            let mut narrow = RTLPassProgram::default();
+            let fixture = seed_direct_pointer_fixture(&mut narrow, 0, 32, 1, -1, 40);
+            for (node, dst_sym, dst_name, src_sym, ofs) in [
+                (
+                    fixture.base_def,
+                    "narrow_base_dst",
+                    "EAX",
+                    "narrow_base_src",
+                    0_i64,
+                ),
+                (
+                    fixture.endpoint_def,
+                    "narrow_end_dst",
+                    "ECX",
+                    "narrow_end_src",
+                    32_i64,
+                ),
+            ] {
+                narrow.plea.push((node, dst_sym, src_sym));
+                narrow.op_register.push((dst_sym, dst_name));
+                narrow
+                    .op_indirect
+                    .push((src_sym, "", "RSP", "NONE", 1, ofs, 8));
+            }
+            narrow.run();
+            assert!(narrow.stack_pointer_walk_region.is_empty());
+            drop(narrow);
+
+            // Pointer-width LEAs above an established frame pointer name the
+            // caller's incoming area, not this callee's local frame.  The
+            // numeric interval happens to fit the recovered frame size, so
+            // only exact local-frame provenance can reject this false walk.
+            let mut incoming = RTLPassProgram::default();
+            let fixture = seed_direct_pointer_fixture(&mut incoming, 16, 32, 1, -1, 40);
+            let frame_setup = 0x20f8;
+            incoming.instr_in_function.push((frame_setup, fixture.func));
+            incoming.stack_base_move.push((frame_setup, "RSP", "RBP"));
+            incoming.abi_incoming_bp_stack_base.push((16,));
+            for (node, dst_sym, dst_name, src_sym, ofs) in [
+                (
+                    fixture.base_def,
+                    "incoming_base_dst",
+                    "RAX",
+                    "incoming_base_src",
+                    16_i64,
+                ),
+                (
+                    fixture.endpoint_def,
+                    "incoming_end_dst",
+                    "RCX",
+                    "incoming_end_src",
+                    32_i64,
+                ),
+            ] {
+                incoming.plea.push((node, dst_sym, src_sym));
+                incoming.op_register.push((dst_sym, dst_name));
+                incoming
+                    .op_indirect
+                    .push((src_sym, "", "RBP", "NONE", 1, ofs, 8));
+            }
+            incoming.run();
+            assert!(incoming
+                .incoming_stack_tail_base
+                .iter()
+                .any(|(_, node, _, _)| *node == fixture.base_def));
             assert!(incoming.stack_pointer_walk_region.is_empty());
         });
     }
