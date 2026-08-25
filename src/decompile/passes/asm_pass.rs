@@ -7121,16 +7121,18 @@ ascent_par! {
         let args = vec![*res, *a2],
         let op = if *r_is_64 { Operation::Oleal(Addressing::Aindexed2(0)) } else { Operation::Olea(Addressing::Aindexed2(0)) };
 
-    mach_inst(address, MachInst::Mop(Operation::Olea(addressing), Arc::new(empty_args), *res)) <--
+    mach_inst(address, MachInst::Mop(op, Arc::new(empty_args), *res)) <--
         plea(address, dst_reg, src_addr),
         op_register(dst_reg, dst_str),
         op_indirect(src_addr, _, base_str, idx_str, _, offset, _),
         reg_sp(base_str),
         if *idx_str == "NONE" || idx_str.is_empty(),
+        reg_is_64(dst_str, dst_is_64),
         ireg_of(preg_of_dst, Ireg::from(dst_str)),
         preg_of(res, preg_of_dst),
         sp_lea_shift(address, depth),
         let addressing = Addressing::Ainstack(offset - depth),
+        let op = if *dst_is_64 { Operation::Oleal(addressing) } else { Operation::Olea(addressing) },
         let empty_args = vec![];
 
     // `mov reg, rsp` is `lea reg, 0(%rsp)`, so its slot identity is the raw
@@ -7139,17 +7141,19 @@ ascent_par! {
     // `lea disp(%rsp)`).  Naming it by the entry-relative SP delta instead put
     // an escaping out-parameter base in a different coordinate system than the
     // frame it names, so nothing downstream could size or index the object.
-    mach_inst(address, MachInst::Mop(Operation::Olea(addressing), Arc::new(empty_args), *res)) <--
+    mach_inst(address, MachInst::Mop(op, Arc::new(empty_args), *res)) <--
         pmov(address, dst_reg, src_reg),
         op_register(src_reg, src_str),
         reg_sp(src_str),
         op_register(dst_reg, dst_str),
         !reg_sp(dst_str),
+        reg_is_64(dst_str, dst_is_64),
         ireg_of(preg_of_dst, Ireg::from(dst_str)),
         preg_of(res, preg_of_dst),
         stack_offset(_, address, rsp_offsets),
         if let Some(_rsp_ofs) = exact_stack_offset(&rsp_offsets.0),
         let addressing = Addressing::Ainstack(0),
+        let op = if *dst_is_64 { Operation::Oleal(addressing) } else { Operation::Olea(addressing) },
         let empty_args = vec![];
 
     mach_inst(address, MachInst::Mop(Operation::Oindirectsymbol(*ident as usize), Arc::new(empty_args), *res)) <--
@@ -8386,7 +8390,7 @@ ascent_par! {
             Addressing::Aindexed2(*disp)
         };
 
-    mach_inst(address, MachInst::Mop(Operation::Olea(addr), Arc::new(args), *res)) <--
+    mach_inst(address, MachInst::Mop(Operation::Oleal(addr), Arc::new(args), *res)) <--
         plea(address, r, am),
         op_indirect(am, _, r_str, index_str, scale, disp, _),
         !reg_sp(*r_str), !reg_bp(*r_str),
@@ -8401,7 +8405,7 @@ ascent_par! {
         let addr = Addressing::Aindexed(*disp);
 
 
-    mach_inst(address, MachInst::Mop(Operation::Olea(addr), Arc::new(args), *res)) <--
+    mach_inst(address, MachInst::Mop(Operation::Oleal(addr), Arc::new(args), *res)) <--
         plea(address, r, am),
         op_indirect(am, _, base_str, index_str, scale, disp, _),
         if *index_str != "NONE" && !index_str.is_empty(),
@@ -8418,7 +8422,7 @@ ascent_par! {
         let args = vec![*base_arg, *index_arg],
         let addr = Addressing::Aindexed2(*disp);
 
-    mach_inst(address, MachInst::Mop(Operation::Olea(addr), Arc::new(args), *res)) <--
+    mach_inst(address, MachInst::Mop(Operation::Oleal(addr), Arc::new(args), *res)) <--
         plea(address, r, am),
         op_indirect(am, _, base_str, index_str, scale, disp, _),
         if *index_str != "NONE" && !index_str.is_empty(),
@@ -8435,7 +8439,7 @@ ascent_par! {
         let args = vec![*base_arg, *index_arg],
         let addr = Addressing::Aindexed2scaled(*scale, *disp);
 
-    mach_inst(address, MachInst::Mop(Operation::Olea(addr), Arc::new(args), *res)) <--
+    mach_inst(address, MachInst::Mop(Operation::Oleal(addr), Arc::new(args), *res)) <--
         plea(address, r, am),
         op_indirect(am, _, base_str, index_str, scale, disp, _),
         if *index_str != "NONE" && !index_str.is_empty(),
@@ -8450,7 +8454,7 @@ ascent_par! {
         let addr = Addressing::Ascaled(*scale, *disp);
 
     // 64-bit LEA with a BP base and index when BP is not the frame pointer: without it the index is dropped and a frame-relative &local is fabricated for an argv-indexed pointer.
-    mach_inst(address, MachInst::Mop(Operation::Olea(addr), Arc::new(args), *res)) <--
+    mach_inst(address, MachInst::Mop(Operation::Oleal(addr), Arc::new(args), *res)) <--
         plea(address, r, am),
         op_indirect(am, _, base_str, index_str, scale, disp, _),
         if *index_str != "NONE" && !index_str.is_empty(),
@@ -8478,7 +8482,7 @@ ascent_par! {
     // identity at that address IS the BP register's value identity, so the
     // register's pointer and whatever really lives at that frame offset are
     // welded into a single variable.
-    mach_inst(address, MachInst::Mop(Operation::Olea(Addressing::Aindexed(*disp)), Arc::new(args), *res)) <--
+    mach_inst(address, MachInst::Mop(Operation::Oleal(Addressing::Aindexed(*disp)), Arc::new(args), *res)) <--
         plea(address, r, am),
         op_indirect(am, _, base_str, index_str, _scale, disp, _),
         reg_bp(*base_str),
@@ -12743,6 +12747,110 @@ mod structural_dataflow_tests {
                         )
                     )
             }));
+        });
+    }
+
+    #[test]
+    fn asm_general_lea_preserves_destination_width() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let [indexed64, indexed32, base64, base32] = synthetic_ids();
+
+            let cases = [
+                (
+                    indexed64,
+                    "dst_indexed64",
+                    "R11",
+                    "mem_indexed64",
+                    "RDI",
+                    "R12",
+                    Operation::Oleal(Addressing::Aindexed2(0)),
+                    Mreg::R11,
+                ),
+                (
+                    indexed32,
+                    "dst_indexed32",
+                    "EAX",
+                    "mem_indexed32",
+                    "RDI",
+                    "R12",
+                    Operation::Olea(Addressing::Aindexed2(0)),
+                    Mreg::AX,
+                ),
+                (
+                    base64,
+                    "dst_base64",
+                    "R10",
+                    "mem_base64",
+                    "RDI",
+                    "NONE",
+                    Operation::Oleal(Addressing::Aindexed(24)),
+                    Mreg::R10,
+                ),
+                (
+                    base32,
+                    "dst_base32",
+                    "ECX",
+                    "mem_base32",
+                    "RDI",
+                    "NONE",
+                    Operation::Olea(Addressing::Aindexed(24)),
+                    Mreg::CX,
+                ),
+            ];
+
+            for (addr, dst_sym, dst_name, mem_sym, base_name, index_name, _, _) in &cases {
+                prog.plea.push((*addr, *dst_sym, *mem_sym));
+                prog.op_register.push((*dst_sym, *dst_name));
+                let displacement = if *index_name == "NONE" { 24 } else { 0 };
+                prog.op_indirect
+                    .push((*mem_sym, "", *base_name, *index_name, 1, displacement, 8));
+            }
+
+            prog.run();
+
+            for (addr, _, _, _, _, _, expected_op, expected_dst) in cases {
+                assert!(
+                    prog.mach_inst.iter().any(|fact| {
+                        fact == &(
+                            addr,
+                            MachInst::Mop(
+                                expected_op.clone(),
+                                Arc::new(match &expected_op {
+                                    Operation::Olea(Addressing::Aindexed2(_))
+                                    | Operation::Oleal(Addressing::Aindexed2(_)) => {
+                                        vec![Mreg::DI, Mreg::R12]
+                                    }
+                                    _ => vec![Mreg::DI],
+                                }),
+                                expected_dst,
+                            ),
+                        )
+                    }),
+                    "missing width-preserving general LEA at {addr:#x}; facts: {:?}",
+                    prog.mach_inst
+                        .iter()
+                        .filter(|(node, _)| *node == addr)
+                        .collect::<Vec<_>>()
+                );
+                assert!(
+                    !prog.mach_inst.iter().any(|(node, inst)| {
+                        *node == addr
+                            && match (&expected_op, inst) {
+                                (
+                                    Operation::Oleal(_),
+                                    MachInst::Mop(Operation::Olea(_), _, _),
+                                )
+                                | (
+                                    Operation::Olea(_),
+                                    MachInst::Mop(Operation::Oleal(_), _, _),
+                                ) => true,
+                                _ => false,
+                            }
+                    }),
+                    "general LEA at {addr:#x} also admitted the opposite result width",
+                );
+            }
         });
     }
 
