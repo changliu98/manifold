@@ -1435,15 +1435,73 @@ fn remove_buffer_owned_array_layouts(
     arrays.members.retain(|_, layouts| !layouts.is_empty());
 }
 
+/// Choose the C storage declaration for each recovered global array owner.
+///
+/// `is_global_array` describes a possible logical element interpretation;
+/// `global_storage_extent` describes physical ownership.  When the two agree
+/// exactly, retain the typed element shape.  When they disagree (or the
+/// logical stride has no scalar C element type), preserve the exact object as
+/// a byte array.  This keeps alternative interpretations from overlapping the
+/// next ELF object while still giving every interior address one C owner.
+pub(crate) fn recovered_global_array_declarations(
+    db: &DecompileDB,
+) -> HashMap<Ident, (usize, usize)> {
+    let mut logical: HashMap<Ident, (usize, usize)> = HashMap::new();
+    for (ident, elem_size, count) in db.rel_iter::<(Ident, usize, usize)>("is_global_array") {
+        if *elem_size == 0 || *count == 0 {
+            continue;
+        }
+        let candidate = (*elem_size, *count);
+        logical
+            .entry(*ident)
+            .and_modify(|winner| *winner = (*winner).min(candidate))
+            .or_insert(candidate);
+    }
+
+    let mut extent_candidates: HashMap<Ident, BTreeSet<usize>> = HashMap::new();
+    for (ident, extent) in db.rel_iter::<(Ident, usize)>("global_storage_extent") {
+        if *extent > 0 {
+            extent_candidates.entry(*ident).or_default().insert(*extent);
+        }
+    }
+    let exact_extents: HashMap<Ident, usize> = extent_candidates
+        .into_iter()
+        .filter_map(|(ident, extents)| {
+            (extents.len() == 1).then(|| (ident, *extents.first().unwrap()))
+        })
+        .collect();
+
+    let mut owners: BTreeSet<Ident> = logical.keys().copied().collect();
+    owners.extend(exact_extents.keys().copied());
+    owners
+        .into_iter()
+        .filter_map(
+            |ident| match (logical.get(&ident), exact_extents.get(&ident)) {
+                (Some(&(elem_size, count)), Some(&extent))
+                    if matches!(elem_size, 1 | 2 | 4 | 8)
+                        && elem_size.checked_mul(count) == Some(extent) =>
+                {
+                    Some((ident, (elem_size, count)))
+                }
+                (_, Some(&extent)) => Some((ident, (1, extent))),
+                (Some(&layout), None) => Some((ident, layout)),
+                (None, None) => None,
+            },
+        )
+        .collect()
+}
+
 pub fn build_cast_from_relations(
     db: &DecompileDB,
     selected_functions: &[SelectedFunction],
     globals: &[GlobalData],
     id_to_name: &HashMap<usize, String>,
+    global_lvalue_aliases: &HashMap<usize, CExpr>,
     edges: &[(crate::x86::types::Node, crate::x86::types::Node)],
     data_model: crate::abi::DataModel,
 ) -> TranslationUnit {
     let mut ctx = ConversionContext::new(id_to_name.clone(), data_model);
+    ctx.global_lvalue_aliases = global_lvalue_aliases.clone();
     ctx.func_renames = header_collision_policy(selected_functions).renames;
     for global in globals {
         if global.is_string {
@@ -1490,6 +1548,7 @@ pub fn build_cast_from_relations(
         selected_functions,
         globals,
         id_to_name,
+        global_lvalue_aliases,
         &stmt_map,
         edges,
         &ctx.var_types,
@@ -1502,6 +1561,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     selected_functions: &[SelectedFunction],
     globals: &[GlobalData],
     id_to_name: &HashMap<usize, String>,
+    global_lvalue_aliases: &HashMap<usize, CExpr>,
     stmt_map: &HashMap<crate::x86::types::Node, CStmt>,
     edges: &[(crate::x86::types::Node, crate::x86::types::Node)],
     var_types: &HashMap<String, CType>,
@@ -1743,24 +1803,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     };
     let global_aggregate_coalescing =
         derive_global_aggregate_coalescing(db, globals, &global_struct_decl_layouts);
-    // Same for recovered global arrays: smallest (elem_size, count) per ident -- weakest claim, deterministic across the multi-valued relation.
-    let global_array_decl: HashMap<usize, (usize, usize)> = {
-        let mut m: HashMap<usize, (usize, usize)> = HashMap::new();
-        for (ident, elem_size, count) in db.rel_iter::<(Ident, usize, usize)>("is_global_array") {
-            if *elem_size == 0 || *count == 0 {
-                continue;
-            }
-            let cand = (*elem_size, *count);
-            m.entry(*ident)
-                .and_modify(|e| {
-                    if cand < *e {
-                        *e = cand;
-                    }
-                })
-                .or_insert(cand);
-        }
-        m
-    };
+    let global_array_decl = recovered_global_array_declarations(db);
     let ctype_of_chunk = |chunk: &MemoryChunk| -> CType {
         match chunk {
             // c26: MBool is a 1-byte store; emit _Bool rather than widening to a 4-byte int. _Bool is the true storage type and is consistent with the 1-byte chunk_byte_size used for array elements.
@@ -1876,6 +1919,98 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         }
     };
 
+    // Initialized image bytes belong to the recovered object owner.  When an
+    // array base is introduced only because code referenced interior cells,
+    // omitting this initializer creates correctly shaped but zero-filled
+    // storage.  Materialize integer arrays from one unambiguous retained image
+    // range; relocations are excluded because their runtime value needs the
+    // separate relocation-aware initializer path.
+    let initialized_ranges: Vec<(Address, Arc<Vec<u8>>)> = db
+        .rel_iter::<(Address, Arc<Vec<u8>>)>("retained_initialized_data_range")
+        .map(|(start, bytes)| (*start, bytes.clone()))
+        .collect();
+    let relocation_slots: Vec<Address> = db
+        .rel_iter::<(Address, Address)>("pointer_in_data")
+        .chain(db.rel_iter::<(Address, Address)>("code_pointer_in_data"))
+        .map(|(slot, _)| *slot)
+        .collect();
+    let pointer_width = db.abi().pointer_size as Address;
+    let initialized_array_initializer =
+        |id: usize, elem_size: usize, count: usize, elem_ty: &CType| {
+            use crate::decompile::passes::c_pass::types::{Designator, InitItem, Initializer};
+            if !matches!(elem_size, 1 | 2 | 4 | 8) || count == 0 {
+                return None;
+            }
+            let start = id as Address;
+            let extent = elem_size.checked_mul(count)?;
+            let end = start.checked_add(Address::try_from(extent).ok()?)?;
+            if relocation_slots.iter().any(|slot| {
+                let slot_end = slot.saturating_add(pointer_width);
+                *slot < end && slot_end > start
+            }) {
+                return None;
+            }
+            let mut ranges = initialized_ranges.iter().filter(|(range_start, bytes)| {
+                start >= *range_start
+                    && end
+                        <= range_start
+                            .saturating_add(Address::try_from(bytes.len()).unwrap_or(Address::MAX))
+            });
+            let (range_start, bytes) = ranges.next()?;
+            if ranges.next().is_some() {
+                return None;
+            }
+            let offset = usize::try_from(start - *range_start).ok()?;
+            let image = bytes.get(offset..offset.checked_add(extent)?)?;
+            let (signed, boolean) = match elem_ty {
+                CType::Int(_, Signedness::Signed) => (true, false),
+                CType::Int(_, Signedness::Unsigned) => (false, false),
+                CType::Bool => (false, true),
+                _ => return None,
+            };
+            let mut items = Vec::new();
+            for index in 0..count {
+                let begin = index.checked_mul(elem_size)?;
+                let raw = image[begin..begin + elem_size]
+                    .iter()
+                    .enumerate()
+                    .fold(0_u64, |word, (byte_index, byte)| {
+                        word | ((*byte as u64) << (byte_index * 8))
+                    });
+                if raw == 0 {
+                    continue;
+                }
+                if boolean && raw != 1 {
+                    return None;
+                }
+                let value = if signed {
+                    match elem_size {
+                        1 => raw as u8 as i8 as i128,
+                        2 => raw as u16 as i16 as i128,
+                        4 => raw as u32 as i32 as i128,
+                        _ => raw as i64 as i128,
+                    }
+                } else {
+                    raw as i128
+                };
+                let suffix = match (signed, elem_size) {
+                    (true, 8) => IntLiteralSuffix::L,
+                    (false, 8) => IntLiteralSuffix::ULL,
+                    (false, 4) => IntLiteralSuffix::U,
+                    _ => IntLiteralSuffix::None,
+                };
+                items.push(InitItem {
+                    designator: Some(Designator::Index(CExpr::int(index as i64))),
+                    init: Initializer::Expr(CExpr::IntLit(IntLiteral {
+                        value,
+                        suffix,
+                        base: IntLiteralBase::Decimal,
+                    })),
+                });
+            }
+            (!items.is_empty()).then_some(Initializer::List(items))
+        };
+
     // Names the emitted functions write or address-take, used to keep a data global defined rather than extern only when this TU owns its storage.
     let mutated_globals: HashSet<String> = {
         let mut m = HashSet::new();
@@ -1886,22 +2021,41 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     };
 
     for global in order_globals_for_aggregate_initializers(globals, &global_aggregate_coalescing) {
-        // String literals emit separately and read-only scalars are constant-folded, but a writable .data scalar keeps its storage and must be a real initialized declaration.
-        if global.is_string || (global.scalar_value.is_some() && !global.scalar_writable) {
+        // An interior identifier is an lvalue coordinate in its owner's
+        // storage, not a separately allocated C object.  Its expression uses
+        // the owner declaration emitted below.
+        if global_lvalue_aliases.contains_key(&global.id) {
+            continue;
+        }
+        // String literals emit separately. A read-only scalar can be folded
+        // only when it is not also the proven owner of recovered aggregate
+        // storage: interior aliases require that one owner declaration and
+        // its image initializer to remain materialized.
+        let is_recovered_aggregate_owner =
+            global_aggregate_coalescing.owner_ids.contains(&global.id)
+                || global_struct_decl_ids.contains_key(&global.id)
+                || global_array_decl.contains_key(&global.id);
+        if global.is_string
+            || (global.scalar_value.is_some()
+                && !global.scalar_writable
+                && !is_recovered_aggregate_owner)
+        {
             continue;
         }
         // A recovered rodata FP constant reaches here with no scalar_value, so emit a typed static const with the real bits instead of a loader-zeroed long L_<addr>.
-        if let Some(addr) = global
-            .name
-            .strip_prefix("L_")
-            .and_then(|h| u64::from_str_radix(h, 16).ok())
-        {
-            if let Some(&(width, bits)) = rodata_fp_consts.get(&addr) {
-                if let Some(decl) =
-                    make_rodata_fp_decl(sanitize_c_symbol_name(&global.name), width, bits)
-                {
-                    tu.decls.push(decl);
-                    continue;
+        if !is_recovered_aggregate_owner {
+            if let Some(addr) = global
+                .name
+                .strip_prefix("L_")
+                .and_then(|h| u64::from_str_radix(h, 16).ok())
+            {
+                if let Some(&(width, bits)) = rodata_fp_consts.get(&addr) {
+                    if let Some(decl) =
+                        make_rodata_fp_decl(sanitize_c_symbol_name(&global.name), width, bits)
+                    {
+                        tu.decls.push(decl);
+                        continue;
+                    }
                 }
             }
         }
@@ -1961,7 +2115,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             (CType::Struct(format!("struct_{:x}", sid)), None)
         } else if let Some(&(elem_size, count)) = global_array_decl.get(&global.id) {
             // SR-1: non-scalar strides (e.g. 12-byte struct elements) have no honest scalar element type, so declare the full extent as a byte array rather than an undersized `int name[count]` that would let a recompile overlap the following symbol.
-            let (elem_ty, decl_count) = match elem_size {
+            let (elem_ty, decl_count, emitted_elem_size) = match elem_size {
                 1 | 2 | 4 | 8 => {
                     let elem_ty = match global_chunks.get(&global.id) {
                         Some(chunk) if chunk_byte_size(chunk) == elem_size => ctype_of_chunk(chunk),
@@ -1978,7 +2132,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                             _ => CType::int(),
                         },
                     };
-                    (elem_ty, count)
+                    (elem_ty, count, elem_size)
                 }
                 _ => (
                     CType::Int(
@@ -1986,9 +2140,12 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                         crate::decompile::passes::c_pass::types::Signedness::Unsigned,
                     ),
                     elem_size * count,
+                    1,
                 ),
             };
-            (CType::Array(Box::new(elem_ty), Some(decl_count)), None)
+            let init =
+                initialized_array_initializer(global.id, emitted_elem_size, decl_count, &elem_ty);
+            (CType::Array(Box::new(elem_ty), Some(decl_count)), init)
         } else if global_char_ptr_ids.contains(&global.id) {
             (
                 CType::Pointer(
@@ -4610,6 +4767,12 @@ fn collect_var_names_from_initializer(
 
 pub struct ConversionContext {
     pub id_to_name: HashMap<usize, String>,
+    /// Exact lvalue coordinates for identifiers that name an interior byte of
+    /// a recovered global object.  Keeping this as CExpr (rather than encoding
+    /// `owner[index]` into a string) preserves aliasing and prevents the name
+    /// sanitizer from turning an address coordinate into an unrelated C
+    /// global.
+    pub global_lvalue_aliases: HashMap<usize, CExpr>,
     /// The target's C data model, so a 64-bit value gets a 64-bit spelling.
     pub data_model: crate::abi::DataModel,
     #[allow(dead_code)]
@@ -4634,6 +4797,7 @@ impl ConversionContext {
         let label_disambig = Self::build_label_disambig(&id_to_name);
         Self {
             id_to_name,
+            global_lvalue_aliases: HashMap::new(),
             data_model,
             global_names,
             string_globals: HashSet::new(),
@@ -5717,7 +5881,7 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
             value: val.0 as f64,
             suffix: FloatLiteralSuffix::F,
         }),
-        clight::ClightExpr::Evar(id, _ty) => {
+        clight::ClightExpr::Evar(id, ty) => {
             let raw_name = ctx
                 .id_to_name
                 .get(id)
@@ -5730,6 +5894,26 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
                         is_wide: false,
                     });
                 }
+            }
+            if let Some(alias) = ctx.global_lvalue_aliases.get(id) {
+                // The owner declaration models storage; the Clight Evar type
+                // models this particular machine access.  Keep both.  The
+                // typed dereference remains an lvalue for stores and turns
+                // `&Evar` into the correctly typed interior pointer, while a
+                // signed/extended load does not inherit an arbitrary owner
+                // element signedness.
+                return match ty {
+                    clight::ClightType::Tvoid
+                    | clight::ClightType::Tarray(..)
+                    | clight::ClightType::Tfunction(..) => alias.clone(),
+                    _ => CExpr::Unary(
+                        UnaryOp::Deref,
+                        Box::new(CExpr::Cast(
+                            CType::ptr(convert_clight_type(ty, ctx.data_model)),
+                            Box::new(CExpr::Unary(UnaryOp::AddrOf, Box::new(alias.clone()))),
+                        )),
+                    ),
+                };
             }
             CExpr::Var(ctx.var_name(*id))
         }
@@ -7622,6 +7806,77 @@ mod escaped_stack_array_tests {
                         && matches!(inner.as_ref(), CExpr::Unary(UnaryOp::AddrOf, _))
             ) && matches!(rhs.as_ref(), CExpr::IntLit(literal) if literal.value == 8)
         ));
+    }
+
+    #[test]
+    fn interior_global_alias_keeps_owner_lvalue_and_access_signedness() {
+        let interior_id = 0xe131_usize;
+        let alias = CExpr::Index(
+            Box::new(CExpr::Var("global_bytes".to_string())),
+            Box::new(CExpr::int(1)),
+        );
+        let access_ty = clight::ClightType::Tint(
+            clight::ClightIntSize::I8,
+            clight::ClightSignedness::Signed,
+            clight::ClightAttr::default(),
+        );
+        let mut ctx = ConversionContext::new(HashMap::new(), crate::abi::DataModel::Lp64);
+        ctx.global_lvalue_aliases.insert(interior_id, alias.clone());
+
+        let converted = convert_expr(
+            &clight::ClightExpr::Evar(interior_id, access_ty.clone()),
+            &mut ctx,
+        );
+        let typed_alias = CExpr::Unary(
+            UnaryOp::Deref,
+            Box::new(CExpr::Cast(
+                CType::ptr(CType::Int(IntSize::Char, Signedness::Signed)),
+                Box::new(CExpr::Unary(UnaryOp::AddrOf, Box::new(alias))),
+            )),
+        );
+        assert_eq!(converted, typed_alias);
+
+        let address = convert_expr(
+            &clight::ClightExpr::Eaddrof(
+                Box::new(clight::ClightExpr::Evar(interior_id, access_ty)),
+                clight::ClightType::Tpointer(
+                    Arc::new(clight::ClightType::Tint(
+                        clight::ClightIntSize::I8,
+                        clight::ClightSignedness::Signed,
+                        clight::ClightAttr::default(),
+                    )),
+                    clight::ClightAttr::default(),
+                ),
+            ),
+            &mut ctx,
+        );
+        assert_eq!(
+            address,
+            CExpr::Unary(UnaryOp::AddrOf, Box::new(typed_alias))
+        );
+    }
+
+    #[test]
+    fn physical_global_extent_bounds_incompatible_logical_stride() {
+        let owner = 0x404030_usize;
+        let mut db = DecompileDB::default();
+        db.rel_push("is_global_array", (owner, 6_usize, 3_usize));
+        db.rel_push("global_storage_extent", (owner, 16_usize));
+
+        assert_eq!(
+            recovered_global_array_declarations(&db).get(&owner),
+            Some(&(1, 16)),
+            "an 18-byte interpretation must not enlarge a 16-byte ELF object",
+        );
+
+        let typed_owner = owner + 0x20;
+        db.rel_push("is_global_array", (typed_owner, 4_usize, 4_usize));
+        db.rel_push("global_storage_extent", (typed_owner, 16_usize));
+        assert_eq!(
+            recovered_global_array_declarations(&db).get(&typed_owner),
+            Some(&(4, 4)),
+            "an exact logical layout should retain its element type",
+        );
     }
 
     #[test]

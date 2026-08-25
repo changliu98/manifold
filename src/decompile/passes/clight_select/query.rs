@@ -2999,6 +2999,57 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
         layouts.dedup();
     }
 
+    // A Clight global ident may name an interior coordinate even when no
+    // instruction directly mentions the object's base.  The base still owns
+    // the storage and must receive the C declaration/initializer; otherwise a
+    // later `base[index]` rewrite names an undeclared, zero-filled surrogate.
+    // Admit an owner only when the producer supplied an exact array/struct
+    // layout and the symbol name resolves to one unique owner id.
+    let referenced_global_ids: HashSet<usize> = global_var_ids.iter().copied().collect();
+    let mut recovered_owner_ids: HashSet<usize> = global_array_layouts.keys().copied().collect();
+    recovered_owner_ids.extend(
+        db.rel_iter::<(Ident, usize)>("global_storage_extent")
+            .map(|(ident, _)| *ident),
+    );
+    let struct_catalog_ids: HashSet<usize> = db
+        .rel_iter::<(u64, usize, usize, usize)>("global_struct_catalog")
+        .map(|(_, id, _, _)| *id)
+        .collect();
+    recovered_owner_ids.extend(
+        db.rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>(
+            "emit_global_struct_fields",
+        )
+        .filter_map(|(ident, sid, _)| struct_catalog_ids.contains(sid).then_some(*ident)),
+    );
+    let mut owner_ids_by_symbol: HashMap<Symbol, BTreeSet<usize>> = HashMap::new();
+    for (addr, _, name) in db.rel_iter::<(Address, usize, Symbol)>("symbol_size") {
+        let ident = *addr as usize;
+        if recovered_owner_ids.contains(&ident) {
+            owner_ids_by_symbol.entry(*name).or_default().insert(ident);
+        }
+    }
+    for (addr, name, _) in db.rel_iter::<(Address, Symbol, Symbol)>("symbols") {
+        let ident = *addr as usize;
+        if recovered_owner_ids.contains(&ident) {
+            owner_ids_by_symbol.entry(*name).or_default().insert(ident);
+        }
+    }
+    for (interior, owner_name, offset) in
+        db.rel_iter::<(Ident, Symbol, i64)>("emit_address_as_offset")
+    {
+        if *offset <= 0 || !referenced_global_ids.contains(interior) {
+            continue;
+        }
+        let Some(candidates) = owner_ids_by_symbol.get(owner_name) else {
+            continue;
+        };
+        if candidates.len() == 1 {
+            global_var_ids.push(*candidates.first().unwrap());
+        }
+    }
+    global_var_ids.sort_unstable();
+    global_var_ids.dedup();
+
     // A pointer initializer may name a higher-address anonymous global.  Walk
     // definitions in dependency order so that target has C declaration scope
     // when recovery validates and emits `&target`.
@@ -3151,6 +3202,7 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
             .unwrap_or_else(|| format!("global_{}", id));
 
         let addr = *id as u64;
+        let is_recovered_aggregate = recovered_owner_ids.contains(id);
         let mut is_string = false;
         let mut content = Vec::new();
 
@@ -3207,7 +3259,7 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
         let is_pointer = !pointer_init.is_empty() || global_ptr_ids.contains(id);
 
         // Pointer globals are never string literals; skip all string detection for them.
-        if !is_pointer {
+        if !is_pointer && !is_recovered_aggregate {
             if let Some(str_content) = string_data_map.get(&name) {
                 if is_valid_ascii_content(str_content.as_bytes()) {
                     is_string = true;
@@ -3241,7 +3293,10 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
         }
 
         // Try to resolve scalar constants from initialized-data sections before string detection, since float constants (e.g. 3.0f) start with 0x00 and would be misidentified as empty strings. The resolved value also reports whether it came from a writable (.data) or read-only (.rodata) section.
-        let (scalar_value, scalar_writable) = if !is_string && !is_pointer {
+        let (scalar_value, scalar_writable) = if !is_string
+            && !is_pointer
+            && !is_recovered_aggregate
+        {
             match resolve_rodata_scalar(addr, &global_chunks, *id, &data_ranges, &symbol_size_map) {
                 Some((v, w)) => (Some(v), w),
                 None => (None, false),
@@ -3251,7 +3306,7 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
         };
 
         // Pointer globals must never be classified as string literals: their file bytes are zero pre-relocation, so a leading 0x00 does not mean an empty string.
-        if !is_string && scalar_value.is_none() && !is_pointer {
+        if !is_string && scalar_value.is_none() && !is_pointer && !is_recovered_aggregate {
             for section in obj_file.sections() {
                 // A global_var_ref id is a runtime address, which only SHF_ALLOC sections have; non-allocated metadata sections sit at sh_addr=0 and would render a constant as their bytes, so skip them.
                 if !section_is_allocated(&section) {

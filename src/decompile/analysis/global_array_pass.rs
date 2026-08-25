@@ -120,6 +120,19 @@ ascent_par! {
         address_in_sized_symbol(interior_ident, start_addr, offset),
         symbol_address(base_ident, start_addr);
 
+    // Physical object identity is independent of a guessed logical element
+    // stride.  A sized symbol that owns a referenced interior address has an
+    // exact byte extent even when the observations also admit several array
+    // or struct interpretations.  Keep this fact separate so no candidate
+    // layout can enlarge storage past the ELF object boundary.
+    relation global_storage_extent(Ident, usize);
+
+    global_storage_extent(base_ident, *size) <--
+        interior_to_base_ident(_interior_ident, base_ident, _offset),
+        symbol_address(base_ident, base_addr),
+        symbol_size(base_addr, size, _name),
+        if *size > 0;
+
     relation global_distinct_offset(Ident, i64);
 
     global_distinct_offset(ident, offset) <--
@@ -844,6 +857,9 @@ impl IRPass for GlobalArrayPass {
             for t in db.rel_iter::<(Ident, usize, usize)>("is_global_array") {
                 eprintln!("[GA] is_global_array {:x?}", t);
             }
+            for t in db.rel_iter::<(Ident, usize)>("global_storage_extent") {
+                eprintln!("[GA] global_storage_extent {:x?}", t);
+            }
         }
     }
 
@@ -1002,5 +1018,25 @@ mod relocated_string_array_tests {
         assert!(pass.inputs().contains(&"initialized_data_range"));
         assert!(pass.outputs().contains(&"retained_initialized_data_range"));
         assert!(pass.outputs().contains(&"is_global_array"));
+        assert!(pass.outputs().contains(&"global_storage_extent"));
+    }
+
+    #[test]
+    fn interior_symbol_publishes_physical_owner_extent_independent_of_stride() {
+        let mut prog = GlobalArrayPassProgram::default();
+        let owner = 0x404030;
+        prog.interior_to_base_ident.push((owner + 1, owner, 1));
+        prog.base_ident_to_symbol.push((owner, "global_bytes"));
+        prog.symbols
+            .push((owner as Address, "global_bytes", "OBJECT"));
+        prog.symbol_size
+            .push((owner as Address, 16, "global_bytes"));
+
+        prog.run();
+
+        assert!(prog
+            .global_storage_extent
+            .iter()
+            .any(|fact| *fact == (owner, 16)));
     }
 }

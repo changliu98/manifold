@@ -557,6 +557,15 @@ fn rewrite_recovered_global_expr(
             Box::new(rewrite_recovered_global_expr(base, arrays, structs)),
             f.clone(),
         ),
+        // An explicit interior alias already indexes the recovered owner.
+        // Rewriting its direct owner Var as owner[0] would produce the invalid
+        // two-dimensional form owner[0][N].
+        CExpr::Index(base, idx) if matches!(base.as_ref(), CExpr::Var(name) if arrays.contains(name)) => {
+            CExpr::Index(
+                base.clone(),
+                Box::new(rewrite_recovered_global_expr(idx, arrays, structs)),
+            )
+        }
         CExpr::Index(arr, idx) => CExpr::Index(
             Box::new(rewrite_recovered_global_expr(arr, arrays, structs)),
             Box::new(rewrite_recovered_global_expr(idx, arrays, structs)),
@@ -1467,8 +1476,8 @@ const CLIGHT_EMIT_INPUTS: &[&str] = &[
     "instr_in_function",
     "emit_address_as_offset",
     "symbol_size",
-    "interior_element_size",
     "is_global_array",
+    "global_storage_extent",
     "global_var_ref",
     "global_load_chunk",
     "emit_canonical_struct_id",
@@ -1710,51 +1719,68 @@ impl IRPass for ClightEmitPass {
             }
         }
 
+        let mut global_lvalue_alias_candidates: HashMap<usize, HashSet<CExpr>> = HashMap::new();
         {
-            // Both relations are multi-valued per ident; keep the smallest value explicitly to avoid non-deterministic last-wins from Ascent iteration order.
-            let mut interior_elem_sizes: HashMap<usize, usize> = HashMap::new();
-            for (ident, elem_size) in db.rel_iter::<(Ident, usize)>("interior_element_size") {
-                interior_elem_sizes
-                    .entry(*ident)
-                    .and_modify(|e| *e = (*e).min(*elem_size))
-                    .or_insert(*elem_size);
-            }
-            let mut array_elem_sizes: HashMap<usize, usize> = HashMap::new();
-            for (ident, elem_size, _count) in
-                db.rel_iter::<(Ident, usize, usize)>("is_global_array")
-            {
-                array_elem_sizes
-                    .entry(*ident)
-                    .and_modify(|e| *e = (*e).min(*elem_size))
-                    .or_insert(*elem_size);
-            }
-            // symbol_size may carry several addresses per name (e.g. local statics sharing a name); resolve by min address for determinism.
-            let mut symbol_addr_by_name: HashMap<&str, usize> = HashMap::new();
+            // Use the same physical-storage/logical-layout reconciliation as
+            // the declaration builder. A byte fallback here must correspond
+            // to the byte array actually emitted there.
+            let array_layouts = crate::decompile::passes::c_pass::convert::from_relations::recovered_global_array_declarations(db);
+            // A repeated local-static spelling does not identify one storage
+            // owner. Preserve every candidate and reject ambiguous aliases
+            // instead of deterministically choosing the wrong address.
+            let mut symbol_addrs_by_name: HashMap<&str, std::collections::BTreeSet<usize>> =
+                HashMap::new();
             for (addr, _, name) in db.rel_iter::<(Address, usize, Symbol)>("symbol_size") {
-                symbol_addr_by_name
+                symbol_addrs_by_name
                     .entry(*name)
-                    .and_modify(|e| *e = (*e).min(*addr as usize))
-                    .or_insert(*addr as usize);
+                    .or_default()
+                    .insert(*addr as usize);
             }
+            for (addr, name, _) in db.rel_iter::<(Address, Symbol, Symbol)>("symbols") {
+                symbol_addrs_by_name
+                    .entry(*name)
+                    .or_default()
+                    .insert(*addr as usize);
+            }
+
+            let struct_catalog_ids: HashSet<usize> = db
+                .rel_iter::<(u64, usize, usize, usize)>("global_struct_catalog")
+                .map(|(_, id, _, _)| *id)
+                .collect();
+            let known_typed_names: HashSet<String> = db
+                .rel_iter::<(Symbol, XType)>("known_global_type")
+                .map(|(name, _)| {
+                    crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(name)
+                })
+                .collect();
+            let struct_owner_ids: HashSet<usize> = db
+                .rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>(
+                    "emit_global_struct_fields",
+                )
+                .filter_map(|(ident, sid, _)| struct_catalog_ids.contains(sid).then_some(*ident))
+                .collect();
+
+            // These are the names the translation-unit builder can actually
+            // define. Read-only scalar folding is overridden for recovered
+            // aggregate owners, because their interior aliases need storage.
+            let declared_global_ids: HashSet<usize> = globals
+                .iter()
+                .filter(|global| {
+                    !global.is_string
+                        && (global.scalar_value.is_none()
+                            || global.scalar_writable
+                            || array_layouts.contains_key(&global.id)
+                            || struct_owner_ids.contains(&global.id))
+                })
+                .map(|global| global.id)
+                .collect();
+            let globals_by_id: HashMap<
+                usize,
+                &crate::decompile::passes::clight_select::query::GlobalData,
+            > = globals.iter().map(|global| (global.id, global)).collect();
 
             // SR-1 (FIXPLAN 4.5): interior idents of a recovered-struct global must not render as `(g + N)` (struct + int is invalid); name them `g.ofs_N` when the layout has a field at that offset, otherwise fall back to `(g + N)` byte-offset form.
             let struct_decl_field_offsets: HashMap<usize, std::collections::BTreeSet<i64>> = {
-                // A global gets a top-level declaration unless it is a string literal or a read-only inlined scalar.
-                let declared_global_ids: HashSet<usize> = globals
-                    .iter()
-                    .filter(|g| !g.is_string && (g.scalar_value.is_none() || g.scalar_writable))
-                    .map(|g| g.id)
-                    .collect();
-                let known_typed_names: HashSet<String> = db
-                    .rel_iter::<(Symbol, XType)>("known_global_type")
-                    .map(|(name, _)| {
-                        crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(name)
-                    })
-                    .collect();
-                let catalog_ids: HashSet<usize> = db
-                    .rel_iter::<(u64, usize, usize, usize)>("global_struct_catalog")
-                    .map(|(_, id, _, _)| *id)
-                    .collect();
                 // Min-sid per ident mirrors from_relations' winner; merge field offsets of every row carrying that sid.
                 let mut chosen_sid: HashMap<usize, usize> = HashMap::new();
                 for (ident, sid, _fields) in db
@@ -1762,7 +1788,7 @@ impl IRPass for ClightEmitPass {
                         "emit_global_struct_fields",
                     )
                 {
-                    if !catalog_ids.contains(sid) || !declared_global_ids.contains(ident) {
+                    if !struct_catalog_ids.contains(sid) || !declared_global_ids.contains(ident) {
                         continue;
                     }
                     chosen_sid
@@ -1805,40 +1831,85 @@ impl IRPass for ClightEmitPass {
             for (interior_ident, base_name, offset) in
                 db.rel_iter::<(Ident, Symbol, i64)>("emit_address_as_offset")
             {
-                let maybe_base_ident = symbol_addr_by_name.get(*base_name).copied();
-
-                let rewritten_name = if let Some(base_ident) = maybe_base_ident {
-                    let elem_size_opt = interior_elem_sizes
+                let maybe_base_ident = symbol_addrs_by_name
+                    .get(*base_name)
+                    .filter(|addresses| addresses.len() == 1)
+                    .and_then(|addresses| addresses.first().copied());
+                let alias = if let Some(base_ident) = maybe_base_ident {
+                    let owner_name = id_to_name
                         .get(&base_ident)
-                        .or_else(|| array_elem_sizes.get(&base_ident));
-                    if let Some(&elem_size) = elem_size_opt {
+                        .map(|name| {
+                            crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(name)
+                        });
+                    // The TU builder gives recovered structs precedence over
+                    // arrays. Mirror that object-shape choice here.
+                    if let (Some(field_offsets), Some(owner_name)) = (
+                        struct_decl_field_offsets.get(&base_ident),
+                        owner_name.as_ref(),
+                    ) {
+                        if globals_by_id
+                            .get(&base_ident)
+                            .is_some_and(|global| !global.pointer_init.is_empty())
+                        {
+                            continue;
+                        }
+                        if *offset > 0 && field_offsets.contains(offset) {
+                            Some(CExpr::Member(
+                                Box::new(CExpr::Var(owner_name.clone())),
+                                format!("ofs_{}", offset),
+                            ))
+                        } else {
+                            None
+                        }
+                    } else if let (Some(&(elem_size, _)), Some(owner_name)) =
+                        (array_layouts.get(&base_ident), owner_name.as_ref())
+                    {
+                        if !declared_global_ids.contains(&base_ident)
+                            || known_typed_names.contains(owner_name)
+                            || globals_by_id
+                                .get(&base_ident)
+                                .is_some_and(|global| global.pointer_init.len() == 1)
+                            || globals_by_id
+                                .get(interior_ident)
+                                .is_some_and(|global| !global.pointer_init.is_empty())
+                        {
+                            continue;
+                        }
                         if elem_size > 0 && *offset >= 0 && (*offset as usize) % elem_size == 0 {
                             let index = (*offset as usize) / elem_size;
-                            format!("{}[{}]", base_name, index)
+                            Some(CExpr::Index(
+                                Box::new(CExpr::Var(owner_name.clone())),
+                                Box::new(CExpr::int(index as i64)),
+                            ))
                         } else {
-                            format!("({} + {})", base_name, offset)
+                            None
                         }
-                    } else if let Some(field_offsets) = struct_decl_field_offsets.get(&base_ident) {
-                        // NOTE: these synthetic names are sanitized into plain identifiers downstream (sanitize_c_symbol_name), so they never parse as expressions; the member form yields a readable name ("g_ofs_4") instead of the opaque "(g + 4)".
-                        if *offset == 0 {
-                            base_name.to_string()
-                        } else if field_offsets.contains(offset) {
-                            // Matches the recovered definition's field naming (make_field_ident(offset) -> "ofs_N").
-                            format!("{}.ofs_{}", base_name, offset)
-                        } else {
-                            format!("({} + {})", base_name, offset)
-                        }
-                    } else if *offset == 0 {
-                        base_name.to_string()
                     } else {
-                        format!("({} + {})", base_name, offset)
+                        None
                     }
                 } else {
-                    format!("({} + {})", base_name, offset)
+                    None
                 };
-                id_to_name.insert(*interior_ident, rewritten_name);
+                // An interior coordinate must remain an expression. Encoding
+                // `owner[index]` in id_to_name loses the brackets when the C
+                // identifier sanitizer runs and silently allocates unrelated
+                // storage. Offset zero already has the owner's ordinary name.
+                if *offset > 0 {
+                    if let Some(alias) = alias {
+                        global_lvalue_alias_candidates
+                            .entry(*interior_ident)
+                            .or_default()
+                            .insert(alias);
+                    }
+                }
             }
         }
+        let global_lvalue_aliases: HashMap<usize, CExpr> = global_lvalue_alias_candidates
+            .into_iter()
+            .filter_map(|(ident, candidates)| {
+                (candidates.len() == 1).then(|| (ident, candidates.into_iter().next().unwrap()))
+            })
+            .collect();
 
         // Resolve post-selection field types before either TU build. The
         // explicit function-scope ablation also runs the retired local/global
@@ -1936,6 +2007,7 @@ impl IRPass for ClightEmitPass {
                 &selected_functions,
                 &globals,
                 &id_to_name,
+                &global_lvalue_aliases,
                 &edges,
                 db.data_model(),
             );
@@ -2025,6 +2097,7 @@ impl IRPass for ClightEmitPass {
                 id_to_name.clone(),
                 data_model,
             );
+        ctx.global_lvalue_aliases = global_lvalue_aliases.clone();
         let mut var_types_for_emission: HashMap<String, CType> = HashMap::new();
         let mut all_statements: Vec<(Node, CStmt)> = Vec::new();
         let mut all_edges: Vec<(Node, Node)> = Vec::new();
@@ -2192,6 +2265,7 @@ impl IRPass for ClightEmitPass {
             &db.cast_selected_functions,
             &db.cast_globals,
             &db.cast_id_to_name,
+            &global_lvalue_aliases,
             &stmt_map,
             &all_edges,
             &db.cast_var_types_for_emission,
@@ -2524,6 +2598,23 @@ mod tests {
                 "ofs_8".to_string(),
             ),
             "an interior field already rewritten to its owner was composed twice",
+        );
+    }
+
+    #[test]
+    fn explicit_recovered_global_index_is_not_prefixed_by_first_element() {
+        let owner = "global_bytes".to_string();
+        let expr = CExpr::Index(Box::new(CExpr::Var(owner.clone())), Box::new(CExpr::int(7)));
+        let arrays = HashSet::from([owner.clone()]);
+
+        assert_eq!(
+            rewrite_recovered_global_expr(&expr, &arrays, &HashMap::new()),
+            expr,
+        );
+        assert_eq!(
+            rewrite_recovered_global_expr(&CExpr::Var(owner.clone()), &arrays, &HashMap::new(),),
+            CExpr::Index(Box::new(CExpr::Var(owner)), Box::new(CExpr::int(0))),
+            "a genuinely bare aggregate use must still select its first element",
         );
     }
 
