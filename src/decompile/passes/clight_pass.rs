@@ -2148,6 +2148,31 @@ mod tests {
     }
 
     #[test]
+    fn two_exact_walk_bases_cannot_both_claim_one_endpoint_alias() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x7700;
+        let base0: RTLReg = 0x8000_0000_0000_7700;
+        let base8: RTLReg = 0x8000_0000_0000_7708;
+        let endpoint: RTLReg = 0x8000_0000_0000_7720;
+        for (low, high) in [(0_i64, 32_i64), (8, 32)] {
+            db.rel_push("stack_pointer_walk_region", (func, low, high));
+        }
+        for (node, offset, local) in [
+            (0x7710_u64, 0_i64, base0),
+            (0x7711_u64, 8_i64, base8),
+            (0x7712_u64, 32_i64, endpoint),
+        ] {
+            db.rel_push("stack_var", (func, node, offset, local));
+        }
+
+        size_indexed_stack_arrays(&mut db);
+
+        assert!(!db
+            .rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_end_alias")
+            .any(|alias| alias.0 == func && alias.1 == endpoint));
+    }
+
+    #[test]
     fn exact_pointer_walk_does_not_absorb_storage_starting_at_exclusive_end() {
         let mut db = DecompileDB::default();
         let func: Address = 0x7800;
@@ -2180,6 +2205,96 @@ mod tests {
                 .count(),
             0,
         );
+    }
+
+    #[test]
+    fn adjacent_exact_pointer_walks_keep_boundary_as_second_owner() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x7850;
+        let first_base: RTLReg = 0x8000_0000_0000_7850;
+        let second_base: RTLReg = 0x8000_0000_0000_7870;
+        let final_end: RTLReg = 0x8000_0000_0000_7890;
+        for (low, high) in [(0_i64, 32_i64), (32, 64)] {
+            db.rel_push("stack_pointer_walk_region", (func, low, high));
+        }
+        for (node, offset, local) in [
+            (0x7851_u64, 0_i64, first_base),
+            (0x7852_u64, 32_i64, second_base),
+            (0x7853_u64, 64_i64, final_end),
+        ] {
+            db.rel_push("stack_var", (func, node, offset, local));
+            db.rel_push("instr_in_function", (node, func));
+            db.rel_push(
+                "rtl_inst",
+                (
+                    node,
+                    RTLInst::Iop(
+                        Operation::Oleal(Addressing::Ainstack(offset)),
+                        Arc::new(vec![]),
+                        local,
+                    ),
+                ),
+            );
+        }
+        let subtract = 0x7854_u64;
+        db.rel_push("instr_in_function", (subtract, func));
+        db.rel_push(
+            "rtl_inst",
+            (
+                subtract,
+                RTLInst::Iop(
+                    Operation::Osubl,
+                    Arc::new(vec![second_base, first_base]),
+                    0x8000_0000_0000_7900,
+                ),
+            ),
+        );
+
+        size_indexed_stack_arrays(&mut db);
+
+        assert_eq!(
+            db.stack_array_buffers
+                .get(&func)
+                .and_then(|arrays| arrays.get(&first_base)),
+            Some(&(MemoryChunk::MInt8Unsigned, 32)),
+        );
+        assert_eq!(
+            db.stack_array_buffers
+                .get(&func)
+                .and_then(|arrays| arrays.get(&second_base)),
+            Some(&(MemoryChunk::MInt8Unsigned, 32)),
+        );
+        assert!(!db
+            .rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_end_alias")
+            .any(|alias| alias.0 == func && alias.1 == second_base));
+        assert!(db
+            .rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_end_alias")
+            .any(|alias| alias == &(func, final_end, second_base, 32)));
+    }
+
+    #[test]
+    fn ambiguous_adjacent_walk_start_is_not_absorbed_as_an_endpoint() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x78a0;
+        let first_base: RTLReg = 0x8000_0000_0000_78a0;
+        let second_base: RTLReg = 0x8000_0000_0000_78c0;
+        db.rel_push("stack_pointer_walk_region", (func, 0_i64, 32_i64));
+        db.rel_push("stack_pointer_walk_region", (func, 32_i64, 64_i64));
+        db.rel_push("stack_pointer_walk_region", (func, 32_i64, 72_i64));
+        db.rel_push("stack_var", (func, 0x78a1_u64, 0_i64, first_base));
+        db.rel_push("stack_var", (func, 0x78a2_u64, 32_i64, second_base));
+
+        size_indexed_stack_arrays(&mut db);
+
+        assert_eq!(
+            db.stack_array_buffers
+                .get(&func)
+                .and_then(|arrays| arrays.get(&first_base)),
+            Some(&(MemoryChunk::MInt8Unsigned, 32)),
+        );
+        assert!(!db
+            .rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_end_alias")
+            .any(|alias| alias.0 == func && alias.1 == second_base));
     }
 
     #[test]
@@ -6973,8 +7088,16 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
             .or_default()
             .insert(*high);
     }
-    let mut exact_walk_end_aliases = Vec::new();
+    // Every structurally published start owns a potential object boundary,
+    // even when its local Clight layout is ambiguous and the walk cannot be
+    // sized below.  Otherwise an earlier [a,b) can absorb b as one-past storage
+    // merely because the independent walk beginning at b has two candidate
+    // ends or an ambiguous local identity.
+    let proven_exact_starts: HashSet<_> = exact_walk_ends.keys().copied().collect();
+    let mut exact_walk_end_alias_claims: BTreeMap<(Address, RTLReg), BTreeSet<(RTLReg, usize)>> =
+        BTreeMap::new();
     let mut exact_walk_arrays = HashSet::new();
+    let mut accepted_exact_walks = Vec::new();
     for ((func, low), ends) in exact_walk_ends {
         let mut ends = ends.into_iter();
         let Some(high) = ends.next() else {
@@ -7014,12 +7137,19 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
             (low, high, MemoryChunk::MInt8Unsigned, count),
         );
         exact_walk_arrays.insert((func, base_local));
+        accepted_exact_walks.push((func, low, high, base_local, count));
+    }
 
+    // Endpoint aliases are a second phase, after every exact base has entered
+    // `sized`.  Otherwise [a,b) can publish b as its one-past alias before an
+    // adjacent exact [b,c) proves that b owns independent storage.
+    for (func, _low, high, base_local, count) in accepted_exact_walks {
         // The compared high root denotes the exclusive end, not a second C
         // object. Keep a separately named endpoint only when it has unique,
         // address-only local identity; a real direct access at `high` remains
         // independent evidence and vetoes this alias.
-        if directly_accessed.contains(&(func, high))
+        if proven_exact_starts.contains(&(func, high))
+            || directly_accessed.contains(&(func, high))
             || db.stack_struct_buffers.get(&func).is_some_and(|buffers| {
                 slot_locals
                     .get(&(func, high))
@@ -7047,8 +7177,22 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         {
             continue;
         }
-        exact_walk_end_aliases.push((func, endpoint_local, base_local, count));
+        exact_walk_end_alias_claims
+            .entry((func, endpoint_local))
+            .or_default()
+            .insert((base_local, count));
     }
+    let exact_walk_end_aliases: Vec<_> = exact_walk_end_alias_claims
+        .into_iter()
+        .filter_map(|((func, endpoint), claims)| {
+            let mut claims = claims.into_iter();
+            let (base, count) = claims.next()?;
+            claims
+                .next()
+                .is_none()
+                .then_some((func, endpoint, base, count))
+        })
+        .collect();
 
     // Point-keyed address-origin lattice over exact stack LEAs and explicit
     // RTL copies. It is used only to prove that an address-only boundary is
@@ -7133,6 +7277,16 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
     }
     let mut pending_end_aliases = Vec::new();
     for (&(func, base_local), &(start, end, _, _)) in &sized {
+        // Exact walks have their own complete, conflict-checked endpoint
+        // phase above.  Letting this older subtraction heuristic process them
+        // again can bypass that phase; in particular [a,b) would absorb b even
+        // when a second exact [b,c) proves b is an independent base.  A
+        // fallback range must likewise never claim an accepted exact base.
+        if exact_walk_arrays.contains(&(func, base_local))
+            || proven_exact_starts.contains(&(func, end))
+        {
+            continue;
+        }
         let roots_are_subtracted = subtracted_stack_roots.contains(&(func, end, start))
             || subtracted_stack_roots.contains(&(func, start, end));
         if !roots_are_subtracted || directly_accessed.contains(&(func, end)) {

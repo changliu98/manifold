@@ -54,6 +54,10 @@ pub fn dump_dead_relations() -> String {
     gather!(linear_pass::LinearPassProgram, "linear");
     gather!(mach_pass::MachPassProgram, "mach");
     gather!(ptr_to_pass::PtrToPassProgram, "ptr_to");
+    gather!(
+        rtl_dominator_pass::RTLDominatorPassProgram,
+        "rtl_dominators"
+    );
     gather!(rtl_pass::RTLPassProgram, "rtl");
     gather!(signature_pass::SignatureReconciliationProgram, "signature");
     gather!(stack_pass::StackAnalysisProgram, "stack");

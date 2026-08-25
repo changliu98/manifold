@@ -1876,6 +1876,7 @@ pub fn pipeline_passes() -> Vec<Box<dyn crate::decompile::passes::pass::IRPass>>
         Box::new(stack_pass::StackAnalysisPass),
         Box::new(mach_pass::MachPass),
         Box::new(linear_pass::LinearPass),
+        Box::new(rtl_dominator_pass::RTLDominatorPass),
         Box::new(rtl_pass::RTLPass),
         Box::new(rtl_optimize_pass::RTLOptimizePass),
         Box::new(type_pass::TypePass),

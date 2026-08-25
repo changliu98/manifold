@@ -13,5 +13,6 @@ pub mod cshminor_pass;
 pub mod linear_pass;
 pub mod mach_pass;
 pub mod pass;
+pub mod rtl_dominator_pass;
 pub mod rtl_optimize_pass;
 pub mod rtl_pass;

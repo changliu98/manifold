@@ -524,6 +524,39 @@ mod schedule_tests {
     }
 
     #[test]
+    fn direct_pointer_rtl_consumes_only_the_prepass_settled_dominator_summary() {
+        let passes = pipeline_passes();
+        let schedule = PassScheduler::build_schedule(&passes);
+        let dominators = passes
+            .iter()
+            .find(|pass| pass.name() == "rtl_dominators")
+            .expect("RTL dominator pass must be registered");
+        let rtl = passes
+            .iter()
+            .find(|pass| pass.name() == "rtl")
+            .expect("RTL pass must be registered");
+        let producers: Vec<_> = passes
+            .iter()
+            .filter(|pass| pass.outputs().contains(&"settled_block_dom_set"))
+            .map(|pass| pass.name())
+            .collect();
+
+        assert_eq!(producers, vec!["rtl_dominators"]);
+        assert!(dominators.outputs().contains(&"settled_block_dom_set"));
+        assert!(dominators.inputs().contains(&"call_targets_noreturn"));
+        assert!(rtl.inputs().contains(&"settled_block_dom_set"));
+        assert!(!rtl.outputs().contains(&"settled_block_dom_set"));
+        assert!(
+            stage_of(&schedule, "linear") < stage_of(&schedule, "rtl_dominators"),
+            "noreturn call fallthroughs must be removed before dominance settles"
+        );
+        assert!(
+            stage_of(&schedule, "rtl_dominators") < stage_of(&schedule, "rtl"),
+            "the final dominator summary must be published before RTL"
+        );
+    }
+
+    #[test]
     fn post_emit_audit_checkpoints_cover_every_tree_writer() {
         let passes = pipeline_passes();
         let writers: Vec<_> = passes
