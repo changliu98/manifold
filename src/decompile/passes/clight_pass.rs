@@ -2074,6 +2074,153 @@ mod tests {
     }
 
     #[test]
+    fn exact_pointer_walk_owns_interior_address_roots_and_one_past_end() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x6000;
+        let [base_node, interior3_node, interior8_node, interior16_node, end_node] =
+            synthetic_ids();
+        let base_local = 0x8000_0000_0000_6100;
+        let interior3_local = 0x8000_0000_0000_6103;
+        let interior8_local = 0x8000_0000_0000_6108;
+        let interior16_local = 0x8000_0000_0000_6110;
+        let end_local = 0x8000_0000_0000_6120;
+
+        db.rel_push("stack_pointer_walk_region", (func, 0_i64, 32_i64));
+        for (node, offset, local) in [
+            (base_node, 0_i64, base_local),
+            (interior3_node, 3_i64, interior3_local),
+            (interior8_node, 8_i64, interior8_local),
+            (interior16_node, 16_i64, interior16_local),
+            (end_node, 32_i64, end_local),
+        ] {
+            db.rel_push("stack_var", (func, node, offset, local));
+        }
+        db.stack_struct_buffers.entry(func).or_default().extend([
+            (interior3_local, 5),
+            (interior8_local, 8),
+            (interior16_local, 16),
+        ]);
+
+        size_indexed_stack_arrays(&mut db);
+
+        assert_eq!(
+            db.stack_struct_buffers
+                .get(&func)
+                .and_then(|buffers| buffers.get(&base_local)),
+            Some(&32),
+        );
+        for (interior, offset) in [
+            (interior3_local, 3_usize),
+            (interior8_local, 8),
+            (interior16_local, 16),
+        ] {
+            assert!(db
+                .rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_alias")
+                .any(|alias| alias == &(func, interior, base_local, offset)));
+        }
+        assert!(db
+            .rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_end_alias")
+            .any(|alias| alias == &(func, end_local, base_local, 32)));
+    }
+
+    #[test]
+    fn conflicting_pointer_walk_endpoints_do_not_choose_by_relation_order() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x7000;
+        let base_local: RTLReg = 0x8000_0000_0000_7100;
+        let end_local: RTLReg = 0x8000_0000_0000_7120;
+        db.rel_push("stack_pointer_walk_region", (func, 0_i64, 32_i64));
+        db.rel_push("stack_pointer_walk_region", (func, 0_i64, 24_i64));
+        db.rel_push("stack_var", (func, 0x7010_u64, 0_i64, base_local));
+        db.rel_push("stack_var", (func, 0x7020_u64, 32_i64, end_local));
+
+        size_indexed_stack_arrays(&mut db);
+
+        assert!(!db
+            .stack_array_buffers
+            .get(&func)
+            .is_some_and(|arrays| arrays.contains_key(&base_local)));
+        assert_eq!(
+            db.rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_end_alias")
+                .count(),
+            0,
+        );
+    }
+
+    #[test]
+    fn exact_pointer_walk_does_not_absorb_storage_starting_at_exclusive_end() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x7800;
+        let base_local: RTLReg = 0x8000_0000_0000_7800;
+        let next_local: RTLReg = 0x8000_0000_0000_7820;
+        db.rel_push("stack_pointer_walk_region", (func, 0_i64, 32_i64));
+        db.rel_push("stack_var", (func, 0x7810_u64, 0_i64, base_local));
+        db.rel_push("stack_var", (func, 0x7820_u64, 32_i64, next_local));
+        db.stack_struct_buffers
+            .entry(func)
+            .or_default()
+            .insert(next_local, 8);
+
+        size_indexed_stack_arrays(&mut db);
+
+        assert_eq!(
+            db.stack_array_buffers
+                .get(&func)
+                .and_then(|arrays| arrays.get(&base_local)),
+            Some(&(MemoryChunk::MInt8Unsigned, 32)),
+        );
+        assert_eq!(
+            db.stack_struct_buffers
+                .get(&func)
+                .and_then(|buffers| buffers.get(&next_local)),
+            Some(&8),
+        );
+        assert_eq!(
+            db.rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_end_alias")
+                .count(),
+            0,
+        );
+    }
+
+    #[test]
+    fn overlapping_exact_pointer_walks_share_one_physical_owner() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x7900;
+        let base0: RTLReg = 0x8000_0000_0000_7900;
+        let base8: RTLReg = 0x8000_0000_0000_7908;
+        let end24: RTLReg = 0x8000_0000_0000_7918;
+        let end32: RTLReg = 0x8000_0000_0000_7920;
+        for (low, high) in [(0_i64, 32_i64), (8, 24)] {
+            db.rel_push("stack_pointer_walk_region", (func, low, high));
+        }
+        for (node, offset, local) in [
+            (0x7910_u64, 0_i64, base0),
+            (0x7911_u64, 8_i64, base8),
+            (0x7912_u64, 24_i64, end24),
+            (0x7913_u64, 32_i64, end32),
+        ] {
+            db.rel_push("stack_var", (func, node, offset, local));
+        }
+
+        size_indexed_stack_arrays(&mut db);
+
+        assert_eq!(
+            db.stack_struct_buffers
+                .get(&func)
+                .and_then(|buffers| buffers.get(&base0)),
+            Some(&32),
+        );
+        assert!(db
+            .rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_alias")
+            .any(|alias| alias == &(func, base8, base0, 8)));
+        for (endpoint, offset) in [(end24, 24_usize), (end32, 32_usize)] {
+            assert!(db
+                .rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_end_alias")
+                .any(|alias| alias == &(func, endpoint, base0, offset)));
+        }
+    }
+
+    #[test]
     fn field_pass_sizes_opaque_storage_without_struct_fields() {
         let mut db = DecompileDB::default();
         db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
@@ -2168,6 +2315,7 @@ mod tests {
             "op_indirect",
             "stack_var",
             "stack_var_chunk",
+            "stack_pointer_walk_region",
         ] {
             assert!(pass.inputs().contains(&input));
         }
@@ -2556,6 +2704,7 @@ impl IRPass for ClightFieldPass {
             "reg_to_struct_id",
             "rtl_inst",
             "op_produces_ptr",
+            "stack_pointer_walk_region",
             "stack_var",
             "stack_var_chunk",
             "slot_escaped_canonical",
@@ -6811,6 +6960,96 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         }
     }
 
+    // The RTL loop proof supplies an exact byte-coordinate interval. Group by
+    // (function, start) and accept only a unique end: two incompatible loop
+    // contracts are ambiguity, not permission to choose whichever relation
+    // happens to be visited first. Unlike the indexed-addressing fallback
+    // above, interior address-taken roots do not terminate this range; they are
+    // aliases proved to lie inside the endpoint-bounded object.
+    let mut exact_walk_ends: BTreeMap<(Address, i64), BTreeSet<i64>> = BTreeMap::new();
+    for (func, low, high) in db.rel_iter::<(Address, i64, i64)>("stack_pointer_walk_region") {
+        exact_walk_ends
+            .entry((*func, *low))
+            .or_default()
+            .insert(*high);
+    }
+    let mut exact_walk_end_aliases = Vec::new();
+    let mut exact_walk_arrays = HashSet::new();
+    for ((func, low), ends) in exact_walk_ends {
+        let mut ends = ends.into_iter();
+        let Some(high) = ends.next() else {
+            continue;
+        };
+        if ends.next().is_some() {
+            continue;
+        }
+        let Some(byte_size) = high
+            .checked_sub(low)
+            .filter(|extent| *extent > 0 && *extent <= (1 << 20))
+        else {
+            continue;
+        };
+        let Some(base_locals) = slot_locals.get(&(func, low)) else {
+            continue;
+        };
+        let mut base_locals = base_locals.iter();
+        let Some(&base_local) = base_locals.next() else {
+            continue;
+        };
+        if base_locals.next().is_some()
+            || local_offsets
+                .get(&(func, base_local))
+                .is_none_or(|offsets| offsets.len() != 1)
+        {
+            continue;
+        }
+
+        let Ok(count) = usize::try_from(byte_size) else {
+            continue;
+        };
+        // Byte storage preserves machine pointer increments exactly even when
+        // the source-level element type is unavailable.
+        sized.insert(
+            (func, base_local),
+            (low, high, MemoryChunk::MInt8Unsigned, count),
+        );
+        exact_walk_arrays.insert((func, base_local));
+
+        // The compared high root denotes the exclusive end, not a second C
+        // object. Keep a separately named endpoint only when it has unique,
+        // address-only local identity; a real direct access at `high` remains
+        // independent evidence and vetoes this alias.
+        if directly_accessed.contains(&(func, high))
+            || db.stack_struct_buffers.get(&func).is_some_and(|buffers| {
+                slot_locals
+                    .get(&(func, high))
+                    .is_some_and(|locals| locals.iter().any(|local| buffers.contains_key(local)))
+            })
+        {
+            continue;
+        }
+        let Some(endpoint_locals) = slot_locals.get(&(func, high)) else {
+            continue;
+        };
+        let mut endpoint_locals = endpoint_locals.iter();
+        let Some(&endpoint_local) = endpoint_locals.next() else {
+            continue;
+        };
+        if endpoint_locals.next().is_some()
+            || local_offsets
+                .get(&(func, endpoint_local))
+                .is_none_or(|offsets| offsets.len() != 1)
+            || sized.contains_key(&(func, endpoint_local))
+            || db
+                .stack_array_buffers
+                .get(&func)
+                .is_some_and(|arrays| arrays.contains_key(&endpoint_local))
+        {
+            continue;
+        }
+        exact_walk_end_aliases.push((func, endpoint_local, base_local, count));
+    }
+
     // Point-keyed address-origin lattice over exact stack LEAs and explicit
     // RTL copies. It is used only to prove that an address-only boundary is
     // subtracted from the indexed range's base -- the machine shape of a
@@ -6928,7 +7167,8 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum RangeKind {
-        Indexed,
+        IndexedFallback,
+        ExactWalk,
         ByteBuffer,
     }
 
@@ -6948,7 +7188,11 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
             start,
             end,
             local,
-            kind: RangeKind::Indexed,
+            kind: if exact_walk_arrays.contains(&(func, local)) {
+                RangeKind::ExactWalk
+            } else {
+                RangeKind::IndexedFallback
+            },
         });
     }
     for (&func, buffers) in &db.stack_struct_buffers {
@@ -6983,7 +7227,7 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
             range.func,
             range.start,
             range.end,
-            matches!(range.kind, RangeKind::Indexed),
+            !matches!(range.kind, RangeKind::ByteBuffer),
             range.local,
         )
     });
@@ -7010,11 +7254,17 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
                 ranges[left].start < ranges[right].end && ranges[right].start < ranges[left].end;
             let abuts =
                 ranges[left].end == ranges[right].start || ranges[right].end == ranges[left].start;
-            if !overlaps
-                && !(abuts
-                    && (ranges[left].kind == RangeKind::Indexed
-                        || ranges[right].kind == RangeKind::Indexed))
-            {
+            // A fallback indexed anchor may sit one element before its actual
+            // byte buffer, so the older abutting merge remains valid there.
+            // An exact endpoint is an exclusive boundary: storage beginning
+            // exactly at that address is a distinct object unless some range
+            // really overlaps it.
+            let fallback_abut = abuts
+                && !matches!(ranges[left].kind, RangeKind::ExactWalk)
+                && !matches!(ranges[right].kind, RangeKind::ExactWalk)
+                && (matches!(ranges[left].kind, RangeKind::IndexedFallback)
+                    || matches!(ranges[right].kind, RangeKind::IndexedFallback));
+            if !overlaps && !fallback_abut {
                 continue;
             }
             let left_root = find_root(&mut parents, left);
@@ -7036,11 +7286,18 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
     for members in components.values() {
         let has_indexed = members
             .iter()
-            .any(|index| ranges[*index].kind == RangeKind::Indexed);
+            .any(|index| !matches!(ranges[*index].kind, RangeKind::ByteBuffer));
+        let has_exact = members
+            .iter()
+            .any(|index| matches!(ranges[*index].kind, RangeKind::ExactWalk));
         let has_buffer = members
             .iter()
             .any(|index| ranges[*index].kind == RangeKind::ByteBuffer);
-        if !has_indexed || !has_buffer {
+        // Two proven walk intervals which overlap cannot become two disjoint C
+        // objects either. Exact boundaries do not merge merely by abutting,
+        // but a real overlap uses one physical byte range just like an
+        // overlapping address-taken buffer.
+        if !has_indexed || (!has_buffer && !(has_exact && members.len() > 1)) {
             continue;
         }
 
@@ -7089,13 +7346,13 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
             .iter()
             .map(|index| ranges[*index])
             .filter(|range| range.start == start)
-            .min_by_key(|range| (matches!(range.kind, RangeKind::Indexed), range.local))
+            .min_by_key(|range| (!matches!(range.kind, RangeKind::ByteBuffer), range.local))
             .unwrap();
 
         for index in members {
             let range = ranges[*index];
             match range.kind {
-                RangeKind::Indexed => {
+                RangeKind::IndexedFallback | RangeKind::ExactWalk => {
                     coalesced_indexed.insert((func, range.local));
                     if let Some(func_arrays) = db.stack_array_buffers.get_mut(&func) {
                         func_arrays.remove(&range.local);
@@ -7138,12 +7395,34 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         .retain(|_, buffers| !buffers.is_empty());
     db.stack_array_buffers
         .retain(|_, buffers| !buffers.is_empty());
-    for alias in aliases {
-        db.rel_push("stack_buffer_alias", alias);
+    // Every component alias points directly at its final backing owner. Retain
+    // that map while publishing rows so an exact one-past endpoint can follow
+    // a base local which the same coalescing step just absorbed.
+    let alias_targets: BTreeMap<(Address, RTLReg), (RTLReg, usize)> = aliases
+        .iter()
+        .map(|(func, local, backing, offset)| ((*func, *local), (*backing, *offset)))
+        .collect();
+    for alias in &aliases {
+        db.rel_push("stack_buffer_alias", *alias);
     }
     for (func, endpoint, base, offset) in pending_end_aliases {
         if !coalesced_indexed.contains(&(func, base)) {
             db.rel_push("stack_buffer_end_alias", (func, endpoint, base, offset));
+        }
+    }
+    for (func, endpoint, base, offset) in exact_walk_end_aliases {
+        let (backing, prefix) = alias_targets
+            .get(&(func, base))
+            .copied()
+            .unwrap_or((base, 0));
+        let Some(backing_offset) = prefix.checked_add(offset) else {
+            continue;
+        };
+        if endpoint != backing {
+            db.rel_push(
+                "stack_buffer_end_alias",
+                (func, endpoint, backing, backing_offset),
+            );
         }
     }
 

@@ -94,6 +94,116 @@ fn positive_integral_extent(constant: &Constant) -> Option<i64> {
     }
 }
 
+// A direct induction pointer changes by one compile-time byte displacement on
+// every trip around the loop. Keep this deliberately narrower than generic
+// integer addition: a second value operand would need its own loop-invariance
+// proof before it could establish an object extent.
+fn direct_pointer_step_delta(op: &Operation) -> Option<i64> {
+    let delta = match op {
+        Operation::Oaddimm(delta) | Operation::Oaddlimm(delta) => *delta,
+        Operation::Olea(Addressing::Aindexed(delta))
+        | Operation::Oleal(Addressing::Aindexed(delta)) => *delta,
+        _ => return None,
+    };
+    (delta != 0).then_some(delta)
+}
+
+// A direct walker may dereference either the element selected by its current
+// pointer or, after a pre-increment, the immediately preceding element. Keep
+// the full memory access inside that one stride so the endpoint interval is a
+// sufficient bound for every iteration.
+fn direct_pointer_access_fits_stride(delta: i64, displacement: i64, chunk: &MemoryChunk) -> bool {
+    if matches!(chunk, MemoryChunk::Unknown) {
+        return false;
+    }
+    let Some(stride) = delta.checked_abs().filter(|stride| *stride > 0) else {
+        return false;
+    };
+    let width = crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk) as i64;
+    let Some(end) = displacement.checked_add(width) else {
+        return false;
+    };
+    (displacement >= 0 && end <= stride) || (displacement >= -stride && end <= 0)
+}
+
+fn direct_pointer_access_contradicts_stride(
+    delta: i64,
+    addressing: &Addressing,
+    args: &[Mreg],
+    induction: Mreg,
+    chunk: &MemoryChunk,
+) -> bool {
+    if !args.contains(&induction) {
+        return false;
+    }
+    match addressing {
+        Addressing::Aindexed(displacement) if args.len() == 1 && args[0] == induction => {
+            !direct_pointer_access_fits_stride(delta, *displacement, chunk)
+        }
+        // A second dynamic address component needs its own range proof before
+        // this direct pointer's endpoints can bound the resulting access.
+        _ => true,
+    }
+}
+
+// Normalize the latch predicate to "induction CMP endpoint" and to the branch
+// which actually returns to the loop header.  A positive step is bounded only
+// by `induction != endpoint` or `induction < endpoint`; a negative step has the
+// corresponding `!=`/`>` contract.  Conditions which continue after crossing
+// the endpoint (`<=` for a positive step, for example) cannot establish the
+// exclusive object extent.
+fn direct_pointer_loop_continues_toward_endpoint(
+    condition: &Condition,
+    induction_is_rhs: bool,
+    backedge_on_true: bool,
+    delta: i64,
+) -> bool {
+    let mut comparison = match condition {
+        Condition::Ccomp(comparison)
+        | Condition::Ccompu(comparison)
+        | Condition::Ccompl(comparison)
+        | Condition::Ccomplu(comparison) => *comparison,
+        _ => return false,
+    };
+    if induction_is_rhs {
+        comparison = match comparison {
+            Comparison::Clt => Comparison::Cgt,
+            Comparison::Cle => Comparison::Cge,
+            Comparison::Cgt => Comparison::Clt,
+            Comparison::Cge => Comparison::Cle,
+            same => same,
+        };
+    }
+    if !backedge_on_true {
+        comparison = match comparison {
+            Comparison::Ceq => Comparison::Cne,
+            Comparison::Cne => Comparison::Ceq,
+            Comparison::Clt => Comparison::Cge,
+            Comparison::Cle => Comparison::Cgt,
+            Comparison::Cgt => Comparison::Cle,
+            Comparison::Cge => Comparison::Clt,
+            Comparison::Unknown => return false,
+        };
+    }
+    match comparison {
+        Comparison::Cne => delta != 0,
+        Comparison::Clt => delta > 0,
+        Comparison::Cgt => delta < 0,
+        _ => false,
+    }
+}
+
+fn direct_pointer_walk_bounds(start: i64, end: i64, delta: i64) -> Option<(i64, i64)> {
+    if (delta > 0 && end <= start) || (delta < 0 && end >= start) || delta == 0 {
+        return None;
+    }
+    let low = start.min(end);
+    let high = start.max(end);
+    let stride = delta.checked_abs()?;
+    let extent = high.checked_sub(low)?;
+    (extent > 0 && extent <= (1 << 20) && extent % stride == 0).then_some((low, high))
+}
+
 // ABI-1 (3.2e): MOVSX/MOVSXD/MOVZX -> MemoryChunk; returns None for non-extending mnemonics so plain MOV (which also covers callee-save reloads) never fires; (unsigned, 4) rejected because 32-bit writes zero-extend implicitly.
 fn extending_load_chunk(mnem: &str, size: usize) -> Option<MemoryChunk> {
     let m = mnem.to_ascii_uppercase();
@@ -7248,12 +7358,17 @@ ascent_par! {
         block_dom_set(func, src_block, doms),
         if doms.0.contains(dst_block);
     // A loop whose jump and header share one basic-block identity is still
-    // recognized from the explicit branch edge, never from address order.
+    // recognized from the explicit branch in that block, never from address
+    // order. The LTL condition may be fused onto its preceding CMP while the
+    // ddisasm edge remains keyed by the following Jcc, so the semantic source
+    // and physical branch are deliberately bridged through exact block
+    // membership.
     is_loop_back_edge(src, dst) <--
         rtl_next(src, dst),
-        ddisasm_cfg_edge(src, dst, "branch"),
         code_in_block(src, blk),
-        code_in_block(dst, blk);
+        code_in_block(dst, blk),
+        ddisasm_cfg_edge(branch_src, dst, "branch"),
+        code_in_block(branch_src, blk);
 
     // Forward MAY-reaching-defs at each block ENTRY (join is union).  Keep the
     // state keyed by (function, block, register): consumers may materialize the
@@ -7836,6 +7951,11 @@ ascent_par! {
         abi_pointer_size(width),
         let rtlreg = fresh_stack_slot_reg(*addr);
 
+    stack_xtl(func_start, addr, ofs, rtlreg) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Oleal(Addressing::Ainstack(ofs)), _, _)),
+        instr_in_function(addr, func_start),
+        let rtlreg = fresh_stack_slot_reg(*addr);
+
 
     alias_edge(rtlreg1, rtlreg2) <--
         stack_xtl(func_start, use_addr, ofs, rtlreg1),
@@ -7947,6 +8067,12 @@ ascent_par! {
     slot_addr_escaped(func_start, lea_addr, *ofs) <--
         exact_local_stack_addr_lea_def(func_start, lea_addr, _, ofs, width),
         abi_pointer_size(width),
+        reg_holds_slot_addr(func_start, def_addr, *ofs, dst_reg),
+        arg_setup_candidate(def_addr, dst_reg, _);
+
+    slot_addr_escaped(func_start, lea_addr, *ofs) <--
+        ltl_inst(lea_addr, ?LTLInst::Lop(Operation::Oleal(Addressing::Ainstack(ofs)), _, _)),
+        instr_in_function(lea_addr, func_start),
         reg_holds_slot_addr(func_start, def_addr, *ofs, dst_reg),
         arg_setup_candidate(def_addr, dst_reg, _);
 
@@ -8222,6 +8348,10 @@ ascent_par! {
     slot_addr_taken_reg(*func, *node, *ofs, *base_rtl) <--
         indexed_synth_stack_base(func, node, ofs, base_rtl);
 
+    slot_addr_taken_reg(func, *lea_addr, *ofs, *base_rtl) <--
+        rtl_inst_candidate(lea_addr, ?RTLInst::Iop(Operation::Oleal(Addressing::Ainstack(ofs)), _, base_rtl)),
+        instr_in_function(lea_addr, func);
+
     slot_addr_taken_reg(func, *lea_addr, *ofs, *dst) <--
         slot_addr_taken_reg(func, lea_addr, ofs, src),
         rtl_inst_candidate(copy, ?RTLInst::Iop(Operation::Omove, args, dst)),
@@ -8250,63 +8380,251 @@ ascent_par! {
     #[local] relation slot_has_local_deref_field(Address, i64);
     slot_has_local_deref_field(func, *ofs) <-- slot_local_deref_field(func, ofs, _, _);
 
-    // A taken slot address that is ADVANCED by pointer arithmetic and then
-    // dereferenced walks the object instead of naming one field, so no single
-    // access reveals its extent: the loop that reads `p->f; p += 16` shows only
-    // the constant 16.  Bound the object structurally, the same way an escaped
-    // region is bounded -- by the next address-taken object above it, else the
-    // end of the frame -- and claim every frame cell in that range.  Without
-    // this the array's initializing stores are dead by SSA liveness (their only
-    // reader is the pointer) and DSE deletes all but the first two.
-    #[local] relation slot_addr_base_deref(Address, RTLReg);
-    slot_addr_base_deref(func, args[0]) <--
-        rtl_inst_candidate(access, ?RTLInst::Iload(_, Addressing::Aindexed(_), args, _)),
-        instr_in_function(access, func),
-        if args.len() == 1;
-    slot_addr_base_deref(func, args[0]) <--
-        rtl_inst_candidate(access, ?RTLInst::Istore(_, Addressing::Aindexed(_), args, _)),
-        instr_in_function(access, func),
-        if args.len() == 1;
+    // Exact direct induction-pointer object extent.
+    //
+    // The former rule joined a stack LEA, any add, and any dereference carrying
+    // the same RTL web anywhere in a function, then guessed the object's end at
+    // the next address-taken slot. Besides combining disjoint branches, that
+    // makes interior addresses (`&a[3]`, `&a[8]`) terminate the object whose
+    // actual loop condition is `p != &a[32]`.
+    //
+    // Build each natural loop backwards from a structural CFG back edge. The
+    // state is point-keyed: one Set of loop headers per (function, block), bounded
+    // by nesting depth rather than an O(V^2) reachability relation. A
+    // predecessor joins a loop only when the loop header dominates it.
+    #[local] lattice block_natural_loop_headers(Address, Address, Set<Node>);
 
-    #[local] relation slot_addr_advanced(Address, RTLReg);
-    slot_addr_advanced(func, *base_rtl) <--
-        rtl_inst_candidate(step, ?RTLInst::Iop(op, args, _)),
-        instr_in_function(step, func),
-        if matches!(op, Operation::Oadd | Operation::Oaddl
-                      | Operation::Oaddimm(_) | Operation::Oaddlimm(_)),
-        for base_rtl in args.iter();
+    block_natural_loop_headers(*func, *latch_block, Set::singleton(*header)) <--
+        is_loop_back_edge(latch, header),
+        instr_in_function(latch, func),
+        code_in_block(latch, latch_block);
 
-    #[local] relation slot_addr_walked(Address, i64);
-    slot_addr_walked(func, *ofs) <--
-        slot_addr_taken_reg(func, _, ofs, base_rtl),
-        slot_addr_advanced(func, base_rtl),
-        slot_addr_base_deref(func, base_rtl);
+    block_natural_loop_headers(*func, *pred, Set::singleton(*header)) <--
+        block_natural_loop_headers(func, block, headers),
+        asm_block_next(pred, block),
+        block_in_function(pred, func),
+        for header in headers.0.iter(),
+        code_in_block(header, header_block),
+        block_dom_set(func, pred, pred_doms),
+        if pred_doms.0.contains(header_block);
 
-    #[local] relation slot_addr_taken_base(Address, i64);
-    slot_addr_taken_base(func, *ofs) <-- slot_addr_taken_reg(func, _, ofs, _);
+    // Projecting the point-keyed header Set costs O(blocks * nesting-depth),
+    // while making it possible to prove that the latch's other successor
+    // really exits this loop. A conditional with both arms still inside the
+    // loop is not an endpoint contract.
+    #[local] relation block_in_natural_loop(Address, Node, Address);
+    block_in_natural_loop(*func, *header, *block) <--
+        block_natural_loop_headers(func, block, headers),
+        for header in headers.0.iter();
 
-    #[local] relation slot_walk_next_base(Address, i64, i64);
-    slot_walk_next_base(func, *base, *other) <--
-        slot_addr_walked(func, base),
-        slot_addr_taken_base(func, other),
-        if *other > *base;
+    #[local] relation ltl_condition_true_edge(Node, Node);
+    ltl_condition_true_edge(latch, *target) <--
+        ltl_inst(latch, ?LTLInst::Lcond(_, _, Either::Right(target), _));
+    ltl_condition_true_edge(latch, *target_addr) <--
+        ltl_inst(latch, ?LTLInst::Lcond(_, _, Either::Left(target_symbol), _)),
+        symbol_resolved_addr(*target_symbol, target_addr);
 
-    #[local] relation slot_walk_limit(Address, i64, i64);
-    slot_walk_limit(func, *base, limit) <--
-        slot_addr_walked(func, base),
-        agg limit = ascent::aggregators::min(o) in slot_walk_next_base(func, base, o);
-    slot_walk_limit(func, *base, limit) <--
-        slot_addr_walked(func, base),
-        !slot_walk_next_base(func, base, _),
-        func_stacksz(func, _, _, size),
-        if let Ok(size_i64) = i64::try_from(*size),
-        let limit = size_i64;
+    #[local] relation ltl_condition_false_edge(Node, Node);
+    ltl_condition_false_edge(latch, *target) <--
+        ltl_inst(latch, ?LTLInst::Lcond(_, _, _, Either::Right(target)));
+    ltl_condition_false_edge(latch, *target_addr) <--
+        ltl_inst(latch, ?LTLInst::Lcond(_, _, _, Either::Left(target_symbol))),
+        symbol_resolved_addr(*target_symbol, target_addr);
 
-    escaped_stack_region_caller_field(func, *base, field_ofs, MemoryChunk::MAny64) <--
-        slot_walk_limit(func, base, limit),
+    #[local] relation direct_pointer_loop_latch_polarity(Address, Node, Node, bool);
+    direct_pointer_loop_latch_polarity(*func, *header, *latch, true) <--
+        is_loop_back_edge(latch, header),
+        instr_in_function(latch, func),
+        ltl_condition_true_edge(latch, header),
+        ltl_condition_false_edge(latch, exit),
+        code_in_block(exit, exit_block),
+        !block_in_natural_loop(func, header, exit_block);
+
+    direct_pointer_loop_latch_polarity(*func, *header, *latch, false) <--
+        is_loop_back_edge(latch, header),
+        instr_in_function(latch, func),
+        ltl_condition_false_edge(latch, header),
+        ltl_condition_true_edge(latch, exit),
+        code_in_block(exit, exit_block),
+        !block_in_natural_loop(func, header, exit_block);
+
+    // The induction step is a unary, in-place, constant byte adjustment inside
+    // the natural loop. A two-register add is intentionally excluded until a
+    // separate loop-invariance proof exists for its second operand.
+    #[local] relation direct_pointer_loop_step(Address, Node, Node, Mreg, i64);
+    direct_pointer_loop_step(*func, *header, *step, *dst, delta) <--
+        block_natural_loop_headers(func, step_block, headers),
+        for header in headers.0.iter(),
+        code_in_block(step, step_block),
+        ltl_inst(step, ?LTLInst::Lop(op, args, dst)),
+        if args.len() == 1 && args[0] == *dst,
+        if let Some(delta) = direct_pointer_step_delta(op);
+
+    // A real memory access through the loop-carried definition is required.
+    // reg_def_used is derived from the point-keyed reaching_def_in lattice, so
+    // this cannot pair a step with a same-named register on a disjoint path.
+    // Every other loop access reached by that definition must also fit inside
+    // the current or immediately previous stride; one outlying/dynamic access
+    // is counterevidence to the claimed endpoint-bounded object.
+    #[local] relation direct_pointer_loop_bad_access(Address, Node, Node, Mreg);
+    direct_pointer_loop_bad_access(*func, *header, *step, *reg) <--
+        direct_pointer_loop_step(func, header, step, reg, delta),
+        reg_def_used(step, reg, access),
+        ltl_inst(access, ?LTLInst::Lload(chunk, addressing, args, _)),
+        code_in_block(access, access_block),
+        block_natural_loop_headers(func, access_block, access_headers),
+        if access_headers.0.contains(header),
+        if direct_pointer_access_contradicts_stride(*delta, addressing, args, *reg, chunk);
+
+    direct_pointer_loop_bad_access(*func, *header, *step, *reg) <--
+        direct_pointer_loop_step(func, header, step, reg, delta),
+        reg_def_used(step, reg, access),
+        ltl_inst(access, ?LTLInst::Lstore(chunk, addressing, args, _)),
+        code_in_block(access, access_block),
+        block_natural_loop_headers(func, access_block, access_headers),
+        if access_headers.0.contains(header),
+        if direct_pointer_access_contradicts_stride(*delta, addressing, args, *reg, chunk);
+
+    #[local] relation direct_pointer_loop_access(Address, Node, Node, Mreg);
+    direct_pointer_loop_access(*func, *header, *step, *reg) <--
+        direct_pointer_loop_step(func, header, step, reg, delta),
+        reg_def_used(step, reg, access),
+        ltl_inst(access, ?LTLInst::Lload(chunk, Addressing::Aindexed(displacement), args, _)),
+        if args.len() == 1 && args[0] == *reg,
+        if direct_pointer_access_fits_stride(*delta, *displacement, chunk),
+        code_in_block(step, step_block),
+        code_in_block(access, access_block),
+        block_natural_loop_headers(func, access_block, access_headers),
+        if access_headers.0.contains(header),
+        block_dom_set(func, access_block, access_doms),
+        if access_doms.0.contains(step_block),
+        !direct_pointer_loop_bad_access(func, header, step, reg);
+
+    direct_pointer_loop_access(*func, *header, *step, *reg) <--
+        direct_pointer_loop_step(func, header, step, reg, delta),
+        reg_def_used(step, reg, access),
+        ltl_inst(access, ?LTLInst::Lstore(chunk, Addressing::Aindexed(displacement), args, _)),
+        if args.len() == 1 && args[0] == *reg,
+        if direct_pointer_access_fits_stride(*delta, *displacement, chunk),
+        code_in_block(step, step_block),
+        code_in_block(access, access_block),
+        block_natural_loop_headers(func, access_block, access_headers),
+        if access_headers.0.contains(header),
+        block_dom_set(func, access_block, access_doms),
+        if access_doms.0.contains(step_block),
+        !direct_pointer_loop_bad_access(func, header, step, reg);
+
+    #[local] relation direct_pointer_loop_other_latch_def(Address, Node, Node, Node, Mreg);
+    direct_pointer_loop_other_latch_def(*func, *header, *latch, *step, *reg) <--
+        direct_pointer_loop_step(func, header, step, reg, _),
+        direct_pointer_loop_latch_polarity(func, header, latch, _),
+        reg_def_used(other_def, reg, latch),
+        if other_def != step;
+
+    // The compared non-induction operand is the direct one-past endpoint. The
+    // induction definition must reach the latch condition, and the condition
+    // itself is the back-edge latch of this exact natural loop.
+    #[local] relation direct_pointer_loop_endpoint_operand(Address, Node, Node, Node, Mreg, Mreg);
+    direct_pointer_loop_endpoint_operand(*func, *header, *latch, *step, *induction, endpoint) <--
+        direct_pointer_loop_access(func, header, step, induction),
+        direct_pointer_loop_latch_polarity(func, header, latch, backedge_on_true),
+        direct_pointer_loop_step(func, header, step, induction, delta),
+        reg_def_used(step, induction, latch),
+        !direct_pointer_loop_other_latch_def(func, header, latch, step, induction),
+        ltl_inst(latch, ?LTLInst::Lcond(condition, args, _, _)),
+        if direct_pointer_loop_continues_toward_endpoint(condition, false, *backedge_on_true, *delta),
+        code_in_block(step, step_block),
+        code_in_block(latch, latch_block),
+        block_dom_set(func, latch_block, latch_doms),
+        if latch_doms.0.contains(step_block),
+        if args.len() == 2 && args[0] == *induction,
+        let endpoint = args[1];
+
+    direct_pointer_loop_endpoint_operand(*func, *header, *latch, *step, *induction, endpoint) <--
+        direct_pointer_loop_access(func, header, step, induction),
+        direct_pointer_loop_latch_polarity(func, header, latch, backedge_on_true),
+        direct_pointer_loop_step(func, header, step, induction, delta),
+        reg_def_used(step, induction, latch),
+        !direct_pointer_loop_other_latch_def(func, header, latch, step, induction),
+        ltl_inst(latch, ?LTLInst::Lcond(condition, args, _, _)),
+        if direct_pointer_loop_continues_toward_endpoint(condition, true, *backedge_on_true, *delta),
+        code_in_block(step, step_block),
+        code_in_block(latch, latch_block),
+        block_dom_set(func, latch_block, latch_doms),
+        if latch_doms.0.contains(step_block),
+        if args.len() == 2 && args[1] == *induction,
+        let endpoint = args[0];
+
+    // Retain every reaching stack/non-stack origin only for those candidate
+    // endpoint uses, rather than materializing origin state for every register
+    // use in the program. Only a singleton Slot projects below; a CMOV/phi
+    // merge with another slot or a non-stack value cannot manufacture an end.
+    #[local] lattice direct_pointer_loop_endpoint_origins(Address, Node, Node, Node, Mreg, Mreg, Set<StackAddrOrigin>);
+    direct_pointer_loop_endpoint_origins(*func, *header, *latch, *step, *induction, *endpoint, origins.clone()) <--
+        direct_pointer_loop_endpoint_operand(func, header, latch, step, induction, endpoint),
+        reg_def_used(def_node, endpoint, latch),
+        reg_stack_addr_origins(func, def_node, endpoint, origins);
+
+    direct_pointer_loop_endpoint_origins(*func, *header, *latch, *step, *induction, *endpoint, Set::singleton(StackAddrOrigin::NonStack)) <--
+        direct_pointer_loop_endpoint_operand(func, header, latch, step, induction, endpoint),
+        reg_def_used(def_node, endpoint, latch),
+        !reg_stack_addr_origins(func, def_node, endpoint, _);
+
+    #[local] relation direct_pointer_loop_endpoint(Address, Node, Node, Node, Mreg, Mreg, i64);
+    direct_pointer_loop_endpoint(*func, *header, *latch, *step, *induction, *endpoint, end) <--
+        direct_pointer_loop_endpoint_operand(func, header, latch, step, induction, endpoint),
+        direct_pointer_loop_endpoint_origins(func, header, latch, step, induction, endpoint, endpoint_origins),
+        if let Some(end) = sole_stack_slot(endpoint_origins);
+
+    // Recover the induction value entering the loop from every definition
+    // which structurally reaches the step from outside this natural loop. A
+    // dominance-only filter is insufficient: definitions on distinct
+    // preheader branches do not individually dominate the header, but all are
+    // possible initial values and must join this Set. Loop-carried definitions
+    // are excluded by exact natural-loop membership, not by node ordering.
+    #[local] lattice direct_pointer_loop_entry_origins(Address, Node, Node, Mreg, Set<StackAddrOrigin>);
+    direct_pointer_loop_entry_origins(*func, *header, *step, *reg, origins.clone()) <--
+        direct_pointer_loop_step(func, header, step, reg, _),
+        reg_def_used(entry_def, reg, step),
+        reg_stack_addr_origins(func, entry_def, reg, origins),
+        code_in_block(entry_def, entry_block),
+        !block_in_natural_loop(func, header, entry_block);
+
+    direct_pointer_loop_entry_origins(*func, *header, *step, *reg, Set::singleton(StackAddrOrigin::NonStack)) <--
+        direct_pointer_loop_step(func, header, step, reg, _),
+        reg_def_used(entry_def, reg, step),
+        code_in_block(entry_def, entry_block),
+        !block_in_natural_loop(func, header, entry_block),
+        !reg_stack_addr_origins(func, entry_def, reg, _);
+
+    // Public handoff to the layout layer. Offset comparisons here describe
+    // byte coordinates inside one proven frame object; they never stand in for
+    // CFG reachability. Direction must agree with the induction delta and the
+    // finite extent is bounded defensively before it can become a C object.
+    relation stack_pointer_walk_region(Address, i64, i64);
+    stack_pointer_walk_region(*func, low, high) <--
+        direct_pointer_loop_endpoint(func, header, latch, step, induction, _, end),
+        direct_pointer_loop_step(func, header, step, induction, delta),
+        direct_pointer_loop_entry_origins(func, header, step, induction, entry_origins),
+        if let Some(start) = sole_stack_slot(entry_origins),
+        if let Some((low, high)) = direct_pointer_walk_bounds(start, *end, *delta);
+
+    // Preserve initialized frame cells inside the exact object. This feeds the
+    // existing escaped-region DSE protection, while Clight consumes the exact
+    // (low, high) handoff to choose one backing owner and interior aliases.
+    escaped_stack_region_caller_field(func, *low, field_ofs, *chunk) <--
+        stack_pointer_walk_region(func, low, high),
         frame_slot_offset(func, cell),
-        if *cell >= *base && *cell < *limit,
-        let field_ofs = *cell - *base;
+        if *cell >= *low && *cell < *high,
+        stack_var_chunk(func, cell, chunk),
+        let field_ofs = *cell - *low;
+
+    escaped_stack_region_caller_field(func, *low, field_ofs, MemoryChunk::MInt8Unsigned) <--
+        stack_pointer_walk_region(func, low, high),
+        frame_slot_offset(func, cell),
+        if *cell >= *low && *cell < *high,
+        !stack_var_chunk(func, cell, _),
+        let field_ofs = *cell - *low;
 
     escaped_stack_region_caller_field(func, *ofs, *field_ofs, *chunk) <--
         slot_local_deref_field(func, ofs, field_ofs, chunk);
@@ -8433,6 +8751,9 @@ ascent_par! {
         let limit = size_i64;
 
     relation escaped_stack_region_extent(Address, i64, i64);
+    escaped_stack_region_extent(func, *low, high - low) <--
+        stack_pointer_walk_region(func, low, high);
+
     escaped_stack_region_extent(func, *base, extent) <--
         escaped_region_limit(func, base, limit),
         if *limit > *base,
@@ -12230,6 +12551,7 @@ impl IRPass for RTLPass {
 #[cfg(test)]
 mod tests {
     use super::{
+        direct_pointer_access_contradicts_stride, direct_pointer_loop_continues_toward_endpoint,
         fresh_call_input_reg, fresh_simd_dword_lane_reg, fresh_simd_dword_operand_reg,
         fresh_stack_param_reg, fresh_stack_slot_reg, fresh_xmm_hi_value_reg, fresh_xtl_reg,
         indexed_store_ends_at_extent, simd_broadcast_lane_node, simd_dword_event_stage_node,
@@ -12256,6 +12578,50 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn direct_pointer_contract_rejects_cross_stride_access_and_wrong_latch_direction() {
+        assert!(!direct_pointer_access_contradicts_stride(
+            1,
+            &Addressing::Aindexed(-1),
+            &[Mreg::AX],
+            Mreg::AX,
+            &MemoryChunk::MInt8Unsigned,
+        ));
+        assert!(direct_pointer_access_contradicts_stride(
+            1,
+            &Addressing::Aindexed(1),
+            &[Mreg::AX],
+            Mreg::AX,
+            &MemoryChunk::MInt8Unsigned,
+        ));
+        assert!(direct_pointer_access_contradicts_stride(
+            4,
+            &Addressing::Aindexed2(0),
+            &[Mreg::AX, Mreg::CX],
+            Mreg::AX,
+            &MemoryChunk::MInt32,
+        ));
+
+        let ne = Condition::Ccomplu(Comparison::Cne);
+        assert!(direct_pointer_loop_continues_toward_endpoint(
+            &ne, false, true, 1,
+        ));
+        assert!(!direct_pointer_loop_continues_toward_endpoint(
+            &Condition::Ccomplu(Comparison::Cle),
+            false,
+            true,
+            1,
+        ));
+        // `endpoint > induction` is the rhs-normalized form of
+        // `induction < endpoint` and is valid for a positive step.
+        assert!(direct_pointer_loop_continues_toward_endpoint(
+            &Condition::Ccomplu(Comparison::Cgt),
+            true,
+            true,
+            1,
+        ));
     }
 
     fn seed_materialized_branch(
@@ -13698,6 +14064,272 @@ mod tests {
                 .escaped_stack_region_extent
                 .iter()
                 .any(|fact| fact == &(func, base_ofs, 8)));
+        });
+    }
+
+    #[test]
+    fn direct_pointer_loop_uses_compared_stack_endpoint_not_interior_roots() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x1000;
+            // Deliberately nonmonotonic block/node ids: no numeric ordering can
+            // establish the loop, its body, or any reaching definition.
+            let entry_block = 0x9000;
+            let header_block = 0x3000;
+            // The real gcc witness fuses CMP+JCC inside the header block, so
+            // the semantic latch and target share a block identity.
+            let latch_block = header_block;
+            let side_block = 0x2000;
+            let exit_block = 0x5000;
+            let base_def = 0x8800;
+            let endpoint_def = 0x8600;
+            let header = 0x2400;
+            let step = 0x2300;
+            let access = 0x2200;
+            let latch = 0x2100;
+            let physical_jcc = 0x2050;
+            let exit = 0x200;
+            let fake_base = 0x8a00;
+            let fake_step = 0x1f00;
+            let fake_access = 0x1e00;
+
+            for block in [
+                entry_block,
+                header_block,
+                latch_block,
+                side_block,
+                exit_block,
+            ] {
+                prog.block_in_function.push((block, func));
+                prog.instr_in_function.push((block, func));
+            }
+            for (node, block) in [
+                (func, entry_block),
+                (base_def, entry_block),
+                (endpoint_def, entry_block),
+                (fake_base, entry_block),
+                (header, header_block),
+                (step, header_block),
+                (access, header_block),
+                (latch, latch_block),
+                (physical_jcc, latch_block),
+                (exit, exit_block),
+                (fake_step, side_block),
+                (fake_access, side_block),
+            ] {
+                prog.code_in_block.push((node, block));
+                prog.instr_in_function.push((node, func));
+            }
+            prog.asm_block_next.extend([
+                (entry_block, header_block),
+                (header_block, latch_block),
+                (latch_block, header_block),
+                (latch_block, exit_block),
+                // A dominated but non-loop side branch contains the same
+                // LEA/add/deref surface pattern and must stay excluded.
+                (header_block, side_block),
+            ]);
+            prog.rtl_next.extend([(latch, header), (latch, exit)]);
+            prog.ddisasm_cfg_edge.push((physical_jcc, header, "branch"));
+
+            prog.ltl_inst.push((
+                base_def,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Ainstack(0)),
+                    Arc::new(vec![]),
+                    Mreg::AX,
+                ),
+            ));
+            prog.ltl_inst.push((
+                endpoint_def,
+                LTLInst::Lop(
+                    Operation::Oleal(Addressing::Ainstack(32)),
+                    Arc::new(vec![]),
+                    Mreg::CX,
+                ),
+            ));
+            prog.ltl_inst.push((
+                step,
+                LTLInst::Lop(Operation::Oaddlimm(1), Arc::new(vec![Mreg::AX]), Mreg::AX),
+            ));
+            prog.ltl_inst.push((
+                access,
+                LTLInst::Lstore(
+                    MemoryChunk::MInt8Unsigned,
+                    Addressing::Aindexed(-1),
+                    Arc::new(vec![Mreg::AX]),
+                    Mreg::SI,
+                ),
+            ));
+            prog.ltl_inst.push((
+                latch,
+                LTLInst::Lcond(
+                    Condition::Ccomplu(Comparison::Cne),
+                    Arc::new(vec![Mreg::AX, Mreg::CX]),
+                    Either::Right(header),
+                    Either::Right(exit),
+                ),
+            ));
+
+            prog.ltl_inst.push((
+                fake_base,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Ainstack(64)),
+                    Arc::new(vec![]),
+                    Mreg::R8,
+                ),
+            ));
+            prog.ltl_inst.push((
+                fake_step,
+                LTLInst::Lop(Operation::Oaddlimm(1), Arc::new(vec![Mreg::R8]), Mreg::R8),
+            ));
+            prog.ltl_inst.push((
+                fake_access,
+                LTLInst::Lload(
+                    MemoryChunk::MInt8Unsigned,
+                    Addressing::Aindexed(-1),
+                    Arc::new(vec![Mreg::R8]),
+                    Mreg::R9,
+                ),
+            ));
+
+            // These are the exact def-use edges the point-keyed reaching-def
+            // lattice supplies in a real run.
+            prog.reg_def_used.extend([
+                (base_def, Mreg::AX, step),
+                (step, Mreg::AX, access),
+                (step, Mreg::AX, latch),
+                (endpoint_def, Mreg::CX, latch),
+                (fake_base, Mreg::R8, fake_step),
+                (fake_step, Mreg::R8, fake_access),
+            ]);
+
+            prog.run();
+
+            let regions: std::collections::BTreeSet<_> =
+                prog.stack_pointer_walk_region.iter().copied().collect();
+            assert_eq!(regions, std::collections::BTreeSet::from([(func, 0, 32)]));
+            assert!(prog
+                .escaped_stack_region_extent
+                .iter()
+                .any(|row| row == &(func, 0, 32)));
+            assert!(prog.stack_var.iter().any(|(owner, node, offset, _)| {
+                (*owner, *node, *offset) == (func, endpoint_def, 32)
+            }));
+        });
+    }
+
+    #[test]
+    fn direct_pointer_loop_rejects_ambiguous_preheader_origin() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x1100;
+            let entry_block = 0x9100;
+            let stack_preheader = 0x4100;
+            let value_preheader = 0x8100;
+            let header_block = 0x3100;
+            let latch_block = 0x7100;
+            let exit_block = 0x5100;
+            let endpoint_def = 0x8700;
+            let base_def = 0x8900;
+            let value_def = 0x1900;
+            let header = 0x2500;
+            let step = 0x2350;
+            let access = 0x2250;
+            let latch = 0x2150;
+            let exit = 0x250;
+
+            for block in [
+                entry_block,
+                stack_preheader,
+                value_preheader,
+                header_block,
+                latch_block,
+                exit_block,
+            ] {
+                prog.block_in_function.push((block, func));
+            }
+            for (node, block) in [
+                (func, entry_block),
+                (endpoint_def, entry_block),
+                (base_def, stack_preheader),
+                (value_def, value_preheader),
+                (header, header_block),
+                (step, header_block),
+                (access, header_block),
+                (latch, latch_block),
+                (exit, exit_block),
+            ] {
+                prog.code_in_block.push((node, block));
+                prog.instr_in_function.push((node, func));
+            }
+            prog.asm_block_next.extend([
+                (entry_block, stack_preheader),
+                (entry_block, value_preheader),
+                (stack_preheader, header_block),
+                (value_preheader, header_block),
+                (header_block, latch_block),
+                (latch_block, header_block),
+                (latch_block, exit_block),
+            ]);
+            prog.rtl_next.extend([(latch, header), (latch, exit)]);
+
+            prog.ltl_inst.extend([
+                (
+                    endpoint_def,
+                    LTLInst::Lop(
+                        Operation::Oleal(Addressing::Ainstack(32)),
+                        Arc::new(vec![]),
+                        Mreg::CX,
+                    ),
+                ),
+                (
+                    base_def,
+                    LTLInst::Lop(
+                        Operation::Olea(Addressing::Ainstack(0)),
+                        Arc::new(vec![]),
+                        Mreg::AX,
+                    ),
+                ),
+                (
+                    value_def,
+                    LTLInst::Lop(Operation::Olongconst(7), Arc::new(vec![]), Mreg::AX),
+                ),
+                (
+                    step,
+                    LTLInst::Lop(Operation::Oaddlimm(1), Arc::new(vec![Mreg::AX]), Mreg::AX),
+                ),
+                (
+                    access,
+                    LTLInst::Lstore(
+                        MemoryChunk::MInt8Unsigned,
+                        Addressing::Aindexed(-1),
+                        Arc::new(vec![Mreg::AX]),
+                        Mreg::SI,
+                    ),
+                ),
+                (
+                    latch,
+                    LTLInst::Lcond(
+                        Condition::Ccomplu(Comparison::Cne),
+                        Arc::new(vec![Mreg::AX, Mreg::CX]),
+                        Either::Right(header),
+                        Either::Right(exit),
+                    ),
+                ),
+            ]);
+            prog.reg_def.push((value_def, Mreg::AX));
+            prog.reg_def_used.extend([
+                (base_def, Mreg::AX, step),
+                (value_def, Mreg::AX, step),
+                (step, Mreg::AX, access),
+                (step, Mreg::AX, latch),
+                (endpoint_def, Mreg::CX, latch),
+            ]);
+
+            prog.run();
+
+            assert!(prog.stack_pointer_walk_region.is_empty());
         });
     }
 
