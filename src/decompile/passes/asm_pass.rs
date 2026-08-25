@@ -220,6 +220,26 @@ fn refine_chunk_with_size(mc: MemoryChunk, size: usize) -> MemoryChunk {
     }
 }
 
+// A load's memory width belongs to its source operand, not to the destination
+// register that receives the extended value. Most load rules flow through
+// `transl_load` and already preserve that distinction. Direct symbol-backed
+// MOV rules bypass that path, so refine their typed destination chunk with the
+// source width here. MOVSX/MOVZX also carry signedness in the mnemonic; keep
+// that signedness while selecting the 8- or 16-bit source chunk.
+fn refine_direct_load_chunk(
+    mnem: &str,
+    destination_chunk: MemoryChunk,
+    source_width: usize,
+) -> MemoryChunk {
+    let upper = mnem.to_ascii_uppercase();
+    let source_chunk = if upper.contains("MOVZ") || upper.contains("MOVS") {
+        chunk_from_mnem_ext(mnem)
+    } else {
+        destination_chunk
+    };
+    refine_chunk_with_size(source_chunk, source_width)
+}
+
 /// Maps SETcc TestCond (CF/ZF unsigned-style) to the float Condition it materializes (A->Cgt, AE->Cge, B->Clt, BE->Cle, E->Ceq, NE->Cnotcompf(Ceq)); returns None for parity/signed conditions a bare float setcc cannot express.
 fn fcmp_setcc_condition(tc: TestCond, is_double: bool) -> Option<Condition> {
     let cmp = match tc {
@@ -5910,16 +5930,18 @@ ascent_par! {
         let resolved = Some((*ident, *offset)),
         if let Ok((addressing, args)) = transl_addressing_rev(*addrmode, resolved);
 
-    mach_inst(addr, MachInst::Mload(*mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), dst)) <--
+    mach_inst(addr, MachInst::Mload(mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), dst)) <--
         pmov(addr, dst_sym, src),
         op_register(dst_sym, dst_str),
         let dst = Mreg::x86(dst_str),
-        op_indirect(src, _, base_str, _, _, disp, _),
+        op_indirect(src, _, base_str, _, _, disp, source_width),
         reg_ip(*base_str),
         rip_target_addr(addr, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
         ireg_hold_type(dst_str.to_string(), typ),
-        type_to_memchunk(typ, mc);
+        type_to_memchunk(typ, destination_chunk),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        let mc = refine_direct_load_chunk(mnem, *destination_chunk, *source_width);
 
     mach_inst(addr, MachInst::Mstore(mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), src)) <--
         pmov(addr, dst, src_sym),
@@ -5934,25 +5956,27 @@ ascent_par! {
         let mc = refine_chunk_with_size(*chunk, *msize);
 
     // Absolute addressing load: mov 0x40402c, %eax (base="NONE", disp is the address)
-    mach_inst(addr, MachInst::Mload(*mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), dst)) <--
+    mach_inst(addr, MachInst::Mload(mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), dst)) <--
         pmov(addr, dst_sym, src),
         op_register(dst_sym, dst_str),
         let dst = Mreg::x86(dst_str),
-        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        op_indirect(src, _, base_str, idx_str, _, disp, source_width),
         if *base_str == "NONE" || base_str.is_empty(),
         if *idx_str == "NONE" || idx_str.is_empty(),
         if *disp > 0,
         abs_target_addr(addr, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
         ireg_hold_type(dst_str.to_string(), typ),
-        type_to_memchunk(typ, mc);
+        type_to_memchunk(typ, destination_chunk),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        let mc = refine_direct_load_chunk(mnem, *destination_chunk, *source_width);
 
     // Scaled-index absolute addressing load
-    mach_inst(addr, MachInst::Mload(*mc, Addressing::Abasedscaled(*scale, *ident, *offset), Arc::new(vec![idx_mreg]), dst)) <--
+    mach_inst(addr, MachInst::Mload(mc, Addressing::Abasedscaled(*scale, *ident, *offset), Arc::new(vec![idx_mreg]), dst)) <--
         pmov(addr, dst_sym, src),
         op_register(dst_sym, dst_str),
         let dst = Mreg::x86(dst_str),
-        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        op_indirect(src, _, base_str, idx_str, scale, disp, source_width),
         if *base_str == "NONE" || base_str.is_empty(),
         if *idx_str != "NONE" && !idx_str.is_empty(),
         if *disp > 0,
@@ -5960,7 +5984,9 @@ ascent_par! {
         resolved_addr_to_symbol(target_addr, ident, offset),
         let idx_mreg = Mreg::x86(*idx_str),
         ireg_hold_type(dst_str.to_string(), typ),
-        type_to_memchunk(typ, mc);
+        type_to_memchunk(typ, destination_chunk),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        let mc = refine_direct_load_chunk(mnem, *destination_chunk, *source_width);
 
     mach_inst(addr, MachInst::Mload(mc, Addressing::Abasedscaled(*scale, *ident, *offset), Arc::new(vec![idx_mreg]), dst)) <--
         pmov(addr, dst_sym, src),
@@ -9791,7 +9817,7 @@ impl IRPass for AsmPass {
 
 #[cfg(test)]
 mod structural_dataflow_tests {
-    use super::{exact_stack_offset, AsmPass, AsmPassProgram};
+    use super::{exact_stack_offset, refine_direct_load_chunk, AsmPass, AsmPassProgram};
     use crate::decompile::passes::pass::IRPass;
     use crate::mreg::Mreg;
     use crate::x86::asm::TestCond;
@@ -9813,6 +9839,72 @@ mod structural_dataflow_tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn direct_symbol_loads_use_memory_source_width_before_extension() {
+        assert_eq!(
+            refine_direct_load_chunk("MOVZX", MemoryChunk::MInt32, 1),
+            MemoryChunk::MInt8Unsigned
+        );
+        assert_eq!(
+            refine_direct_load_chunk("MOVSX", MemoryChunk::MInt64, 2),
+            MemoryChunk::MInt16Signed
+        );
+        assert_eq!(
+            refine_direct_load_chunk("MOV", MemoryChunk::MInt64, 1),
+            MemoryChunk::MInt8Unsigned
+        );
+
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let rip_load = 0x401138;
+            let absolute_load = 0x401240;
+
+            for (node, source, destination) in [
+                (rip_load, "rip_byte", "rip_dst"),
+                (absolute_load, "absolute_byte", "absolute_dst"),
+            ] {
+                prog.instruction
+                    .push((node, 7, "", "MOVZX", source, destination, "", "", 0, 0));
+                prog.pmov.push((node, destination, source));
+                prog.op_indirect.push((
+                    source,
+                    "",
+                    if node == rip_load { "RIP" } else { "NONE" },
+                    "NONE",
+                    1,
+                    0x404031,
+                    1,
+                ));
+            }
+            prog.op_register
+                .extend([("rip_dst", "EDX"), ("absolute_dst", "EAX")]);
+            prog.rip_target_addr.push((rip_load, 0x404031));
+            prog.abs_target_addr.push((absolute_load, 0x404031));
+            prog.resolved_addr_to_symbol.push((0x404031, 0x404030, 1));
+
+            prog.run();
+
+            for (node, destination) in [(rip_load, Mreg::DX), (absolute_load, Mreg::AX)] {
+                assert!(prog.mach_inst.iter().any(|(candidate_node, inst)| {
+                    *candidate_node == node
+                        && matches!(
+                            inst,
+                            MachInst::Mload(
+                                MemoryChunk::MInt8Unsigned,
+                                Addressing::Aglobal(0x404030, 1),
+                                args,
+                                actual_destination
+                            ) if args.is_empty() && *actual_destination == destination
+                        )
+                }));
+                assert!(!prog.mach_inst.iter().any(|(candidate_node, inst)| {
+                    *candidate_node == node
+                        && matches!(inst, MachInst::Mload(MemoryChunk::MInt32, _, _, _))
+                }));
+            }
+        });
     }
 
     #[test]
