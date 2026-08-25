@@ -536,6 +536,7 @@ ascent_par! {
 
     // Pointer-producing operations
     relation op_produces_ptr(Node, RTLReg);
+    relation exact_stack_addr_ptr_result(Node, RTLReg);
     relation base_addr_usage(Node, RTLReg, i64);
 
     is_ptr(reg) <-- op_produces_ptr(_, reg);
@@ -975,16 +976,16 @@ ascent_par! {
         !hard_int32(dst_rtl);
 
     // An exact stack-address operation is a hard pointer only when RTL proved
-    // that its result width matches the target ABI. The raw Olea/Oleal shape
-    // alone is insufficient: Olea remains 32-bit integer arithmetic on LP64.
-    // Keep the LTL join so this stronger MUST fact remains specific to direct
-    // frame addresses rather than every pointer-producing operation.
+    // from the decoded destination that its result width matches the target
+    // ABI. Consume the base authority rather than the broader
+    // `op_produces_ptr` closure: the latter also propagates through Omove via
+    // `is_ptr` and would create a negation cycle with hard integer evidence.
     must_be_ptr(dst_rtl) <--
         ltl_inst(node, ?LTLInst::Lop(op, args, dst_mreg)),
         if matches!(op, Operation::Olea(Addressing::Ainstack(_)) | Operation::Oleal(Addressing::Ainstack(_))),
         if args.is_empty(),
         reg_rtl(node, *dst_mreg, dst_rtl),
-        op_produces_ptr(node, dst_rtl);
+        exact_stack_addr_ptr_result(node, dst_rtl);
 
     // Oaddl(ptr, offset) -> result is ptr
     is_ptr(dst_rtl) <--
@@ -1434,7 +1435,7 @@ mod tests {
         ]);
         prog.reg_rtl
             .extend([(narrow_node, Mreg::AX, narrow), (wide_node, Mreg::DX, wide)]);
-        prog.op_produces_ptr.push((wide_node, wide));
+        prog.exact_stack_addr_ptr_result.push((wide_node, wide));
 
         prog.run();
 

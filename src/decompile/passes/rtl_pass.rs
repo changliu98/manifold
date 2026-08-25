@@ -7092,26 +7092,26 @@ ascent_par! {
         exact_stack_addr_lea_def(func_start, node, dst, ofs, width),
         !incoming_stack_tail_base(func_start, node, _, dst);
 
-    // Resolve the operation's actual RTL result once from the candidate that
-    // generic lifting emitted. Bind the candidate back to this exact machine
-    // destination: a superset node can carry several operation candidates, so
-    // matching only the operation shape could lend pointer authority to a
-    // sibling destination at the same node.
+    // Bind pointer authority to the raw definition identity for this exact
+    // decoded machine destination.  `fresh_xtl_reg` is the same definition id
+    // used by ordinary register lifting; deriving this fact from the settled
+    // canonical relation here would feed an aggregate back into RTL candidate
+    // construction and make the program unstratifiable.
     #[local] relation exact_stack_addr_lea_result(Address, Address, Mreg, i64, i64, RTLReg);
-    exact_stack_addr_lea_result(*func, *node, *dst_mreg, *ofs, *width, *dst_rtl) <--
+    exact_stack_addr_lea_result(*func, *node, *dst_mreg, *ofs, *width, dst_rtl) <--
         exact_stack_addr_lea_def(func, node, dst_mreg, ofs, width),
-        reg_rtl(node, dst_mreg, dst_rtl),
-        rtl_inst_candidate(node, ?RTLInst::Iop(Operation::Olea(Addressing::Ainstack(seen_ofs)), args, dst_rtl)),
-        if *width == 4 && seen_ofs == ofs && args.is_empty();
-    exact_stack_addr_lea_result(*func, *node, *dst_mreg, *ofs, *width, *dst_rtl) <--
-        exact_stack_addr_lea_def(func, node, dst_mreg, ofs, width),
-        reg_rtl(node, dst_mreg, dst_rtl),
-        rtl_inst_candidate(node, ?RTLInst::Iop(Operation::Oleal(Addressing::Ainstack(seen_ofs)), args, dst_rtl)),
-        if *width == 8 && seen_ofs == ofs && args.is_empty();
+        let dst_rtl = fresh_xtl_reg(*node, *dst_mreg);
 
-    op_produces_ptr(node, *dst_rtl) <--
+    // Keep the exact decoded-width authority separate from the broader
+    // `op_produces_ptr` closure.  Type analysis consumes this base fact as a
+    // hard constraint without creating a negation cycle through pointer-copy
+    // propagation and hard-integer evidence.
+    relation exact_stack_addr_ptr_result(Node, RTLReg);
+    exact_stack_addr_ptr_result(node, *dst_rtl) <--
         exact_stack_addr_lea_result(_, node, _, _, width, dst_rtl),
         abi_pointer_size(width);
+
+    op_produces_ptr(node, dst_rtl) <-- exact_stack_addr_ptr_result(node, dst_rtl);
 
     stack_var(func_start, use_addr, ofs, canonical.0) <--
         stack_xtl(func_start, use_addr, ofs, xtl_id),
@@ -13316,7 +13316,7 @@ mod tests {
             assert!(!bad
                 .reg_stack_addr_origins
                 .iter()
-                .any(|(_, node, _, _)| *node == synthetic));
+                .any(|row| row.read().unwrap().1 == synthetic));
             assert!(bad.slot_addr_taken_reg.iter().any(|fact| {
                 fact == &(
                     func64,
@@ -13328,7 +13328,7 @@ mod tests {
             assert!(!bad
                 .reg_stack_addr_origins
                 .iter()
-                .any(|(_, node, _, _)| *node == incoming));
+                .any(|row| row.read().unwrap().1 == incoming));
             assert!(!bad
                 .slot_addr_taken_reg
                 .iter()
