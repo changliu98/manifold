@@ -536,7 +536,7 @@ ascent_par! {
 
     // Pointer-producing operations
     relation op_produces_ptr(Node, RTLReg);
-    relation exact_stack_addr_ptr_result(Node, RTLReg);
+    relation canonical_exact_stack_addr_ptr_result(Node, RTLReg);
     relation base_addr_usage(Node, RTLReg, i64);
 
     is_ptr(reg) <-- op_produces_ptr(_, reg);
@@ -985,7 +985,7 @@ ascent_par! {
         if matches!(op, Operation::Olea(Addressing::Ainstack(_)) | Operation::Oleal(Addressing::Ainstack(_))),
         if args.is_empty(),
         reg_rtl(node, *dst_mreg, dst_rtl),
-        exact_stack_addr_ptr_result(node, dst_rtl);
+        canonical_exact_stack_addr_ptr_result(node, dst_rtl);
 
     // Oaddl(ptr, offset) -> result is ptr
     is_ptr(dst_rtl) <--
@@ -1435,7 +1435,8 @@ mod tests {
         ]);
         prog.reg_rtl
             .extend([(narrow_node, Mreg::AX, narrow), (wide_node, Mreg::DX, wide)]);
-        prog.exact_stack_addr_ptr_result.push((wide_node, wide));
+        prog.canonical_exact_stack_addr_ptr_result
+            .push((wide_node, wide));
 
         prog.run();
 

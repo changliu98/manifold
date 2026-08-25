@@ -180,6 +180,7 @@ ascent_par! {
 
     relation rtl_inst(Node, RTLInst);
     relation op_produces_ptr(Node, RTLReg);
+    relation canonical_exact_stack_addr_ptr_result(Node, RTLReg);
     relation ltl_inst(Node, LTLInst);
     relation reg_rtl(Node, Mreg, RTLReg);
     relation instr_in_function(Node, Address);
@@ -403,18 +404,25 @@ ascent_par! {
         !is_charptr_from_string(reg);
 
 
-    // Stack struct detection via LEA base offsets
+    // Stack struct detection via LEA base offsets. Exact local-stack pointer
+    // authority is projected to the settled RTL alias result after RTL closes;
+    // include that authority directly rather than depending on Type's broader
+    // pointer-candidate closure to rediscover it.
+    #[local] relation proven_ptr_result(Node, RTLReg);
+    proven_ptr_result(node, reg) <-- op_produces_ptr(node, reg);
+    proven_ptr_result(node, reg) <-- canonical_exact_stack_addr_ptr_result(node, reg);
+
     #[local] relation stack_lea_base(Address, i64);
 
     stack_lea_base(*func, *base_ofs) <--
         rtl_inst(node, ?RTLInst::Iop(Operation::Olea(Addressing::Ainstack(base_ofs)), _, dst)),
-        op_produces_ptr(node, dst),
+        proven_ptr_result(node, dst),
         stack_var(func, node, *base_ofs, _),
         instr_in_function(node, func);
 
     stack_lea_base(*func, *base_ofs) <--
         rtl_inst(node, ?RTLInst::Iop(Operation::Oleal(Addressing::Ainstack(base_ofs)), _, dst)),
-        op_produces_ptr(node, dst),
+        proven_ptr_result(node, dst),
         stack_var(func, node, *base_ofs, _),
         instr_in_function(node, func);
 
@@ -422,13 +430,13 @@ ascent_par! {
 
     stack_lea_reg(*func, *base_ofs, *dst) <--
         rtl_inst(node, ?RTLInst::Iop(Operation::Olea(Addressing::Ainstack(base_ofs)), _, dst)),
-        op_produces_ptr(node, dst),
+        proven_ptr_result(node, dst),
         stack_var(func, node, *base_ofs, _),
         instr_in_function(node, func);
 
     stack_lea_reg(*func, *base_ofs, *dst) <--
         rtl_inst(node, ?RTLInst::Iop(Operation::Oleal(Addressing::Ainstack(base_ofs)), _, dst)),
-        op_produces_ptr(node, dst),
+        proven_ptr_result(node, dst),
         stack_var(func, node, *base_ofs, _),
         instr_in_function(node, func);
 
@@ -629,6 +637,7 @@ impl IRPass for StructRecoveryPass {
         &[
             "rtl_inst",
             "op_produces_ptr",
+            "canonical_exact_stack_addr_ptr_result",
             "ltl_inst",
             "reg_rtl",
             "instr_in_function",

@@ -47,6 +47,28 @@ fn is_rsp_reg(cs: &Capstone, op_type: &X86OperandType) -> bool {
     })
 }
 
+fn explicit_stack_pointer_delta(
+    mnemonic: &str,
+    first_operand_size: usize,
+    first_operand_is_sp: bool,
+) -> Option<i64> {
+    match mnemonic {
+        "PUSH" if first_operand_size > 0 => i64::try_from(first_operand_size)
+            .ok()
+            .and_then(|width| width.checked_neg()),
+        "POP" if first_operand_size > 0 && !first_operand_is_sp => {
+            i64::try_from(first_operand_size).ok()
+        }
+        "PUSHF" => Some(-2),
+        "PUSHFD" => Some(-4),
+        "PUSHFQ" => Some(-8),
+        "POPF" => Some(2),
+        "POPFD" => Some(4),
+        "POPFQ" => Some(8),
+        _ => None,
+    }
+}
+
 // Capstone exposes explicit writable memory operands directly. A few string
 // operations encode their data-memory destination implicitly; count one
 // element's fixed width when no operands were materialized. REP changes the
@@ -177,6 +199,14 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
     )> = Vec::new();
     let mut stack_defs: Vec<(u64, &'static str, i64)> = Vec::new();
     let mut stack_uses: Vec<(u64, &'static str, i64)> = Vec::new();
+    // Exact writable stack operands retain their byte width and operand role.
+    // `stack_def` deliberately expands wide accesses into coarse cells for the
+    // legacy def-use analysis, so it cannot answer byte-overlap questions on
+    // its own without accidentally joining a read operand's width.
+    let mut decoded_stack_write_bytes: Vec<(u64, &'static str, i64, usize)> = Vec::new();
+    let mut decoded_stack_read_bytes: Vec<(u64, &'static str, i64, usize)> = Vec::new();
+    let mut decoded_stack_write_unresolved: Vec<(u64, &'static str)> = Vec::new();
+    let mut decoded_stack_pointer_delta: Vec<(u64, i64)> = Vec::new();
     let mut reg_defs: Vec<(u64, Mreg)> = Vec::new();
     let mut reg_uses: Vec<(u64, Mreg)> = Vec::new();
     let mut adjusts_stack: Vec<(u64, &'static str, i64)> = Vec::new();
@@ -246,7 +276,12 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
 
             let mut op_ids: [&'static str; 4] = [NO_OP; 4];
             let num_operands = ops.len();
+            let mut first_operand_size = 0_usize;
+            let mut first_operand_is_sp = false;
             let mut explicit_memory_write_bytes = 0usize;
+            let mut stack_memory_operands: Vec<(&'static str, i64, usize, bool, bool, bool)> =
+                Vec::new();
+            let stack_write_fact_start = decoded_stack_write_bytes.len();
 
             let is_nop = mnemonic == "NOP" || mnemonic == "VZEROUPPER" || mnemonic == "VZEROALL";
 
@@ -263,6 +298,10 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
             for (i, op) in ops.enumerate() {
                 if i >= 4 {
                     break;
+                }
+                if i == 0 {
+                    first_operand_size = op.size as usize;
+                    first_operand_is_sp = is_rsp_reg(&cs, &op.op_type);
                 }
                 match op.op_type {
                     X86OperandType::Reg(reg_id) => {
@@ -331,9 +370,24 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
 
                         // Stack def/use classification for frame/stack-relative memory accesses, in either width's spelling.
                         if let Some(canon_base) = canonical_stack_reg(base) {
-                            if index == "NONE" && mnemonic != "LEA" {
+                            if mnemonic != "LEA" {
                                 let is_write = op.access.map_or(false, |a| a.is_writable());
                                 let is_read = op.access.map_or(false, |a| a.is_readable());
+                                let indexed = index != "NONE" && !index.is_empty();
+                                stack_memory_operands.push((
+                                    base,
+                                    disp,
+                                    op.size as usize,
+                                    is_write,
+                                    indexed,
+                                    seg == "NONE",
+                                ));
+                                if indexed {
+                                    if is_write {
+                                        decoded_stack_write_unresolved.push((addr, base));
+                                    }
+                                    continue;
+                                }
                                 // An SSE/AVX access is wider than the 8-byte cell the frame is
                                 // tracked in, so record every cell it spans; recording only the
                                 // first left the upper halves of every XMM stack move with no
@@ -350,6 +404,36 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
                                         stack_uses.push((addr, canon_base, cell_disp));
                                     }
                                 }
+                                if seg != "NONE" {
+                                    if is_write {
+                                        decoded_stack_write_unresolved.push((addr, base));
+                                    }
+                                    continue;
+                                }
+                                // POP r/m computes an RSP-based destination
+                                // after incrementing SP. Its raw displacement
+                                // therefore does not name the in-state frame
+                                // coordinate used by ordinary memory operands.
+                                // Keep it as an opaque frame write until that
+                                // post-increment addressing rule is modeled.
+                                if is_write && mnemonic == "POP" && canon_base == "RSP" {
+                                    decoded_stack_write_unresolved.push((addr, base));
+                                } else if is_write {
+                                    decoded_stack_write_bytes.push((
+                                        addr,
+                                        base,
+                                        disp,
+                                        op.size as usize,
+                                    ));
+                                }
+                                if is_read {
+                                    decoded_stack_read_bytes.push((
+                                        addr,
+                                        base,
+                                        disp,
+                                        op.size as usize,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -357,11 +441,23 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
                 }
             }
 
+            let explicit_stack_delta =
+                explicit_stack_pointer_delta(mnemonic, first_operand_size, first_operand_is_sp);
+            if let Some(delta) = explicit_stack_delta {
+                decoded_stack_pointer_delta.push((addr, delta));
+            }
+
             if explicit_memory_write_bytes == 0 {
                 explicit_memory_write_bytes =
                     implicit_data_memory_write_width(mnemonic, num_operands);
             }
             let (fixed_override, unknown_reason) = special_memory_write(mnemonic, prefix);
+            if fixed_override.is_some() || unknown_reason.is_some() {
+                // Replace any ordinary Capstone-width fact emitted above with
+                // the architectural override. Keeping both widths would make
+                // one special store look like two distinct memory roles.
+                decoded_stack_write_bytes.truncate(stack_write_fact_start);
+            }
             if unknown_reason.is_some() && fixed_override.is_none() {
                 // A dynamic/scalable obligation must not also enter the fixed
                 // denominator as Capstone's address-word size or one REP
@@ -372,6 +468,46 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
             }
             if let Some(reason) = unknown_reason {
                 decoded_memory_write_unknown.push((addr, reason));
+            }
+            // Some architectural stores are missing or mislabelled in
+            // Capstone's per-operand access flags. Retain their exact stack
+            // operand identity here too: fixed-size overrides carry that
+            // width, while dynamic writes carry zero and become an explicit
+            // downstream veto. Ordinary read-modify-write operands have
+            // already entered through `is_write` above.
+            if unknown_reason.is_some() {
+                for (base, disp, _, _, indexed, exact_segment) in &stack_memory_operands {
+                    if *indexed || !*exact_segment {
+                        decoded_stack_write_unresolved.push((addr, *base));
+                    } else {
+                        decoded_stack_write_bytes.push((addr, *base, *disp, 0));
+                    }
+                }
+            } else if let Some(bytes) = fixed_override {
+                for (base, disp, _, _, indexed, exact_segment) in &stack_memory_operands {
+                    if *indexed || !*exact_segment {
+                        decoded_stack_write_unresolved.push((addr, *base));
+                    } else {
+                        decoded_stack_write_bytes.push((addr, *base, *disp, bytes));
+                    }
+                }
+            } else if explicit_memory_write_bytes > 0
+                && !stack_memory_operands
+                    .iter()
+                    .any(|(_, _, _, write, _, _)| *write)
+            {
+                for (base, disp, _, _, indexed, exact_segment) in &stack_memory_operands {
+                    if *indexed || !*exact_segment {
+                        decoded_stack_write_unresolved.push((addr, *base));
+                    } else {
+                        decoded_stack_write_bytes.push((
+                            addr,
+                            *base,
+                            *disp,
+                            explicit_memory_write_bytes,
+                        ));
+                    }
+                }
             }
             // Source-level data-memory effects only. CALL/PUSH control-stack
             // writes are intentionally absent, while a 16-byte vector store
@@ -562,6 +698,30 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
         "stack_use",
         stack_uses.into_iter().collect::<ascent::boxcar::Vec<_>>(),
     );
+    db.rel_set(
+        "decoded_stack_write_bytes",
+        decoded_stack_write_bytes
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "decoded_stack_read_bytes",
+        decoded_stack_read_bytes
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "decoded_stack_write_unresolved",
+        decoded_stack_write_unresolved
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "decoded_stack_pointer_delta",
+        decoded_stack_pointer_delta
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
 
     db.rel_set(
         "reg_def",
@@ -608,7 +768,28 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
 
 #[cfg(test)]
 mod tests {
-    use super::{evex_has_opmask, implicit_data_memory_write_width, special_memory_write};
+    use super::{
+        evex_has_opmask, explicit_stack_pointer_delta, implicit_data_memory_write_width,
+        special_memory_write,
+    };
+    use capstone::prelude::*;
+
+    fn decoded_push_delta(bytes: &[u8]) -> i64 {
+        let cs = Capstone::new()
+            .x86()
+            .mode(arch::x86::ArchMode::Mode64)
+            .syntax(arch::x86::ArchSyntax::Intel)
+            .detail(true)
+            .build()
+            .expect("x86-64 Capstone");
+        let insns = cs.disasm_all(bytes, 0x1000).expect("one PUSH");
+        let insn = insns.iter().next().expect("decoded PUSH");
+        let detail = cs.insn_detail(insn).expect("PUSH detail");
+        let arch_detail = detail.arch_detail();
+        let x86_detail = arch_detail.x86().expect("x86 detail");
+        let operand_size = x86_detail.operands().next().expect("PUSH operand").size as usize;
+        explicit_stack_pointer_delta("PUSH", operand_size, false).expect("known PUSH delta")
+    }
 
     #[test]
     fn evex_opmask_detection_handles_prefixes_and_k0() {
@@ -638,5 +819,11 @@ mod tests {
             special_memory_write("MOVSB", "REP"),
             (None, Some("dynamic-repeat-count"))
         );
+    }
+
+    #[test]
+    fn push_delta_uses_architectural_operand_width_not_immediate_encoding_width() {
+        assert_eq!(decoded_push_delta(&[0x6a, 0x01]), -8);
+        assert_eq!(decoded_push_delta(&[0x66, 0x6a, 0x01]), -2);
     }
 }

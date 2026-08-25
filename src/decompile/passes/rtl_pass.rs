@@ -4,6 +4,7 @@ use crate::run_pass;
 use crate::decompile::passes::asm_pass::transl_addressing_rev;
 use crate::decompile::passes::cminor_pass::*;
 use crate::decompile::passes::csh_pass::*;
+use crate::decompile::passes::frame_write_pass::{frame_origin_overlaps, FrameWriteOrigin};
 use crate::decompile::passes::pass::IRPass;
 use crate::mreg::{Mreg, RegClass};
 use crate::util::{
@@ -211,6 +212,13 @@ fn direct_pointer_interval_within_local_frame(low: i64, high: i64, frame_size: i
     (low >= 0 && high <= frame_size) || (low >= frame_size.saturating_neg() && high <= 0)
 }
 
+fn typ_is_pointer_width(typ: &Typ, pointer_width: i64) -> bool {
+    matches!(
+        (pointer_width, typ),
+        (4, Typ::Tint | Typ::Tany32) | (8, Typ::Tlong | Typ::Tany64)
+    )
+}
+
 // ABI-1 (3.2e): MOVSX/MOVSXD/MOVZX -> MemoryChunk; returns None for non-extending mnemonics so plain MOV (which also covers callee-save reloads) never fires; (unsigned, 4) rejected because 32-bit writes zero-extend implicitly.
 fn extending_load_chunk(mnem: &str, size: usize) -> Option<MemoryChunk> {
     let m = mnem.to_ascii_uppercase();
@@ -397,6 +405,7 @@ ascent_par! {
     // Final point-keyed dominator summaries published after the dedicated
     // pre-RTL lattice pass has reached its fixpoint.
     relation settled_block_dom_set(Address, Address, Set<Address>);
+    relation settled_frame_write_state(Address, Address, Set<FrameWriteOrigin>);
     relation emit_clight_stmt(Address, Node, ClightStmt);
     relation emit_goto_target(Address, Node);
     relation emit_loop_body(Address, Node, Node);
@@ -518,6 +527,8 @@ ascent_par! {
     relation reg_use(Address, Mreg);
     relation trim_instruction(Address);
     relation stack_def_used(Address, Symbol, i64, Address, Symbol, i64);
+    relation exact_frame_stack_lea(Address, Address, i64);
+    relation frame_stack_read_bytes(Address, Address, i64, usize);
     relation stack_offset_backedge_rescued_access(Address, Address);
     // Exact nonzero distance from the function's stable frame origin to SP at
     // this instruction, published by asm_pass.  Absence means zero or unknown;
@@ -7211,6 +7222,11 @@ ascent_par! {
     #[local] relation exact_local_stack_addr_lea_def(Address, Address, Mreg, i64, i64);
     exact_local_stack_addr_lea_def(*func_start, *node, *dst, *ofs, *width) <--
         exact_stack_addr_lea_def(func_start, node, dst, ofs, width),
+        exact_frame_stack_lea(func_start, node, ofs),
+        function_has_ltl_body(func_start),
+        !function_has_uncovered_block(func_start),
+        !function_unknown_terminal(func_start, _),
+        !function_unresolved_control(func_start, _),
         !incoming_stack_tail_base(func_start, node, _, dst);
 
     // Bind pointer authority to the raw definition identity for this exact
@@ -8035,19 +8051,74 @@ ascent_par! {
         if args.len() == 1,
         let src_reg = &args[0];
 
+    // Mreg aliases every x86 GPR view, so LTL Omove alone cannot distinguish a
+    // full pointer copy from eax/ax/al truncation. Preserve Slot provenance
+    // only across a raw plain register move whose source and destination views
+    // both have the target ABI width. Extending moves are value transforms,
+    // not pointer-bit-pattern copies.
+    #[local] relation pointer_width_reg_copy(Address, Mreg, Mreg);
+    pointer_width_reg_copy(*mov_addr, *src_reg, *dst_reg) <--
+        explicit_reg_copy(mov_addr, src_reg, dst_reg),
+        instruction(mov_addr, _, _, mnemonic, raw_src, raw_dst, _, _, _, _),
+        if matches!(*mnemonic, "MOV" | "MOVABS"),
+        op_register(raw_src, src_name),
+        op_register(raw_dst, dst_name),
+        if Mreg::x86(*src_name) == *src_reg && Mreg::x86(*dst_name) == *dst_reg,
+        if let (Some(src_width), Some(dst_width)) =
+            (x86_gpr_view_width(src_name), x86_gpr_view_width(dst_name)),
+        abi_pointer_size(pointer_width),
+        if src_width == *pointer_width && dst_width == *pointer_width;
+
     // A compiler may spill a frame address before putting it in an argument
-    // register.  The stack reaching-definition edge is the structural proof
-    // that the reload carries the value stored by this exact Lsetstack; follow
-    // it just like an explicit register copy.  Without this edge an out-param
-    // passed through a spill is not classified as escaped, and the optimizer
-    // can propagate the slot's initializer across the call that mutates it.
+    // register. The dedicated frame-write pass publishes the final point-keyed
+    // may-reaching state for this exact pointer-width reload. Every path state
+    // must be an exact full-width Local Lsetstack before Slot can survive.
     #[local] relation stack_addr_reload_edge(Address, Address, Mreg, Address, Mreg);
-    stack_addr_reload_edge(*func_start, *reload_addr, *dst_reg, *spill_addr, *src_reg) <--
-        ltl_inst(reload_addr, ?LTLInst::Lgetstack(_, _, _, dst_reg)),
-        instr_in_function(reload_addr, func_start),
-        stack_def_used(spill_addr, _, _, reload_addr, _, _),
-        ltl_inst(spill_addr, ?LTLInst::Lsetstack(src_reg, _, _, _)),
-        instr_in_function(spill_addr, func_start);
+    stack_addr_reload_edge(*func, *reload, *dst, *spill, *src) <--
+        ltl_inst(reload, ?LTLInst::Lgetstack(Slot::Local, reload_ofs, reload_typ, dst)),
+        function_has_ltl_body(func),
+        !function_has_uncovered_block(func),
+        !function_unknown_terminal(func, _),
+        !function_unresolved_control(func, _),
+        abi_pointer_size(pointer_width),
+        if typ_is_pointer_width(reload_typ, *pointer_width),
+        if let Ok(cell_width) = usize::try_from(*pointer_width),
+        frame_stack_read_bytes(func, reload, normalized_ofs, decoded_width),
+        if normalized_ofs == reload_ofs && *decoded_width == cell_width,
+        settled_frame_write_state(func, reload, reaching),
+        for origin in reaching.0.iter(),
+        if let FrameWriteOrigin::Write(spill, write_ofs, write_width) = origin,
+        if *write_ofs == *reload_ofs && i64::try_from(*write_width).ok() == Some(*pointer_width),
+        ltl_inst(spill, ?LTLInst::Lsetstack(src, Slot::Local, spill_ofs, spill_typ)),
+        if spill_ofs == reload_ofs && typ_is_pointer_width(spill_typ, *pointer_width),
+        instr_in_function(reload, func),
+        instr_in_function(spill, func);
+
+    #[local] relation stack_addr_reload_state_conflict(Address, Address, Mreg);
+    stack_addr_reload_state_conflict(*func, *reload, *dst) <--
+        ltl_inst(reload, ?LTLInst::Lgetstack(Slot::Local, reload_ofs, reload_typ, dst)),
+        abi_pointer_size(pointer_width),
+        if typ_is_pointer_width(reload_typ, *pointer_width),
+        if let Ok(cell_width) = usize::try_from(*pointer_width),
+        frame_stack_read_bytes(func, reload, normalized_ofs, decoded_width),
+        if normalized_ofs == reload_ofs && *decoded_width == cell_width,
+        settled_frame_write_state(func, reload, reaching),
+        for origin in reaching.0.iter(),
+        if frame_origin_overlaps(origin, *reload_ofs, cell_width),
+        if matches!(origin, FrameWriteOrigin::Unwritten(..) | FrameWriteOrigin::Unknown(..));
+
+    stack_addr_reload_state_conflict(*func, *reload, *dst) <--
+        ltl_inst(reload, ?LTLInst::Lgetstack(Slot::Local, reload_ofs, reload_typ, dst)),
+        abi_pointer_size(pointer_width),
+        if typ_is_pointer_width(reload_typ, *pointer_width),
+        if let Ok(cell_width) = usize::try_from(*pointer_width),
+        frame_stack_read_bytes(func, reload, normalized_ofs, decoded_width),
+        if normalized_ofs == reload_ofs && *decoded_width == cell_width,
+        settled_frame_write_state(func, reload, reaching),
+        for origin in reaching.0.iter(),
+        if frame_origin_overlaps(origin, *reload_ofs, cell_width),
+        if let FrameWriteOrigin::Write(spill, _, _) = origin,
+        !stack_addr_reload_edge(func, reload, dst, spill, _);
 
     #[local] lattice reg_stack_addr_origins(Address, Address, Mreg, Set<StackAddrOrigin>);
 
@@ -8061,7 +8132,7 @@ ascent_par! {
         asm_effective_def(def_addr, reg),
         instr_in_function(def_addr, func_start),
         !exact_local_stack_addr_lea_def(func_start, def_addr, reg, _, _),
-        !explicit_reg_copy(def_addr, _, reg),
+        !pointer_width_reg_copy(def_addr, _, reg),
         !stack_addr_reload_edge(func_start, def_addr, reg, _, _);
 
     // Entry pseudo-definitions represent caller values, never addresses of this
@@ -8073,7 +8144,7 @@ ascent_par! {
         !asm_effective_def(func_start, reg);
 
     reg_stack_addr_origins(*func_start, *mov_addr, *dst_reg, origins.clone()) <--
-        explicit_reg_copy(mov_addr, src_reg, dst_reg),
+        pointer_width_reg_copy(mov_addr, src_reg, dst_reg),
         instr_in_function(mov_addr, func_start),
         reg_def_used(src_def, src_reg, mov_addr),
         reg_stack_addr_origins(func_start, src_def, src_reg, origins);
@@ -8083,7 +8154,7 @@ ascent_par! {
     // is MAY rather than MUST provenance; retain the unknown arm explicitly so
     // a transient singleton Slot can never escape through this copy.
     reg_stack_addr_origins(*func_start, *mov_addr, *dst_reg, Set::singleton(StackAddrOrigin::NonStack)) <--
-        explicit_reg_copy(mov_addr, src_reg, dst_reg),
+        pointer_width_reg_copy(mov_addr, src_reg, dst_reg),
         instr_in_function(mov_addr, func_start),
         unknown_reg_value_reaches_use(func_start, mov_addr, src_reg);
 
@@ -8096,10 +8167,17 @@ ascent_par! {
         stack_addr_reload_edge(func_start, reload_addr, dst_reg, spill_addr, src_reg),
         unknown_reg_value_reaches_use(func_start, spill_addr, src_reg);
 
+    reg_stack_addr_origins(*func, *reload, *dst, Set::singleton(StackAddrOrigin::NonStack)) <--
+        stack_addr_reload_state_conflict(func, reload, dst);
+
+    reg_stack_addr_origins(*func_start, *reload_addr, *dst_reg, Set::singleton(StackAddrOrigin::NonStack)) <--
+        stack_addr_reload_edge(func_start, reload_addr, dst_reg, spill_addr, src_reg),
+        !reg_def_used(_, src_reg, spill_addr);
+
     // An explicit copy without a recovered source definition is unknown, not a
     // proof that it carries some earlier stack address.
     reg_stack_addr_origins(*func_start, *mov_addr, *dst_reg, Set::singleton(StackAddrOrigin::NonStack)) <--
-        explicit_reg_copy(mov_addr, src_reg, dst_reg),
+        pointer_width_reg_copy(mov_addr, src_reg, dst_reg),
         instr_in_function(mov_addr, func_start),
         !reg_def_used(_, src_reg, mov_addr);
 
@@ -8417,6 +8495,7 @@ ascent_par! {
     slot_addr_taken_reg(func, *lea_addr, *ofs, *dst) <--
         slot_addr_taken_reg(func, lea_addr, ofs, src),
         rtl_inst_candidate(copy, ?RTLInst::Iop(Operation::Omove, args, dst)),
+        pointer_width_reg_copy(copy, _, _),
         instr_in_function(copy, func),
         if args.len() == 1 && args[0] == *src;
 
@@ -8510,18 +8589,59 @@ ascent_par! {
         code_in_block(exit, exit_block),
         !block_in_natural_loop(func, header, exit_block);
 
-    // The induction step is a unary, in-place, constant byte adjustment inside
-    // the natural loop. A two-register add is intentionally excluded until a
-    // separate loop-invariance proof exists for its second operand.
+    // Superset lifting also represents ADC/SBB fallbacks as Oaddlimm even
+    // though their delta depends on carry. Pin the recurrence to a raw exact
+    // ADD/SUB/INC/DEC or base-only LEA before treating it as constant.
+    #[local] relation direct_pointer_exact_step(Address, Mreg, i64);
+    direct_pointer_exact_step(*step, dst, delta) <--
+        instruction(step, _, _, mnemonic, raw_imm, raw_dst, _, _, _, _),
+        if *mnemonic == "ADD" || *mnemonic == "SUB",
+        op_immediate(raw_imm, immediate, _),
+        op_register(raw_dst, dst_name),
+        let dst = Mreg::x86(*dst_name),
+        if let Some(width) = x86_gpr_view_width(dst_name),
+        abi_pointer_size(pointer_width),
+        if width == *pointer_width,
+        if let Some(delta) = if *mnemonic == "ADD" { Some(*immediate) } else { immediate.checked_neg() },
+        if delta != 0;
+
+    direct_pointer_exact_step(*step, dst, delta) <--
+        instruction(step, _, _, mnemonic, raw_dst, _, _, _, _, _),
+        if *mnemonic == "INC" || *mnemonic == "DEC",
+        op_register(raw_dst, dst_name),
+        let dst = Mreg::x86(*dst_name),
+        if let Some(width) = x86_gpr_view_width(dst_name),
+        abi_pointer_size(pointer_width),
+        if width == *pointer_width,
+        let delta = if *mnemonic == "INC" { 1 } else { -1 };
+
+    direct_pointer_exact_step(*step, dst, *displacement) <--
+        plea(step, raw_dst, memory),
+        op_register(raw_dst, dst_name),
+        let dst = Mreg::x86(*dst_name),
+        if let Some(width) = x86_gpr_view_width(dst_name),
+        abi_pointer_size(pointer_width),
+        if width == *pointer_width,
+        op_indirect(memory, _, base_name, index_name, _, displacement, _),
+        if Mreg::x86(*base_name) == dst,
+        if *index_name == "NONE" || index_name.is_empty(),
+        if *displacement != 0;
+
+    // The induction step is a decoder-visible effective definition performing
+    // a unary, in-place, constant byte adjustment inside the natural loop. A
+    // two-register add is intentionally excluded until a separate
+    // loop-invariance proof exists for its second operand.
     #[local] relation direct_pointer_loop_step(Address, Node, Node, Mreg, i64);
     direct_pointer_loop_step(*func, *header, *step, *dst, delta) <--
         block_natural_loop_headers(func, step_block, headers),
         for header in headers.0.iter(),
         code_in_block(step, step_block),
         ltl_inst(step, ?LTLInst::Lop(op, args, dst)),
+        asm_effective_def(step, dst),
         if args.len() == 1 && args[0] == *dst,
         abi_pointer_size(pointer_size),
-        if let Some(delta) = direct_pointer_step_delta(op, *pointer_size);
+        if let Some(delta) = direct_pointer_step_delta(op, *pointer_size),
+        direct_pointer_exact_step(step, dst, delta);
 
     // Prove an access occurs after this iteration's step. Same-block order is
     // the exact last-definition chain; cross-block order is strict dominance.
@@ -8640,9 +8760,7 @@ ascent_par! {
     // pointer without either the use or its derived value entering the closed
     // graph. Treat every such use as veto-only; unlike surviving semantic
     // memory facts, a canary/VLA-trimmed instruction is not independently safe
-    // to reinterpret. The exact recognized induction step is exempted in the
-    // candidate-keyed rules below because its source is the legitimate
-    // loop-carried recurrence.
+    // to reinterpret.
     #[local] relation direct_pointer_trimmed_reg_use(Address, Mreg);
     direct_pointer_trimmed_reg_use(addr, reg) <--
         trim_instruction(addr),
@@ -8743,8 +8861,7 @@ ascent_par! {
 
     direct_pointer_carried_def(*func, *header, *step, *induction, *copy, *dst) <--
         direct_pointer_carried_def_precedes_use(func, header, step, induction, _, src, copy),
-        ltl_inst(copy, ?LTLInst::Lop(Operation::Omove, args, dst)),
-        if args.len() == 1 && args[0] == *src,
+        pointer_width_reg_copy(copy, src, dst),
         instr_in_function(copy, func);
 
     // Role-precise supported dereferences through either the induction value
@@ -8954,8 +9071,7 @@ ascent_par! {
 
     direct_pointer_loop_bad_use(*func, *header, *step, *induction) <--
         direct_pointer_carried_def_precedes_use(func, header, step, induction, _, reg, use_node),
-        direct_pointer_trimmed_reg_use(use_node, reg),
-        if *use_node != *step || *reg != *induction;
+        direct_pointer_trimmed_reg_use(use_node, reg);
 
     direct_pointer_loop_bad_use(*func, *header, *step, *induction) <--
         direct_pointer_carried_def(func, header, step, induction, def, reg),
@@ -9137,6 +9253,8 @@ ascent_par! {
     // byte coordinates inside one proven frame object; they never stand in for
     // CFG reachability. Direction must agree with the induction delta and the
     // finite extent is bounded defensively before it can become a C object.
+    // Linear's closed-body contract is also mandatory: dominance over an
+    // incomplete CFG can only be MAY evidence and must not allocate storage.
     #[local] relation direct_pointer_walk_region_candidate(Address, i64, i64);
     direct_pointer_walk_region_candidate(*func, low, high) <--
         direct_pointer_loop_endpoint(func, header, latch, step, induction, _, end),
@@ -9144,6 +9262,10 @@ ascent_par! {
         direct_pointer_loop_entry(func, header, step, induction, start),
         !direct_pointer_loop_other_step_def(func, header, step, induction),
         !direct_pointer_loop_bad_use(func, header, step, induction),
+        function_has_ltl_body(func),
+        !function_has_uncovered_block(func),
+        !function_unknown_terminal(func, _),
+        !function_unresolved_control(func, _),
         direct_pointer_local_frame_size(func, frame_size),
         if let Some((low, high)) = direct_pointer_walk_bounds(*start, *end, *delta),
         if direct_pointer_interval_within_local_frame(low, high, *frame_size);
@@ -13106,7 +13228,8 @@ mod tests {
         fresh_simd_dword_lane_reg, fresh_simd_dword_operand_reg, fresh_stack_param_reg,
         fresh_stack_slot_reg, fresh_xmm_hi_value_reg, fresh_xtl_reg, indexed_store_ends_at_extent,
         simd_broadcast_lane_node, simd_dword_event_stage_node, simd_dword_reg_event,
-        xmm_hi_lane_node, xmm_hi_store_node, RTLPassProgram, StackAddrOrigin, FRESH_NS_SP_BASE,
+        xmm_hi_lane_node, xmm_hi_store_node, FrameWriteOrigin, RTLPassProgram, StackAddrOrigin,
+        FRESH_NS_SP_BASE,
     };
     use crate::aarch64::mach::A64Mreg;
     use crate::mreg::Mreg;
@@ -13133,6 +13256,22 @@ mod tests {
 
     fn address_set(values: &[u64]) -> Set<u64> {
         Set(values.iter().copied().collect())
+    }
+
+    fn seed_pointer_width_copy(
+        prog: &mut RTLPassProgram,
+        node: u64,
+        src_name: &'static str,
+        dst_name: &'static str,
+    ) {
+        let src_sym: &'static str =
+            Box::leak(format!("pointer_copy_src_{node:x}").into_boxed_str());
+        let dst_sym: &'static str =
+            Box::leak(format!("pointer_copy_dst_{node:x}").into_boxed_str());
+        prog.instruction
+            .push((node, 3, "", "MOV", src_sym, dst_sym, "", "", 0, 0));
+        prog.op_register
+            .extend([(src_sym, src_name), (dst_sym, dst_name)]);
     }
 
     #[derive(Clone, Copy)]
@@ -13178,11 +13317,35 @@ mod tests {
         prog: &mut RTLPassProgram,
         start: i64,
         end: i64,
-        _delta: i64,
+        delta: i64,
         frame_size: u64,
         step_operation: Operation,
         access_inst: Option<LTLInst>,
         access_after_step: bool,
+    ) -> DirectPointerFixture {
+        seed_direct_pointer_fixture_with_raw_step(
+            prog,
+            start,
+            end,
+            delta,
+            frame_size,
+            step_operation,
+            access_inst,
+            access_after_step,
+            "ADD",
+        )
+    }
+
+    fn seed_direct_pointer_fixture_with_raw_step(
+        prog: &mut RTLPassProgram,
+        start: i64,
+        end: i64,
+        delta: i64,
+        frame_size: u64,
+        step_operation: Operation,
+        access_inst: Option<LTLInst>,
+        access_after_step: bool,
+        raw_step_mnemonic: &'static str,
     ) -> DirectPointerFixture {
         // Deliberately unrelated numeric order: every ordering/reachability
         // fact below is structural.
@@ -13253,6 +13416,26 @@ mod tests {
             .extend([(fixture.latch, header), (fixture.latch, fixture.exit)]);
         prog.ddisasm_cfg_edge.push((physical_jcc, header, "branch"));
         prog.abi_pointer_size.push((8,));
+        prog.exact_frame_stack_lea.extend([
+            (fixture.func, fixture.base_def, start),
+            (fixture.func, fixture.endpoint_def, end),
+        ]);
+        prog.instruction.push((
+            fixture.step,
+            4,
+            "",
+            raw_step_mnemonic,
+            "direct_pointer_step_imm",
+            "direct_pointer_step_dst",
+            "",
+            "",
+            0,
+            0,
+        ));
+        prog.op_immediate
+            .push(("direct_pointer_step_imm", delta, 8));
+        prog.op_register.push(("direct_pointer_step_dst", "RAX"));
+        prog.function_has_ltl_body.push((fixture.func,));
         prog.func_stacksz.push((
             fixture.func,
             fixture.exit,
@@ -13430,6 +13613,34 @@ mod tests {
             assert!(narrow_step.stack_pointer_walk_region.is_empty());
             drop(narrow_step);
 
+            // Superset lifting represents carry-dependent ADC/SBB fallbacks
+            // as an Oaddlimm candidate too. Their raw mnemonic is therefore a
+            // mandatory part of the fixed-step proof.
+            for mnemonic in ["ADC", "SBB"] {
+                let mut carry_step = RTLPassProgram::default();
+                seed_direct_pointer_fixture_with_raw_step(
+                    &mut carry_step,
+                    0,
+                    32,
+                    1,
+                    40,
+                    Operation::Oaddlimm(1),
+                    Some(LTLInst::Lstore(
+                        MemoryChunk::MInt8Unsigned,
+                        Addressing::Aindexed(-1),
+                        Arc::new(vec![Mreg::AX]),
+                        Mreg::SI,
+                    )),
+                    true,
+                    mnemonic,
+                );
+                carry_step.run();
+                assert!(
+                    carry_step.stack_pointer_walk_region.is_empty(),
+                    "{mnemonic} must not become a constant pointer recurrence"
+                );
+            }
+
             let mut reverse = RTLPassProgram::default();
             let fixture = seed_direct_pointer_fixture(&mut reverse, 32, 0, -1, 0, 40);
             reverse.run();
@@ -13520,6 +13731,32 @@ mod tests {
                 .iter()
                 .any(|(_, node, _, _)| *node == fixture.base_def));
             assert!(incoming.stack_pointer_walk_region.is_empty());
+        });
+    }
+
+    #[test]
+    fn direct_pointer_walk_requires_a_closed_linear_body() {
+        on_large_stack(|| {
+            for incomplete_kind in 0..3 {
+                let mut prog = RTLPassProgram::default();
+                let fixture = seed_direct_pointer_fixture(&mut prog, 0, 32, 1, -1, 40);
+                match incomplete_kind {
+                    0 => prog.function_has_uncovered_block.push((fixture.func,)),
+                    1 => prog
+                        .function_unknown_terminal
+                        .push((fixture.func, fixture.exit)),
+                    2 => prog
+                        .function_unresolved_control
+                        .push((fixture.func, fixture.latch)),
+                    _ => unreachable!(),
+                }
+
+                prog.run();
+                assert!(
+                    prog.stack_pointer_walk_region.is_empty(),
+                    "incomplete Linear body kind {incomplete_kind} must veto an otherwise valid walk"
+                );
+            }
         });
     }
 
@@ -13630,6 +13867,8 @@ mod tests {
                 (first_copy, Mreg::R15, second_copy),
                 (second_copy, Mreg::AX, fixture.step),
             ]);
+            seed_pointer_width_copy(&mut ambiguous, first_copy, "RAX", "R15");
+            seed_pointer_width_copy(&mut ambiguous, second_copy, "R15", "RAX");
             ambiguous.run();
             assert!(ambiguous.stack_pointer_walk_region.is_empty());
         });
@@ -13727,6 +13966,7 @@ mod tests {
                 (copy, fixture.step, Mreg::AX),
                 (fixture.access, copy, Mreg::R8),
             ]);
+            seed_pointer_width_copy(&mut copied, copy, "RAX", "R8");
             copied.run();
             assert!(copied
                 .stack_pointer_walk_region
@@ -13888,6 +14128,8 @@ mod tests {
                 (copy2, copy1, Mreg::R8),
                 (hidden_load, copy2, Mreg::R9),
             ]);
+            seed_pointer_width_copy(&mut derived, copy1, "RAX", "R8");
+            seed_pointer_width_copy(&mut derived, copy2, "R8", "R9");
             derived.run();
             assert!(derived.stack_pointer_walk_region.is_empty());
             drop(derived);
@@ -14013,6 +14255,7 @@ mod tests {
                         escaped.block_last_def.push((copy, fixture.step, Mreg::AX));
                         escaped.def_reaches_call.push((observer, copy, Mreg::DI));
                         escaped.abi_int_arg_position.push((Mreg::DI, 0));
+                        seed_pointer_width_copy(&mut escaped, copy, "RAX", "RDI");
                     }
                     _ => {
                         // Raw PUSH is an implicit value observer and therefore
@@ -14741,6 +14984,10 @@ mod tests {
                 copy,
                 LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::R15]), Mreg::DI),
             ));
+            prog.exact_frame_stack_lea.push((func, lea, 16));
+            prog.function_has_ltl_body.push((func,));
+            seed_pointer_width_copy(&mut prog, redefine, "RAX", "R15");
+            seed_pointer_width_copy(&mut prog, copy, "R15", "RDI");
 
             prog.run();
 
@@ -14793,6 +15040,7 @@ mod tests {
             ];
 
             prog.abi_pointer_size.push((8,));
+            prog.function_has_ltl_body.push((caller,));
             prog.abi_int_arg_position.push((Mreg::DI, 0));
             for (lea, call, callee, store, ofs, chunk) in cases {
                 let param = fresh_xtl_reg(callee, Mreg::DI);
@@ -14807,6 +15055,7 @@ mod tests {
                         Mreg::DI,
                     ),
                 ));
+                prog.exact_frame_stack_lea.push((caller, lea, ofs));
                 prog.arg_setup_candidate.push((lea, Mreg::DI, call));
                 prog.call_target_func.push((call, callee));
                 prog.func_param_validated.push((callee, Mreg::DI));
@@ -14870,6 +15119,7 @@ mod tests {
 
             let mut good = RTLPassProgram::default();
             good.abi_pointer_size.push((4,));
+            good.function_has_ltl_body.push((func32,));
             good.instr_in_function.push((good32, func32));
             good.ltl_inst.push((
                 good32,
@@ -14880,6 +15130,7 @@ mod tests {
                 ),
             ));
             good.arg_setup_candidate.push((good32, Mreg::DI, call32));
+            good.exact_frame_stack_lea.push((func32, good32, 24));
             good.run();
 
             assert!(good
@@ -14905,6 +15156,7 @@ mod tests {
 
             let mut bad = RTLPassProgram::default();
             bad.abi_pointer_size.push((8,));
+            bad.function_has_ltl_body.push((func64,));
             for node in [
                 wrong_width,
                 alternate_width,
@@ -15037,6 +15289,13 @@ mod tests {
                 .push(("incoming_src", "", "RBP", "NONE", 1, 16, 8));
             bad.reg_def_used
                 .push((incoming32, Mreg::AX, incoming32_load));
+            bad.exact_frame_stack_lea.extend([
+                (func64, wrong_width, 40),
+                (func64, alternate_width, 64),
+                (func64, narrow_width, 72),
+                (func64, incoming, 16),
+                (func64, incoming32, 24),
+            ]);
             bad.run();
 
             assert!(bad
@@ -15155,6 +15414,7 @@ mod tests {
             let mut prog = RTLPassProgram::default();
 
             prog.abi_pointer_size.push((8,));
+            prog.function_has_ltl_body.push((func,));
             prog.block_in_function.push((block, func));
             for node in [frame_setup, lea64, lea32] {
                 prog.code_in_block.push((node, block));
@@ -15170,6 +15430,7 @@ mod tests {
                 prog.op_register.push((dst_sym, dst_name));
                 prog.op_indirect
                     .push((src_sym, "", "RBP", "NONE", 1, ofs, 8));
+                prog.exact_frame_stack_lea.push((func, node, ofs));
             }
 
             prog.run();
@@ -15247,6 +15508,9 @@ mod tests {
                 copy,
                 LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::R15]), Mreg::DI),
             ));
+            prog.exact_frame_stack_lea.push((func, lea, 16));
+            prog.function_has_ltl_body.push((func,));
+            seed_pointer_width_copy(&mut prog, copy, "R15", "RDI");
 
             prog.run();
 
@@ -15258,6 +15522,184 @@ mod tests {
                 .reg_holds_slot_addr
                 .iter()
                 .any(|fact| fact == &(func, copy, 16, Mreg::DI)));
+        });
+    }
+
+    #[test]
+    fn stack_address_provenance_rejects_truncating_register_copies() {
+        on_large_stack(|| {
+            let [func, block, lea, copy] = synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+            prog.abi_pointer_size.push((8,));
+            for node in [lea, copy] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, block));
+            }
+            prog.next.push((lea, copy));
+            prog.reg_def.extend([(lea, Mreg::R15), (copy, Mreg::DI)]);
+            prog.reg_use.push((copy, Mreg::R15));
+            prog.ltl_inst.extend([
+                (
+                    lea,
+                    LTLInst::Lop(
+                        Operation::Oleal(Addressing::Ainstack(16)),
+                        Arc::new(vec![]),
+                        Mreg::R15,
+                    ),
+                ),
+                (
+                    copy,
+                    LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::R15]), Mreg::DI),
+                ),
+            ]);
+            prog.exact_frame_stack_lea.push((func, lea, 16));
+            prog.function_has_ltl_body.push((func,));
+            prog.instruction.push((
+                copy,
+                3,
+                "",
+                "MOV",
+                "truncating_copy_src",
+                "truncating_copy_dst",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.op_register.extend([
+                ("truncating_copy_src", "R15D"),
+                ("truncating_copy_dst", "EDI"),
+            ]);
+
+            prog.run();
+
+            assert!(!prog
+                .pointer_width_reg_copy
+                .iter()
+                .any(|fact| { fact == &(copy, Mreg::R15, Mreg::DI) }));
+            assert!(prog
+                .reg_stack_addr_origin_member
+                .iter()
+                .any(|fact| { fact == &(func, copy, Mreg::DI, StackAddrOrigin::NonStack) }));
+            assert!(!prog
+                .reg_holds_slot_addr
+                .iter()
+                .any(|fact| fact == &(func, copy, 16, Mreg::DI)));
+        });
+    }
+
+    #[test]
+    fn stack_address_provenance_rejects_partial_or_truncating_spill_state() {
+        on_large_stack(|| {
+            for partial_overlap in [false, true] {
+                let [func, lea, spill, overwrite, reload] = synthetic_ids();
+                let mut prog = RTLPassProgram::default();
+                let object_ofs = 32;
+                let spill_ofs = 8;
+                prog.abi_pointer_size.push((8,));
+                prog.function_has_ltl_body.push((func,));
+                for node in [lea, spill, overwrite, reload] {
+                    prog.instr_in_function.push((node, func));
+                }
+                prog.ltl_inst.push((
+                    lea,
+                    LTLInst::Lop(
+                        Operation::Oleal(Addressing::Ainstack(object_ofs)),
+                        Arc::new(vec![]),
+                        Mreg::AX,
+                    ),
+                ));
+                prog.exact_frame_stack_lea.push((func, lea, object_ofs));
+                prog.reg_def_used.push((lea, Mreg::AX, spill));
+
+                if partial_overlap {
+                    prog.ltl_inst.push((
+                        spill,
+                        LTLInst::Lsetstack(Mreg::AX, Slot::Local, spill_ofs, Typ::Tany64),
+                    ));
+                    prog.ltl_inst.push((
+                        overwrite,
+                        LTLInst::Lsetstack(Mreg::CX, Slot::Local, spill_ofs + 1, Typ::Tint),
+                    ));
+                    prog.ltl_inst.push((
+                        reload,
+                        LTLInst::Lgetstack(Slot::Local, spill_ofs, Typ::Tany64, Mreg::DI),
+                    ));
+                    prog.settled_frame_write_state.push((
+                        func,
+                        reload,
+                        Set(std::collections::BTreeSet::from([
+                            FrameWriteOrigin::Write(spill, spill_ofs, 8),
+                            FrameWriteOrigin::Write(overwrite, spill_ofs + 1, 1),
+                        ])),
+                    ));
+                } else {
+                    prog.ltl_inst.push((
+                        spill,
+                        LTLInst::Lsetstack(Mreg::AX, Slot::Local, spill_ofs, Typ::Tint),
+                    ));
+                    prog.ltl_inst.push((
+                        reload,
+                        LTLInst::Lgetstack(Slot::Local, spill_ofs, Typ::Tint, Mreg::DI),
+                    ));
+                    prog.settled_frame_write_state.push((
+                        func,
+                        reload,
+                        Set::singleton(FrameWriteOrigin::Write(spill, spill_ofs, 4)),
+                    ));
+                }
+                prog.frame_stack_read_bytes
+                    .push((func, reload, spill_ofs, 8));
+
+                prog.run();
+
+                if partial_overlap {
+                    assert!(prog
+                        .stack_addr_reload_state_conflict
+                        .iter()
+                        .any(|fact| fact == &(func, reload, Mreg::DI)));
+                } else {
+                    assert!(prog.stack_addr_reload_edge.is_empty());
+                }
+                assert!(!prog
+                    .reg_holds_slot_addr
+                    .iter()
+                    .any(|fact| fact == &(func, reload, object_ofs, Mreg::DI)));
+            }
+        });
+    }
+
+    #[test]
+    fn unknown_sp_shift_keeps_pointer_semantics_without_local_slot_authority() {
+        on_large_stack(|| {
+            let [func, lea] = synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+            prog.abi_pointer_size.push((8,));
+            prog.instr_in_function.push((lea, func));
+            prog.reg_def.push((lea, Mreg::AX));
+            prog.ltl_inst.push((
+                lea,
+                LTLInst::Lop(
+                    Operation::Oleal(Addressing::Ainstack(16)),
+                    Arc::new(vec![]),
+                    Mreg::AX,
+                ),
+            ));
+
+            prog.run();
+
+            assert!(prog
+                .exact_stack_addr_ptr_result
+                .iter()
+                .any(|(node, _)| *node == lea));
+            assert!(!prog
+                .exact_local_stack_addr_lea_def
+                .iter()
+                .any(|(_, node, _, _, _)| *node == lea));
+            assert!(!prog
+                .reg_holds_slot_addr
+                .iter()
+                .any(|(_, node, _, _)| *node == lea));
         });
     }
 
@@ -15277,6 +15719,8 @@ mod tests {
                     Mreg::AX,
                 ),
             ));
+            prog.exact_frame_stack_lea.push((func, lea, 16));
+            prog.function_has_ltl_body.push((func,));
 
             prog.run();
 
@@ -15326,6 +15770,15 @@ mod tests {
             prog.reg_def_used.push((lea, Mreg::AX, spill));
             prog.stack_def_used
                 .push((spill, "RSP", spill_ofs, reload, "RSP", spill_ofs));
+            prog.exact_frame_stack_lea.push((func, lea, object_ofs));
+            prog.function_has_ltl_body.push((func,));
+            prog.frame_stack_read_bytes
+                .push((func, reload, spill_ofs, 8));
+            prog.settled_frame_write_state.push((
+                func,
+                reload,
+                Set::singleton(FrameWriteOrigin::Write(spill, spill_ofs, 8)),
+            ));
             prog.arg_setup_candidate.push((reload, Mreg::DI, call));
 
             prog.run();
@@ -15342,6 +15795,75 @@ mod tests {
                 .slot_addr_escaped
                 .iter()
                 .any(|fact| fact == &(func, lea, object_ofs)));
+        });
+    }
+
+    #[test]
+    fn stack_reload_requires_closed_body_and_matching_settled_coordinate() {
+        on_large_stack(|| {
+            for veto in 0..5 {
+                let [func, lea, spill, reload] = synthetic_ids();
+                let mut prog = RTLPassProgram::default();
+                let object_ofs = 64_i64;
+                let spill_ofs = 16_i64;
+                prog.abi_pointer_size.push((8,));
+                if veto != 0 {
+                    prog.function_has_ltl_body.push((func,));
+                }
+                match veto {
+                    1 => prog.function_has_uncovered_block.push((func,)),
+                    2 => prog.function_unknown_terminal.push((func, reload)),
+                    3 => prog.function_unresolved_control.push((func, reload)),
+                    _ => {}
+                }
+                for node in [lea, spill, reload] {
+                    prog.instr_in_function.push((node, func));
+                }
+                prog.reg_def.extend([(lea, Mreg::AX), (reload, Mreg::DI)]);
+                prog.reg_def_used.push((lea, Mreg::AX, spill));
+                prog.ltl_inst.extend([
+                    (
+                        lea,
+                        LTLInst::Lop(
+                            Operation::Oleal(Addressing::Ainstack(object_ofs)),
+                            Arc::new(vec![]),
+                            Mreg::AX,
+                        ),
+                    ),
+                    (
+                        spill,
+                        LTLInst::Lsetstack(Mreg::AX, Slot::Local, spill_ofs, Typ::Tany64),
+                    ),
+                    (
+                        reload,
+                        LTLInst::Lgetstack(Slot::Local, spill_ofs, Typ::Tany64, Mreg::DI),
+                    ),
+                ]);
+                prog.exact_frame_stack_lea.push((func, lea, object_ofs));
+                let normalized_read = if veto == 4 { spill_ofs + 8 } else { spill_ofs };
+                prog.frame_stack_read_bytes
+                    .push((func, reload, normalized_read, 8));
+                prog.settled_frame_write_state.push((
+                    func,
+                    reload,
+                    Set::singleton(FrameWriteOrigin::Write(spill, spill_ofs, 8)),
+                ));
+
+                prog.run();
+
+                assert_eq!(
+                    prog.exact_local_stack_addr_lea_def
+                        .iter()
+                        .any(|(_, node, _, _, _)| *node == lea),
+                    veto == 4,
+                    "exact LEA body gate, veto {veto}"
+                );
+                assert!(prog.stack_addr_reload_edge.is_empty(), "veto {veto}");
+                assert!(!prog
+                    .reg_holds_slot_addr
+                    .iter()
+                    .any(|fact| fact == &(func, reload, object_ofs, Mreg::DI)));
+            }
         });
     }
 
@@ -15391,6 +15913,10 @@ mod tests {
                 copy,
                 LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::R15]), Mreg::DI),
             ));
+            prog.exact_frame_stack_lea.push((func, lea, 16));
+            prog.function_has_ltl_body.push((func,));
+            seed_pointer_width_copy(&mut prog, overwrite, "RAX", "R15");
+            seed_pointer_width_copy(&mut prog, copy, "R15", "RDI");
 
             prog.run();
 
@@ -15448,6 +15974,9 @@ mod tests {
                 copy,
                 LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::R15]), Mreg::DI),
             ));
+            prog.exact_frame_stack_lea.push((func, lea, 16));
+            prog.function_has_ltl_body.push((func,));
+            seed_pointer_width_copy(&mut prog, copy, "R15", "RDI");
 
             prog.run();
 
@@ -15529,6 +16058,16 @@ mod tests {
                 ]);
                 prog.stack_def_used
                     .push((spill, "RSP", spill_ofs, reload, "RSP", spill_ofs));
+                prog.exact_frame_stack_lea.push((func, lea, object_ofs));
+                prog.function_has_ltl_body.push((func,));
+                prog.frame_stack_read_bytes
+                    .push((func, reload, spill_ofs, 8));
+                prog.settled_frame_write_state.push((
+                    func,
+                    reload,
+                    Set::singleton(FrameWriteOrigin::Write(spill, spill_ofs, 8)),
+                ));
+                seed_pointer_width_copy(&mut prog, copy, "R15", "RDI");
 
                 if trimmed_arm {
                     prog.instr_in_function.push((unknown_def, func));
@@ -15612,6 +16151,9 @@ mod tests {
             prog.abi_int_arg_position.push((Mreg::SI, 1));
             prog.known_func_param_pointee_size
                 .push(("fixed_writer", 1, 8));
+            prog.exact_frame_stack_lea.push((func, lea, base_ofs));
+            prog.function_has_ltl_body.push((func,));
+            seed_pointer_width_copy(&mut prog, copy, "R15", "RSI");
 
             prog.run();
 
@@ -15721,9 +16263,46 @@ mod tests {
             prog.rtl_next.extend([(latch, header), (latch, exit)]);
             prog.ddisasm_cfg_edge.push((physical_jcc, header, "branch"));
             prog.abi_pointer_size.push((8,));
+            prog.function_has_ltl_body.push((func,));
             prog.func_stacksz.push((func, exit, "pointer_walk", 40));
+            prog.exact_frame_stack_lea.extend([
+                (func, base_def, 0),
+                (func, endpoint_def, 32),
+                (func, fake_base, 64),
+            ]);
             prog.block_last_def
                 .extend([(access, step, Mreg::AX), (latch, step, Mreg::AX)]);
+
+            prog.instruction.extend([
+                (
+                    step,
+                    4,
+                    "",
+                    "ADD",
+                    "manual_step_imm",
+                    "manual_step_dst",
+                    "",
+                    "",
+                    0,
+                    0,
+                ),
+                (
+                    fake_step,
+                    4,
+                    "",
+                    "ADD",
+                    "manual_fake_step_imm",
+                    "manual_fake_step_dst",
+                    "",
+                    "",
+                    0,
+                    0,
+                ),
+            ]);
+            prog.op_immediate
+                .extend([("manual_step_imm", 1, 8), ("manual_fake_step_imm", 1, 8)]);
+            prog.op_register
+                .extend([("manual_step_dst", "RAX"), ("manual_fake_step_dst", "R8")]);
 
             prog.ltl_inst.push((
                 base_def,
@@ -15907,9 +16486,26 @@ mod tests {
             ]);
             prog.rtl_next.extend([(latch, header), (latch, exit)]);
             prog.abi_pointer_size.push((8,));
+            prog.function_has_ltl_body.push((func,));
             prog.func_stacksz.push((func, exit, "ambiguous_walk", 40));
+            prog.exact_frame_stack_lea
+                .extend([(func, base_def, 0), (func, endpoint_def, 32)]);
             prog.block_last_def
                 .extend([(access, step, Mreg::AX), (latch, step, Mreg::AX)]);
+            prog.instruction.push((
+                step,
+                4,
+                "",
+                "ADD",
+                "ambiguous_step_imm",
+                "ambiguous_step_dst",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.op_immediate.push(("ambiguous_step_imm", 1, 8));
+            prog.op_register.push(("ambiguous_step_dst", "RAX"));
 
             prog.ltl_inst.extend([
                 (

@@ -490,7 +490,6 @@ ascent_par! {
     relation stack_def(Address, Symbol, i64);
     relation stack_use(Address, Symbol, i64);
     relation stack_def_used(Address, Symbol, i64, Address, Symbol, i64);
-
     relation flags_and_jump_pair(Address, Address, &'static str);
 
     // The compare/test node whose flags a SETcc materializes.  The boolean

@@ -1700,7 +1700,12 @@ mod tests {
                 ),
             ),
         );
-        db.rel_push("op_produces_ptr", (lea_node, address_reg));
+        // The exact stack LEA initially names a raw RTL definition; the
+        // post-RTL projection is the hard authority for its settled result.
+        db.rel_push(
+            "canonical_exact_stack_addr_ptr_result",
+            (lea_node, address_reg),
+        );
         db.rel_push(
             "rtl_inst",
             (
@@ -2819,6 +2824,7 @@ impl IRPass for ClightFieldPass {
             "reg_to_struct_id",
             "rtl_inst",
             "op_produces_ptr",
+            "canonical_exact_stack_addr_ptr_result",
             "stack_pointer_walk_region",
             "stack_var",
             "stack_var_chunk",
@@ -6914,10 +6920,14 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
     // Pointer authority is definition-local. A raw Olea/Oleal stack shape
     // cannot establish an address on its own because the operation width may
     // be narrower than the target ABI (notably Olea on LP64).
-    let pointer_defs: BTreeSet<(Node, RTLReg)> = db
+    let mut pointer_defs: BTreeSet<(Node, RTLReg)> = db
         .rel_iter::<(Node, RTLReg)>("op_produces_ptr")
         .copied()
         .collect();
+    pointer_defs.extend(
+        db.rel_iter::<(Node, RTLReg)>("canonical_exact_stack_addr_ptr_result")
+            .copied(),
+    );
 
     // node -> function ownership for every real RTL instruction.  Split
     // fragments can transiently publish more than one owner, so consume only

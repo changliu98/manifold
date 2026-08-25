@@ -535,6 +535,22 @@ mod schedule_tests {
             .iter()
             .find(|pass| pass.name() == "rtl")
             .expect("RTL pass must be registered");
+        let frame_writes = passes
+            .iter()
+            .find(|pass| pass.name() == "frame_write_state")
+            .expect("frame-write state pass must be registered");
+        let frame_coordinates = passes
+            .iter()
+            .find(|pass| pass.name() == "frame_coordinates")
+            .expect("settled frame-coordinate pass must be registered");
+        let stack_ptr_canonical = passes
+            .iter()
+            .find(|pass| pass.name() == "stack_ptr_canonical")
+            .expect("settled stack-pointer projection must be registered");
+        let type_pass = passes
+            .iter()
+            .find(|pass| pass.name() == "type")
+            .expect("type pass must be registered");
         let producers: Vec<_> = passes
             .iter()
             .filter(|pass| pass.outputs().contains(&"settled_block_dom_set"))
@@ -546,6 +562,40 @@ mod schedule_tests {
         assert!(dominators.inputs().contains(&"call_targets_noreturn"));
         assert!(rtl.inputs().contains(&"settled_block_dom_set"));
         assert!(!rtl.outputs().contains(&"settled_block_dom_set"));
+        let coordinate_producers: Vec<_> = passes
+            .iter()
+            .filter(|pass| pass.outputs().contains(&"settled_sp_frame_shift"))
+            .map(|pass| pass.name())
+            .collect();
+        assert_eq!(coordinate_producers, vec!["frame_coordinates"]);
+        assert!(frame_coordinates.inputs().contains(&"stack_delta"));
+        assert!(frame_coordinates
+            .inputs()
+            .contains(&"settled_block_dom_set"));
+        assert!(frame_coordinates
+            .outputs()
+            .contains(&"settled_sp_frame_shift"));
+        assert!(frame_coordinates
+            .outputs()
+            .contains(&"settled_sp_entry_offset"));
+        assert!(frame_writes.inputs().contains(&"decoded_stack_write_bytes"));
+        assert!(frame_writes.inputs().contains(&"settled_sp_frame_shift"));
+        assert!(frame_writes.inputs().contains(&"call_targets_noreturn"));
+        assert!(frame_writes.inputs().contains(&"settled_block_dom_set"));
+        assert!(frame_writes
+            .outputs()
+            .contains(&"settled_frame_write_state"));
+        assert!(rtl.inputs().contains(&"settled_frame_write_state"));
+        assert!(stack_ptr_canonical
+            .inputs()
+            .contains(&"exact_stack_addr_ptr_result"));
+        assert!(stack_ptr_canonical.inputs().contains(&"xtl_canonical"));
+        assert!(stack_ptr_canonical
+            .outputs()
+            .contains(&"canonical_exact_stack_addr_ptr_result"));
+        assert!(type_pass
+            .inputs()
+            .contains(&"canonical_exact_stack_addr_ptr_result"));
         assert!(
             stage_of(&schedule, "linear") < stage_of(&schedule, "rtl_dominators"),
             "noreturn call fallthroughs must be removed before dominance settles"
@@ -553,6 +603,30 @@ mod schedule_tests {
         assert!(
             stage_of(&schedule, "rtl_dominators") < stage_of(&schedule, "rtl"),
             "the final dominator summary must be published before RTL"
+        );
+        assert!(
+            stage_of(&schedule, "linear") < stage_of(&schedule, "frame_write_state"),
+            "noreturn call fallthroughs must be removed before frame writes settle"
+        );
+        assert!(
+            stage_of(&schedule, "rtl_dominators") < stage_of(&schedule, "frame_coordinates"),
+            "frame coordinates must consume only final structural dominators"
+        );
+        assert!(
+            stage_of(&schedule, "frame_coordinates") < stage_of(&schedule, "frame_write_state"),
+            "reaching writes must consume only settled exact frame coordinates"
+        );
+        assert!(
+            stage_of(&schedule, "frame_write_state") < stage_of(&schedule, "rtl"),
+            "the final reaching-write summary must be published before RTL"
+        );
+        assert!(
+            stage_of(&schedule, "rtl") < stage_of(&schedule, "stack_ptr_canonical"),
+            "exact pointer authority must wait for RTL alias closure"
+        );
+        assert!(
+            stage_of(&schedule, "stack_ptr_canonical") < stage_of(&schedule, "type"),
+            "hard pointer typing must consume the settled canonical result"
         );
     }
 
