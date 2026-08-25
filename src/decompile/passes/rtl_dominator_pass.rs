@@ -201,13 +201,13 @@ mod tests {
     fn direct_pointer_dominators_exclude_only_proven_noreturn_fallthroughs() {
         let mut db = DecompileDB::default();
         let returning_func: u64 = 0x1000;
-        let returning_entry = 0x9000;
-        let returning_dst = 0x3000;
-        let returning_target = 0x3010;
+        let returning_entry: u64 = 0x9000;
+        let returning_dst: u64 = 0x3000;
+        let returning_target: u64 = 0x3010;
         let noreturn_func: u64 = 0x2000;
-        let noreturn_entry = 0x8000;
-        let noreturn_dst = 0x4000;
-        let noreturn_target = 0x4010;
+        let noreturn_entry: u64 = 0x8000;
+        let noreturn_dst: u64 = 0x4000;
+        let noreturn_target: u64 = 0x4010;
 
         for (func, entry, dst, target) in [
             (
