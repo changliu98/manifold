@@ -2123,6 +2123,106 @@ mod tests {
     }
 
     #[test]
+    fn escaped_region_span_does_not_claim_unowned_stack_initializer() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x2000;
+        let unowned_init: Address = 0x2010;
+        let owned_init: Address = 0x2020;
+        let base_ofs = 16_i64;
+        let base_local: RTLReg = 0x8100;
+
+        // Two exact fields establish a 72-byte backing span.  The scalar at
+        // +50 lies between them, but no machine access through the escaped
+        // pointer established that it is a member of this object.
+        for field_ofs in [0_i64, 64] {
+            db.rel_push(
+                "escaped_stack_region_field",
+                (func, base_ofs, field_ofs, MemoryChunk::MAny64),
+            );
+        }
+        db.rel_push("slot_escaped_canonical", (func, base_ofs, base_local));
+        db.rel_push("pmov", (unowned_init, "unowned_mem", "zero"));
+        db.rel_push("pmov", (owned_init, "owned_mem", "one"));
+        db.rel_push(
+            "op_indirect",
+            ("unowned_mem", "", "RSP", "NONE", 1_i64, 66_i64, 1_usize),
+        );
+        db.rel_push(
+            "op_indirect",
+            ("owned_mem", "", "RSP", "NONE", 1_i64, 80_i64, 8_usize),
+        );
+
+        let func_stack_inits = HashMap::from([(
+            func,
+            vec![
+                (unowned_init, base_ofs + 50, 0_i64, Typ::Tint),
+                (owned_init, base_ofs + 64, 1_i64, Typ::Tany64),
+            ],
+        )]);
+        let mut result = StructConstructionResult {
+            new_stmts: Vec::new(),
+            new_emit_stmts: Vec::new(),
+            rewritten_stmts: HashMap::new(),
+            stack_buffers: Vec::new(),
+        };
+        synthesize_escaped_stack_region_construction(&db, &func_stack_inits, &mut result);
+
+        assert_eq!(result.stack_buffers, vec![(func, base_local as Ident, 72)]);
+        assert_eq!(
+            result
+                .new_stmts
+                .iter()
+                .map(|(node, _)| *node)
+                .collect::<Vec<_>>(),
+            vec![owned_init],
+            "the exact +64 field moves into the buffer; the merely enclosed +50 scalar does not",
+        );
+    }
+
+    #[test]
+    fn escaped_region_conflicting_field_widths_do_not_create_a_buffer_write() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x3000;
+        let init: Address = 0x3010;
+        let base_ofs = 16_i64;
+        let base_local: RTLReg = 0x9100;
+
+        db.rel_push(
+            "escaped_stack_region_field",
+            (func, base_ofs, 0_i64, MemoryChunk::MAny64),
+        );
+        // The same tail address was observed at incompatible byte widths.  C
+        // layout rejects that region; synthesis must not independently invent
+        // a byte buffer and move just one interpretation's write into it.
+        for chunk in [MemoryChunk::MInt8Unsigned, MemoryChunk::MAny64] {
+            db.rel_push(
+                "escaped_stack_region_field",
+                (func, base_ofs, 64_i64, chunk),
+            );
+        }
+        db.rel_push("slot_escaped_canonical", (func, base_ofs, base_local));
+        db.rel_push("pmov", (init, "tail_mem", "one"));
+        db.rel_push(
+            "op_indirect",
+            ("tail_mem", "", "RSP", "NONE", 1_i64, 80_i64, 1_usize),
+        );
+
+        let func_stack_inits =
+            HashMap::from([(func, vec![(init, base_ofs + 64, 1_i64, Typ::Tint)])]);
+        let mut result = StructConstructionResult {
+            new_stmts: Vec::new(),
+            new_emit_stmts: Vec::new(),
+            rewritten_stmts: HashMap::new(),
+            stack_buffers: Vec::new(),
+        };
+        synthesize_escaped_stack_region_construction(&db, &func_stack_inits, &mut result);
+
+        assert!(result.stack_buffers.is_empty());
+        assert!(result.new_stmts.is_empty());
+        assert!(result.new_emit_stmts.is_empty());
+    }
+
+    #[test]
     fn jumptable_target_is_preserved_as_empty_emit_next_anchor() {
         let mut prog = ClightPassProgram::default();
         let func = 0x1000;
@@ -7016,6 +7116,62 @@ fn exact_immediate_stack_init_chunks(db: &DecompileDB) -> HashMap<Address, Memor
         .collect()
 }
 
+/// Exact physical cells owned by each escaped stack region.
+///
+/// Callee-observed fields are the primary authority.  Caller-only observations
+/// fill offsets the callee did not expose, but never compete with a callee's
+/// width at the same offset.  Both initializer synthesis and final C layout
+/// consume this map: using a region's far end as membership would let an
+/// unrelated scalar between two fields become a write into the byte buffer
+/// while its reads still name a separate C local.
+pub(crate) fn escaped_stack_region_owned_fields(
+    db: &DecompileDB,
+) -> BTreeMap<(Address, i64), BTreeMap<i64, BTreeSet<MemoryChunk>>> {
+    use crate::decompile::analysis::struct_recovery_pass::chunk_byte_size;
+
+    let mut regions: BTreeMap<(Address, i64), BTreeMap<i64, BTreeSet<MemoryChunk>>> =
+        BTreeMap::new();
+    for &(func, base_ofs, field_ofs, chunk) in
+        db.rel_iter::<(Address, i64, i64, MemoryChunk)>("escaped_stack_region_field")
+    {
+        if field_ofs < 0 || matches!(chunk, MemoryChunk::Unknown) {
+            continue;
+        }
+        regions
+            .entry((func, base_ofs))
+            .or_default()
+            .entry(field_ofs)
+            .or_default()
+            .insert(chunk);
+    }
+
+    let mut caller_regions: BTreeMap<(Address, i64), BTreeMap<i64, BTreeSet<MemoryChunk>>> =
+        BTreeMap::new();
+    for &(func, base_ofs, field_ofs, chunk) in
+        db.rel_iter::<(Address, i64, i64, MemoryChunk)>("escaped_stack_region_caller_field")
+    {
+        if field_ofs < 0 || matches!(chunk, MemoryChunk::Unknown) {
+            continue;
+        }
+        caller_regions
+            .entry((func, base_ofs))
+            .or_default()
+            .entry(field_ofs)
+            .or_default()
+            .insert(chunk);
+    }
+    for (key, fields) in caller_regions {
+        let owned = regions.entry(key).or_default();
+        for (field_ofs, chunks) in fields {
+            let widths: BTreeSet<_> = chunks.iter().map(chunk_byte_size).collect();
+            if widths.len() == 1 {
+                owned.entry(field_ofs).or_insert(chunks);
+            }
+        }
+    }
+    regions
+}
+
 fn immediate_value_expr(value: i64, chunk: &MemoryChunk) -> ClightExpr {
     if matches!(chunk, MemoryChunk::MInt64 | MemoryChunk::MAny64) {
         ClightExpr::EconstLong(value, default_long_type())
@@ -7091,6 +7247,7 @@ fn synthesize_escaped_stack_region_construction(
     }
 
     let exact_chunks = exact_immediate_stack_init_chunks(db);
+    let owned_fields = escaped_stack_region_owned_fields(db);
 
     let mut base_locals: BTreeMap<(Address, i64), RTLReg> = BTreeMap::new();
     for (func, ofs, local) in db.rel_iter::<(Address, i64, RTLReg)>("slot_escaped_canonical") {
@@ -7125,6 +7282,23 @@ fn synthesize_escaped_stack_region_construction(
 
     for ((func, base_ofs), fields) in regions {
         if fields.len() < 2 || !fields.contains_key(&0) {
+            continue;
+        }
+        let Some(region_owned_fields) = owned_fields.get(&(func, base_ofs)) else {
+            continue;
+        };
+        // Final member layout rejects a field offset observed at two physical
+        // widths.  Initializer synthesis must make the same decision before it
+        // declares or writes a backing buffer, or the two consumers would
+        // recreate the split this shared ownership contract is meant to stop.
+        if region_owned_fields.values().any(|chunks| {
+            chunks
+                .iter()
+                .map(chunk_byte_size)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != 1
+        }) {
             continue;
         }
         let Some(&base_local) = base_locals.get(&(func, base_ofs)) else {
@@ -7183,6 +7357,22 @@ fn synthesize_escaped_stack_region_construction(
                 continue;
             };
             if *ofs < base_ofs || store_end > region_end {
+                continue;
+            }
+            // The span is a size bound, not an ownership proof.  Only a field
+            // observed at this exact offset and physical width belongs to the
+            // backing object.  Otherwise keep the ordinary scalar stack-SSA
+            // candidate, which is also what subsequent reloads consume.
+            let Some(field_ofs) = ofs.checked_sub(base_ofs) else {
+                continue;
+            };
+            let Some(field_chunks) = region_owned_fields.get(&field_ofs) else {
+                continue;
+            };
+            let field_widths: BTreeSet<_> = field_chunks.iter().map(chunk_byte_size).collect();
+            if field_widths.len() != 1
+                || field_widths.iter().next().copied() != Some(width as usize)
+            {
                 continue;
             }
             let stmt = raw_stack_buffer_store(

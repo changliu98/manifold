@@ -1136,59 +1136,11 @@ fn derive_escaped_stack_buffer_layouts(
             .or_insert(extent);
     }
 
-    let mut regions: BTreeMap<(Address, i64), BTreeMap<i64, BTreeSet<MemoryChunk>>> =
-        BTreeMap::new();
-    for &(func, base_ofs, field_ofs, chunk) in
-        db.rel_iter::<(Address, i64, i64, MemoryChunk)>("escaped_stack_region_field")
-    {
-        if field_ofs < 0 || matches!(chunk, MemoryChunk::Unknown) {
-            continue;
-        }
-        regions
-            .entry((func, base_ofs))
-            .or_default()
-            .entry(field_ofs)
-            .or_default()
-            .insert(chunk);
-    }
-    // Caller-observed cells fill in what the callee projection cannot see: an
-    // external callee has no body at all.  Where both saw an offset the
-    // callee's width is authoritative, so contribute only to fresh offsets --
-    // one offset carrying two widths invalidates the whole region.  A cell the
-    // caller itself read at two widths has no single C lvalue, so leave it out.
-    let mut caller_regions: BTreeMap<(Address, i64), BTreeMap<i64, BTreeSet<MemoryChunk>>> =
-        BTreeMap::new();
-    for &(func, base_ofs, field_ofs, chunk) in
-        db.rel_iter::<(Address, i64, i64, MemoryChunk)>("escaped_stack_region_caller_field")
-    {
-        if field_ofs < 0 || matches!(chunk, MemoryChunk::Unknown) {
-            continue;
-        }
-        caller_regions
-            .entry((func, base_ofs))
-            .or_default()
-            .entry(field_ofs)
-            .or_default()
-            .insert(chunk);
-    }
-    for (key, fields) in caller_regions {
-        let target = regions.entry(key).or_default();
-        for (field_ofs, chunks) in fields {
-            if target.contains_key(&field_ofs) {
-                continue;
-            }
-            if chunks
-                .iter()
-                .map(chunk_byte_size)
-                .collect::<BTreeSet<_>>()
-                .len()
-                != 1
-            {
-                continue;
-            }
-            target.insert(field_ofs, chunks);
-        }
-    }
+    // This is the same exact ownership map used when raw stack initializers
+    // are moved into the backing object.  Sharing it prevents a write from
+    // becoming `buffer[offset]` while the corresponding stack web remains an
+    // unrelated scalar local.
+    let regions = crate::decompile::passes::clight_pass::escaped_stack_region_owned_fields(db);
 
     // Diagnostic hook (env-gated, like GA_DUMP/ESC_DUMP in the clight sizer).
     let trace = std::env::var("ESC_DUMP").is_ok();
@@ -8104,6 +8056,52 @@ mod escaped_stack_array_tests {
             Some(&(fields[0].2, 4, MemoryChunk::MInt32))
         );
         assert_eq!(buffers.members.get(&func).map(HashMap::len), Some(6));
+    }
+
+    #[test]
+    fn escaped_buffer_membership_does_not_follow_region_span_alone() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0xb100;
+        let base_ofs = 16_i64;
+        let base: RTLReg = 0x8100;
+        let enclosed_scalar: RTLReg = 0x8200;
+        let exact_tail: RTLReg = 0x8300;
+
+        for (index, (field_ofs, local)) in [(0_i64, base), (64_i64, exact_tail)]
+            .into_iter()
+            .enumerate()
+        {
+            db.rel_push(
+                "escaped_stack_region_field",
+                (func, base_ofs, field_ofs, MemoryChunk::MAny64),
+            );
+            db.rel_push(
+                "stack_var",
+                (func, 0xb200 + index as u64, base_ofs + field_ofs, local),
+            );
+        }
+        db.rel_push("slot_escaped_canonical", (func, base_ofs, base));
+        db.rel_push(
+            "stack_var",
+            (func, 0xb210_u64, base_ofs + 50, enclosed_scalar),
+        );
+
+        let arrays = derive_escaped_stack_array_layouts(&db);
+        assert!(!arrays.arrays.contains_key(&func));
+        let buffers = derive_escaped_stack_buffer_layouts(&db, &arrays);
+
+        assert_eq!(
+            buffers.buffers.get(&func).and_then(|m| m.get(&base)),
+            Some(&72),
+        );
+        assert_eq!(
+            buffers.members.get(&func).and_then(|m| m.get(&exact_tail)),
+            Some(&(base, 64, MemoryChunk::MAny64)),
+        );
+        assert!(buffers
+            .members
+            .get(&func)
+            .is_none_or(|members| !members.contains_key(&enclosed_scalar)));
     }
 
     #[test]
