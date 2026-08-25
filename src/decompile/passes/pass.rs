@@ -578,6 +578,7 @@ mod schedule_tests {
         assert!(frame_coordinates
             .outputs()
             .contains(&"settled_sp_entry_offset"));
+        assert!(rtl.inputs().contains(&"settled_sp_entry_offset"));
         assert!(frame_writes.inputs().contains(&"decoded_stack_write_bytes"));
         assert!(frame_writes.inputs().contains(&"settled_sp_frame_shift"));
         assert!(frame_writes.inputs().contains(&"call_targets_noreturn"));
@@ -615,6 +616,10 @@ mod schedule_tests {
         assert!(
             stage_of(&schedule, "frame_coordinates") < stage_of(&schedule, "frame_write_state"),
             "reaching writes must consume only settled exact frame coordinates"
+        );
+        assert!(
+            stage_of(&schedule, "frame_coordinates") < stage_of(&schedule, "rtl"),
+            "RTL stack consumers must receive only finalized entry coordinates"
         );
         assert!(
             stage_of(&schedule, "frame_write_state") < stage_of(&schedule, "rtl"),

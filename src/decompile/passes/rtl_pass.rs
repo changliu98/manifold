@@ -16,19 +16,11 @@ use crate::x86::op::{Addressing, Comparison, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
 use ascent::lattice::set::Set;
-use ascent::Dual;
 use either::Either;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 const ENDBR64_LEN: u64 = 4;
-
-fn shift_sp_offsets(offsets: &Set<i64>, delta: i64) -> Set<i64> {
-    Set(offsets
-        .iter()
-        .filter_map(|offset| offset.checked_add(delta))
-        .collect())
-}
 
 // Stack-address provenance is a MUST property. A register at a CFG join can
 // have both a local-slot address and an unrelated value as may-reaching
@@ -396,7 +388,9 @@ ascent_par! {
     pub struct RTLPassProgram;
 
     relation arch_bit(i64);
-    // RSP adjustments from disassembly; drives sp_entry_ofs to anchor raw SP displacements to the function-entry frame (ABI-1/3.2e).
+    // RSP adjustments from disassembly; used to recognize structural prologue
+    // allocation. Exact point-local coordinates come from the dedicated,
+    // finalized frame-coordinate pass below.
     relation adjusts_stack(Address, Symbol, i64);
     relation arg_constrained_as_ptr(Node, RTLReg);
     // RSP<->RBP register moves from disassembly; drives func_sets_frame_pointer for BP-relative stack-param rules.
@@ -406,6 +400,7 @@ ascent_par! {
     // pre-RTL lattice pass has reached its fixpoint.
     relation settled_block_dom_set(Address, Address, Set<Address>);
     relation settled_frame_write_state(Address, Address, Set<FrameWriteOrigin>);
+    relation settled_sp_entry_offset(Address, Address, i64);
     relation emit_clight_stmt(Address, Node, ClightStmt);
     relation emit_goto_target(Address, Node);
     relation emit_loop_body(Address, Node, Node);
@@ -4069,8 +4064,7 @@ ascent_par! {
         if Mreg::x86(*base_str) == Mreg::SP,
         if *idx_str == "NONE" || idx_str.is_empty(),
         instr_in_function(addr, func_start),
-        sp_entry_ofs(func_start, addr, sp_offsets),
-        for sp_ofs in sp_offsets.0.iter(),
+        settled_sp_entry_offset(func_start, addr, sp_ofs),
         let slot = *disp + *sp_ofs;
     scalar_stack_cmp_slot(func_start, addr, slot) <--
         pcmp(addr, _, mem_sym),
@@ -4078,8 +4072,7 @@ ascent_par! {
         if Mreg::x86(*base_str) == Mreg::SP,
         if *idx_str == "NONE" || idx_str.is_empty(),
         instr_in_function(addr, func_start),
-        sp_entry_ofs(func_start, addr, sp_offsets),
-        for sp_ofs in sp_offsets.0.iter(),
+        settled_sp_entry_offset(func_start, addr, sp_ofs),
         let slot = *disp + *sp_ofs;
     scalar_stack_cmp_slot(func_start, addr, *disp) <--
         pcmp(addr, mem_sym, _),
@@ -10007,8 +10000,7 @@ ascent_par! {
         // outgoing-argument phi can feed aliasing without a cycle through the
         // settled canonical lattice.
         !stack_xtl(func, st_addr, *ofs, _),
-        sp_entry_ofs(func, st_addr, sp_offsets),
-        for sp_st in sp_offsets.0.iter(),
+        settled_sp_entry_offset(func, st_addr, sp_st),
         let abs_slot = *ofs + *sp_st,
         reg_xtl(st_addr, *src, src_rtl);
 
@@ -10024,8 +10016,7 @@ ascent_par! {
         if *idx_str == "NONE" || idx_str.is_empty(),
         if *disp == *ofs,
         instr_in_function(st_addr, func),
-        sp_entry_ofs(func, st_addr, sp_offsets),
-        for sp_st in sp_offsets.0.iter(),
+        settled_sp_entry_offset(func, st_addr, sp_st),
         let abs_slot = *disp + *sp_st,
         reg_xtl(st_addr, *src, src_rtl);
 
@@ -10038,8 +10029,7 @@ ascent_par! {
         if Mreg::x86(*base_str) == Mreg::SP,
         if *idx_str == "NONE" || idx_str.is_empty(),
         instr_in_function(st_addr, func),
-        sp_entry_ofs(func, st_addr, sp_offsets),
-        for sp_st in sp_offsets.0.iter(),
+        settled_sp_entry_offset(func, st_addr, sp_st),
         let abs_slot = *disp + *sp_st,
         stack_xtl(func, st_addr, stack_ofs, src_rtl);
 
@@ -10110,8 +10100,7 @@ ascent_par! {
         instr_in_function(call_addr, func),
         og_store_in(func, call_addr, stores),
         for (abs_slot, src_rtl, weak) in stores.0.iter(),
-        sp_entry_ofs(func, call_addr, sp_offsets),
-        for sp_call in sp_offsets.0.iter(),
+        settled_sp_entry_offset(func, call_addr, sp_call),
         let k = *abs_slot - *sp_call,
         abi_outgoing_stack_base(stack_base),
         call_stack_arg_base_position(call_addr, first_pos),
@@ -10236,8 +10225,7 @@ ascent_par! {
         // the PUSH use so the call-position join can canonicalize every arm.
         reg_xtl(push_addr, *mreg, src_rtl),
         instr_in_function(push_addr, func),
-        sp_entry_ofs(func, push_addr, sp_offsets),
-        for sp_push in sp_offsets.0.iter(),
+        settled_sp_entry_offset(func, push_addr, sp_push),
         abi_stack_slot_size(slot_size),
         let abs_slot = *sp_push - *slot_size;
 
@@ -10258,8 +10246,7 @@ ascent_par! {
         push_arg_stack(push_addr, use_ofs),
         instr_in_function(push_addr, func),
         stack_xtl(func, push_addr, *use_ofs, src_rtl),
-        sp_entry_ofs(func, push_addr, sp_offsets),
-        for sp_push in sp_offsets.0.iter(),
+        settled_sp_entry_offset(func, push_addr, sp_push),
         abi_stack_slot_size(slot_size),
         let abs_slot = *sp_push - *slot_size;
 
@@ -10287,8 +10274,7 @@ ascent_par! {
     og_arg_store(*push_addr, abs_slot, fresh_reg, *func) <--
         imm_push_call(push_addr, _imm, _call),
         instr_in_function(push_addr, func),
-        sp_entry_ofs(func, push_addr, sp_offsets),
-        for sp_push in sp_offsets.0.iter(),
+        settled_sp_entry_offset(func, push_addr, sp_push),
         abi_stack_slot_size(slot_size),
         let abs_slot = *sp_push - *slot_size,
         let fresh_reg = fresh_xtl_reg(*push_addr, Mreg::AX);
@@ -11057,77 +11043,12 @@ ascent_par! {
     relation stack_passed_param(Address, i64);
 
     // Incoming stack storage is classified by its ABI coordinate in the
-    // function-entry frame, at every owned instruction.  BP is accepted only
-    // after an explicit RSP->RBP frame setup; SP is rebased through the
-    // point-keyed must-offset lattice below.  Those structural facts do not
-    // expire after an arbitrary number of CFG edges, and caller-frame storage
-    // cannot become a callee local merely because its first use is deep in the
-    // function.
-
-    // ABI-1: exact entry-anchored SP offset at each instruction.  Stack height
-    // is a must property: if structural CFG paths disagree, using either path's
-    // offset can turn a local into a caller argument or map an outgoing argument
-    // to the wrong position.  Dual<Set> intersects predecessor states, retaining
-    // one exact offset when all paths agree and becoming empty (unknown) on a
-    // disagreement or an unbalanced cycle.  Besides being the sound abstract
-    // domain, this avoids the combinatorial path-sum explosion of a may-union
-    // lattice on functions with many conditional stack adjustments.  State is
-    // point-keyed (O(V)), never materialized as pairwise reachability.
-    #[local] lattice sp_entry_ofs(Address, Address, Dual<Set<i64>>);
-
-    #[local] relation sp_offset_intra_step(Address, Address);
-    sp_offset_intra_step(src, dst) <--
-        next(src, dst),
-        code_in_block(src, block),
-        code_in_block(dst, block),
-        !call_targets_noreturn(src);
-
-    #[local] relation sp_offset_inter_step(Address, Address);
-    sp_offset_inter_step(src, dst) <--
-        ddisasm_cfg_edge(src, dst, edge_type),
-        if *edge_type != "call" && *edge_type != "indirect" && *edge_type != "indirect_call",
-        !call_targets_noreturn(src);
-
-    // Drop only structurally proven loop back-edges.  This bounds stack states
-    // for stack-probe loops while preserving both arms and forward join edges.
-    #[local] relation sp_offset_back_edge(Address, Address);
-    sp_offset_back_edge(src, dst) <--
-        sp_offset_inter_step(src, dst),
-        code_in_block(src, src_block),
-        code_in_block(dst, dst_block),
-        instr_in_function(src, func_start),
-        instr_in_function(dst, func_start),
-        settled_block_dom_set(func_start, src_block, doms),
-        if doms.0.contains(dst_block);
-
-    sp_entry_ofs(*func_start, *func_start, Dual(Set::singleton(0))) <--
-        func_span(_, func_start, _);
-
-    sp_entry_ofs(*func_start, *curaddr, Dual(shift_sp_offsets(&prev_offsets.0, *delta))) <--
-        sp_entry_ofs(func_start, prevaddr, prev_offsets),
-        sp_offset_intra_step(prevaddr, curaddr),
-        instr_in_function(curaddr, func_start),
-        adjusts_stack(prevaddr, "RSP", delta);
-
-    sp_entry_ofs(*func_start, *curaddr, Dual(prev_offsets.0.clone())) <--
-        sp_entry_ofs(func_start, prevaddr, prev_offsets),
-        sp_offset_intra_step(prevaddr, curaddr),
-        instr_in_function(curaddr, func_start),
-        !adjusts_stack(prevaddr, "RSP", _);
-
-    sp_entry_ofs(*func_start, *curaddr, Dual(shift_sp_offsets(&prev_offsets.0, *delta))) <--
-        sp_entry_ofs(func_start, prevaddr, prev_offsets),
-        sp_offset_inter_step(prevaddr, curaddr),
-        !sp_offset_back_edge(prevaddr, curaddr),
-        instr_in_function(curaddr, func_start),
-        adjusts_stack(prevaddr, "RSP", delta);
-
-    sp_entry_ofs(*func_start, *curaddr, Dual(prev_offsets.0.clone())) <--
-        sp_entry_ofs(func_start, prevaddr, prev_offsets),
-        sp_offset_inter_step(prevaddr, curaddr),
-        !sp_offset_back_edge(prevaddr, curaddr),
-        instr_in_function(curaddr, func_start),
-        !adjusts_stack(prevaddr, "RSP", _);
+    // function-entry frame, at every owned instruction. BP is accepted only
+    // after an explicit RSP->RBP frame setup. SP is rebased exclusively through
+    // `settled_sp_entry_offset`, which the dedicated point-keyed must lattice
+    // publishes only after reaching its final fixpoint. Consuming that final
+    // relation here prevents transient offsets from becoming permanent RTL
+    // candidates while keeping the state O(V), not pairwise O(V^2).
 
     // BP-based arg detection requires an actual frame pointer: in frameless functions RBP is a callee-saved scratch (often a struct pointer), so a positive-offset BP load is a field deref, not an incoming arg. With a frame pointer, caller args start at BP+16 (BP+0=saved RBP, BP+8=return address).
     #[local] relation func_sets_frame_pointer(Address);
@@ -11148,8 +11069,7 @@ ascent_par! {
         op_indirect(src_sym, _, base_str, idx_str, _, disp, _),
         if (*idx_str == "NONE" || idx_str.is_empty()) && Mreg::x86(*base_str) == Mreg::SP,
         instr_in_function(addr, func_start),
-        sp_entry_ofs(func_start, addr, sp_offsets),
-        for sp_ofs in sp_offsets.0.iter(),
+        settled_sp_entry_offset(func_start, addr, sp_ofs),
         abi_incoming_sp_stack_base(stack_base),
         if *disp + *sp_ofs >= *stack_base,
         !func_sets_frame_pointer(func_start);
@@ -11238,8 +11158,7 @@ ascent_par! {
         if Mreg::x86(*base_str) == Mreg::SP,
         if *index_str == "NONE" || index_str.is_empty(),
         if *raw_disp == *disp,
-        sp_entry_ofs(func_start, addr, sp_offsets),
-        for sp_ofs in sp_offsets.0.iter(),
+        settled_sp_entry_offset(func_start, addr, sp_ofs),
         abi_incoming_sp_stack_base(stack_base),
         abi_stack_slot_size(slot_size),
         if let Some(actual) = raw_disp.checked_add(*sp_ofs),
@@ -11286,12 +11205,12 @@ ascent_par! {
         if *arg == Mreg::BP && *ofs >= *stack_base,
         func_sets_frame_pointer(func_start);
 
-    // SP rules use *ofs + sp_ofs.0 >= 8 (ENTRY-frame anchor); a missing sp_entry_ofs row conservatively yields no param claim.
+    // SP rules use *ofs + sp_ofs >= 8 (ENTRY-frame anchor); a missing settled
+    // coordinate conservatively yields no parameter claim.
     stack_passed_param(func_start, *ofs) <--
         instr_in_function(addr, func_start),
         ltl_inst(addr, ?LTLInst::Lload(_, Addressing::Aindexed(ofs), args, _)),
-        sp_entry_ofs(func_start, addr, sp_offsets),
-        for sp_ofs in sp_offsets.0.iter(),
+        settled_sp_entry_offset(func_start, addr, sp_ofs),
         for arg in args.iter(),
         abi_incoming_sp_stack_base(stack_base),
         if *arg == Mreg::SP && *ofs + *sp_ofs >= *stack_base,
@@ -11301,8 +11220,7 @@ ascent_par! {
     stack_passed_param(func_start, *ofs) <--
         instr_in_function(addr, func_start),
         arith_load_op(addr, _, _, base, ofs, _),
-        sp_entry_ofs(func_start, addr, sp_offsets),
-        for sp_ofs in sp_offsets.0.iter(),
+        settled_sp_entry_offset(func_start, addr, sp_ofs),
         abi_incoming_sp_stack_base(stack_base),
         if *base == Mreg::SP && *ofs + *sp_ofs >= *stack_base,
         !func_sets_frame_pointer(func_start);
@@ -11319,8 +11237,7 @@ ascent_par! {
         instr_in_function(addr, func_start),
         float_arith_stack_op(addr, _, base, disp, _),
         if *base == Mreg::SP,
-        sp_entry_ofs(func_start, addr, sp_offsets),
-        for sp_ofs in sp_offsets.0.iter(),
+        settled_sp_entry_offset(func_start, addr, sp_ofs),
         abi_incoming_sp_stack_base(stack_base),
         if *disp + *sp_ofs >= *stack_base,
         !func_sets_frame_pointer(func_start);
@@ -11336,7 +11253,7 @@ ascent_par! {
     // Sign/zero-extending stack-arg loads bypass Lload, so the capstone operand pins base, width and signedness; restricted to extending mnemonics since plain MOV includes callee-save reloads.
     #[local] relation extending_stack_arg_load(Node, Address, i64, MemoryChunk);
 
-    // SP-relative: disp + sp_entry_ofs >= 8 anchors to the ENTRY frame.  Frame
+    // SP-relative: disp + the settled entry offset anchors to the ENTRY frame. Frame
     // status comes only from the structural RSP->RBP setup; a frameless
     // function is free to use callee-saved RBP as an ordinary object pointer.
     // !stack_var would self-defeat against the asm pass's shadow Olea.
@@ -11348,8 +11265,7 @@ ascent_par! {
         if *disp == *ofs,
         if *idx_str == "NONE" || idx_str.is_empty(),
         if Mreg::x86(*base_str) == Mreg::SP,
-        sp_entry_ofs(func_start, addr, sp_offsets),
-        for sp_ofs in sp_offsets.0.iter(),
+        settled_sp_entry_offset(func_start, addr, sp_ofs),
         abi_incoming_sp_stack_base(stack_base),
         if *disp + *sp_ofs >= *stack_base,
         !func_sets_frame_pointer(func_start),
@@ -11366,8 +11282,7 @@ ascent_par! {
         if *disp == *ofs,
         if *idx_str == "NONE" || idx_str.is_empty(),
         if Mreg::x86(*base_str) == Mreg::SP,
-        sp_entry_ofs(func_start, addr, sp_offsets),
-        for sp_ofs in sp_offsets.0.iter(),
+        settled_sp_entry_offset(func_start, addr, sp_ofs),
         abi_incoming_sp_stack_base(stack_base),
         if *disp + *sp_ofs >= *stack_base,
         !func_sets_frame_pointer(func_start),
@@ -14802,6 +14717,13 @@ mod tests {
             prog.stack_xtl
                 .push((entry, alternate_push, 0, alternate_source_rtl));
             prog.adjusts_stack.push((alternate_push, "RSP", -8));
+            // RTL consumes only the frame pass's finalized entry coordinates.
+            // Both arms push from -32 and join at the call at -40.
+            prog.settled_sp_entry_offset.extend([
+                (entry, push, -32),
+                (entry, alternate_push, -32),
+                (entry, call, -40),
+            ]);
             prog.ltl_inst.push((
                 call,
                 LTLInst::Lcall(Either::Right(Either::Right("__fprintf_chk"))),
@@ -14832,57 +14754,6 @@ mod tests {
                     .iter()
                     .any(|fact| fact == &(source, call_value)));
             }
-        });
-    }
-
-    #[test]
-    fn rtl_stack_state_diamonds_become_unknown_without_path_sum_growth() {
-        on_large_stack(|| {
-            let mut prog = RTLPassProgram::default();
-            let func = 0x9000;
-            let mut predecessor = func;
-            let mut next_node = 0x8000;
-
-            prog.func_span.push(("f", func, 0xa000));
-            prog.instr_in_function.push((func, func));
-
-            // Each arm contributes a distinct optional stack adjustment.  A
-            // may-union state grows to 2^N path sums here even though the CFG is
-            // acyclic.  Exact stack height is a must fact, so the first unequal
-            // merge becomes unknown and later diamonds remain bounded.
-            for level in 0..8 {
-                let left = next_node;
-                let right = next_node - 1;
-                let merge = next_node - 2;
-                next_node -= 3;
-
-                for node in [left, right, merge] {
-                    prog.instr_in_function.push((node, func));
-                }
-                prog.ddisasm_cfg_edge.push((predecessor, left, "branch"));
-                prog.ddisasm_cfg_edge
-                    .push((predecessor, right, "fallthrough"));
-                prog.ddisasm_cfg_edge.push((left, merge, "fallthrough"));
-                prog.ddisasm_cfg_edge.push((right, merge, "fallthrough"));
-                prog.adjusts_stack.push((left, "RSP", -(1_i64 << level)));
-                predecessor = merge;
-            }
-
-            prog.run();
-
-            let final_state = prog
-                .sp_entry_ofs
-                .iter()
-                .find_map(|fact| {
-                    let fact = fact.read().unwrap();
-                    (fact.0 == func && fact.1 == predecessor).then(|| fact.2 .0.clone())
-                })
-                .expect("final diamond must have a stack-state fact");
-            assert!(final_state.is_empty());
-            assert!(prog.sp_entry_ofs.iter().all(|fact| {
-                let fact = fact.read().unwrap();
-                fact.0 != func || fact.2 .0.len() <= 1
-            }));
         });
     }
 
@@ -16681,6 +16552,8 @@ mod tests {
             prog.next.push((push, call));
             prog.next.push((call, successor));
             prog.adjusts_stack.push((push, "RSP", -8));
+            prog.settled_sp_entry_offset
+                .extend([(push, push, 0), (push, call, -8)]);
             prog.code_in_block.push((push, block));
             prog.code_in_block.push((call, block));
             for node in [push, call, successor] {
@@ -16895,6 +16768,7 @@ mod tests {
             prog.instr_in_function.push((taken, func));
             prog.block_in_function.push((func, func));
             prog.block_in_function.push((cmp, func));
+            prog.settled_sp_entry_offset.push((func, cmp, -280));
 
             prog.run();
 
@@ -16966,6 +16840,7 @@ mod tests {
             prog.instr_in_function.push((taken, func));
             prog.block_in_function.push((func, func));
             prog.block_in_function.push((cmp, func));
+            prog.settled_sp_entry_offset.push((func, cmp, -248));
 
             prog.run();
 
@@ -17092,6 +16967,11 @@ mod tests {
                 prog.instr_in_function.push((node, func));
                 prog.code_in_block.push((node, func));
             }
+            prog.settled_sp_entry_offset.extend([
+                (func, load0, -248),
+                (func, load1, -248),
+                (func, load2, -248),
+            ]);
 
             for (addr, ofs, sym, dst) in [
                 (load0, 256, "stack_arg_0", Mreg::AX),
@@ -17661,6 +17541,7 @@ mod tests {
             prog.block_in_function.push((func, func));
             prog.settled_block_dom_set
                 .push((func, func, address_set(&[func])));
+            prog.settled_sp_entry_offset.push((func, cmp, -280));
 
             prog.run();
 
