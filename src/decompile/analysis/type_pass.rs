@@ -26,6 +26,30 @@ fn chunk_xtype(chunk: &MemoryChunk) -> XType {
     }
 }
 
+/// Resolve a direct symbolic memory operand to the exact byte coordinate it
+/// reads.  Aglobal/Abased offsets are byte offsets; keeping the checked signed
+/// addition here avoids treating a wrapped coordinate as relocation evidence.
+fn direct_global_slot(addressing: &Addressing) -> Option<Address> {
+    let (ident, offset) = match addressing {
+        Addressing::Aglobal(ident, offset) | Addressing::Abased(ident, offset) => (*ident, *offset),
+        _ => return None,
+    };
+    Address::try_from(ident).ok()?.checked_add_signed(offset)
+}
+
+fn chunk_is_pointer_sized_integer(chunk: &MemoryChunk, pointer_bytes: i64) -> bool {
+    let Some(pointer_bits) = usize::try_from(pointer_bytes)
+        .ok()
+        .and_then(|bytes| bytes.checked_mul(8))
+    else {
+        return false;
+    };
+    matches!(
+        chunk,
+        MemoryChunk::MInt32 | MemoryChunk::MAny32 | MemoryChunk::MInt64 | MemoryChunk::MAny64
+    ) && usize::from(crate::decompile::passes::rtl_pass::chunk_size_bits(chunk)) == pointer_bits
+}
+
 /// Map an operation to its output register's XType, returning None for unclassified operations.
 fn op_output_xtype(op: &Operation) -> Option<XType> {
     use Operation::*;
@@ -199,6 +223,7 @@ ascent_par! {
     relation func_param_position_type(Address, usize, XType);
     relation emit_function(Address, Symbol, Node);
     relation main_function(Address);
+    relation abi_pointer_size(i64);
     relation abi_int_arg_position(Mreg, usize);
     relation emit_function_return_type_xtype_candidate(Address, XType);
     relation emit_function_return(Address, RTLReg);
@@ -283,11 +308,24 @@ ascent_par! {
         if let Some(xtype) = op_output_xtype(op),
         reg_rtl(node, *dst_mreg, rtl_reg);
 
+    // Expansion instructions have no LTL row.  Their final RTL operation is
+    // nevertheless the same exact width/type authority as a physical Lop.
+    emit_var_type_candidate(*dst, xtype) <--
+        rtl_inst(_, ?RTLInst::Iop(op, _, dst)),
+        if let Some(xtype) = op_output_xtype(op);
+
     // From load chunks, suppressed when the value demonstrably holds a float: an xmm spill/reload uses a generic-width chunk, so tagging it Xint pollutes the float candidate with a truncating sibling.
     emit_var_type_candidate(rtl_reg, chunk_xtype(chunk)) <--
         ltl_inst(node, ?LTLInst::Lload(chunk, _, _, dst_mreg)),
         reg_rtl(node, *dst_mreg, rtl_reg),
         !value_float_type(rtl_reg, _);
+
+    // Synthetic/fused loads are born only in RTL.  Without this rule their
+    // destination has no width candidate and the selector's scalar fallback
+    // can truncate an exact 64-bit value to int.
+    emit_var_type_candidate(*dst, chunk_xtype(chunk)) <--
+        rtl_inst(_, ?RTLInst::Iload(chunk, _, _, dst)),
+        !value_float_type(*dst, _);
 
     // From store chunks, width-preserving only (a sub-word store narrows the cell, not the source); integer chunks are suppressed when the stored value demonstrably holds a float.
     emit_var_type_candidate(rtl_reg, chunk_xtype(chunk)) <--
@@ -299,6 +337,13 @@ ascent_par! {
         if matches!(chunk, MemoryChunk::MInt32 | MemoryChunk::MAny32 | MemoryChunk::MInt64 | MemoryChunk::MAny64),
         reg_rtl(node, *src_mreg, rtl_reg),
         !value_float_type(rtl_reg, _);
+    emit_var_type_candidate(*src, chunk_xtype(chunk)) <--
+        rtl_inst(_, ?RTLInst::Istore(chunk, _, _, src)),
+        if matches!(chunk, MemoryChunk::MFloat32 | MemoryChunk::MFloat64);
+    emit_var_type_candidate(*src, chunk_xtype(chunk)) <--
+        rtl_inst(_, ?RTLInst::Istore(chunk, _, _, src)),
+        if matches!(chunk, MemoryChunk::MInt32 | MemoryChunk::MAny32 | MemoryChunk::MInt64 | MemoryChunk::MAny64),
+        !value_float_type(*src, _);
 
     // Attach each stack-access chunk to the canonical produced by structural
     // stack reaching-definitions. A frame offset is only a storage coordinate:
@@ -348,6 +393,10 @@ ascent_par! {
         if let Some(xtype) = cond_operand_xtype(cond),
         for mreg in args.iter(),
         reg_rtl(node, *mreg, rtl_reg);
+    emit_var_type_candidate(*arg, xtype.clone()) <--
+        rtl_inst(_, ?RTLInst::Iop(Operation::Ocmp(cond), args, _)),
+        if let Some(xtype) = cond_operand_xtype(cond),
+        for arg in args.iter();
 
     // Apply embedded exact types without requiring a second symbol lookup.
     // Unknown-width placeholders remain non-constraints, matching the older
@@ -1053,6 +1102,19 @@ ascent_par! {
     relation emit_global_is_char_ptr(Ident);
     // Ground-truth pointer evidence from ELF relocations: a data slot relocated to a data target is unconditionally a pointer, which the access-based signals miss for never-dereferenced tables.
     relation pointer_in_data(Address, Address);
+    // A direct pointer-sized load from the exact byte coordinate of an ELF
+    // relocation reads a pointer value even when the load was introduced by
+    // an RTL expansion (for example the high lane of a 16-byte SIMD copy).
+    #[local] relation relocated_pointer_value(RTLReg);
+    relocated_pointer_value(*dst) <--
+        rtl_inst(_, ?RTLInst::Iload(chunk, addressing, args, dst)),
+        if args.is_empty(),
+        if let Some(slot) = direct_global_slot(addressing),
+        pointer_in_data(slot, _),
+        abi_pointer_size(pointer_bytes),
+        if chunk_is_pointer_sized_integer(chunk, *pointer_bytes);
+    must_be_ptr(reg) <-- relocated_pointer_value(reg);
+
     #[local] relation global_value_reg(Ident, RTLReg);
     // Integer counter-evidence: the loaded value participates in an integer comparison or non-pointer arithmetic, fed from the same global_value_reg so it weighs against the pointer signals.
     #[local] relation global_used_as_int(Ident);
@@ -1223,6 +1285,99 @@ mod tests {
 
     fn synthetic_ids<const N: usize>() -> [u64; N] {
         std::array::from_fn(|index| index as u64 + 1)
+    }
+
+    #[test]
+    fn synthetic_rtl_instructions_publish_their_exact_value_widths() {
+        let [load_node, const_node, store_node] = synthetic_ids();
+        let [loaded, constant, base] = [101, 102, 103];
+        let mut prog = TypePassProgram::default();
+        prog.rtl_inst.extend([
+            (
+                load_node,
+                RTLInst::Iload(
+                    MemoryChunk::MAny64,
+                    Addressing::Aglobal(0x4000, 0),
+                    Arc::new(vec![]),
+                    loaded,
+                ),
+            ),
+            (
+                const_node,
+                RTLInst::Iop(Operation::Olongconst(7), Arc::new(vec![]), constant),
+            ),
+            (
+                store_node,
+                RTLInst::Istore(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed(0),
+                    Arc::new(vec![base]),
+                    loaded,
+                ),
+            ),
+        ]);
+
+        prog.run();
+
+        assert!(prog
+            .emit_var_type_candidate
+            .iter()
+            .any(|row| *row == (loaded, XType::Xany64)));
+        assert!(prog
+            .emit_var_type_candidate
+            .iter()
+            .any(|row| *row == (constant, XType::Xlong)));
+    }
+
+    #[test]
+    fn exact_relocation_slot_types_only_a_pointer_sized_direct_load() {
+        let [exact_node, adjacent_node, narrow_node] = synthetic_ids();
+        let [exact, adjacent, narrow] = [201, 202, 203];
+        let base = 0x4000_usize;
+        let slot = base as Address + 8;
+        let mut prog = TypePassProgram::default();
+        prog.abi_pointer_size.push((8,));
+        prog.pointer_in_data.push((slot, 0x5000));
+        prog.rtl_inst.extend([
+            (
+                exact_node,
+                RTLInst::Iload(
+                    MemoryChunk::MInt64,
+                    Addressing::Aglobal(base, 8),
+                    Arc::new(vec![]),
+                    exact,
+                ),
+            ),
+            (
+                adjacent_node,
+                RTLInst::Iload(
+                    MemoryChunk::MInt64,
+                    Addressing::Aglobal(base, 0),
+                    Arc::new(vec![]),
+                    adjacent,
+                ),
+            ),
+            (
+                narrow_node,
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aglobal(base, 8),
+                    Arc::new(vec![]),
+                    narrow,
+                ),
+            ),
+        ]);
+
+        prog.run();
+
+        assert!(prog.must_be_ptr.iter().any(|row| *row == (exact,)));
+        assert!(prog
+            .emit_var_type_candidate
+            .iter()
+            .any(|row| *row == (exact, XType::Xptr)));
+        for non_pointer in [adjacent, narrow] {
+            assert!(!prog.must_be_ptr.iter().any(|row| *row == (non_pointer,)));
+        }
     }
 
     #[test]
