@@ -280,8 +280,9 @@ ascent_par! {
         tracked_pointer_cell(func, cell_ofs, cell_width),
         !node_has_cfg_predecessor(func, root);
 
-    frame_write_in(*func, *func, Set::singleton(FrameWriteOrigin::Unwritten(*cell_ofs, *cell_width))) <--
-        reachable_frame_node(func, func),
+    frame_write_in(*func, *entry, Set::singleton(FrameWriteOrigin::Unwritten(*cell_ofs, *cell_width))) <--
+        reachable_frame_node(func, entry),
+        if func == entry,
         tracked_pointer_cell(func, cell_ofs, cell_width);
 
     frame_write_in(*func, *succ, state.clone()) <--
@@ -310,8 +311,8 @@ ascent_par! {
         frame_stack_write_bytes(func, write, write_ofs, write_width),
         !opaque_frame_stack_write(func, write),
         tracked_pointer_cell(func, cell_ofs, cell_width),
-        if let Ok(cell_width) = i64::try_from(*cell_width),
-        if matches!(frame_intervals_overlap(*write_ofs, *write_width, *cell_ofs, cell_width), Some(true));
+        if let Ok(cell_width_i64) = i64::try_from(*cell_width),
+        if matches!(frame_intervals_overlap(*write_ofs, *write_width, *cell_ofs, cell_width_i64), Some(true));
 
     // An indexed/dynamic/ambiguous write may replace any tracked cell. Give
     // each cell its own interval-bearing Unknown value, so a later exact write

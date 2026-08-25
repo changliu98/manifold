@@ -229,8 +229,9 @@ ascent_par! {
         stack_delta(node, _),
         !frame_exact_stack_delta(node, _);
 
-    frame_stack_offset(*func, *func, Dual(Set::singleton(0))) <--
-        reachable_frame_node(func, func);
+    frame_stack_offset(*func, *entry, Dual(Set::singleton(0))) <--
+        reachable_frame_node(func, entry),
+        if func == entry;
 
     frame_stack_offset(*func, *succ, Dual(shift_stack_offsets(&offsets.0, *delta))) <--
         frame_stack_offset(func, node, offsets),
@@ -560,7 +561,7 @@ mod tests {
         db.rel_push(
             "instruction",
             (
-                leave, 1_usize, "", "LEAVE", "NONE", "NONE", "NONE", "NONE", 0, 0,
+                leave, 1_usize, "", "LEAVE", "NONE", "NONE", "NONE", "NONE", 0_usize, 0_usize,
             ),
         );
         // Capstone reports CALL's transient hardware SP write, but the
@@ -568,7 +569,7 @@ mod tests {
         db.rel_push(
             "instruction",
             (
-                call, 1_usize, "", "CALL", "NONE", "NONE", "NONE", "NONE", 0, 0,
+                call, 1_usize, "", "CALL", "NONE", "NONE", "NONE", "NONE", 0_usize, 0_usize,
             ),
         );
         db.rel_push("reg_def", (call, Mreg::SP));
@@ -610,16 +611,40 @@ mod tests {
         db.rel_push("function_has_ltl_body", (callee,));
         db.rel_push(
             "instruction",
-            (call, 5_usize, "", "CALL", "callee", "", "", "", 0, 0),
+            (
+                call, 5_usize, "", "CALL", "callee", "", "", "", 0_usize, 0_usize,
+            ),
         );
         db.rel_push("op_immediate", ("callee", callee as i64, 8_usize));
         db.rel_push(
             "instruction",
-            (plain_ret, 1_usize, "", "RET", "plain_ret", "", "", "", 0, 0),
+            (
+                plain_ret,
+                1_usize,
+                "",
+                "RET",
+                "plain_ret",
+                "",
+                "",
+                "",
+                0_usize,
+                0_usize,
+            ),
         );
         db.rel_push(
             "instruction",
-            (pop_ret, 3_usize, "", "RET", "pop_bytes", "", "", "", 0, 0),
+            (
+                pop_ret,
+                3_usize,
+                "",
+                "RET",
+                "pop_bytes",
+                "",
+                "",
+                "",
+                0_usize,
+                0_usize,
+            ),
         );
         db.rel_push("op_immediate", ("pop_bytes", 8_i64, 2_usize));
 

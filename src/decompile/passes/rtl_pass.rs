@@ -13749,7 +13749,7 @@ mod tests {
                         .function_unresolved_control
                         .push((fixture.func, fixture.latch)),
                     _ => unreachable!(),
-                }
+                };
 
                 prog.run();
                 assert!(
@@ -15811,9 +15811,15 @@ mod tests {
                     prog.function_has_ltl_body.push((func,));
                 }
                 match veto {
-                    1 => prog.function_has_uncovered_block.push((func,)),
-                    2 => prog.function_unknown_terminal.push((func, reload)),
-                    3 => prog.function_unresolved_control.push((func, reload)),
+                    1 => {
+                        prog.function_has_uncovered_block.push((func,));
+                    }
+                    2 => {
+                        prog.function_unknown_terminal.push((func, reload));
+                    }
+                    3 => {
+                        prog.function_unresolved_control.push((func, reload));
+                    }
                     _ => {}
                 }
                 for node in [lea, spill, reload] {
@@ -17264,6 +17270,7 @@ mod tests {
             prog.abi_incoming_bp_stack_base.push((16,));
             prog.abi_stack_slot_size.push((8,));
             prog.stack_base_move.push((frame_setup, "RSP", "RBP"));
+            prog.function_has_ltl_body.push((func,));
 
             prog.plea.push((next_arg, "next_dst", "next_src"));
             prog.op_register.push(("next_dst", "RAX"));
@@ -17292,6 +17299,7 @@ mod tests {
                     Mreg::CX,
                 ),
             ));
+            prog.exact_frame_stack_lea.push((func, save_area_lea, -176));
             prog.reg_def_used
                 .push((save_area_lea, Mreg::CX, save_area_store));
             prog.ltl_inst.push((
@@ -17621,6 +17629,7 @@ mod tests {
             let loaded_rtl = fresh_xtl_reg(cmp, Mreg::x86("RTEMP"));
 
             prog.abi_pointer_size.push((8,));
+            prog.function_has_ltl_body.push((func,));
             prog.func_span.push(("FUN_1000", func, taken));
             prog.func_stacksz.push((func, taken, "FUN_1000", 280));
             prog.next.push((func, frame_adjust));
@@ -17638,6 +17647,7 @@ mod tests {
                 ),
             ));
             prog.slot_addr_escaped.push((func, lea, -280));
+            prog.exact_frame_stack_lea.push((func, lea, -280));
             prog.pcmp.push((cmp, "stack_word", "sentinel"));
             prog.op_indirect
                 .push(("stack_word", "", "RSP", "NONE", 1, 4, 2));
@@ -17782,6 +17792,7 @@ mod tests {
         let mut prog = RTLPassProgram::default();
 
         prog.abi_pointer_size.push((8,));
+        prog.function_has_ltl_body.push((func,));
         prog.func_span.push(("FUN_1000", func, 0x1100));
         prog.ltl_inst.push((
             lea,
@@ -17792,6 +17803,7 @@ mod tests {
             ),
         ));
         prog.slot_addr_escaped.push((func, lea, 16));
+        prog.exact_frame_stack_lea.push((func, lea, 16));
         prog.ltl_inst.push((
             low_store,
             LTLInst::Lsetstack(Mreg::AX, Slot::Local, 0, Typ::Tint),
