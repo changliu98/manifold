@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn direct_pointer_dominators_publish_only_the_settled_diamond_intersection() {
         let mut db = DecompileDB::default();
-        let func = 0x1000;
+        let func: u64 = 0x1000;
         let entry = 0x9000;
         let left = 0x3000;
         let right = 0x7000;
@@ -200,11 +200,11 @@ mod tests {
     #[test]
     fn direct_pointer_dominators_exclude_only_proven_noreturn_fallthroughs() {
         let mut db = DecompileDB::default();
-        let returning_func = 0x1000;
+        let returning_func: u64 = 0x1000;
         let returning_entry = 0x9000;
         let returning_dst = 0x3000;
         let returning_target = 0x3010;
-        let noreturn_func = 0x2000;
+        let noreturn_func: u64 = 0x2000;
         let noreturn_entry = 0x8000;
         let noreturn_dst = 0x4000;
         let noreturn_target = 0x4010;

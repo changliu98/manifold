@@ -13757,17 +13757,18 @@ mod tests {
                 );
             }
 
-            // The one trimmed use which is intrinsically part of the proof is
-            // the recognized in-place recurrence itself.
+            // A generic trimmed instruction has no surviving Mach/LTL value
+            // definition in production: asm_pass removes it before lifting.
+            // Retaining the Lop in this fixture exercises a deliberately
+            // inconsistent superset state, and the decoder-visible trimmed
+            // write must remain an unknown recurrence value rather than being
+            // exempted merely because the stale Lop resembles the step.
             let mut trimmed_step = RTLPassProgram::default();
             let fixture = seed_direct_pointer_fixture(&mut trimmed_step, 0, 32, 1, -1, 40);
             trimmed_step.trim_instruction.push((fixture.step,));
             trimmed_step.reg_use.push((fixture.step, Mreg::AX));
             trimmed_step.run();
-            assert!(trimmed_step
-                .stack_pointer_walk_region
-                .iter()
-                .any(|fact| fact == &(fixture.func, 0, 32)));
+            assert!(trimmed_step.stack_pointer_walk_region.is_empty());
             drop(trimmed_step);
 
             // Multi-hop copies remain pointer-capable; an eventual dynamic
