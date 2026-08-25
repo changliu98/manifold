@@ -1749,12 +1749,26 @@ impl IRPass for ClightEmitPass {
                 .rel_iter::<(u64, usize, usize, usize)>("global_struct_catalog")
                 .map(|(_, id, _, _)| *id)
                 .collect();
-            let known_typed_names: HashSet<String> = db
+            let mut known_typed_names: HashSet<String> = db
                 .rel_iter::<(Symbol, XType)>("known_global_type")
                 .map(|(name, _)| {
                     crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(name)
                 })
                 .collect();
+            // The translation-unit builder gives solver-committed interface
+            // types the same authority as known_global_type. Mirror both
+            // sources here: a recovered aggregate candidate must not create
+            // `owner.ofs_0` aliases when the declaration is committed to a
+            // scalar/pointer type instead.
+            known_typed_names.extend(
+                db.committed_interfaces
+                    .globals
+                    .keys()
+                    .filter_map(|ident| id_to_name.get(ident))
+                    .map(|name| {
+                        crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(name)
+                    }),
+            );
             let struct_owner_ids: HashSet<usize> = db
                 .rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>(
                     "emit_global_struct_fields",
