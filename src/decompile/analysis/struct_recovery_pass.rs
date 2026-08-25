@@ -179,6 +179,7 @@ ascent_par! {
     pub struct StructRecoveryProgram;
 
     relation rtl_inst(Node, RTLInst);
+    relation op_produces_ptr(Node, RTLReg);
     relation ltl_inst(Node, LTLInst);
     relation reg_rtl(Node, Mreg, RTLReg);
     relation instr_in_function(Node, Address);
@@ -406,21 +407,29 @@ ascent_par! {
     #[local] relation stack_lea_base(Address, i64);
 
     stack_lea_base(*func, *base_ofs) <--
-        rtl_inst(node, ?RTLInst::Iop(Operation::Olea(Addressing::Ainstack(base_ofs)), _, _)),
+        rtl_inst(node, ?RTLInst::Iop(Operation::Olea(Addressing::Ainstack(base_ofs)), _, dst)),
+        op_produces_ptr(node, dst),
+        stack_var(func, node, *base_ofs, _),
         instr_in_function(node, func);
 
     stack_lea_base(*func, *base_ofs) <--
-        rtl_inst(node, ?RTLInst::Iop(Operation::Oleal(Addressing::Ainstack(base_ofs)), _, _)),
+        rtl_inst(node, ?RTLInst::Iop(Operation::Oleal(Addressing::Ainstack(base_ofs)), _, dst)),
+        op_produces_ptr(node, dst),
+        stack_var(func, node, *base_ofs, _),
         instr_in_function(node, func);
 
     relation stack_lea_reg(Address, i64, RTLReg);
 
     stack_lea_reg(*func, *base_ofs, *dst) <--
         rtl_inst(node, ?RTLInst::Iop(Operation::Olea(Addressing::Ainstack(base_ofs)), _, dst)),
+        op_produces_ptr(node, dst),
+        stack_var(func, node, *base_ofs, _),
         instr_in_function(node, func);
 
     stack_lea_reg(*func, *base_ofs, *dst) <--
         rtl_inst(node, ?RTLInst::Iop(Operation::Oleal(Addressing::Ainstack(base_ofs)), _, dst)),
+        op_produces_ptr(node, dst),
+        stack_var(func, node, *base_ofs, _),
         instr_in_function(node, func);
 
     // (func, base_ofs, field_ofs, chunk, value_rtl_reg)
@@ -619,6 +628,7 @@ impl IRPass for StructRecoveryPass {
     fn inputs(&self) -> &'static [&'static str] {
         &[
             "rtl_inst",
+            "op_produces_ptr",
             "ltl_inst",
             "reg_rtl",
             "instr_in_function",
@@ -1321,6 +1331,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stack_lea_width_struct_recovery_uses_rtl_pointer_authority() {
+        let mut prog = StructRecoveryProgram::default();
+        let func = 0x1000;
+        let narrow_node = 0x1010;
+        let wide_node = 0x1020;
+        let narrow = 0x110;
+        let wide = 0x120;
+        prog.instr_in_function
+            .extend([(narrow_node, func), (wide_node, func)]);
+        prog.rtl_inst.extend([
+            (
+                narrow_node,
+                RTLInst::Iop(
+                    Operation::Olea(Addressing::Ainstack(8)),
+                    Arc::new(vec![]),
+                    narrow,
+                ),
+            ),
+            (
+                wide_node,
+                RTLInst::Iop(
+                    Operation::Oleal(Addressing::Ainstack(16)),
+                    Arc::new(vec![]),
+                    wide,
+                ),
+            ),
+        ]);
+        prog.op_produces_ptr.push((wide_node, wide));
+        prog.stack_var
+            .extend([(func, narrow_node, 8, 0x210), (func, wide_node, 16, 0x220)]);
+
+        prog.run();
+
+        assert!(prog
+            .stack_lea_reg
+            .iter()
+            .any(|fact| fact == &(func, 16, wide)));
+        assert!(!prog
+            .stack_lea_reg
+            .iter()
+            .any(|fact| fact == &(func, 8, narrow)));
+        assert!(prog.stack_lea_base.iter().any(|fact| fact == &(func, 16)));
+        assert!(!prog.stack_lea_base.iter().any(|fact| fact == &(func, 8)));
+    }
+
+    #[test]
     fn pointer_seed_and_residual_type_evidence_are_declarative() {
         let function = 0x1000;
         let parameter = 100;
@@ -1492,6 +1548,7 @@ mod tests {
         );
 
         let pass = StructRecoveryPass;
+        assert!(pass.inputs().contains(&"op_produces_ptr"));
         assert!(pass.inputs().contains(&"pointer_in_data"));
         assert!(pass.inputs().contains(&"code_pointer_in_data"));
     }

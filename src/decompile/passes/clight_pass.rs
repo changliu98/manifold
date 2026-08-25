@@ -1700,6 +1700,7 @@ mod tests {
                 ),
             ),
         );
+        db.rel_push("op_produces_ptr", (lea_node, address_reg));
         db.rel_push(
             "rtl_inst",
             (
@@ -1766,6 +1767,7 @@ mod tests {
                 ),
             ),
         );
+        db.rel_push("op_produces_ptr", (lea_node, address_reg));
         db.rel_push(
             "rtl_inst",
             (
@@ -1851,6 +1853,8 @@ mod tests {
                 ),
             ),
         );
+        db.rel_push("op_produces_ptr", (base_lea, base_addr));
+        db.rel_push("op_produces_ptr", (end_lea, end_addr));
         db.rel_push(
             "rtl_inst",
             (
@@ -1941,6 +1945,8 @@ mod tests {
                 ),
             ),
         );
+        db.rel_push("op_produces_ptr", (base_lea, base_addr));
+        db.rel_push("op_produces_ptr", (end_lea, 0x9200_u64));
         db.rel_push(
             "rtl_inst",
             (
@@ -1963,6 +1969,108 @@ mod tests {
                 .count(),
             0,
         );
+    }
+
+    #[test]
+    fn stack_lea_width_requires_pointer_authority_for_indexed_sizing() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x6000;
+        let lea: Node = 0x6010;
+        let load: Node = 0x6020;
+        let address: RTLReg = 0x7100;
+        let local: RTLReg = 0x8100;
+
+        db.rel_push("func_stacksz", (func, 0x6100_u64, "indexed", 64_u64));
+        db.rel_push("instr_in_function", (lea, func));
+        db.rel_push("instr_in_function", (load, func));
+        db.rel_push(
+            "rtl_inst",
+            (
+                lea,
+                RTLInst::Iop(
+                    Operation::Olea(Addressing::Ainstack(16)),
+                    Arc::new(Vec::new()),
+                    address,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                load,
+                RTLInst::Iload(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed2(0),
+                    Arc::new(vec![address, 0x7200]),
+                    0x7300,
+                ),
+            ),
+        );
+        db.rel_push("stack_var", (func, lea, 16_i64, local));
+
+        size_indexed_stack_arrays(&mut db);
+
+        assert!(!db
+            .stack_array_buffers
+            .get(&func)
+            .is_some_and(|arrays| arrays.contains_key(&local)));
+        assert!(!db
+            .stack_struct_buffers
+            .get(&func)
+            .is_some_and(|buffers| buffers.contains_key(&local)));
+    }
+
+    #[test]
+    fn stack_lea_incoming_pointer_cannot_borrow_local_identity_at_same_offset() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x7000;
+        let incoming_lea: Node = 0x7010;
+        let local_node: Node = 0x7020;
+        let load: Node = 0x7030;
+        let address: RTLReg = 0x7100;
+        let local: RTLReg = 0x8100;
+
+        db.rel_push("func_stacksz", (func, 0x7100_u64, "indexed", 64_u64));
+        db.rel_push("instr_in_function", (incoming_lea, func));
+        db.rel_push("instr_in_function", (load, func));
+        db.rel_push(
+            "rtl_inst",
+            (
+                incoming_lea,
+                RTLInst::Iop(
+                    Operation::Oleal(Addressing::Ainstack(16)),
+                    Arc::new(Vec::new()),
+                    address,
+                ),
+            ),
+        );
+        db.rel_push("op_produces_ptr", (incoming_lea, address));
+        db.rel_push(
+            "rtl_inst",
+            (
+                load,
+                RTLInst::Iload(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed2(0),
+                    Arc::new(vec![address, 0x7200]),
+                    0x7300,
+                ),
+            ),
+        );
+        // Same displacement, different defining node: this is not evidence
+        // that the incoming caller-frame address names the local object.
+        db.rel_push("stack_var", (func, local_node, 16_i64, local));
+
+        size_indexed_stack_arrays(&mut db);
+
+        assert!(!db
+            .stack_array_buffers
+            .get(&func)
+            .is_some_and(|arrays| arrays.contains_key(&local)));
+        assert!(!db
+            .stack_struct_buffers
+            .get(&func)
+            .is_some_and(|buffers| buffers.contains_key(&local)));
     }
 
     #[test]
@@ -2447,6 +2555,7 @@ impl IRPass for ClightFieldPass {
             "call_target_func",
             "reg_to_struct_id",
             "rtl_inst",
+            "op_produces_ptr",
             "stack_var",
             "stack_var_chunk",
             "slot_escaped_canonical",
@@ -6538,6 +6647,14 @@ fn size_opaque_escaped_frame_buffers(db: &mut DecompileDB) {
 fn size_indexed_stack_arrays(db: &mut DecompileDB) {
     use std::ops::Bound::{Excluded, Included};
 
+    // Pointer authority is definition-local. A raw Olea/Oleal stack shape
+    // cannot establish an address on its own because the operation width may
+    // be narrower than the target ABI (notably Olea on LP64).
+    let pointer_defs: BTreeSet<(Node, RTLReg)> = db
+        .rel_iter::<(Node, RTLReg)>("op_produces_ptr")
+        .copied()
+        .collect();
+
     // node -> function ownership for every real RTL instruction.  Split
     // fragments can transiently publish more than one owner, so consume only
     // singleton ownership instead of choosing by relation iteration order.
@@ -6550,27 +6667,6 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
     // only singleton origins below; an SSA-id collision must not manufacture a
     // frame address.
     let mut lea_base: BTreeMap<RTLReg, BTreeSet<(Address, i64)>> = BTreeMap::new();
-    for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
-        if let RTLInst::Iop(op, args, dst) = inst {
-            if args.is_empty() {
-                let base_ofs = match op {
-                    Operation::Olea(Addressing::Ainstack(o))
-                    | Operation::Oleal(Addressing::Ainstack(o)) => Some(*o),
-                    _ => None,
-                };
-                if let Some(o) = base_ofs {
-                    if let Some(funcs) = node_funcs.get(node) {
-                        let mut funcs = funcs.iter();
-                        if let Some(&func) = funcs.next() {
-                            if funcs.next().is_none() {
-                                lea_base.entry(*dst).or_default().insert((func, o));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     // `stack_var` supplies the canonical local at an offset.  Require both
     // directions to be unique: two locals at one address or one local naming
@@ -6587,6 +6683,34 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
             .or_default()
             .insert(*reg);
         boundaries.entry(*func).or_default().insert(*ofs);
+    }
+
+    // Admit only a definition that is both a width-proven pointer and mapped
+    // to this exact local frame byte at this exact node. This excludes incoming
+    // caller-stack tails even when another local happens to share the same
+    // numeric displacement.
+    for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+        let RTLInst::Iop(op, args, dst) = inst else {
+            continue;
+        };
+        if !args.is_empty() || !pointer_defs.contains(&(*node, *dst)) {
+            continue;
+        }
+        let base_ofs = match op {
+            Operation::Olea(Addressing::Ainstack(o))
+            | Operation::Oleal(Addressing::Ainstack(o)) => *o,
+            _ => continue,
+        };
+        let Some(funcs) = node_funcs.get(node) else {
+            continue;
+        };
+        let mut funcs = funcs.iter();
+        let Some(&func) = funcs.next() else {
+            continue;
+        };
+        if funcs.next().is_none() && stack_vars_at_node.contains_key(&(func, *node, base_ofs)) {
+            lea_base.entry(*dst).or_default().insert((func, base_ofs));
+        }
     }
 
     let mut frame_tops: BTreeMap<Address, i64> = BTreeMap::new();
@@ -6713,7 +6837,10 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
                 | Operation::Oleal(Addressing::Ainstack(ofs)),
                 args,
                 dst,
-            ) if args.is_empty() => {
+            ) if args.is_empty()
+                && pointer_defs.contains(&(*node, *dst))
+                && stack_vars_at_node.contains_key(&(func, *node, *ofs)) =>
+            {
                 address_origins
                     .entry((func, *dst))
                     .or_default()
@@ -7955,6 +8082,9 @@ mod known_global_load_tests {
         assert!(clight.inputs().contains(&"known_global_type"));
         assert!(clight.inputs().contains(&"emit_global_is_ptr"));
         assert!(clight.inputs().contains(&"emit_global_is_char_ptr"));
+
+        let field = ClightFieldPass;
+        assert!(field.inputs().contains(&"op_produces_ptr"));
 
         let select = ClightSelectPass;
         assert!(select.extra_reads().contains(&"global_symbol"));

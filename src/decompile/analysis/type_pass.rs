@@ -974,12 +974,17 @@ ascent_par! {
         reg_rtl(node, *dst_mreg, dst_rtl),
         !hard_int32(dst_rtl);
 
-    // &local (lea with Ainstack and no register base) is unconditionally a 64-bit pointer, recorded as must_be_ptr so its Xptr survives register reuse and the backend does not emit (int)&local.
+    // An exact stack-address operation is a hard pointer only when RTL proved
+    // that its result width matches the target ABI. The raw Olea/Oleal shape
+    // alone is insufficient: Olea remains 32-bit integer arithmetic on LP64.
+    // Keep the LTL join so this stronger MUST fact remains specific to direct
+    // frame addresses rather than every pointer-producing operation.
     must_be_ptr(dst_rtl) <--
         ltl_inst(node, ?LTLInst::Lop(op, args, dst_mreg)),
         if matches!(op, Operation::Olea(Addressing::Ainstack(_)) | Operation::Oleal(Addressing::Ainstack(_))),
         if args.is_empty(),
-        reg_rtl(node, *dst_mreg, dst_rtl);
+        reg_rtl(node, *dst_mreg, dst_rtl),
+        op_produces_ptr(node, dst_rtl);
 
     // Oaddl(ptr, offset) -> result is ptr
     is_ptr(dst_rtl) <--
@@ -1399,6 +1404,43 @@ mod tests {
             .iter()
             .any(|row| *row == (base, XType::Xptr)));
         assert!(!prog.is_ptr.iter().any(|row| *row == (base,)));
+    }
+
+    #[test]
+    fn stack_lea_width_only_rtl_pointer_authority_is_hard_pointer() {
+        let mut prog = TypePassProgram::default();
+        let narrow_node = 0x40;
+        let wide_node = 0x50;
+        let narrow = 0x140;
+        let wide = 0x150;
+
+        prog.ltl_inst.extend([
+            (
+                narrow_node,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Ainstack(16)),
+                    Arc::new(vec![]),
+                    Mreg::AX,
+                ),
+            ),
+            (
+                wide_node,
+                LTLInst::Lop(
+                    Operation::Oleal(Addressing::Ainstack(24)),
+                    Arc::new(vec![]),
+                    Mreg::DX,
+                ),
+            ),
+        ]);
+        prog.reg_rtl
+            .extend([(narrow_node, Mreg::AX, narrow), (wide_node, Mreg::DX, wide)]);
+        prog.op_produces_ptr.push((wide_node, wide));
+
+        prog.run();
+
+        assert!(prog.must_be_ptr.iter().any(|fact| fact == &(wide,)));
+        assert!(!prog.must_be_ptr.iter().any(|fact| fact == &(narrow,)));
+        assert!(!prog.is_ptr.iter().any(|fact| fact == &(narrow,)));
     }
 
     #[test]

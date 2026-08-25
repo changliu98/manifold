@@ -43,16 +43,28 @@ fn shift_sp_offsets(offsets: &Set<i64>, delta: i64) -> Set<i64> {
 // in a lattice and expose a slot only when that set is exactly one Slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum StackAddrOrigin {
-    Slot(i64),
+    // Normalized frame offset plus the defining operation's result width.
+    // Width stays attached to provenance so a 32-bit LEA cannot become a
+    // machine pointer on a 64-bit target merely because both forms name the
+    // same frame byte.
+    Slot(i64, i64),
     NonStack,
 }
 
-fn sole_stack_slot(origins: &Set<StackAddrOrigin>) -> Option<i64> {
-    if origins.0.len() != 1 {
-        return None;
-    }
-    match origins.0.iter().next() {
-        Some(StackAddrOrigin::Slot(ofs)) => Some(*ofs),
+/// Exact byte width of an x86 GPR *view* as spelled by Capstone. `Mreg`
+/// intentionally aliases EAX/AX/AL to AX, so this must run before that
+/// normalization; a boolean `reg_is_64` is likewise insufficient because its
+/// false arm contains 32-, 16-, and 8-bit views.
+fn x86_gpr_view_width(reg: &str) -> Option<i64> {
+    match reg {
+        "RAX" | "RBX" | "RCX" | "RDX" | "RSI" | "RDI" | "RBP" | "RSP" | "R8" | "R9" | "R10"
+        | "R11" | "R12" | "R13" | "R14" | "R15" => Some(8),
+        "EAX" | "EBX" | "ECX" | "EDX" | "ESI" | "EDI" | "EBP" | "ESP" | "R8D" | "R9D" | "R10D"
+        | "R11D" | "R12D" | "R13D" | "R14D" | "R15D" => Some(4),
+        "AX" | "BX" | "CX" | "DX" | "SI" | "DI" | "BP" | "SP" | "R8W" | "R9W" | "R10W" | "R11W"
+        | "R12W" | "R13W" | "R14W" | "R15W" => Some(2),
+        "AL" | "BL" | "CL" | "DL" | "AH" | "BH" | "CH" | "DH" | "SIL" | "DIL" | "BPL" | "SPL"
+        | "R8B" | "R9B" | "R10B" | "R11B" | "R12B" | "R13B" | "R14B" | "R15B" => Some(1),
         _ => None,
     }
 }
@@ -4001,13 +4013,14 @@ ascent_par! {
         if let Ok(frame_size) = i64::try_from(*stack_size),
         if *base_slot == -frame_size,
         if *slot >= *base_slot && *slot + *sz as i64 <= 0,
-        ltl_inst(lea_addr, ?LTLInst::Lop(Operation::Olea(Addressing::Ainstack(lea_slot)), _, dst_mreg)),
+        exact_local_stack_addr_lea_def(func_start, lea_addr, dst_mreg, lea_slot, width),
+        exact_stack_addr_lea_result(func_start, lea_addr, dst_mreg, lea_slot, width, base_addr_rtl),
         if *lea_slot == *base_slot,
+        abi_pointer_size(width),
         code_in_block(lea_addr, lea_block),
         code_in_block(addr, use_block),
         block_dom_set(func_start, use_block, doms),
         if doms.0.contains(lea_block),
-        let base_addr_rtl = fresh_xtl_reg(*lea_addr, *dst_mreg),
         let delta = *slot - *base_slot,
         let load_rtl = fresh_xtl_reg(*addr, Mreg::x86("RTEMP"));
     escaped_frame_cmp_mem(func_start, addr, slot, *sz, base_addr_rtl, delta, load_rtl) <--
@@ -4019,13 +4032,14 @@ ascent_par! {
         if let Ok(frame_size) = i64::try_from(*stack_size),
         if *base_slot == -frame_size,
         if *slot >= *base_slot && *slot + *sz as i64 <= 0,
-        ltl_inst(lea_addr, ?LTLInst::Lop(Operation::Olea(Addressing::Ainstack(lea_slot)), _, dst_mreg)),
+        exact_local_stack_addr_lea_def(func_start, lea_addr, dst_mreg, lea_slot, width),
+        exact_stack_addr_lea_result(func_start, lea_addr, dst_mreg, lea_slot, width, base_addr_rtl),
         if *lea_slot == *base_slot,
+        abi_pointer_size(width),
         code_in_block(lea_addr, lea_block),
         code_in_block(addr, use_block),
         block_dom_set(func_start, use_block, doms),
         if doms.0.contains(lea_block),
-        let base_addr_rtl = fresh_xtl_reg(*lea_addr, *dst_mreg),
         let delta = *slot - *base_slot,
         let load_rtl = fresh_xtl_reg(*addr, Mreg::x86("RTEMP"));
 
@@ -6421,7 +6435,7 @@ ascent_par! {
         real_addr_in_func(addr, func_start),
         func_sets_fp_stable(func_start);
 
-    reg_xtl(addr, dst_mreg, dst_rtl), op_produces_ptr(addr, dst_rtl) <--
+    reg_xtl(addr, dst_mreg, dst_rtl) <--
         plea(addr, dst_sym, src_addr),
         op_register(dst_sym, dst_str),
         op_indirect(src_addr, _, base_str, index_str, _scale, disp, _),
@@ -6439,9 +6453,12 @@ ascent_par! {
         if *index_str == "NONE" || index_str.is_empty(),
         addr_in_framed_func(addr),
         !variadic_next_arg_site(_, addr, _),
+        reg_is_64(dst_str, dst_is_64),
         let dst_mreg = Mreg::x86(dst_str.to_string()),
         let dst_rtl = fresh_xtl_reg(*addr, dst_mreg),
-        let inst = RTLInst::Iop(Operation::Olea(Addressing::Ainstack(*disp)), Arc::new(vec![]), dst_rtl);
+        let addressing = Addressing::Ainstack(*disp),
+        let op = if *dst_is_64 { Operation::Oleal(addressing) } else { Operation::Olea(addressing) },
+        let inst = RTLInst::Iop(op, Arc::new(vec![]), dst_rtl);
 
     ltl_inst(addr, ltl) <--
         plea(addr, dst_sym, src_addr),
@@ -6450,8 +6467,11 @@ ascent_par! {
         if (*base_str).ends_with("BP"),
         if *index_str == "NONE" || index_str.is_empty(),
         addr_in_framed_func(addr),
+        reg_is_64(dst_str, dst_is_64),
         let dst_mreg = Mreg::x86(dst_str.to_string()),
-        let ltl = LTLInst::Lop(Operation::Olea(Addressing::Ainstack(*disp)), Arc::new(vec![]), dst_mreg);
+        let addressing = Addressing::Ainstack(*disp),
+        let op = if *dst_is_64 { Operation::Oleal(addressing) } else { Operation::Olea(addressing) },
+        let ltl = LTLInst::Lop(op, Arc::new(vec![]), dst_mreg);
 
 
     stack_mem_add_imm(addr, disp, imm_val, sz) <--
@@ -7021,6 +7041,78 @@ ascent_par! {
     relation stack_xtl(Address, Address, i64, RTLReg);
     relation stack_var(Address, Address, i64, RTLReg);
 
+    // One authority for a direct, exact frame-address definition.  Olea and
+    // Oleal retain their distinct 32/64-bit value semantics in LTL/RTL; this
+    // relation normalizes only the addressed frame byte and carries the result
+    // width so pointer consumers can require the target ABI width.  Incoming
+    // caller-stack tails retain their separate entry-SP/BP provenance below;
+    // indexed stack expansions likewise have an explicit synthetic-base
+    // relation.  A separate classification below prevents incoming arguments
+    // from entering local-frame provenance without discarding their real
+    // machine-pointer semantics.
+    // The Mach/LTL superset may deliberately contain an Oleal alternative for
+    // a decoded 32-bit LEA. Recover width from Capstone's destination spelling
+    // before Mreg aliases register views, and use the Operation width only on
+    // non-x86 frontends that have no x86 raw `plea` fact.
+    #[local] relation decoded_stack_lea_result_width(Address, Mreg, i64);
+    decoded_stack_lea_result_width(*node, dst_mreg, width) <--
+        plea(node, dst_sym, _),
+        op_register(dst_sym, dst_str),
+        if let Some(width) = x86_gpr_view_width(dst_str),
+        let dst_mreg = Mreg::x86(dst_str.to_string()),
+        if !dst_mreg.is_unknown();
+
+    #[local] relation exact_stack_addr_lea_def(Address, Address, Mreg, i64, i64);
+    exact_stack_addr_lea_def(func_start, node, *dst, *ofs, 4) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Olea(Addressing::Ainstack(ofs)), args, dst)),
+        if args.is_empty(),
+        decoded_stack_lea_result_width(node, dst, 4),
+        instr_in_function(node, func_start);
+
+    exact_stack_addr_lea_def(func_start, node, *dst, *ofs, 4) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Olea(Addressing::Ainstack(ofs)), args, dst)),
+        if args.is_empty(),
+        !decoded_stack_lea_result_width(node, _, _),
+        instr_in_function(node, func_start);
+
+    exact_stack_addr_lea_def(func_start, node, *dst, *ofs, 8) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Oleal(Addressing::Ainstack(ofs)), args, dst)),
+        if args.is_empty(),
+        decoded_stack_lea_result_width(node, dst, 8),
+        instr_in_function(node, func_start);
+
+    exact_stack_addr_lea_def(func_start, node, *dst, *ofs, 8) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Oleal(Addressing::Ainstack(ofs)), args, dst)),
+        if args.is_empty(),
+        !decoded_stack_lea_result_width(node, _, _),
+        instr_in_function(node, func_start);
+
+    #[local] relation exact_local_stack_addr_lea_def(Address, Address, Mreg, i64, i64);
+    exact_local_stack_addr_lea_def(*func_start, *node, *dst, *ofs, *width) <--
+        exact_stack_addr_lea_def(func_start, node, dst, ofs, width),
+        !incoming_stack_tail_base(func_start, node, _, dst);
+
+    // Resolve the operation's actual RTL result once from the candidate that
+    // generic lifting emitted. Bind the candidate back to this exact machine
+    // destination: a superset node can carry several operation candidates, so
+    // matching only the operation shape could lend pointer authority to a
+    // sibling destination at the same node.
+    #[local] relation exact_stack_addr_lea_result(Address, Address, Mreg, i64, i64, RTLReg);
+    exact_stack_addr_lea_result(*func, *node, *dst_mreg, *ofs, *width, *dst_rtl) <--
+        exact_stack_addr_lea_def(func, node, dst_mreg, ofs, width),
+        reg_rtl(node, dst_mreg, dst_rtl),
+        rtl_inst_candidate(node, ?RTLInst::Iop(Operation::Olea(Addressing::Ainstack(seen_ofs)), args, dst_rtl)),
+        if *width == 4 && seen_ofs == ofs && args.is_empty();
+    exact_stack_addr_lea_result(*func, *node, *dst_mreg, *ofs, *width, *dst_rtl) <--
+        exact_stack_addr_lea_def(func, node, dst_mreg, ofs, width),
+        reg_rtl(node, dst_mreg, dst_rtl),
+        rtl_inst_candidate(node, ?RTLInst::Iop(Operation::Oleal(Addressing::Ainstack(seen_ofs)), args, dst_rtl)),
+        if *width == 8 && seen_ofs == ofs && args.is_empty();
+
+    op_produces_ptr(node, *dst_rtl) <--
+        exact_stack_addr_lea_result(_, node, _, _, width, dst_rtl),
+        abi_pointer_size(width);
+
     stack_var(func_start, use_addr, ofs, canonical.0) <--
         stack_xtl(func_start, use_addr, ofs, xtl_id),
         xtl_canonical_lat(xtl_id, canonical);
@@ -7029,6 +7121,7 @@ ascent_par! {
     relation symbol_table(Address, usize, Symbol, Symbol, Symbol, usize, Symbol, usize, Symbol);
     relation op_indirect(Symbol, &'static str, &'static str, &'static str, i64, i64, usize);
     relation op_register(Symbol, &'static str);
+    relation reg_is_64(&'static str, bool);
 
     relation global_symbol(Address, Symbol);
     global_symbol(addr, name) <--
@@ -7739,8 +7832,8 @@ ascent_par! {
         let rtlreg = fresh_stack_slot_reg(*addr);
 
     stack_xtl(func_start, addr, ofs, rtlreg) <--
-        ltl_inst(addr, ?LTLInst::Lop(Operation::Olea(Addressing::Ainstack(ofs)), _, _)),
-        instr_in_function(addr, func_start),
+        exact_local_stack_addr_lea_def(func_start, addr, _, ofs, width),
+        abi_pointer_size(width),
         let rtlreg = fresh_stack_slot_reg(*addr);
 
 
@@ -7757,11 +7850,6 @@ ascent_par! {
     // CFG joins, so the origin lattice retains every possible source. Only a
     // singleton Slot is projected below; Slot+NonStack and two distinct slots
     // remain ambiguous and cannot manufacture an escaped caller-frame object.
-    #[local] relation stack_addr_lea_def(Address, Address, Mreg, i64);
-    stack_addr_lea_def(func_start, lea_addr, *dst_reg, *ofs) <--
-        ltl_inst(lea_addr, ?LTLInst::Lop(Operation::Olea(Addressing::Ainstack(ofs)), _, dst_reg)),
-        instr_in_function(lea_addr, func_start);
-
     #[local] relation explicit_reg_copy(Address, Mreg, Mreg);
     explicit_reg_copy(mov_addr, *src_reg, *dst_reg) <--
         ltl_inst(mov_addr, ?LTLInst::Lop(Operation::Omove, args, dst_reg)),
@@ -7784,8 +7872,8 @@ ascent_par! {
 
     #[local] lattice reg_stack_addr_origins(Address, Address, Mreg, Set<StackAddrOrigin>);
 
-    reg_stack_addr_origins(*func_start, *lea_addr, *dst_reg, Set::singleton(StackAddrOrigin::Slot(*ofs))) <--
-        stack_addr_lea_def(func_start, lea_addr, dst_reg, ofs);
+    reg_stack_addr_origins(*func_start, *lea_addr, *dst_reg, Set::singleton(StackAddrOrigin::Slot(*ofs, *width))) <--
+        exact_local_stack_addr_lea_def(func_start, lea_addr, dst_reg, ofs, width);
 
     // Every ordinary definition that is neither a stack LEA nor a copy starts
     // a definitely non-stack value. Copies get their complete source set from
@@ -7793,7 +7881,7 @@ ascent_par! {
     reg_stack_addr_origins(*func_start, *def_addr, *reg, Set::singleton(StackAddrOrigin::NonStack)) <--
         asm_effective_def(def_addr, reg),
         instr_in_function(def_addr, func_start),
-        !stack_addr_lea_def(func_start, def_addr, reg, _),
+        !exact_local_stack_addr_lea_def(func_start, def_addr, reg, _, _),
         !explicit_reg_copy(def_addr, _, reg),
         !stack_addr_reload_edge(func_start, def_addr, reg, _, _);
 
@@ -7823,10 +7911,28 @@ ascent_par! {
         instr_in_function(mov_addr, func_start),
         !reg_def_used(_, src_reg, mov_addr);
 
-    #[local] relation reg_holds_slot_addr(Address, Address, i64, Mreg);
-    reg_holds_slot_addr(func_start, def_addr, ofs, reg) <--
+    // Project lattice members monotonically, then publish MUST provenance only
+    // in a later negation stratum.  Projecting a singleton directly from an
+    // improving Set leaks an irrevocable Slot fact if a NonStack or alternate
+    // Slot member arrives on a later iteration.
+    #[local] relation reg_stack_addr_origin_member(Address, Address, Mreg, StackAddrOrigin);
+    reg_stack_addr_origin_member(*func_start, *def_addr, *reg, *origin) <--
         reg_stack_addr_origins(func_start, def_addr, reg, origins),
-        if let Some(ofs) = sole_stack_slot(origins);
+        for origin in origins.0.iter();
+
+    #[local] relation reg_stack_addr_origin_conflict(Address, Address, Mreg);
+    reg_stack_addr_origin_conflict(*func_start, *def_addr, *reg) <--
+        reg_stack_addr_origin_member(func_start, def_addr, reg, ?StackAddrOrigin::NonStack);
+    reg_stack_addr_origin_conflict(*func_start, *def_addr, *reg) <--
+        reg_stack_addr_origin_member(func_start, def_addr, reg, ?StackAddrOrigin::Slot(left, left_width)),
+        reg_stack_addr_origin_member(func_start, def_addr, reg, ?StackAddrOrigin::Slot(right, right_width)),
+        if left != right || left_width != right_width;
+
+    #[local] relation reg_holds_slot_addr(Address, Address, i64, Mreg);
+    reg_holds_slot_addr(*func_start, *def_addr, *ofs, *reg) <--
+        reg_stack_addr_origin_member(func_start, def_addr, reg, ?StackAddrOrigin::Slot(ofs, width)),
+        abi_pointer_size(width),
+        !reg_stack_addr_origin_conflict(func_start, def_addr, reg);
 
     // A may-projection is intentionally separate from the must-alias fact
     // above. At a CMOV/phi join, {Slot(base), NonStack} is not permission to
@@ -7835,13 +7941,12 @@ ascent_par! {
     // narrow below: only tabled, fixed-size external pointees use this fact.
     #[local] relation reg_may_hold_slot_addr(Address, Address, i64, Mreg);
     reg_may_hold_slot_addr(*func_start, *def_addr, *ofs, *reg) <--
-        reg_stack_addr_origins(func_start, def_addr, reg, origins),
-        for origin in origins.0.iter(),
-        if let StackAddrOrigin::Slot(ofs) = origin;
+        reg_stack_addr_origin_member(func_start, def_addr, reg, ?StackAddrOrigin::Slot(ofs, width)),
+        abi_pointer_size(width);
 
     slot_addr_escaped(func_start, lea_addr, *ofs) <--
-        ltl_inst(lea_addr, ?LTLInst::Lop(Operation::Olea(Addressing::Ainstack(ofs)), _, _)),
-        instr_in_function(lea_addr, func_start),
+        exact_local_stack_addr_lea_def(func_start, lea_addr, _, ofs, width),
+        abi_pointer_size(width),
         reg_holds_slot_addr(func_start, def_addr, *ofs, dst_reg),
         arg_setup_candidate(def_addr, dst_reg, _);
 
@@ -8107,8 +8212,15 @@ ascent_par! {
     // LEA produced, so an unrelated pointer's field access can never widen it.
     #[local] relation slot_addr_taken_reg(Address, Address, i64, RTLReg);
     slot_addr_taken_reg(func, *lea_addr, *ofs, *base_rtl) <--
-        rtl_inst_candidate(lea_addr, ?RTLInst::Iop(Operation::Olea(Addressing::Ainstack(ofs)), _, base_rtl)),
-        instr_in_function(lea_addr, func);
+        exact_local_stack_addr_lea_def(func, lea_addr, dst_mreg, ofs, width),
+        abi_pointer_size(width),
+        exact_stack_addr_lea_result(func, lea_addr, dst_mreg, ofs, width, base_rtl);
+
+    // Indexed frame expansions materialize their own synthetic pointer base.
+    // Keep that base as local object-extent evidence without admitting it to
+    // direct register provenance or call-escape classification.
+    slot_addr_taken_reg(*func, *node, *ofs, *base_rtl) <--
+        indexed_synth_stack_base(func, node, ofs, base_rtl);
 
     slot_addr_taken_reg(func, *lea_addr, *ofs, *dst) <--
         slot_addr_taken_reg(func, lea_addr, ofs, src),
@@ -10038,6 +10150,8 @@ ascent_par! {
         plea(addr, dst_sym, src_sym),
         op_register(dst_sym, dst_str),
         let dst_mreg = Mreg::x86(dst_str.to_string()),
+        exact_stack_addr_lea_def(func_start, addr, dst_mreg, disp, width),
+        abi_pointer_size(width),
         op_indirect(src_sym, _, base_str, idx_str, _, disp, _),
         if (*idx_str == "NONE" || idx_str.is_empty()) && Mreg::x86(*base_str) == Mreg::SP,
         instr_in_function(addr, func_start),
@@ -10054,6 +10168,8 @@ ascent_par! {
         plea(addr, dst_sym, src_sym),
         op_register(dst_sym, dst_str),
         let dst_mreg = Mreg::x86(dst_str.to_string()),
+        exact_stack_addr_lea_def(func_start, addr, dst_mreg, disp, width),
+        abi_pointer_size(width),
         op_indirect(src_sym, _, base_str, idx_str, _, disp, _),
         if (*idx_str == "NONE" || idx_str.is_empty()) && Mreg::x86(*base_str) == Mreg::BP,
         instr_in_function(addr, func_start),
@@ -10089,10 +10205,10 @@ ascent_par! {
     variadic_register_save_area_init(*func_start, *save_slot) <--
         func_has_variadic_xmm_prologue(func_start),
         !abi_shared_arg_slots(true),
-        abi_pointer_size(8),
+        exact_local_stack_addr_lea_def(func_start, lea_addr, dst_mreg, base, width),
+        abi_pointer_size(width),
+        if *width == 8,
         variadic_xmm_block_base(func_start, xmm_base),
-        ltl_inst(lea_addr, ?LTLInst::Lop(Operation::Olea(Addressing::Ainstack(base)), args, dst_mreg)),
-        if args.is_empty(),
         if let Some(expected_base) = xmm_base.checked_sub(48),
         if *base == expected_base,
         instr_in_function(lea_addr, func_start),
@@ -12786,6 +12902,7 @@ mod tests {
         on_large_stack(|| {
             let [func, block, lea, redefine, copy] = synthetic_ids();
             let mut prog = RTLPassProgram::default();
+            prog.abi_pointer_size.push((8,));
 
             for node in [lea, redefine, copy] {
                 prog.instr_in_function.push((node, func));
@@ -12799,7 +12916,7 @@ mod tests {
             prog.ltl_inst.push((
                 lea,
                 LTLInst::Lop(
-                    Operation::Olea(Addressing::Ainstack(16)),
+                    Operation::Oleal(Addressing::Ainstack(16)),
                     Arc::new(vec![]),
                     Mreg::R15,
                 ),
@@ -12831,10 +12948,473 @@ mod tests {
     }
 
     #[test]
+    fn pointer_width_stack_lea_drives_exact_outparam_width_chain() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [caller, lea8, call8, callee8, store8, lea16, call16, callee16, store16, lea64, call64, callee64, store64] =
+                synthetic_ids();
+            let cases = [
+                (
+                    lea8,
+                    call8,
+                    callee8,
+                    store8,
+                    3_i64,
+                    MemoryChunk::MInt8Unsigned,
+                ),
+                (
+                    lea16,
+                    call16,
+                    callee16,
+                    store16,
+                    8_i64,
+                    MemoryChunk::MInt16Unsigned,
+                ),
+                (
+                    lea64,
+                    call64,
+                    callee64,
+                    store64,
+                    16_i64,
+                    MemoryChunk::MAny64,
+                ),
+            ];
+
+            prog.abi_pointer_size.push((8,));
+            prog.abi_int_arg_position.push((Mreg::DI, 0));
+            for (lea, call, callee, store, ofs, chunk) in cases {
+                let param = fresh_xtl_reg(callee, Mreg::DI);
+                let value = fresh_xtl_reg(store, Mreg::AX);
+                prog.instr_in_function
+                    .extend([(lea, caller), (call, caller), (store, callee)]);
+                prog.ltl_inst.push((
+                    lea,
+                    LTLInst::Lop(
+                        Operation::Oleal(Addressing::Ainstack(ofs)),
+                        Arc::new(vec![]),
+                        Mreg::DI,
+                    ),
+                ));
+                prog.arg_setup_candidate.push((lea, Mreg::DI, call));
+                prog.call_target_func.push((call, callee));
+                prog.func_param_validated.push((callee, Mreg::DI));
+                prog.reg_rtl.push((callee, Mreg::DI, param));
+                prog.rtl_inst_candidate.push((
+                    store,
+                    RTLInst::Istore(
+                        chunk.clone(),
+                        Addressing::Aindexed(0),
+                        Arc::new(vec![param]),
+                        value,
+                    ),
+                ));
+            }
+
+            prog.run();
+
+            for (lea, _, _, _, ofs, chunk) in cases {
+                assert!(prog
+                    .exact_stack_addr_lea_def
+                    .iter()
+                    .any(|fact| fact == &(caller, lea, Mreg::DI, ofs, 8)));
+                assert!(prog.stack_xtl.iter().any(|(func, node, slot, _)| {
+                    *func == caller && *node == lea && *slot == ofs
+                }));
+                assert!(prog.stack_var.iter().any(|(func, node, slot, _)| {
+                    *func == caller && *node == lea && *slot == ofs
+                }));
+                assert!(prog
+                    .reg_holds_slot_addr
+                    .iter()
+                    .any(|fact| fact == &(caller, lea, ofs, Mreg::DI)));
+                assert!(prog
+                    .slot_addr_escaped
+                    .iter()
+                    .any(|fact| fact == &(caller, lea, ofs)));
+                assert!(prog
+                    .escaped_stack_region_field
+                    .iter()
+                    .any(|fact| { fact == &(caller, ofs, 0, chunk.clone()) }));
+                assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                    *node == lea
+                        && matches!(
+                            inst,
+                            RTLInst::Iop(
+                                Operation::Oleal(Addressing::Ainstack(actual)),
+                                args,
+                                _
+                            ) if *actual == ofs && args.is_empty()
+                        )
+                }));
+            }
+        });
+    }
+
+    #[test]
+    fn exact_stack_lea_identity_has_32_bit_parity_and_rejects_nonpointer_shapes() {
+        on_large_stack(|| {
+            let [func32, good32, call32, func64, wrong_width, alternate_width, narrow_width, indexed, with_arg, synthetic, frame_setup, incoming, incoming32, incoming32_load] =
+                synthetic_ids();
+
+            let mut good = RTLPassProgram::default();
+            good.abi_pointer_size.push((4,));
+            good.instr_in_function.push((good32, func32));
+            good.ltl_inst.push((
+                good32,
+                LTLInst::Lop(
+                    Operation::Olea(Addressing::Ainstack(24)),
+                    Arc::new(vec![]),
+                    Mreg::DI,
+                ),
+            ));
+            good.arg_setup_candidate.push((good32, Mreg::DI, call32));
+            good.run();
+
+            assert!(good
+                .exact_stack_addr_lea_def
+                .iter()
+                .any(|fact| fact == &(func32, good32, Mreg::DI, 24, 4)));
+            assert!(good
+                .stack_xtl
+                .iter()
+                .any(|(func, node, ofs, _)| { *func == func32 && *node == good32 && *ofs == 24 }));
+            assert!(good
+                .reg_holds_slot_addr
+                .iter()
+                .any(|fact| fact == &(func32, good32, 24, Mreg::DI)));
+            assert!(good
+                .slot_addr_taken_reg
+                .iter()
+                .any(|(func, node, ofs, _)| { *func == func32 && *node == good32 && *ofs == 24 }));
+            assert!(good
+                .slot_addr_escaped
+                .iter()
+                .any(|fact| fact == &(func32, good32, 24)));
+
+            let mut bad = RTLPassProgram::default();
+            bad.abi_pointer_size.push((8,));
+            for node in [
+                wrong_width,
+                alternate_width,
+                narrow_width,
+                indexed,
+                with_arg,
+                frame_setup,
+                incoming,
+                incoming32,
+                incoming32_load,
+            ] {
+                bad.instr_in_function.push((node, func64));
+            }
+            bad.ltl_inst.extend([
+                (
+                    wrong_width,
+                    LTLInst::Lop(
+                        Operation::Olea(Addressing::Ainstack(40)),
+                        Arc::new(vec![]),
+                        Mreg::DI,
+                    ),
+                ),
+                (
+                    alternate_width,
+                    LTLInst::Lop(
+                        Operation::Olea(Addressing::Ainstack(64)),
+                        Arc::new(vec![]),
+                        Mreg::DI,
+                    ),
+                ),
+                // Superset interpretation: this 64-bit alternative coexists
+                // with the decoded EDI operation but is not width authority.
+                (
+                    alternate_width,
+                    LTLInst::Lop(
+                        Operation::Oleal(Addressing::Ainstack(64)),
+                        Arc::new(vec![]),
+                        Mreg::DI,
+                    ),
+                ),
+                // Nor may a same-node superset candidate borrow the raw
+                // instruction's absence of decoded width for another Mreg.
+                (
+                    alternate_width,
+                    LTLInst::Lop(
+                        Operation::Oleal(Addressing::Ainstack(64)),
+                        Arc::new(vec![]),
+                        Mreg::SI,
+                    ),
+                ),
+                (
+                    narrow_width,
+                    LTLInst::Lop(
+                        Operation::Olea(Addressing::Ainstack(72)),
+                        Arc::new(vec![]),
+                        Mreg::DI,
+                    ),
+                ),
+                (
+                    indexed,
+                    LTLInst::Lop(
+                        Operation::Oleal(Addressing::Aindexed(40)),
+                        Arc::new(vec![Mreg::SP]),
+                        Mreg::SI,
+                    ),
+                ),
+                (
+                    with_arg,
+                    LTLInst::Lop(
+                        Operation::Oleal(Addressing::Ainstack(48)),
+                        Arc::new(vec![Mreg::SP]),
+                        Mreg::DX,
+                    ),
+                ),
+                (
+                    incoming,
+                    LTLInst::Lop(
+                        Operation::Oleal(Addressing::Ainstack(16)),
+                        Arc::new(vec![]),
+                        Mreg::AX,
+                    ),
+                ),
+                (
+                    incoming32,
+                    LTLInst::Lop(
+                        Operation::Olea(Addressing::Ainstack(24)),
+                        Arc::new(vec![]),
+                        Mreg::AX,
+                    ),
+                ),
+                (
+                    incoming32_load,
+                    LTLInst::Lload(
+                        MemoryChunk::MInt32,
+                        Addressing::Aindexed(0),
+                        Arc::new(vec![Mreg::AX]),
+                        Mreg::R8,
+                    ),
+                ),
+            ]);
+            bad.arg_setup_candidate
+                .push((wrong_width, Mreg::DI, call32));
+            bad.indexed_synth_stack_base.push((
+                func64,
+                synthetic,
+                56,
+                fresh_xtl_reg(synthetic, Mreg::SP) | FRESH_NS_SP_BASE,
+            ));
+            bad.abi_incoming_bp_stack_base.push((16,));
+            bad.stack_base_move.push((frame_setup, "RSP", "RBP"));
+            for (node, dst_sym, dst_name, src_sym, base, ofs) in [
+                (alternate_width, "alt_dst", "EDI", "alt_src", "RSP", 64),
+                (narrow_width, "narrow_dst", "DI", "narrow_src", "RSP", 72),
+                (
+                    incoming32,
+                    "incoming32_dst",
+                    "EAX",
+                    "incoming32_src",
+                    "RBP",
+                    24,
+                ),
+            ] {
+                bad.plea.push((node, dst_sym, src_sym));
+                bad.op_register.push((dst_sym, dst_name));
+                bad.op_indirect.push((src_sym, "", base, "NONE", 1, ofs, 8));
+            }
+            bad.plea.push((incoming, "incoming_dst", "incoming_src"));
+            bad.op_register.push(("incoming_dst", "RAX"));
+            bad.op_indirect
+                .push(("incoming_src", "", "RBP", "NONE", 1, 16, 8));
+            bad.reg_def_used
+                .push((incoming32, Mreg::AX, incoming32_load));
+            bad.run();
+
+            assert!(bad
+                .exact_stack_addr_lea_def
+                .iter()
+                .any(|fact| fact == &(func64, wrong_width, Mreg::DI, 40, 4)));
+            assert!(bad
+                .decoded_stack_lea_result_width
+                .iter()
+                .any(|fact| fact == &(alternate_width, Mreg::DI, 4)));
+            assert!(bad
+                .exact_stack_addr_lea_def
+                .iter()
+                .any(|fact| fact == &(func64, alternate_width, Mreg::DI, 64, 4)));
+            assert!(!bad
+                .exact_stack_addr_lea_def
+                .iter()
+                .any(|(_, node, _, _, width)| *node == alternate_width && *width == 8));
+            assert!(!bad
+                .op_produces_ptr
+                .iter()
+                .any(|(node, _)| *node == alternate_width));
+            assert!(bad
+                .decoded_stack_lea_result_width
+                .iter()
+                .any(|fact| fact == &(narrow_width, Mreg::DI, 2)));
+            assert!(!bad
+                .exact_stack_addr_lea_def
+                .iter()
+                .any(|(_, node, _, _, _)| *node == narrow_width));
+            assert!(bad
+                .incoming_stack_tail_base
+                .iter()
+                .any(|fact| fact == &(func64, incoming, 16, Mreg::AX)));
+            assert!(bad
+                .exact_stack_addr_lea_def
+                .iter()
+                .any(|fact| fact == &(func64, incoming, Mreg::AX, 16, 8)));
+            assert!(!bad
+                .exact_local_stack_addr_lea_def
+                .iter()
+                .any(|(_, node, _, _, _)| *node == incoming));
+            assert!(bad
+                .op_produces_ptr
+                .iter()
+                .any(|(node, _)| *node == incoming));
+            assert!(!bad
+                .incoming_stack_tail_base
+                .iter()
+                .any(|(_, node, _, _)| *node == incoming32));
+            assert!(!bad
+                .incoming_stack_tail_load
+                .iter()
+                .any(|(node, _, _)| *node == incoming32_load));
+            assert!(!bad
+                .op_produces_ptr
+                .iter()
+                .any(|(node, _)| *node == incoming32));
+            for node in [indexed, with_arg, synthetic] {
+                assert!(!bad
+                    .exact_stack_addr_lea_def
+                    .iter()
+                    .any(|(_, candidate, _, _, _)| *candidate == node));
+            }
+            assert!(!bad
+                .stack_xtl
+                .iter()
+                .any(|(_, node, _, _)| *node == incoming));
+            assert!(!bad
+                .stack_xtl
+                .iter()
+                .any(|(_, node, _, _)| *node == wrong_width));
+            assert!(!bad
+                .reg_holds_slot_addr
+                .iter()
+                .any(|(_, node, _, _)| *node == wrong_width));
+            assert!(!bad
+                .slot_addr_taken_reg
+                .iter()
+                .any(|(_, node, _, _)| *node == wrong_width));
+            assert!(!bad
+                .slot_addr_taken_reg
+                .iter()
+                .any(|(_, node, _, _)| *node == alternate_width));
+            assert!(!bad
+                .slot_addr_escaped
+                .iter()
+                .any(|(_, node, _)| *node == wrong_width));
+            assert!(!bad
+                .reg_stack_addr_origins
+                .iter()
+                .any(|(_, node, _, _)| *node == synthetic));
+            assert!(bad.slot_addr_taken_reg.iter().any(|fact| {
+                fact == &(
+                    func64,
+                    synthetic,
+                    56,
+                    fresh_xtl_reg(synthetic, Mreg::SP) | FRESH_NS_SP_BASE,
+                )
+            }));
+            assert!(!bad
+                .reg_stack_addr_origins
+                .iter()
+                .any(|(_, node, _, _)| *node == incoming));
+            assert!(!bad
+                .slot_addr_taken_reg
+                .iter()
+                .any(|(_, node, _, _)| *node == incoming));
+        });
+    }
+
+    #[test]
+    fn framed_bp_stack_lea_preserves_result_width_before_identity_normalization() {
+        on_large_stack(|| {
+            let [func, block, frame_setup, lea64, lea32] = synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+
+            prog.abi_pointer_size.push((8,));
+            prog.block_in_function.push((block, func));
+            for node in [frame_setup, lea64, lea32] {
+                prog.code_in_block.push((node, block));
+                prog.instr_in_function.push((node, func));
+            }
+            prog.stack_base_move.push((frame_setup, "RSP", "RBP"));
+            prog.reg_is_64.extend([("RAX", true), ("EAX", false)]);
+            for (node, dst_sym, dst_name, src_sym, ofs) in [
+                (lea64, "bp_dst64", "RAX", "bp_src64", -32_i64),
+                (lea32, "bp_dst32", "EAX", "bp_src32", -16_i64),
+            ] {
+                prog.plea.push((node, dst_sym, src_sym));
+                prog.op_register.push((dst_sym, dst_name));
+                prog.op_indirect
+                    .push((src_sym, "", "RBP", "NONE", 1, ofs, 8));
+            }
+
+            prog.run();
+
+            for (node, expected, opposite) in [
+                (
+                    lea64,
+                    Operation::Oleal(Addressing::Ainstack(-32)),
+                    Operation::Olea(Addressing::Ainstack(-32)),
+                ),
+                (
+                    lea32,
+                    Operation::Olea(Addressing::Ainstack(-16)),
+                    Operation::Oleal(Addressing::Ainstack(-16)),
+                ),
+            ] {
+                assert!(prog
+                    .ltl_inst
+                    .iter()
+                    .any(|(candidate, inst)| {
+                        *candidate == node
+                            && matches!(inst, LTLInst::Lop(op, args, _) if *op == expected && args.is_empty())
+                    }));
+                assert!(!prog.ltl_inst.iter().any(|(candidate, inst)| {
+                    *candidate == node && matches!(inst, LTLInst::Lop(op, _, _) if *op == opposite)
+                }));
+                assert!(prog
+                    .rtl_inst_candidate
+                    .iter()
+                    .any(|(candidate, inst)| {
+                        *candidate == node
+                            && matches!(inst, RTLInst::Iop(op, args, _) if *op == expected && args.is_empty())
+                    }));
+                assert!(!prog.rtl_inst_candidate.iter().any(|(candidate, inst)| {
+                    *candidate == node && matches!(inst, RTLInst::Iop(op, _, _) if *op == opposite)
+                }));
+            }
+
+            assert!(prog
+                .exact_stack_addr_lea_def
+                .iter()
+                .any(|fact| fact == &(func, lea64, Mreg::AX, -32, 8)));
+            assert!(prog
+                .exact_stack_addr_lea_def
+                .iter()
+                .any(|fact| fact == &(func, lea32, Mreg::AX, -16, 4)));
+            assert!(prog.op_produces_ptr.iter().any(|(node, _)| *node == lea64));
+            assert!(!prog.op_produces_ptr.iter().any(|(node, _)| *node == lea32));
+        });
+    }
+
+    #[test]
     fn stack_address_provenance_follows_an_unredefined_copy() {
         on_large_stack(|| {
             let [func, block, lea, copy] = synthetic_ids();
             let mut prog = RTLPassProgram::default();
+            prog.abi_pointer_size.push((8,));
 
             for node in [lea, copy] {
                 prog.instr_in_function.push((node, func));
@@ -12846,7 +13426,7 @@ mod tests {
             prog.ltl_inst.push((
                 lea,
                 LTLInst::Lop(
-                    Operation::Olea(Addressing::Ainstack(16)),
+                    Operation::Oleal(Addressing::Ainstack(16)),
                     Arc::new(vec![]),
                     Mreg::R15,
                 ),
@@ -12874,13 +13454,14 @@ mod tests {
         on_large_stack(|| {
             let [func, lea, spill, reload, call] = synthetic_ids();
             let mut prog = RTLPassProgram::default();
+            prog.abi_pointer_size.push((8,));
             let object_ofs = 144;
             let spill_ofs = 24;
 
             prog.ltl_inst.push((
                 lea,
                 LTLInst::Lop(
-                    Operation::Olea(Addressing::Ainstack(object_ofs)),
+                    Operation::Oleal(Addressing::Ainstack(object_ofs)),
                     Arc::new(vec![]),
                     Mreg::AX,
                 ),
@@ -12924,6 +13505,7 @@ mod tests {
             let [func, entry_block, overwrite_block, header_block, latch_block, lea, overwrite, copy, latch] =
                 synthetic_ids();
             let mut prog = RTLPassProgram::default();
+            prog.abi_pointer_size.push((8,));
 
             for (node, block) in [
                 (lea, entry_block),
@@ -12950,7 +13532,7 @@ mod tests {
             prog.ltl_inst.push((
                 lea,
                 LTLInst::Lop(
-                    Operation::Olea(Addressing::Ainstack(16)),
+                    Operation::Oleal(Addressing::Ainstack(16)),
                     Arc::new(vec![]),
                     Mreg::R15,
                 ),
@@ -12986,6 +13568,7 @@ mod tests {
         on_large_stack(|| {
             let [func, stack_block, data_block, join_block, lea, data_def, copy] = synthetic_ids();
             let mut prog = RTLPassProgram::default();
+            prog.abi_pointer_size.push((8,));
 
             for (node, block) in [
                 (lea, stack_block),
@@ -13006,7 +13589,7 @@ mod tests {
             prog.ltl_inst.push((
                 lea,
                 LTLInst::Lop(
-                    Operation::Olea(Addressing::Ainstack(16)),
+                    Operation::Oleal(Addressing::Ainstack(16)),
                     Arc::new(vec![]),
                     Mreg::R15,
                 ),
@@ -13043,6 +13626,7 @@ mod tests {
             let [func, stack_block, data_block, join_block, lea, data_def, copy, call] =
                 synthetic_ids();
             let mut prog = RTLPassProgram::default();
+            prog.abi_pointer_size.push((8,));
             let base_ofs = 16_i64;
 
             for (node, block) in [
@@ -13070,7 +13654,7 @@ mod tests {
             prog.ltl_inst.push((
                 lea,
                 LTLInst::Lop(
-                    Operation::Olea(Addressing::Ainstack(base_ofs)),
+                    Operation::Oleal(Addressing::Ainstack(base_ofs)),
                     Arc::new(vec![]),
                     Mreg::R15,
                 ),
@@ -13707,6 +14291,7 @@ mod tests {
             let load1 = 0x528;
 
             prog.emit_function.push((func, "FUN_500", func));
+            prog.abi_pointer_size.push((8,));
             prog.abi_incoming_bp_stack_base.push((16,));
             prog.stack_base_move.push((frame_setup, "RSP", "RBP"));
             prog.plea.push((lea, "tail_dst", "tail_src"));
@@ -13717,7 +14302,7 @@ mod tests {
             prog.ltl_inst.push((
                 lea,
                 LTLInst::Lop(
-                    Operation::Olea(Addressing::Ainstack(16)),
+                    Operation::Oleal(Addressing::Ainstack(16)),
                     Arc::new(vec![]),
                     Mreg::AX,
                 ),
@@ -13817,7 +14402,7 @@ mod tests {
             prog.ltl_inst.push((
                 next_arg,
                 LTLInst::Lop(
-                    Operation::Olea(Addressing::Ainstack(24)),
+                    Operation::Oleal(Addressing::Ainstack(24)),
                     Arc::new(vec![]),
                     Mreg::AX,
                 ),
@@ -13832,7 +14417,7 @@ mod tests {
             prog.ltl_inst.push((
                 save_area_lea,
                 LTLInst::Lop(
-                    Operation::Olea(Addressing::Ainstack(-176)),
+                    Operation::Oleal(Addressing::Ainstack(-176)),
                     Arc::new(vec![]),
                     Mreg::CX,
                 ),
@@ -14165,6 +14750,7 @@ mod tests {
             let address_rtl = fresh_xtl_reg(lea, Mreg::SI);
             let loaded_rtl = fresh_xtl_reg(cmp, Mreg::x86("RTEMP"));
 
+            prog.abi_pointer_size.push((8,));
             prog.func_span.push(("FUN_1000", func, taken));
             prog.func_stacksz.push((func, taken, "FUN_1000", 280));
             prog.next.push((func, frame_adjust));
@@ -14176,7 +14762,7 @@ mod tests {
             prog.ltl_inst.push((
                 lea,
                 LTLInst::Lop(
-                    Operation::Olea(Addressing::Ainstack(-280)),
+                    Operation::Oleal(Addressing::Ainstack(-280)),
                     Arc::new(vec![]),
                     Mreg::SI,
                 ),
@@ -14321,11 +14907,12 @@ mod tests {
         let settled_store = 0x1040;
         let mut prog = RTLPassProgram::default();
 
+        prog.abi_pointer_size.push((8,));
         prog.func_span.push(("FUN_1000", func, 0x1100));
         prog.ltl_inst.push((
             lea,
             LTLInst::Lop(
-                Operation::Olea(Addressing::Ainstack(16)),
+                Operation::Oleal(Addressing::Ainstack(16)),
                 Arc::new(vec![]),
                 Mreg::DI,
             ),
@@ -15799,6 +16386,26 @@ mod tests {
             }
 
             prog.run();
+
+            let frame_base = fresh_xtl_reg(store, Mreg::SP) | FRESH_NS_SP_BASE;
+            assert!(prog
+                .indexed_synth_stack_base
+                .iter()
+                .any(|fact| fact == &(func, store, -24, frame_base)));
+            assert!(prog
+                .slot_addr_taken_reg
+                .iter()
+                .any(|fact| fact == &(func, store, -24, frame_base)));
+            for field_ofs in [4_i64, 8, 12] {
+                assert!(prog
+                    .slot_local_deref_field
+                    .iter()
+                    .any(|fact| { fact == &(func, -24, field_ofs, MemoryChunk::MInt32) }));
+                assert!(prog
+                    .escaped_stack_region_caller_field
+                    .iter()
+                    .any(|fact| fact == &(func, -24, field_ofs, MemoryChunk::MInt32)));
+            }
 
             for ident in [base as usize, addend as usize, mask as usize] {
                 assert!(prog.global_var_ref.iter().any(|fact| fact == &(ident,)));

@@ -252,13 +252,6 @@ ascent_par! {
     relation signature_hard_pointer_reg(RTLReg);
     signature_hard_pointer_reg(reg) <-- op_produces_ptr(_, reg);
     signature_hard_pointer_reg(reg) <-- global_addr_reg(_, reg);
-    signature_hard_pointer_reg(*dst) <--
-        rtl_inst(_, ?RTLInst::Iop(
-            Operation::Olea(Addressing::Ainstack(_))
-                | Operation::Oleal(Addressing::Ainstack(_)),
-            _,
-            dst,
-        ));
     signature_hard_pointer_reg(reg) <--
         signature_internal_call_result_type(reg, xtype),
         if pointer_like_xtype(xtype);
@@ -997,6 +990,45 @@ mod tests {
     use crate::x86::types::{CallConv, MemoryChunk, RTLInst, Signature, XType};
     use std::collections::HashSet;
     use std::sync::Arc;
+
+    #[test]
+    fn stack_lea_width_signature_uses_rtl_pointer_authority() {
+        let mut prog = SignatureReconciliationProgram::default();
+        let narrow_node = 0x10;
+        let wide_node = 0x20;
+        let narrow = 0x110;
+        let wide = 0x120;
+        prog.rtl_inst.extend([
+            (
+                narrow_node,
+                RTLInst::Iop(
+                    Operation::Olea(Addressing::Ainstack(8)),
+                    Arc::new(vec![]),
+                    narrow,
+                ),
+            ),
+            (
+                wide_node,
+                RTLInst::Iop(
+                    Operation::Oleal(Addressing::Ainstack(16)),
+                    Arc::new(vec![]),
+                    wide,
+                ),
+            ),
+        ]);
+        prog.op_produces_ptr.push((wide_node, wide));
+
+        prog.run();
+
+        assert!(prog
+            .signature_hard_pointer_reg
+            .iter()
+            .any(|fact| fact == &(wide,)));
+        assert!(!prog
+            .signature_hard_pointer_reg
+            .iter()
+            .any(|fact| fact == &(narrow,)));
+    }
 
     #[test]
     fn variadic_gp_register_save_suffix_recovers_fixed_prefix() {
