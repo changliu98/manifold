@@ -2824,12 +2824,19 @@ fn resolve_rodata_scalar(
             let bytes: [u8; 2] = remaining[..2].try_into().ok()?;
             Some(ScalarConstant::Int32(u16::from_le_bytes(bytes) as i32))
         }
-        MemoryChunk::MInt32 if remaining.len() >= 4 => {
+        // MAny32/MAny64 are width-authoritative integer carriers at this
+        // boundary: chunk_to_ctype maps them to the corresponding signed C
+        // integer type, so preserving their file bytes is identical to the
+        // concrete MInt variants.  Dropping them here instead emitted an
+        // uninitialized declaration (or a zero-valued definition), losing
+        // initialized data merely because the machine load had no stronger
+        // signedness/type interpretation.
+        MemoryChunk::MInt32 | MemoryChunk::MAny32 if remaining.len() >= 4 => {
             let bytes: [u8; 4] = remaining[..4].try_into().ok()?;
             let val = i32::from_le_bytes(bytes);
             Some(ScalarConstant::Int32(val))
         }
-        MemoryChunk::MInt64 if remaining.len() >= 8 => {
+        MemoryChunk::MInt64 | MemoryChunk::MAny64 if remaining.len() >= 8 => {
             let bytes: [u8; 8] = remaining[..8].try_into().ok()?;
             let val = i64::from_le_bytes(bytes);
             Some(ScalarConstant::Int64(val))
@@ -3460,6 +3467,43 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
     }
 
     Ok(globals)
+}
+
+#[cfg(test)]
+mod rodata_scalar_tests {
+    use super::*;
+
+    fn resolve(chunk: MemoryChunk, bytes: Vec<u8>) -> Option<(ScalarConstant, bool)> {
+        let addr = 0x1000;
+        resolve_rodata_scalar(
+            addr,
+            &HashMap::from([(addr as usize, chunk)]),
+            addr as usize,
+            &[(addr, addr + bytes.len() as u64, bytes, false)],
+            &HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn any_width_integer_chunks_preserve_initialized_bits() {
+        let value32 = 0xfedc_ba98u32;
+        assert!(matches!(
+            resolve(MemoryChunk::MAny32, value32.to_le_bytes().to_vec()),
+            Some((ScalarConstant::Int32(value), false)) if value as u32 == value32
+        ));
+
+        let value64 = 0x0123_4567_89ab_cdefu64;
+        assert!(matches!(
+            resolve(MemoryChunk::MAny64, value64.to_le_bytes().to_vec()),
+            Some((ScalarConstant::Int64(value), false)) if value as u64 == value64
+        ));
+    }
+
+    #[test]
+    fn any_width_integer_chunks_require_the_complete_load_width() {
+        assert!(resolve(MemoryChunk::MAny32, vec![1, 2, 3]).is_none());
+        assert!(resolve(MemoryChunk::MAny64, vec![1, 2, 3, 4, 5, 6, 7]).is_none());
+    }
 }
 
 use crate::decompile::passes::c_pass::types::{
