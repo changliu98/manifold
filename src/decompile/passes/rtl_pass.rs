@@ -6,7 +6,9 @@ use crate::decompile::passes::cminor_pass::*;
 use crate::decompile::passes::csh_pass::*;
 use crate::decompile::passes::pass::IRPass;
 use crate::mreg::{Mreg, RegClass};
-use crate::util::DEFAULT_VAR;
+use crate::util::{
+    multi_synth_address_is_encodable, DEFAULT_VAR, MULTI_SYNTH_NODE_BIT, MULTI_SYNTH_STAGE_SHIFT,
+};
 use crate::x86::asm::{Ireg, TestCond};
 use crate::x86::mach::X86Mreg;
 use crate::x86::op::{Addressing, Comparison, Condition, Operation};
@@ -143,6 +145,60 @@ fn simd_broadcast_lane_node(node: Node, lane: usize) -> Node {
     }
 }
 
+// One packed-dword machine event expands to at most eight scalar RTL
+// instructions.  Real x86 user addresses occupy the low canonical bits; this
+// namespace keeps the event address recoverable while leaving bits 62/63 free
+// for the existing tail-duplication tags.
+fn simd_dword_event_stage_node(event: Node, stage: usize) -> Node {
+    debug_assert!(stage < 8);
+    debug_assert!(multi_synth_address_is_encodable(event));
+    if stage == 0 {
+        event
+    } else {
+        event | MULTI_SYNTH_NODE_BIT | ((stage as u64) << MULTI_SYNTH_STAGE_SHIFT)
+    }
+}
+
+// Bits 56..59 encode one of four persistent result lanes or four event-local
+// memory operands.  Bit 62 makes the namespace disjoint from every existing
+// fresh-value namespace; tag zero is intentionally unused so it also cannot
+// collide with the older single bit-62 use pseudo.
+const FRESH_NS_SIMD_DWORD: u64 = 1u64 << 62;
+
+fn fresh_simd_dword_reg(event: Node, tag: usize) -> RTLReg {
+    debug_assert!((1..=8).contains(&tag));
+    debug_assert!(multi_synth_address_is_encodable(event));
+    (1u64 << 63)
+        | FRESH_NS_SIMD_DWORD
+        | (event << MREG_DISCRIMINANT_BITS)
+        | ((tag as u64) << 56)
+        | MREG_UNKNOWN_DISCRIMINANT
+}
+
+fn fresh_simd_dword_lane_reg(event: Node, lane: usize) -> RTLReg {
+    debug_assert!(lane < 4);
+    fresh_simd_dword_reg(event, lane + 1)
+}
+
+fn fresh_simd_dword_operand_reg(event: Node, lane: usize) -> RTLReg {
+    debug_assert!(lane < 4);
+    fresh_simd_dword_reg(event, lane + 5)
+}
+
+/// Recover the machine event embedded in a packed-dword lane/operand value.
+/// Its namespace and nonzero 1..=8 tag distinguish it from legacy bit-62 use
+/// pseudo-registers.  Admission keeps event bits below the tag field.
+pub(crate) fn simd_dword_reg_event(reg: RTLReg) -> Option<Node> {
+    const TAG_MASK: u64 = 0xFu64 << 56;
+    let namespace = (1u64 << 63) | FRESH_NS_SIMD_DWORD;
+    let tag = (reg & TAG_MASK) >> 56;
+    if reg & namespace == namespace && (1..=8).contains(&tag) {
+        Some((reg & !(namespace | TAG_MASK | MREG_DISCRIMINANT_MASK)) >> MREG_DISCRIMINANT_BITS)
+    } else {
+        None
+    }
+}
+
 // The private node carrying the upper 8 bytes of a 16-byte frame move; the
 // original node keeps the lower half, as CompCert has no 128-bit chunk.
 // A general-base destination needs a second node as well, because its upper
@@ -178,6 +234,22 @@ fn offset_addressing(addressing: &Addressing, delta: i64) -> Option<Addressing> 
         Addressing::Ainstack(offset) => add(*offset).map(Addressing::Ainstack),
         Addressing::Unknown => None,
     }
+}
+
+fn is_indexed_integer_rmw_operation(op: &Operation) -> bool {
+    matches!(
+        op,
+        Operation::Oadd
+            | Operation::Oaddl
+            | Operation::Osub
+            | Operation::Osubl
+            | Operation::Oand
+            | Operation::Oandl
+            | Operation::Oor
+            | Operation::Oorl
+            | Operation::Oxor
+            | Operation::Oxorl
+    )
 }
 
 ascent_par! {
@@ -241,6 +313,8 @@ ascent_par! {
     relation mach_imm_indirect_store(Address, i64, MemoryChunk, Mreg, i64);
     relation mach_imm_stack_init(Address, i64, i64, Typ);
     relation simd_dword_broadcast_store(Address, Address, &'static str, &'static str, i64, i64, Mreg);
+    relation simd_dword_lane_event(Address, i64, Address, Address);
+    relation simd_dword_lane_frame_store(Address, i64, Address);
     relation movhps_hi_load(Address, Mreg, &'static str, &'static str, i64, i64, bool);
     // The upper 8 bytes of a 16-byte frame move, which has no CompCert chunk:
     // (store addr, destination cell, source kind, source reg, source cell, defining site).
@@ -300,6 +374,10 @@ ascent_par! {
     relation trim_instruction(Address);
     relation stack_def_used(Address, Symbol, i64, Address, Symbol, i64);
     relation stack_offset_backedge_rescued_access(Address, Address);
+    // Exact nonzero distance from the function's stable frame origin to SP at
+    // this instruction, published by asm_pass.  Absence means zero or unknown;
+    // both preserve the raw displacement, matching the established fallback.
+    relation sp_window_depth(Address, i64);
     relation symbols(Address, Symbol, Symbol);
 
     relation base_addr_usage(Node, RTLReg, i64);
@@ -340,6 +418,10 @@ ascent_par! {
     relation rtl_inst_candidate(Node, RTLInst);
     relation emit_function(Address, Symbol, Node);
     relation rtl_succ_candidate(Node, Node);
+    // Explicit semantic sequencing for expansions with more than the two
+    // legacy synthetic slots.  Downstream passes consume this relation rather
+    // than guessing expansion membership from node magnitudes or masks.
+    relation rtl_expansion_edge(Node, Node);
 
     relation rtl_edge_negated(Node, Node);
     // Memory-indirect call (CALL with op_indirect operand that is a true memory load); tuple is (call_addr, base_reg_str, idx_reg_str, scale, disp).
@@ -412,6 +494,13 @@ ascent_par! {
     // BP-frame-pointer-indexed load/store detection (mregs[0] == BP in a framed function), expanded like the SP-indexed case, or the base collapses to the whole-frame Olea(Ainstack(0)) and walks off the frame.
     #[local] relation bp_indexed_load(Node);
     #[local] relation bp_indexed_store(Node);
+
+    // A fused integer RMW whose memory source is indexed from the structural
+    // stack/frame base.  asm_pass represents indexed integer arithmetic in the
+    // operation-agnostic float_load_op relation; this classifier prevents the
+    // generic two-node load+op lowering from treating SP as an ordinary C
+    // pointer and gives the frame form its required base+load+op expansion.
+    #[local] relation frame_indexed_load_op(Node);
 
     // Every stack-indexed expansion has one synthetic tail. Keep the CFG
     // takeover policy common so adding a new SP/BP form cannot accidentally
@@ -701,6 +790,20 @@ ascent_par! {
         instr_in_function(addr, func_start),
         func_sets_frame_pointer(func_start);
 
+    frame_indexed_load_op(addr) <--
+        float_load_op(addr, op, _, addressing, args, _, false),
+        if is_indexed_integer_rmw_operation(op),
+        if args.len() == 2 && args[0] == Mreg::SP,
+        if matches!(addressing, Addressing::Aindexed2(_) | Addressing::Aindexed2scaled(_, _));
+
+    frame_indexed_load_op(addr) <--
+        float_load_op(addr, op, _, addressing, args, _, false),
+        if is_indexed_integer_rmw_operation(op),
+        if args.len() == 2 && args[0] == Mreg::BP,
+        if matches!(addressing, Addressing::Aindexed2(_) | Addressing::Aindexed2scaled(_, _)),
+        real_addr_in_func(addr, func_start),
+        func_sets_fp_stable(func_start);
+
     stack_indexed_chain(addr) <-- sp_indexed_lea(addr);
     stack_indexed_chain(addr) <-- sp_indexed_load(addr);
     stack_indexed_chain(addr) <-- sp_indexed_store(addr);
@@ -871,6 +974,26 @@ ascent_par! {
 
     global_load_chunk(*ident, chunk.clone()) <--
         ltl_inst(_, ?LTLInst::Lstore(chunk, Addressing::Abasedscaled(_, ident, _), _, _));
+
+    // Synthetic semantic loads/stores do not necessarily have an LTL source
+    // row (packed SIMD lanes, fused memory arithmetic, recovered wide halves,
+    // and similar expansions).  Publish the same global-reference contract
+    // from the actual RTL candidates so declaration recovery sees every
+    // addressable candidate the selector can later retain.  This is deliberately
+    // candidate-level/high-recall; the solver remains responsible for choosing
+    // statements, while an unused declaration is semantics-neutral.
+    global_var_ref(*ident), global_load_chunk(*ident, chunk.clone()) <--
+        rtl_inst_candidate(_, ?RTLInst::Iload(chunk, Addressing::Aglobal(ident, _), _, _));
+    global_var_ref(*ident), global_load_chunk(*ident, chunk.clone()) <--
+        rtl_inst_candidate(_, ?RTLInst::Istore(chunk, Addressing::Aglobal(ident, _), _, _));
+    global_var_ref(*ident), global_load_chunk(*ident, chunk.clone()) <--
+        rtl_inst_candidate(_, ?RTLInst::Iload(chunk, Addressing::Abased(ident, _), _, _));
+    global_var_ref(*ident), global_load_chunk(*ident, chunk.clone()) <--
+        rtl_inst_candidate(_, ?RTLInst::Istore(chunk, Addressing::Abased(ident, _), _, _));
+    global_var_ref(*ident), global_load_chunk(*ident, chunk.clone()) <--
+        rtl_inst_candidate(_, ?RTLInst::Iload(chunk, Addressing::Abasedscaled(_, ident, _), _, _));
+    global_var_ref(*ident), global_load_chunk(*ident, chunk.clone()) <--
+        rtl_inst_candidate(_, ?RTLInst::Istore(chunk, Addressing::Abasedscaled(_, ident, _), _, _));
 
     // Track RTL register holding address of a global (from Oindirectsymbol, used in PIC binaries)
     global_addr_reg(*ident, rtl_reg) <--
@@ -1769,11 +1892,143 @@ ascent_par! {
 
     synth_only_addr(addr) <-- float_arith_stack_op(addr, _, _, _, _), !has_ltl_op(addr);
 
-    // float_load_op: an SSE op with a memory source produces no mach/ltl op, so lower it as a float load into a fresh temp plus the op at a synthetic address; fires only when nothing else lowered it.
+    // Indexed integer RMW from SP (or a proven frame-pointer BP) needs three
+    // semantic instructions: materialize the frame address, load through the
+    // runtime index, then update the destination register.  The x86 memory
+    // read occurs before the register write, so a destination/index collision
+    // takes the index from the structurally reaching pre-definition.
+    #[local] relation frame_indexed_load_op_offset(Node, i64);
+    frame_indexed_load_op_offset(addr, normalized) <--
+        frame_indexed_load_op(addr),
+        float_load_op(addr, _, _, addressing, args, _, false),
+        if args[0] == Mreg::SP,
+        if let Addressing::Aindexed2scaled(_, raw) | Addressing::Aindexed2(raw) = addressing,
+        sp_window_depth(addr, depth),
+        if let Some(normalized) = raw.checked_sub(*depth);
+    frame_indexed_load_op_offset(addr, *raw) <--
+        frame_indexed_load_op(addr),
+        float_load_op(addr, _, _, addressing, args, _, false),
+        if args[0] == Mreg::SP,
+        if let Addressing::Aindexed2scaled(_, raw) | Addressing::Aindexed2(raw) = addressing,
+        !sp_window_depth(addr, _);
+    frame_indexed_load_op_offset(addr, *raw) <--
+        frame_indexed_load_op(addr),
+        float_load_op(addr, _, _, addressing, args, _, false),
+        if args[0] == Mreg::BP,
+        if let Addressing::Aindexed2scaled(_, raw) | Addressing::Aindexed2(raw) = addressing;
+
+    #[local] relation frame_indexed_load_op_index_rtl(Node, RTLReg);
+    frame_indexed_load_op_index_rtl(addr, *idx_rtl) <--
+        frame_indexed_load_op(addr),
+        float_load_op(addr, _, _, _, args, dst, false),
+        !has_ltl_op(addr),
+        if args[1] != *dst,
+        reg_rtl(addr, args[1], idx_rtl);
+    frame_indexed_load_op_index_rtl(addr, idx_rtl) <--
+        frame_indexed_load_op(addr),
+        float_load_op(addr, _, _, _, args, dst, false),
+        !has_ltl_op(addr),
+        if args[1] == *dst,
+        reg_def_used(def_addr, *dst, *addr),
+        def_value_rtl(def_addr, *dst, idx_rtl);
+
+    rtl_inst_candidate(addr, base_inst), op_produces_ptr(addr, base_rtl),
+    indexed_synth_stack_base(func, *addr, *frame_ofs, base_rtl) <--
+        frame_indexed_load_op(addr),
+        float_load_op(addr, _, _, _, args, _, false),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func),
+        frame_indexed_load_op_offset(addr, frame_ofs),
+        let base_rtl = fresh_xtl_reg(*addr, args[0]) | FRESH_NS_SP_BASE,
+        let base_inst = RTLInst::Iop(
+            Operation::Olea(Addressing::Ainstack(*frame_ofs)),
+            Arc::new(vec![]),
+            base_rtl,
+        );
+
+    rtl_inst_candidate(load_node, load_inst), op_produces_int(load_node, temp) <--
+        frame_indexed_load_op(addr),
+        float_load_op(addr, _, chunk, ?Addressing::Aindexed2scaled(scale, _), args, _, false),
+        !has_ltl_op(addr),
+        frame_indexed_load_op_index_rtl(addr, idx_rtl),
+        let base_rtl = fresh_xtl_reg(*addr, args[0]) | FRESH_NS_SP_BASE,
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let load_node = *addr | (1u64 << 62),
+        let load_inst = RTLInst::Iload(
+            *chunk,
+            Addressing::Aindexed2scaled(*scale, 0),
+            Arc::new(vec![base_rtl, *idx_rtl]),
+            temp,
+        );
+
+    rtl_inst_candidate(load_node, load_inst), op_produces_int(load_node, temp) <--
+        frame_indexed_load_op(addr),
+        float_load_op(addr, _, chunk, ?Addressing::Aindexed2(_), args, _, false),
+        !has_ltl_op(addr),
+        frame_indexed_load_op_index_rtl(addr, idx_rtl),
+        let base_rtl = fresh_xtl_reg(*addr, args[0]) | FRESH_NS_SP_BASE,
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let load_node = *addr | (1u64 << 62),
+        let load_inst = RTLInst::Iload(
+            *chunk,
+            Addressing::Aindexed2(0),
+            Arc::new(vec![base_rtl, *idx_rtl]),
+            temp,
+        );
+
+    rtl_inst_candidate(op_node, op_inst), op_produces_int(op_node, *dst_rtl) <--
+        frame_indexed_load_op(addr),
+        float_load_op(addr, op, _, _, _, dst, false),
+        !has_ltl_op(addr),
+        reg_rtl(addr, *dst, dst_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let op_node = *addr | (1u64 << 63),
+        let op_inst = RTLInst::Iop(
+            op.clone(),
+            Arc::new(vec![*dst_rtl, temp]),
+            *dst_rtl,
+        );
+
+    rtl_edge_negated(addr, dst) <--
+        frame_indexed_load_op(addr),
+        !has_ltl_op(addr),
+        rtl_next(addr, dst);
+    rtl_edge_negated(addr, jcc) <--
+        frame_indexed_load_op(addr),
+        !has_ltl_op(addr),
+        next_is_materialized_branch(addr, jcc);
+
+    rtl_succ_candidate(addr, load_node), rtl_expansion_edge(addr, load_node) <--
+        frame_indexed_load_op(addr),
+        !has_ltl_op(addr),
+        let load_node = *addr | (1u64 << 62);
+    rtl_succ_candidate(load_node, op_node), rtl_expansion_edge(load_node, op_node) <--
+        frame_indexed_load_op(addr),
+        !has_ltl_op(addr),
+        let load_node = *addr | (1u64 << 62),
+        let op_node = *addr | (1u64 << 63);
+    instr_in_function(load_node, *func), instr_in_function(op_node, *func) <--
+        frame_indexed_load_op(addr),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func),
+        let load_node = *addr | (1u64 << 62),
+        let op_node = *addr | (1u64 << 63);
+    rtl_succ_candidate(op_node, *dst), rtl_expansion_edge(op_node, *dst) <--
+        frame_indexed_load_op(addr),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func),
+        rtl_next_semantic(func, addr, successors),
+        for dst in successors.0.iter(),
+        let op_node = *addr | (1u64 << 63);
+
+    // float_load_op: an SSE op with a memory source produces no mach/ltl op,
+    // so lower it as a float load into a fresh temp plus the op at a synthetic
+    // address.  The structural frame-indexed integer form above owns its row.
     #[local] relation float_load_arg(Node, usize, Mreg);
     float_load_arg(addr, pos, *m) <--
         float_load_op(addr, _, _, _, args, _, _),
         !has_ltl_op(addr),
+        !frame_indexed_load_op(addr),
         for (pos, m) in args.iter().enumerate();
 
     #[local] relation float_load_arg_rtl(Node, usize, RTLReg);
@@ -1785,15 +2040,18 @@ ascent_par! {
     float_load_args_collected(addr, args) <--
         float_load_op(addr, _, _, _, _, _, _),
         !has_ltl_op(addr),
+        !frame_indexed_load_op(addr),
         agg args = build_call_args(pos, reg) in float_load_arg_rtl(addr, pos, reg);
     float_load_args_collected(addr, Arc::new(vec![])) <--
         float_load_op(addr, _, _, _, _, _, _),
         !has_ltl_op(addr),
+        !frame_indexed_load_op(addr),
         !float_load_arg(addr, _, _);
 
     rtl_inst_candidate(addr, load_inst) <--
         float_load_op(addr, _, chunk, addressing, _, _, _),
         !has_ltl_op(addr),
+        !frame_indexed_load_op(addr),
         float_load_args_collected(addr, arg_rtls),
         let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
         let load_inst = RTLInst::Iload(*chunk, addressing.clone(), arg_rtls.clone(), temp);
@@ -1802,6 +2060,7 @@ ascent_par! {
     rtl_inst_candidate(synthetic_addr, op_inst) <--
         float_load_op(addr, op, _, _, _, dst, false),
         !has_ltl_op(addr),
+        !frame_indexed_load_op(addr),
         reg_rtl(addr, *dst, dst_rtl),
         let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
         let synthetic_addr = *addr | (1u64 << 62),
@@ -1839,6 +2098,7 @@ ascent_par! {
     rtl_succ_candidate(synthetic_addr, next), instr_in_function(synthetic_addr, func_start) <--
         float_load_op(addr, _, _, _, _, _, _),
         !has_ltl_op(addr),
+        !frame_indexed_load_op(addr),
         instr_in_function(addr, func_start),
         let synthetic_addr = *addr | (1u64 << 62),
         next(addr, next);
@@ -2579,6 +2839,7 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
         if mregs.is_empty(),
+        !simd_dword_event_required(addr),
         reg_rtl(addr, *dst_reg, dst_rtl),
         let inst = RTLInst::Iload(*chunk, addressing.clone(), Arc::new(vec![]), *dst_rtl);
 
@@ -3044,6 +3305,11 @@ ascent_par! {
 
     rtl_semantic_node(addr) <-- ltl_inst(addr, _);
     rtl_semantic_node(addr) <-- synth_only_addr(addr);
+    // Packed events may be interior instructions with no ordinary Linear
+    // operation.  Their scalar expansion is nevertheless a semantic CFG
+    // point and must stop the first-successor lattice walk.
+    rtl_semantic_node(addr) <-- simd_dword_event_required(addr);
+    rtl_semantic_node(addr) <-- simd_dword_frame_store_ready(addr, _, _);
 
     rtl_raw_cfg_step(src, dst) <--
         next(src, dst),
@@ -3133,6 +3399,8 @@ ascent_par! {
         !has_ltl_op(addr);
     synth_tail_is_bit63(addr) <--
         imm_indirect_store_bp_indexed(addr, _, _, _, _, _);
+    synth_tail_is_bit63(addr) <--
+        frame_indexed_load_op(addr);
 
     // Some synth-only producers emit only a single synth (bit 62), not the double (62+63); tail is `addr | (1<<62)`, emit bridging edge from that synth too.
     rtl_succ_candidate(synth_last, dst) <--
@@ -4108,6 +4376,204 @@ ascent_par! {
         instr_in_function(*mid, func_start),
         sp_synth_skip_to_ltl(*mid, *func_start, dst),
         let lane3 = simd_broadcast_lane_node(*addr, 3);
+
+    // Materialize packed-dword provenance at the machine events that read
+    // memory.  The load event reads four lanes; every binary event first reads
+    // all four operand lanes and then computes four new persistent lane values.
+    // A later frame spill only stores those values, so calls and intervening
+    // writes cannot move an earlier read forward in time.
+    #[local] relation simd_dword_lane_source(Address, usize, Ident, i64);
+    simd_dword_lane_source(*event, lane, *ident, lane_offset) <--
+        simd_dword_lane_event(event, _, _, target),
+        resolved_addr_to_symbol(target, ident, base_offset),
+        for lane in 0usize..4,
+        let delta = (lane as i64) * 4,
+        if let Some(lane_offset) = base_offset.checked_add(delta);
+
+    #[local] relation simd_dword_event_addressable(Address);
+    simd_dword_event_addressable(*event) <--
+        simd_dword_lane_event(event, _, _, _),
+        simd_dword_lane_source(event, 0, _, _),
+        simd_dword_lane_source(event, 1, _, _),
+        simd_dword_lane_source(event, 2, _, _),
+        simd_dword_lane_source(event, 3, _, _);
+
+    // A materializable event has a complete addressable predecessor chain.
+    // These links were selected from settled point-keyed may-state in asm_pass;
+    // recursion follows value provenance, not an address-ordered CFG surrogate.
+    #[local] relation simd_dword_event_materializable(Address);
+    simd_dword_event_materializable(*event) <--
+        simd_dword_lane_event(event, 0, 0, _),
+        simd_dword_event_addressable(event);
+    simd_dword_event_materializable(*event) <--
+        simd_dword_lane_event(event, kind, input, _),
+        if (1..=5).contains(kind),
+        simd_dword_event_addressable(event),
+        simd_dword_event_materializable(input);
+
+    #[local] relation simd_dword_frame_store_ready(Address, i64, Address);
+    simd_dword_frame_store_ready(*store, *frame_ofs, *definition) <--
+        simd_dword_lane_frame_store(store, frame_ofs, definition),
+        simd_dword_event_materializable(definition);
+
+    // Only events feeding a complete store take over their original CFG node.
+    // This prevents a partially addressable vector chain from replacing the
+    // conservative fallback and then dead-ending midway through the function.
+    #[local] relation simd_dword_event_required(Address);
+    simd_dword_event_required(*definition) <--
+        simd_dword_frame_store_ready(_, _, definition);
+    simd_dword_event_required(*input) <--
+        simd_dword_event_required(event),
+        simd_dword_lane_event(event, kind, input, _),
+        if *kind != 0;
+
+    // Initial four-dword load.  Each lane result is keyed by the defining
+    // event, so later operations can consume it without consulting an XMM
+    // register whose ordinary Mach representation contains only 64 bits.
+    rtl_inst_candidate(node, RTLInst::Iload(
+        MemoryChunk::MInt32,
+        Addressing::Aglobal(*ident, *offset),
+        Arc::new(vec![]),
+        value,
+    )), is_unsigned(value), op_produces_int(node, value) <--
+        simd_dword_event_required(event),
+        simd_dword_lane_event(event, 0, 0, _),
+        simd_dword_lane_source(event, lane, ident, offset),
+        let node = simd_dword_event_stage_node(*event, *lane),
+        let value = fresh_simd_dword_lane_reg(*event, *lane);
+
+    // All memory reads of a packed operation precede its lane computations,
+    // matching one vector instruction rather than interleaving a read with a
+    // visible write or a later machine event.
+    rtl_inst_candidate(node, RTLInst::Iload(
+        MemoryChunk::MInt32,
+        Addressing::Aglobal(*ident, *offset),
+        Arc::new(vec![]),
+        operand,
+    )), is_unsigned(operand), op_produces_int(node, operand) <--
+        simd_dword_event_required(event),
+        simd_dword_lane_event(event, kind, _, _),
+        if (1..=5).contains(kind),
+        simd_dword_lane_source(event, lane, ident, offset),
+        let node = simd_dword_event_stage_node(*event, *lane),
+        let operand = fresh_simd_dword_operand_reg(*event, *lane);
+
+    rtl_inst_candidate(node, RTLInst::Iop(op, Arc::new(vec![left, right]), value)),
+    is_unsigned(value), op_produces_int(node, value) <--
+        simd_dword_event_required(event),
+        simd_dword_lane_event(event, kind, input, _),
+        if (1..=5).contains(kind),
+        for lane in 0usize..4,
+        let op = match *kind {
+            1 => Operation::Oadd,
+            2 => Operation::Osub,
+            3 => Operation::Oand,
+            4 => Operation::Oor,
+            5 => Operation::Oxor,
+            _ => unreachable!(),
+        },
+        let node = simd_dword_event_stage_node(*event, lane + 4),
+        let left = fresh_simd_dword_lane_reg(*input, lane),
+        let right = fresh_simd_dword_operand_reg(*event, lane),
+        let value = fresh_simd_dword_lane_reg(*event, lane);
+
+    #[local] relation simd_dword_event_chain_edge(Address, Node, Node);
+    simd_dword_event_chain_edge(*event, from, to) <--
+        simd_dword_event_required(event),
+        simd_dword_lane_event(event, 0, 0, _),
+        for stage in 0usize..3,
+        let from = simd_dword_event_stage_node(*event, stage),
+        let to = simd_dword_event_stage_node(*event, stage + 1);
+    simd_dword_event_chain_edge(*event, from, to) <--
+        simd_dword_event_required(event),
+        simd_dword_lane_event(event, kind, _, _),
+        if (1..=5).contains(kind),
+        for stage in 0usize..7,
+        let from = simd_dword_event_stage_node(*event, stage),
+        let to = simd_dword_event_stage_node(*event, stage + 1);
+
+    rtl_succ_candidate(from, to), rtl_expansion_edge(from, to) <--
+        simd_dword_event_chain_edge(_, from, to);
+    instr_in_function(to, *func) <--
+        simd_dword_event_chain_edge(event, _, to),
+        instr_in_function(event, func);
+
+    #[local] relation simd_dword_event_chain_tail(Address, Node);
+    simd_dword_event_chain_tail(*event, tail) <--
+        simd_dword_event_required(event),
+        simd_dword_lane_event(event, 0, 0, _),
+        let tail = simd_dword_event_stage_node(*event, 3);
+    simd_dword_event_chain_tail(*event, tail) <--
+        simd_dword_event_required(event),
+        simd_dword_lane_event(event, kind, _, _),
+        if (1..=5).contains(kind),
+        let tail = simd_dword_event_stage_node(*event, 7);
+
+    rtl_edge_negated(event, next_node) <--
+        simd_dword_event_required(event),
+        rtl_next(event, next_node);
+    rtl_edge_negated(event, jcc) <--
+        simd_dword_event_required(event),
+        next_is_materialized_branch(event, jcc);
+    rtl_succ_candidate(tail, *dst), rtl_expansion_edge(tail, *dst) <--
+        simd_dword_event_chain_tail(event, tail),
+        instr_in_function(event, func),
+        rtl_next_semantic(func, event, successors),
+        for dst in successors.0.iter();
+
+    // The wide frame spill is now only a write event: take the address of the
+    // settled frame region and store the four lane values defined upstream.
+    rtl_inst_candidate(store, base_inst), op_produces_ptr(store, base_rtl),
+    indexed_synth_stack_base(func, *store, *frame_ofs, base_rtl) <--
+        simd_dword_frame_store_ready(store, frame_ofs, _),
+        instr_in_function(store, func),
+        let base_rtl = fresh_xtl_reg(*store, Mreg::SP) | FRESH_NS_SP_BASE,
+        let base_inst = RTLInst::Iop(
+            Operation::Olea(Addressing::Ainstack(*frame_ofs)),
+            Arc::new(vec![]),
+            base_rtl,
+        );
+
+    rtl_inst_candidate(node, RTLInst::Istore(
+        MemoryChunk::MInt32,
+        Addressing::Aindexed((lane * 4) as i64),
+        Arc::new(vec![base_rtl]),
+        value,
+    )) <--
+        simd_dword_frame_store_ready(store, _, definition),
+        for lane in 0usize..4,
+        let node = simd_dword_event_stage_node(*store, lane + 1),
+        let base_rtl = fresh_xtl_reg(*store, Mreg::SP) | FRESH_NS_SP_BASE,
+        let value = fresh_simd_dword_lane_reg(*definition, lane);
+
+    #[local] relation simd_dword_store_chain_edge(Address, Node, Node);
+    simd_dword_store_chain_edge(*store, from, to) <--
+        simd_dword_frame_store_ready(store, _, _),
+        for stage in 0usize..4,
+        let from = simd_dword_event_stage_node(*store, stage),
+        let to = simd_dword_event_stage_node(*store, stage + 1);
+    rtl_succ_candidate(from, to), rtl_expansion_edge(from, to) <--
+        simd_dword_store_chain_edge(_, from, to);
+    instr_in_function(to, *func) <--
+        simd_dword_store_chain_edge(store, _, to),
+        instr_in_function(store, func);
+
+    #[local] relation simd_dword_store_chain_tail(Address, Node);
+    simd_dword_store_chain_tail(*store, tail) <--
+        simd_dword_frame_store_ready(store, _, _),
+        let tail = simd_dword_event_stage_node(*store, 4);
+
+    rtl_edge_negated(store, next_node) <--
+        simd_dword_frame_store_ready(store, _, _),
+        rtl_next(store, next_node);
+    rtl_edge_negated(store, jcc) <--
+        simd_dword_frame_store_ready(store, _, _),
+        next_is_materialized_branch(store, jcc);
+    rtl_succ_candidate(tail, *dst), rtl_expansion_edge(tail, *dst) <--
+        simd_dword_store_chain_tail(store, tail),
+        instr_in_function(store, func),
+        rtl_next_semantic(func, store, successors),
+        for dst in successors.0.iter();
 
     // Legacy MOVHPS has two simultaneous effects: preserve the low XMM lane
     // (the ordinary LTL Omove at addr) and load a memory quadword into the high
@@ -5183,6 +5649,7 @@ ascent_par! {
         // branch as a competing statement lets selection discard the load or
         // store itself (notably immediate stack initializers in option arms).
         !synth_only_addr(addr),
+        !simd_dword_event_required(addr),
         // R3 immediate global stores use a synthetic chain but are not members
         // of synth_only_addr because their producer has a Linear operation.
         !mach_imm_global_store(addr, _, _, _, _),
@@ -5674,6 +6141,7 @@ ascent_par! {
     // Read the spill SOURCE id at the DEF site, but bind the load's def id at a load_overwrites_base site, or the ADDRESS is spilled instead of the loaded value and the load's real def is DSE'd.
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        !simd_dword_frame_store_ready(addr, _, _),
         instr_in_function(addr, func_start),
         reg_def_used(defaddr, *src, *addr),
         !load_overwrites_base(defaddr, src),
@@ -5683,6 +6151,7 @@ ascent_par! {
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        !simd_dword_frame_store_ready(addr, _, _),
         instr_in_function(addr, func_start),
         reg_def_used(defaddr, *src, *addr),
         load_overwrites_base(defaddr, src),
@@ -5694,6 +6163,7 @@ ascent_par! {
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        !simd_dword_frame_store_ready(addr, _, _),
         instr_in_function(addr, func_start),
         !reg_def_used(_, src, addr),
         is_arg_reg(src),
@@ -5704,6 +6174,7 @@ ascent_par! {
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        !simd_dword_frame_store_ready(addr, _, _),
         instr_in_function(addr, func_start),
         reg_rtl(addr, *src, src_rtl),
         !stack_var(func_start, addr, ofs, _),
@@ -5712,6 +6183,7 @@ ascent_par! {
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        !simd_dword_frame_store_ready(addr, _, _),
         instr_in_function(addr, func_start),
         !reg_def_used(_, src, addr),
         is_arg_reg(src),
@@ -5722,6 +6194,7 @@ ascent_par! {
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        !simd_dword_frame_store_ready(addr, _, _),
         instr_in_function(addr, func_start),
         !reg_def_used(_, src, addr),
         !is_arg_reg(src),
@@ -11464,9 +11937,11 @@ impl IRPass for RTLPass {
 #[cfg(test)]
 mod tests {
     use super::{
-        fresh_call_input_reg, fresh_stack_param_reg, fresh_stack_slot_reg, fresh_xmm_hi_value_reg,
-        fresh_xtl_reg, indexed_store_ends_at_extent, simd_broadcast_lane_node, xmm_hi_lane_node,
-        xmm_hi_store_node, RTLPassProgram, FRESH_NS_SP_BASE,
+        fresh_call_input_reg, fresh_simd_dword_lane_reg, fresh_simd_dword_operand_reg,
+        fresh_stack_param_reg, fresh_stack_slot_reg, fresh_xmm_hi_value_reg, fresh_xtl_reg,
+        indexed_store_ends_at_extent, simd_broadcast_lane_node, simd_dword_event_stage_node,
+        simd_dword_reg_event, xmm_hi_lane_node, xmm_hi_store_node, RTLPassProgram,
+        FRESH_NS_SP_BASE,
     };
     use crate::aarch64::mach::A64Mreg;
     use crate::mreg::Mreg;
@@ -14746,6 +15221,96 @@ mod tests {
     }
 
     #[test]
+    fn frame_indexed_rmw_normalizes_sp_and_has_no_load_to_exit_bypass() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let rmw = 0x900;
+            let ret = 0x100;
+            let prior_stack_site = 0x700;
+            let block = 0xabc;
+            let index_rtl = 0x1111;
+            let dst_rtl = 0x2222;
+            let local_rtl = 0x3333;
+
+            prog.float_load_op.push((
+                rmw,
+                Operation::Oxor,
+                MemoryChunk::MInt32,
+                Addressing::Aindexed2scaled(4, 24),
+                Arc::new(vec![Mreg::SP, Mreg::DI]),
+                Mreg::AX,
+                false,
+            ));
+            // SP is 32 bytes below the stable frame origin here, so raw +24
+            // denotes frame offset -8.
+            prog.sp_window_depth.push((rmw, 32));
+            prog.reg_rtl.push((rmw, Mreg::DI, index_rtl));
+            prog.reg_rtl.push((rmw, Mreg::AX, dst_rtl));
+            prog.stack_xtl.push((func, prior_stack_site, -8, local_rtl));
+            prog.next.push((rmw, ret));
+            prog.ltl_inst.push((ret, LTLInst::Lreturn));
+            for node in [rmw, ret] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, block));
+            }
+            prog.block_in_function.push((block, func));
+
+            prog.run();
+
+            let base_rtl = fresh_xtl_reg(rmw, Mreg::SP) | FRESH_NS_SP_BASE;
+            let temp = fresh_xtl_reg(rmw, Mreg::x86("RTEMP"));
+            let load_node = rmw | (1u64 << 62);
+            let op_node = rmw | (1u64 << 63);
+
+            assert!(prog
+                .indexed_synth_stack_base
+                .iter()
+                .any(|fact| { fact == &(func, rmw, -8, base_rtl) }));
+            assert!(prog
+                .alias_edge
+                .iter()
+                .any(|fact| { fact == &(base_rtl, local_rtl) }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    rmw,
+                    RTLInst::Iop(
+                        Operation::Olea(Addressing::Ainstack(-8)),
+                        Arc::new(vec![]),
+                        base_rtl,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    load_node,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt32,
+                        Addressing::Aindexed2scaled(4, 0),
+                        Arc::new(vec![base_rtl, index_rtl]),
+                        temp,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    op_node,
+                    RTLInst::Iop(Operation::Oxor, Arc::new(vec![dst_rtl, temp]), dst_rtl),
+                )
+            }));
+
+            for edge in [(rmw, load_node), (load_node, op_node), (op_node, ret)] {
+                assert!(prog.rtl_succ_candidate.iter().any(|fact| fact == &edge));
+                assert!(prog.rtl_expansion_edge.iter().any(|fact| fact == &edge));
+            }
+            assert!(!prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(load_node, ret)));
+        });
+    }
+
+    #[test]
     fn simd_dword_broadcast_store_expands_to_four_structural_stores() {
         on_large_stack(|| {
             let mut prog = RTLPassProgram::default();
@@ -14821,6 +15386,208 @@ mod tests {
                 .rtl_edge_negated
                 .iter()
                 .any(|fact| fact == &(store, next)));
+        });
+    }
+
+    #[test]
+    fn simd_dword_memory_reads_stay_at_their_original_cfg_events() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            // Deliberately non-monotonic ids: provenance and sequencing must
+            // come from explicit edges, never numeric address order.
+            let load = 0x900;
+            let add = 0x100;
+            let xor = 0x700;
+            let store = 0x200;
+            let next = 0x50;
+            let base = 0x404040;
+            let addend = 0x402010;
+            let mask = 0x402020;
+
+            prog.simd_dword_lane_event.extend([
+                (load, 0, 0, base),
+                (add, 1, load, addend),
+                (xor, 5, add, mask),
+            ]);
+            prog.simd_dword_lane_frame_store.push((store, -24, xor));
+
+            for (ident, target) in [
+                (base as usize, base),
+                (addend as usize, addend),
+                (mask as usize, mask),
+            ] {
+                prog.resolved_addr_to_symbol.push((target, ident, 0));
+            }
+
+            prog.ltl_inst.push((
+                load,
+                LTLInst::Lload(
+                    MemoryChunk::MAny64,
+                    Addressing::Aglobal(base as usize, 0),
+                    Arc::new(vec![]),
+                    Mreg::X0,
+                ),
+            ));
+            prog.ltl_inst.push((
+                store,
+                LTLInst::Lsetstack(Mreg::X0, Slot::Local, -24, Typ::Tany64),
+            ));
+            prog.ltl_inst.push((next, LTLInst::Lreturn));
+            prog.next
+                .extend([(load, add), (add, xor), (xor, store), (store, next)]);
+            // ADD/XOR deliberately have no hand-seeded LTL placeholders.  As
+            // interior packed events they must stop the semantic CFG lattice
+            // on their own, and every expansion tail must follow that CFG.
+            let block = 0xabc;
+            for node in [load, add, xor, store, next] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, block));
+            }
+
+            prog.run();
+
+            for ident in [base as usize, addend as usize, mask as usize] {
+                assert!(prog.global_var_ref.iter().any(|fact| fact == &(ident,)));
+                assert!(prog
+                    .global_load_chunk
+                    .iter()
+                    .any(|fact| { fact == &(ident, MemoryChunk::MInt32) }));
+            }
+
+            for lane in 0..4usize {
+                let load_node = simd_dword_event_stage_node(load, lane);
+                let add_read_node = simd_dword_event_stage_node(add, lane);
+                let add_op_node = simd_dword_event_stage_node(add, lane + 4);
+                let xor_read_node = simd_dword_event_stage_node(xor, lane);
+                let xor_op_node = simd_dword_event_stage_node(xor, lane + 4);
+                let store_node = simd_dword_event_stage_node(store, lane + 1);
+
+                assert_eq!(
+                    simd_dword_reg_event(fresh_simd_dword_lane_reg(load, lane)),
+                    Some(load)
+                );
+                assert_eq!(
+                    simd_dword_reg_event(fresh_simd_dword_operand_reg(add, lane)),
+                    Some(add)
+                );
+
+                assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                    *node == load_node
+                        && matches!(
+                            inst,
+                            RTLInst::Iload(
+                                MemoryChunk::MInt32,
+                                Addressing::Aglobal(ident, offset),
+                                _,
+                                dst,
+                            ) if *ident == base as usize
+                                && *offset == (lane * 4) as i64
+                                && *dst == fresh_simd_dword_lane_reg(load, lane)
+                        )
+                }));
+                assert!(prog
+                    .op_produces_int
+                    .iter()
+                    .any(|fact| { *fact == (load_node, fresh_simd_dword_lane_reg(load, lane)) }));
+                assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                    *node == add_read_node
+                        && matches!(
+                            inst,
+                            RTLInst::Iload(
+                                MemoryChunk::MInt32,
+                                Addressing::Aglobal(ident, offset),
+                                _,
+                                dst,
+                            ) if *ident == addend as usize
+                                && *offset == (lane * 4) as i64
+                                && *dst == fresh_simd_dword_operand_reg(add, lane)
+                        )
+                }));
+                assert!(prog.op_produces_int.iter().any(|fact| {
+                    *fact == (add_read_node, fresh_simd_dword_operand_reg(add, lane))
+                }));
+                assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                    *node == add_op_node
+                        && matches!(
+                            inst,
+                            RTLInst::Iop(Operation::Oadd, args, dst)
+                                if args.as_slice()
+                                    == [
+                                        fresh_simd_dword_lane_reg(load, lane),
+                                        fresh_simd_dword_operand_reg(add, lane),
+                                    ]
+                                    && *dst == fresh_simd_dword_lane_reg(add, lane)
+                        )
+                }));
+                assert!(prog
+                    .op_produces_int
+                    .iter()
+                    .any(|fact| { *fact == (add_op_node, fresh_simd_dword_lane_reg(add, lane)) }));
+                assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                    *node == xor_read_node
+                        && matches!(
+                            inst,
+                            RTLInst::Iload(
+                                MemoryChunk::MInt32,
+                                Addressing::Aglobal(ident, offset),
+                                _,
+                                dst,
+                            ) if *ident == mask as usize
+                                && *offset == (lane * 4) as i64
+                                && *dst == fresh_simd_dword_operand_reg(xor, lane)
+                        )
+                }));
+                assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                    *node == xor_op_node
+                        && matches!(
+                            inst,
+                            RTLInst::Iop(Operation::Oxor, args, dst)
+                                if args.as_slice()
+                                    == [
+                                        fresh_simd_dword_lane_reg(add, lane),
+                                        fresh_simd_dword_operand_reg(xor, lane),
+                                    ]
+                                    && *dst == fresh_simd_dword_lane_reg(xor, lane)
+                        )
+                }));
+                assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                    *node == store_node
+                        && matches!(
+                            inst,
+                            RTLInst::Istore(
+                                MemoryChunk::MInt32,
+                                Addressing::Aindexed(offset),
+                                _,
+                                src,
+                            ) if *offset == (lane * 4) as i64
+                                && *src == fresh_simd_dword_lane_reg(xor, lane)
+                        )
+                }));
+            }
+
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == load && matches!(inst, RTLInst::Iload(MemoryChunk::MAny64, _, _, _))
+            }));
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == store && matches!(inst, RTLInst::Iop(Operation::Omove, _, _))
+            }));
+
+            for edge in [
+                (simd_dword_event_stage_node(load, 3), add),
+                (simd_dword_event_stage_node(add, 7), xor),
+                (simd_dword_event_stage_node(xor, 7), store),
+                (simd_dword_event_stage_node(store, 4), next),
+            ] {
+                assert!(
+                    prog.rtl_succ_candidate.iter().any(|fact| fact == &edge),
+                    "missing event-time SIMD edge {edge:?}"
+                );
+                assert!(
+                    prog.rtl_expansion_edge.iter().any(|fact| fact == &edge),
+                    "missing explicit expansion edge {edge:?}"
+                );
+            }
         });
     }
 

@@ -6,6 +6,7 @@ use crate::decompile::passes::c_pass::helpers::{
 };
 use crate::decompile::passes::c_pass::types::{CExpr, CStmt, CType, TopLevelDecl, TypeQualifiers};
 use crate::decompile::passes::pass::IRPass;
+use crate::util::exec_order_key;
 use crate::x86::types::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1457,6 +1458,7 @@ const CLIGHT_EMIT_INPUTS: &[&str] = &[
     "interface_vars",
     "emit_clight_stmt",
     "emit_function",
+    "func_entry_node",
     "emit_function_param",
     "emit_function_return_type",
     "emit_next",
@@ -2143,7 +2145,7 @@ impl IRPass for ClightEmitPass {
 
             {
                 let mut sorted_stmt_nodes: Vec<Node> = func.statements.keys().copied().collect();
-                sorted_stmt_nodes.sort();
+                sorted_stmt_nodes.sort_by_key(|node| exec_order_key(*node));
                 for node in sorted_stmt_nodes {
                     let clight_stmt = &func.statements[&node];
                     let cstmt =
@@ -2168,7 +2170,7 @@ impl IRPass for ClightEmitPass {
 
             // func.successors is a HashMap, so iterating it leaks non-deterministic ordering into the edge sets; the pair set is the same, but sort by source for stable diagnostics anyway.
             let mut succ_nodes: Vec<Node> = func.successors.keys().copied().collect();
-            succ_nodes.sort();
+            succ_nodes.sort_by_key(|node| exec_order_key(*node));
             for node in succ_nodes {
                 if let Some(succs) = func.successors.get(&node) {
                     for succ in succs {
@@ -2207,7 +2209,7 @@ impl IRPass for ClightEmitPass {
 
             {
                 let mut sorted_nodes: Vec<Node> = statements.iter().map(|(n, _)| *n).collect();
-                sorted_nodes.sort();
+                sorted_nodes.sort_by_key(|node| exec_order_key(*node));
                 let has_outgoing: HashSet<Node> = func_edges.iter().map(|(f, _)| *f).collect();
                 let stmt_map: HashMap<Node, &CStmt> =
                     statements.iter().map(|(n, s)| (*n, s)).collect();

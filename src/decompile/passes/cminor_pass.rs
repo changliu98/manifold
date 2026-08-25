@@ -19,6 +19,21 @@ ascent_par! {
 
     relation rtl_inst(Node, RTLInst);
     relation rtl_succ(Node, Node);
+    relation rtl_expansion_edge(Node, Node);
+    #[local] relation rtl_expansion_member(Node);
+    rtl_expansion_member(src) <-- rtl_expansion_edge(src, _);
+    rtl_expansion_member(dst) <-- rtl_expansion_edge(_, dst);
+    // rtl_succ is post-optimization, while rtl_expansion_edge records the
+    // pre-optimization provenance. Nop collapse may retarget either endpoint;
+    // membership carries that provenance onto the authoritative optimized
+    // edge without using node ids as a reachability proxy.
+    #[local] relation rtl_optimized_expansion_edge(Node, Node);
+    rtl_optimized_expansion_edge(src, dst) <--
+        rtl_succ(src, dst),
+        rtl_expansion_member(src);
+    rtl_optimized_expansion_edge(src, dst) <--
+        rtl_succ(src, dst),
+        rtl_expansion_member(dst);
     relation instr_in_function(Node, Address);
     relation func_stacksz(Address, Address, Symbol, u64);
     relation call_return_reg(Node, RTLReg);
@@ -158,6 +173,20 @@ ascent_par! {
         cminor_stmt(next, _),
         instr_in_function(node, func),
         instr_in_function(next, func);
+
+    // Multi-stage expansions publish their sequencing explicitly.  Their node
+    // ids need not fit the legacy two-bit synth namespace, and CFG consumers
+    // must not infer reachability from an address mask.
+    cminor_fallthrough(node, next) <--
+        rtl_optimized_expansion_edge(node, next),
+        cminor_stmt(node, stmt),
+        if matches!(stmt,
+            CminorStmt::Sassign(_, _) | CminorStmt::Sstore(_, _, _, _) |
+            CminorStmt::Sbuiltin(_, _, _, _) | CminorStmt::Scall(_, _, _, _) |
+            CminorStmt::Snop),
+        cminor_stmt(next, _),
+        instr_in_function(node, func),
+        instr_in_function(next, func);
 }
 
 pub struct CminorPass;
@@ -172,6 +201,37 @@ impl IRPass for CminorPass {
     }
 
     declare_io_from!(CminorPassProgram);
+}
+
+#[cfg(test)]
+mod expansion_cfg_tests {
+    use super::CminorPassProgram;
+    use crate::x86::types::RTLInst;
+
+    #[test]
+    fn retargeted_expansion_tail_uses_optimized_successor() {
+        let tail = 0x900;
+        let collapsed = 0x100;
+        let live = 0x700;
+        let func = 0x400;
+        let mut prog = CminorPassProgram::default();
+        prog.rtl_inst
+            .extend([(tail, RTLInst::Inop), (live, RTLInst::Inop)]);
+        prog.rtl_expansion_edge.push((tail, collapsed));
+        prog.rtl_succ.push((tail, live));
+        prog.instr_in_function.extend([(tail, func), (live, func)]);
+
+        prog.run();
+
+        assert!(prog
+            .cminor_fallthrough
+            .iter()
+            .any(|fact| fact == &(tail, live)));
+        assert!(!prog
+            .cminor_fallthrough
+            .iter()
+            .any(|fact| fact == &(tail, collapsed)));
+    }
 }
 
 pub(crate) fn immediate_from_operation(op: &Operation) -> Option<i64> {

@@ -250,6 +250,17 @@ ascent_par! {
         !known_noreturn_call_site(n),
         let inst = LTLInst::Lbranch(Either::Right(*next_node));
 
+    // Retained side effects are not necessarily block leaders.  Give every
+    // interior member of this class its own LTL point as well: merely making
+    // it self-canonical does not stop a predecessor from threading past a
+    // node that has no ltl_inst at all.
+    ltl_inst(n, inst) <--
+        node_unlowered_side_effect(n),
+        next(n, next_node),
+        !linear_inst(n, _),
+        !known_noreturn_call_site(n),
+        let inst = LTLInst::Lbranch(Either::Right(*next_node));
+
 
     ltl_branch_candidate(n, *fallthrough) <--
         linear_inst(n, linearinst),
@@ -1009,6 +1020,28 @@ mod tests {
             .ltl_canonical_node
             .iter()
             .any(|fact| fact == &(memory_read, after_read)));
+    }
+
+    #[test]
+    fn interior_unlowered_side_effect_gets_an_ltl_point() {
+        let mut prog = LinearPassProgram::default();
+        // Deliberately omit block_in_function(event): an interior instruction
+        // is retained because of its side effect, not because it starts a
+        // block.  Structural next is the only fallthrough evidence required.
+        let event = 0x900;
+        let next = 0x100;
+        prog.next.push((event, next));
+        prog.node_unlowered_side_effect.push((event,));
+
+        prog.run();
+
+        assert!(prog.ltl_inst.iter().any(|(node, inst)| {
+            *node == event && matches!(inst, LTLInst::Lbranch(Either::Right(dst)) if *dst == next)
+        }));
+        assert!(prog
+            .ltl_canonical_node
+            .iter()
+            .any(|fact| fact == &(event, event)));
     }
 
     #[test]

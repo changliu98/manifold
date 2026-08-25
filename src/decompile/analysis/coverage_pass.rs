@@ -50,7 +50,10 @@ use crate::decompile::passes::c_pass::types::{
 };
 use crate::decompile::passes::clight_select::select::SelectedFunction;
 use crate::decompile::passes::pass::IRPass;
-use crate::util::{SYNTH_NODE_BIT, SYNTH_NODE_BIT2};
+use crate::util::{
+    is_synthetic_node, MULTI_SYNTH_NODE_BIT, MULTI_SYNTH_STAGE_SHIFT, SYNTH_NODE_BIT,
+    SYNTH_NODE_BIT2,
+};
 use crate::x86::types::{
     Address, ClightBinaryOp, ClightExpr, ClightFloatSize, ClightIntSize, ClightStmt, ClightType,
     Ident, Node, RTLInst, Symbol,
@@ -1062,14 +1065,26 @@ fn expr_idents(e: &ClightExpr, out: &mut Vec<Ident>) {
 /// A value-web id packs the node that defined it above the machine-register
 /// discriminant, so the defining node reads straight back out of the id.
 fn web_def_node(reg: u64) -> Node {
-    (reg & !(1u64 << 63)) >> crate::decompile::passes::rtl_pass::MREG_DISCRIMINANT_BITS
+    crate::decompile::passes::rtl_pass::simd_dword_reg_event(reg).unwrap_or_else(|| {
+        (reg & !(1u64 << 63)) >> crate::decompile::passes::rtl_pass::MREG_DISCRIMINANT_BITS
+    })
 }
 
 /// A node and its two synth sub-nodes: an RMW fused into one address emits its
 /// op at synth1 and its store at synth2, so evidence at either is evidence for
 /// the instruction.
-fn node_family(base: Node) -> [Node; 3] {
-    [base, base | SYNTH_NODE_BIT, base | SYNTH_NODE_BIT2]
+fn node_family(base: Node) -> Vec<Node> {
+    let mut family = Vec::with_capacity(11);
+    family.push(base);
+    family.extend(
+        (1u64..=7).map(|stage| base | MULTI_SYNTH_NODE_BIT | (stage << MULTI_SYNTH_STAGE_SHIFT)),
+    );
+    family.extend([
+        base | SYNTH_NODE_BIT,
+        base | SYNTH_NODE_BIT2,
+        base | SYNTH_NODE_BIT | SYNTH_NODE_BIT2,
+    ]);
+    family
 }
 
 // The report
@@ -1236,7 +1251,7 @@ fn collect(db: &DecompileDB) -> AuditInputs {
     for (node, func) in db.rel_iter::<(Node, Address)>("instr_in_function") {
         // Synth nodes are artifacts of lifting, not decoded instructions; they
         // count as evidence for their base, never as universe members.
-        if *node & (SYNTH_NODE_BIT | SYNTH_NODE_BIT2) != 0 {
+        if is_synthetic_node(*node) {
             continue;
         }
         node_funcs.entry(*node).or_default().insert(*func);

@@ -8,6 +8,27 @@ use object::{Object, ObjectSection, SectionFlags, SectionKind};
 
 const SHF_EXECINSTR: u64 = 0x4;
 
+/// EVEX encodes its opmask register in the low three bits of P2.  Capstone's
+/// semantic operand list does not expose the mask register, so retain one
+/// explicit fact before lowering can mistake a masked EVEX operation for an
+/// ordinary VEX three-operand instruction.
+fn evex_has_opmask(mnemonic: &str, bytes: &[u8]) -> bool {
+    if !mnemonic.starts_with('V') {
+        return false;
+    }
+    let prefix_len = bytes
+        .iter()
+        .take_while(|byte| {
+            matches!(
+                **byte,
+                0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
+            )
+        })
+        .count();
+    bytes.get(prefix_len) == Some(&0x62)
+        && bytes.get(prefix_len + 3).is_some_and(|p2| p2 & 0x07 != 0)
+}
+
 // Canonical spelling of the stack/frame registers for the stack FACT relations (stack_def, stack_use, adjusts_stack, stack_base_move): the 32-bit E-names fold onto the 64-bit R-names, since the two spell one register and every consumer (stack_pass, canary_vla_pass, rtl_pass) tests "RSP"/"RBP".
 // Deliberately NOT applied to op_register/op_indirect: asm_pass reads operand width from the E-vs-R spelling there (ireg_hold_type: EAX is Tint, RAX is Tany64), so folding those would mis-size 32-bit operands.
 fn canonical_stack_reg(name: &str) -> Option<&'static str> {
@@ -162,6 +183,7 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
     let mut stack_base_moves: Vec<(u64, &'static str, &'static str)> = Vec::new();
     let mut decoded_memory_writes: Vec<(u64, usize)> = Vec::new();
     let mut decoded_memory_write_unknown: Vec<(u64, &'static str)> = Vec::new();
+    let mut avx_masked_sites: Vec<(u64,)> = Vec::new();
 
     for section in obj.sections() {
         if !is_executable_section(&section) {
@@ -191,6 +213,9 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
                 mnem_str
             };
             let mnemonic: &'static str = Box::leak(mnem_str.into_boxed_str());
+            if evex_has_opmask(mnemonic, insn.bytes()) {
+                avx_masked_sites.push((addr,));
+            }
 
             let prefix: &'static str = {
                 let detail = cs.insn_detail(insn).ok();
@@ -571,13 +596,28 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
             .into_iter()
             .collect::<ascent::boxcar::Vec<_>>(),
     );
+    db.rel_set(
+        "avx_masked_site",
+        avx_masked_sites
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
 
     decoded
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{implicit_data_memory_write_width, special_memory_write};
+    use super::{evex_has_opmask, implicit_data_memory_write_width, special_memory_write};
+
+    #[test]
+    fn evex_opmask_detection_handles_prefixes_and_k0() {
+        assert!(evex_has_opmask("VPADDD", &[0x62, 0xf1, 0x75, 0x09]));
+        assert!(evex_has_opmask("VPADDD", &[0x67, 0x62, 0xf1, 0x75, 0x81]));
+        assert!(!evex_has_opmask("VPADDD", &[0x62, 0xf1, 0x75, 0x08]));
+        assert!(!evex_has_opmask("BOUND", &[0x62, 0x01, 0x02, 0x07]));
+        assert!(!evex_has_opmask("VPADDD", &[0xc5, 0xf1, 0xfe, 0x00]));
+    }
 
     #[test]
     fn implicit_string_stores_keep_their_element_width() {

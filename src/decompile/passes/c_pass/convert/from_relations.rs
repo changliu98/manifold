@@ -8,6 +8,7 @@ use crate::decompile::passes::c_pass::types::{
 use crate::decompile::passes::c_pass::TranslationUnit;
 use crate::decompile::passes::clight_select::query::GlobalData;
 use crate::decompile::passes::clight_select::select::SelectedFunction;
+use crate::util::{exec_order_key, semantic_node_address};
 use crate::x86::types as clight;
 use crate::x86::types::*;
 use log::debug;
@@ -1535,7 +1536,7 @@ pub fn build_cast_from_relations(
     for func in selected_functions {
         // func.statements is a HashMap; iterating it directly leaks non-deterministic order into convert_stmt -> record_var_type (which is first-wins), so a variable's recorded C type flips between runs. Walk nodes in sorted order.
         let mut nodes: Vec<crate::x86::types::Node> = func.statements.keys().copied().collect();
-        nodes.sort();
+        nodes.sort_by_key(|node| exec_order_key(*node));
         for node in nodes {
             let clight_stmt = &func.statements[&node];
             let converted = convert_stmt(clight_stmt, &mut ctx);
@@ -2223,7 +2224,6 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     remove_buffer_owned_array_layouts(&mut escaped_stack_arrays, &escaped_stack_buffers);
 
     // Loop-structure facts for top-level ordering, keyed by synth-masked header to member addresses, keeping a rotated loop's body contiguous and ahead of its exit instead of address tie-breaking.
-    const ORDER_SYNTH_MASK: u64 = !((1u64 << 62) | (1u64 << 63));
     // loop_members must be keyed through the SAME normalization order_nodes_dfs uses (sseq-head resolve then synth-mask), or a header folded into an sseq bundle reads as loop-free and its body orders after its exit.
     let order_sseq_member_to_head: HashMap<crate::x86::types::Node, crate::x86::types::Node> = {
         let mut m: HashMap<crate::x86::types::Node, crate::x86::types::Node> = HashMap::new();
@@ -2244,7 +2244,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         m
     };
     let norm_order_id = |n: crate::x86::types::Node| -> crate::x86::types::Node {
-        order_sseq_member_to_head.get(&n).copied().unwrap_or(n) & ORDER_SYNTH_MASK
+        semantic_node_address(order_sseq_member_to_head.get(&n).copied().unwrap_or(n))
     };
     let loop_members: HashMap<crate::x86::types::Node, HashSet<crate::x86::types::Node>> = {
         let mut m: HashMap<crate::x86::types::Node, HashSet<crate::x86::types::Node>> =
@@ -2329,7 +2329,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         // Normalize a top-level node id to the address loop_body is keyed by: resolve an sseq member to its bundle head, then mask both synthetic-address bits so synth nodes land on their base.
         let order_normalize = |n: crate::x86::types::Node| -> crate::x86::types::Node {
             let resolved = sseq_member_to_head.get(&n).copied().unwrap_or(n);
-            resolved & ORDER_SYNTH_MASK
+            semantic_node_address(resolved)
         };
         redirect_structured_loop_entry_edges(
             entry_node,
@@ -2437,7 +2437,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 .copied()
                 .filter(|n| !covered_nodes.contains(n))
                 .collect();
-            fb_nodes.sort();
+            fb_nodes.sort_by_key(|node| exec_order_key(*node));
             for node in fb_nodes {
                 if let Some(cl_stmt) = func.statements.get(&node) {
                     let cstmt = convert_stmt(cl_stmt, &mut fb_ctx);
@@ -5961,7 +5961,7 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
             }
             CExpr::Unary(UnaryOp::Deref, Box::new(convert_expr(inner, ctx)))
         }
-        clight::ClightExpr::Eaddrof(inner, _ty) => {
+        clight::ClightExpr::Eaddrof(inner, ty) => {
             match inner.as_ref() {
                 clight::ClightExpr::EvarSymbol(name, _) => {
                     if let Some(content) = ctx.string_label_to_content.get(name) {
@@ -5986,7 +5986,29 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
                 }
                 _ => {}
             }
-            CExpr::Unary(UnaryOp::AddrOf, Box::new(convert_expr(inner, ctx)))
+            let address = CExpr::Unary(UnaryOp::AddrOf, Box::new(convert_expr(inner, ctx)));
+            // An Evar's Clight type describes this particular memory access,
+            // while its eventual C declaration can be replaced by a wider
+            // byte-buffer owner during exact stack-layout coalescing.  Keep
+            // the address node's pointer type explicit before that later
+            // rewrite: otherwise `&int_slot + i` can silently become
+            // `&*(long *)&buffer[0] + i`, changing the machine stride from
+            // four bytes to eight.  Named image globals retain their dedicated
+            // byte-coordinate lowering, and interior-global aliases already
+            // carry a typed dereference around their owner coordinate, so
+            // neither needs the additional cast.
+            if matches!(ty, clight::ClightType::Tpointer(..))
+                && matches!(
+                    inner.as_ref(),
+                    clight::ClightExpr::Evar(id, _)
+                        if !ctx.global_lvalue_aliases.contains_key(id)
+                            && !ctx.id_to_name.contains_key(id)
+                )
+            {
+                CExpr::Cast(convert_clight_type(ty, ctx.data_model), Box::new(address))
+            } else {
+                address
+            }
         }
         clight::ClightExpr::Eunop(op, inner, _ty) => {
             if matches!(op, clight::ClightUnaryOp::Oabsfloat) {
@@ -7626,6 +7648,66 @@ mod escaped_stack_array_tests {
                 )),
             )),
             "a true scalar-to-pointer cast must still convert the stored value",
+        );
+    }
+
+    #[test]
+    fn stack_alias_pointer_arithmetic_keeps_clight_access_stride() {
+        let base: RTLReg = 0x7700;
+        let member: RTLReg = 0x7800;
+        let index: RTLReg = 0x7900;
+        let base_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(base);
+        let member_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(member);
+        let index_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(index);
+        let int_ty = clight::ClightType::Tint(
+            clight::ClightIntSize::I32,
+            clight::ClightSignedness::Signed,
+            clight::ClightAttr::default(),
+        );
+        let int_ptr_ty =
+            clight::ClightType::Tpointer(Arc::new(int_ty.clone()), clight::ClightAttr::default());
+        let indexed_address = clight::ClightExpr::Ebinop(
+            clight::ClightBinaryOp::Oadd,
+            Box::new(clight::ClightExpr::Eaddrof(
+                Box::new(clight::ClightExpr::Evar(
+                    member as Ident,
+                    int_ty.clone(),
+                )),
+                int_ptr_ty.clone(),
+            )),
+            Box::new(clight::ClightExpr::Etempvar(index as Ident, int_ty)),
+            int_ptr_ty,
+        );
+        let mut ctx = ConversionContext::new(HashMap::new(), crate::abi::DataModel::Lp64);
+        let body = CStmt::Expr(convert_expr(&indexed_address, &mut ctx));
+
+        // The final storage declaration can be wider than the particular
+        // indexed access.  That must not change the pointer-add stride.
+        let rewritten = rewrite_stack_buffer_aliases(
+            &body,
+            &HashMap::from([(member, (base, 0_usize))]),
+            &HashMap::from([(member_name, CType::long())]),
+        );
+        let final_types = HashMap::from([
+            (
+                base_name,
+                CType::Array(Box::new(CType::char_unsigned()), Some(16)),
+            ),
+            (index_name, CType::int()),
+        ]);
+        let rewritten = strip_trivial_casts(&rewritten, &final_types);
+        let rewritten = repair_arith_stmt(&rewritten, &final_types);
+
+        let CStmt::Expr(CExpr::Binary(BinaryOp::Add, lhs, _)) = rewritten else {
+            panic!("indexed stack address lost its additive shape: {rewritten:?}")
+        };
+        assert!(
+            matches!(
+                lhs.as_ref(),
+                CExpr::Cast(CType::Pointer(pointee, _), _)
+                    if pointee.as_ref() == &CType::int()
+            ),
+            "late storage coalescing changed an int-pointer stride: {lhs:?}",
         );
     }
 

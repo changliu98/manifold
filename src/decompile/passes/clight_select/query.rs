@@ -2069,7 +2069,16 @@ pub fn extract_functions(
         func_return.insert(*addr, *reg);
     }
 
-    for (addr, name, entry_node) in db.rel_iter::<(Address, Symbol, Node)>("emit_function") {
+    // Final statement ordering must start at Cshminor's active semantic entry,
+    // not the raw machine entry retained in emit_function for ABI recovery.
+    // In particular, RTL entry-nop collapse can retarget the entry directly to
+    // a synthetic first expansion stage that raw instruction `next` bypasses.
+    let semantic_entries: HashMap<Address, Node> = db
+        .rel_iter::<(Address, Node)>("func_entry_node")
+        .map(|&(func, entry)| (func, entry))
+        .collect();
+
+    for (addr, name, raw_entry_node) in db.rel_iter::<(Address, Symbol, Node)>("emit_function") {
         let ident = *addr as usize;
         let final_name = if name.starts_with("FUN_") {
             id_to_name
@@ -2120,6 +2129,10 @@ pub fn extract_functions(
 
         let return_reg = func_return.get(addr).copied();
 
+        let entry_node = semantic_entries
+            .get(addr)
+            .copied()
+            .unwrap_or(*raw_entry_node);
         let mut func_data = FunctionData::new(
             *addr,
             final_name,
@@ -2127,7 +2140,7 @@ pub fn extract_functions(
             param_types,
             return_reg,
             0,
-            *entry_node,
+            entry_node,
             db.abi().pointer_size == 8,
         );
         func_data.known_global_types = known_global_types.clone();

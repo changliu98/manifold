@@ -1,5 +1,6 @@
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
+use crate::util::{exec_order_key, is_synthetic_node, semantic_node_address};
 use crate::x86::op::{Comparison, Condition};
 use crate::x86::types::{
     Address, BuiltinArg, Constant, CsharpminorExpr, CsharpminorStmt, Node, RTLReg, Symbol,
@@ -168,13 +169,12 @@ impl IRPass for StructuringPass {
             s
         };
         // Stmt nodes in a packed block; node id low bits are the instruction address (top 2 bits are tail-dup copy tags), so mask them to recover it.
-        let node_addr_mask: u64 = !((1u64 << 62) | (1u64 << 63));
         let packed_alu_nodes: HashSet<Node> = if packed_alu_blocks.is_empty() {
             HashSet::new()
         } else {
             db.rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt_candidate")
                 .filter_map(|(n, _)| {
-                    let addr = *n & node_addr_mask;
+                    let addr = semantic_node_address(*n);
                     code_in_block_map
                         .get(&addr)
                         .filter(|blk| packed_alu_blocks.contains(blk))
@@ -184,29 +184,41 @@ impl IRPass for StructuringPass {
         };
 
         // CF-6: include cminor_succ preds so taint-mirror can catch edges clight sees but the function-local stmt view misses (cross-function preds, preds with no csharp stmt); values sorted for determinism.
-        let cminor_preds: HashMap<Node, Vec<Node>> = {
-            let mut m: HashMap<Node, Vec<Node>> = HashMap::new();
+        let (cminor_succs, cminor_preds): (HashMap<Node, Vec<Node>>, HashMap<Node, Vec<Node>>) = {
+            let mut succs: HashMap<Node, Vec<Node>> = HashMap::new();
+            let mut preds: HashMap<Node, Vec<Node>> = HashMap::new();
             for &(src, dst) in db.rel_iter::<(Node, Node)>("cminor_succ") {
-                m.entry(dst).or_default().push(src);
+                succs.entry(src).or_default().push(dst);
+                preds.entry(dst).or_default().push(src);
             }
-            for v in m.values_mut() {
+            for v in succs.values_mut().chain(preds.values_mut()) {
                 v.sort_unstable();
                 v.dedup();
             }
-            m
+            (succs, preds)
         };
+        let expansion_sources: HashSet<Node> = db
+            .rel_iter::<(Node, Node)>("rtl_expansion_edge")
+            .map(|(src, _)| *src)
+            .collect();
 
-        // Authoritative function entry from emit_function; may point to a non-stmt node that structure() resolves through next_map.
-        let func_entry: HashMap<Address, Node> = db
+        // The raw machine entry is a fallback for isolated/partial pipelines.
+        // Cshminor's func_entry_node overrides it with the post-optimizer,
+        // active-Cminor entry, preserving a synthetic expansion at function
+        // start instead of resolving the stale raw address through `next`.
+        let mut func_entry: HashMap<Address, Node> = db
             .rel_iter::<(Address, Symbol, Node)>("emit_function")
             .map(|(addr, _, entry)| (*addr, *entry))
             .collect();
+        for &(func, entry) in db.rel_iter::<(Address, Node)>("func_entry_node") {
+            func_entry.insert(func, entry);
+        }
 
         let mut all_stmts: Vec<(Node, CsharpminorStmt)> = working
             .iter()
             .map(|(&node, stmt)| (node, stmt.clone()))
             .collect();
-        all_stmts.sort_by_key(|(node, _)| *node);
+        all_stmts.sort_by_key(|(node, _)| exec_order_key(*node));
 
         let mut func_stmts: HashMap<Address, Vec<(Node, CsharpminorStmt)>> = HashMap::new();
         let mut unowned_nodes: Vec<Node> = Vec::new();
@@ -215,7 +227,7 @@ impl IRPass for StructuringPass {
             // Synthetic nodes (tail_dup_pass copies) are not in instr_in_function; fall back to the masked base id to group them into their base node's function.
             let owner = node_to_funcs
                 .get(node)
-                .or_else(|| node_to_funcs.get(&(*node & !((1u64 << 62) | (1u64 << 63)))));
+                .or_else(|| node_to_funcs.get(&semantic_node_address(*node)));
             if let Some(funcs) = owner {
                 for &func_addr in funcs {
                     func_stmts
@@ -229,7 +241,7 @@ impl IRPass for StructuringPass {
         }
 
         for stmts in func_stmts.values_mut() {
-            stmts.sort_by_key(|(n, _)| *n);
+            stmts.sort_by_key(|(n, _)| exec_order_key(*n));
         }
 
         // Process functions in parallel from a sorted outer vector. HashMap
@@ -259,6 +271,8 @@ impl IRPass for StructuringPass {
                 let structured = structure(
                     stmts,
                     &next_map,
+                    &cminor_succs,
+                    &expansion_sources,
                     declared_entry,
                     &cminor_preds,
                     &packed_alu_nodes,
@@ -392,8 +406,13 @@ impl IRPass for StructuringPass {
             "emit_inline_temp",
             "emit_var_type_candidate",
             "emit_function",
+            "func_entry_node",
             "emit_function_param_candidate",
             "packed_alu_addr",
+            // Authoritative semantic CFG.  Both are read imperatively; without
+            // declaring them the parallel scheduler supplies empty relations.
+            "cminor_succ",
+            "rtl_expansion_edge",
             // Read by the dead-copy type transfer below, which is imperative
             // and would see an empty relation in a parallel sub-DB otherwise.
             "web_class_gpr",
@@ -690,7 +709,7 @@ ascent_par! {
         if sources.0.contains(f),
         if node != t,
         if node != f,
-        if (*node & ((1u64 << 62) | (1u64 << 63))) == 0;
+        if !is_synthetic_node(*node);
 
     // A node that reconverges an ENCLOSING no-join branch must stay top-level, but only when the inner branch does not itself dominate it, or the branch's exclusive subtree gets blocked out of its arm.
     relation enclosing_reconverge(Node, Node);
@@ -1085,13 +1104,116 @@ ascent_par! {
 
 #[cfg(test)]
 mod structural_lattice_tests {
-    use super::{detect_comparison_tree_switches, structure, StructuringProgram};
+    use super::{
+        compute_sequential_edges, detect_comparison_tree_switches, structure,
+        unmerge_pure_branch_tails, StructuringProgram,
+    };
+    use crate::util::{MULTI_SYNTH_NODE_BIT, MULTI_SYNTH_STAGE_SHIFT};
     use crate::x86::op::{Comparison, Condition};
     use crate::x86::types::{CsharpminorExpr, CsharpminorStmt};
     use std::collections::{HashMap, HashSet};
 
     fn synthetic_ids<const N: usize>() -> [u64; N] {
         std::array::from_fn(|index| index as u64 + 1)
+    }
+
+    #[test]
+    fn multi_stage_expansion_uses_semantic_cfg_not_raw_bypass() {
+        let event = 0x900;
+        let stage1 = event | MULTI_SYNTH_NODE_BIT | (1 << MULTI_SYNTH_STAGE_SHIFT);
+        let stage2 = event | MULTI_SYNTH_NODE_BIT | (2 << MULTI_SYNTH_STAGE_SHIFT);
+        let next = 0x50;
+        let stmts = [event, stage1, stage2, next]
+            .into_iter()
+            .map(|node| (node, CsharpminorStmt::Snop))
+            .collect::<Vec<_>>();
+        let raw_next = HashMap::from([(event, next)]);
+        let semantic_succs = HashMap::from([
+            (event, vec![stage1]),
+            (stage1, vec![stage2]),
+            (stage2, vec![next]),
+        ]);
+        let expansion_sources = HashSet::from([event, stage1, stage2]);
+
+        let edges =
+            compute_sequential_edges(&stmts, &raw_next, &semantic_succs, &expansion_sources);
+
+        assert!(edges.contains(&(event, stage1)));
+        assert!(edges.contains(&(stage1, stage2)));
+        assert!(edges.contains(&(stage2, next)));
+        assert!(!edges.contains(&(event, next)));
+    }
+
+    #[test]
+    fn retargeted_predecessor_enters_surviving_multi_stage_tail() {
+        let pred = 0x10;
+        let removed_stage0 = 0x900;
+        let stage1 = removed_stage0 | MULTI_SYNTH_NODE_BIT | (1 << MULTI_SYNTH_STAGE_SHIFT);
+        let next = 0x50;
+        let stmts = [pred, stage1, next]
+            .into_iter()
+            .map(|node| (node, CsharpminorStmt::Snop))
+            .collect::<Vec<_>>();
+        // Machine layout still bypasses the expansion, but optimizer CFG
+        // repair has structurally retargeted the ordinary predecessor.
+        let raw_next = HashMap::from([(pred, next)]);
+        let semantic_succs = HashMap::from([(pred, vec![stage1]), (stage1, vec![next])]);
+        let expansion_sources = HashSet::from([removed_stage0, stage1]);
+
+        let edges =
+            compute_sequential_edges(&stmts, &raw_next, &semantic_succs, &expansion_sources);
+
+        assert!(edges.contains(&(pred, stage1)));
+        assert!(edges.contains(&(stage1, next)));
+        assert!(!edges.contains(&(pred, next)));
+    }
+
+    #[test]
+    fn tail_unmerge_preserves_every_multi_stage_statement() {
+        let pred1 = 0x10;
+        let pred2 = 0x20;
+        let event = 0x900;
+        let stage1 = event | MULTI_SYNTH_NODE_BIT | (1 << MULTI_SYNTH_STAGE_SHIFT);
+        let stage2 = event | MULTI_SYNTH_NODE_BIT | (2 << MULTI_SYNTH_STAGE_SHIFT);
+        let jump = 0x50;
+        let ret = 0x60;
+        let event_stmt = CsharpminorStmt::Sset(1, CsharpminorExpr::Evar(10));
+        let stage1_stmt = CsharpminorStmt::Sset(2, CsharpminorExpr::Evar(11));
+        let stage2_stmt = CsharpminorStmt::Sset(3, CsharpminorExpr::Evar(12));
+        let jump_stmt = CsharpminorStmt::Sjump(ret);
+        let expected = vec![
+            event_stmt.clone(),
+            stage1_stmt.clone(),
+            stage2_stmt.clone(),
+            jump_stmt.clone(),
+        ];
+        let mut stmts = vec![
+            (pred1, CsharpminorStmt::Sjump(event)),
+            (pred2, CsharpminorStmt::Sjump(event)),
+            (event, event_stmt),
+            (stage1, stage1_stmt),
+            (stage2, stage2_stmt),
+            (jump, jump_stmt),
+            (ret, CsharpminorStmt::Sreturn(CsharpminorExpr::Evar(3))),
+        ];
+        // Raw machine fallthrough jumps directly from the real event to the
+        // next real instruction; the semantic Cminor CFG contains its scalar
+        // stages and is authoritative for duplication.
+        let raw_next = HashMap::from([(event, jump)]);
+        let semantic_succs = HashMap::from([
+            (event, vec![stage1]),
+            (stage1, vec![stage2]),
+            (stage2, vec![jump]),
+        ]);
+        let expansion_sources = HashSet::from([event, stage1, stage2]);
+
+        unmerge_pure_branch_tails(&mut stmts, &raw_next, &semantic_succs, &expansion_sources);
+
+        let duplicate = event | (1u64 << 62);
+        assert!(stmts.iter().any(|(node, stmt)| {
+            *node == duplicate
+                && matches!(stmt, CsharpminorStmt::Sseq(seq) if seq.as_slice() == expected.as_slice())
+        }));
     }
 
     #[test]
@@ -1287,7 +1409,15 @@ mod structural_lattice_tests {
             }
         }
 
-        let structured = structure(&stmts, &HashMap::new(), Some(head), &preds, &HashSet::new());
+        let structured = structure(
+            &stmts,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            Some(head),
+            &preds,
+            &HashSet::new(),
+        );
 
         assert!(structured
             .valid_switches
@@ -1319,6 +1449,8 @@ pub struct StructuringResult {
 fn unmerge_pure_branch_tails(
     current_stmts: &mut Vec<(Node, CsharpminorStmt)>,
     next_map: &HashMap<Node, Node>,
+    cminor_succs: &HashMap<Node, Vec<Node>>,
+    expansion_sources: &HashSet<Node>,
 ) {
     const SYNTH_BIT: u64 = 1u64 << 62;
     const SYNTH_BIT2: u64 = 1u64 << 63;
@@ -1327,15 +1459,8 @@ fn unmerge_pure_branch_tails(
     let stmt_map: HashMap<Node, CsharpminorStmt> = current_stmts.iter().cloned().collect();
     let stmt_nodes: HashSet<Node> = current_stmts.iter().map(|(n, _)| *n).collect();
 
-    let stmt_next = |mut n: Node| -> Option<Node> {
-        for _ in 0..64 {
-            let nx = *next_map.get(&n)?;
-            if stmt_nodes.contains(&nx) {
-                return Some(nx);
-            }
-            n = nx;
-        }
-        None
+    let stmt_next = |n: Node| -> Option<Node> {
+        sequential_stmt_successor(n, next_map, cminor_succs, expansion_sources, &stmt_nodes)
     };
 
     let branch_targets = |s: &CsharpminorStmt| -> Vec<Node> {
@@ -1506,6 +1631,8 @@ fn unmerge_pure_branch_tails(
 pub fn structure(
     stmts: &[(Node, CsharpminorStmt)],
     next_map: &HashMap<Node, Node>,
+    cminor_succs: &HashMap<Node, Vec<Node>>,
+    expansion_sources: &HashSet<Node>,
     declared_entry: Option<Node>,
     cminor_preds: &HashMap<Node, Vec<Node>>,
     packed_alu_nodes: &HashSet<Node>,
@@ -1523,7 +1650,7 @@ pub fn structure(
     }
 
     let mut current_stmts: Vec<(Node, CsharpminorStmt)> = stmts.to_vec();
-    current_stmts.sort_by_key(|(n, _)| *n);
+    current_stmts.sort_by_key(|(n, _)| exec_order_key(*n));
 
     // Resolve synthetic/missing Scond targets by walking `next` chain.
     let stmt_nodes: HashSet<Node> = current_stmts.iter().map(|(n, _)| *n).collect();
@@ -1532,7 +1659,7 @@ pub fn structure(
         if stmt_nodes.contains(&target) {
             return target;
         }
-        let real_addr = target & !(1u64 << 62);
+        let real_addr = semantic_node_address(target);
         if stmt_nodes.contains(&real_addr) {
             return real_addr;
         }
@@ -1554,7 +1681,12 @@ pub fn structure(
     }
 
     // Un-merge shared value tails before dominance is computed, so structuring folds each copy into its arm (see unmerge_pure_branch_tails).
-    unmerge_pure_branch_tails(&mut current_stmts, next_map);
+    unmerge_pure_branch_tails(
+        &mut current_stmts,
+        next_map,
+        cminor_succs,
+        expansion_sources,
+    );
 
     let mut prog = StructuringProgram::default();
 
@@ -1565,7 +1697,8 @@ pub fn structure(
         }
     }
 
-    let seq_edges = compute_sequential_edges(&current_stmts, next_map);
+    let seq_edges =
+        compute_sequential_edges(&current_stmts, next_map, cminor_succs, expansion_sources);
     for &(a, b) in &seq_edges {
         prog.seq_next.push((a, b));
     }
@@ -2040,7 +2173,7 @@ pub fn structure(
         }
     }
 
-    result_stmts.sort_by_key(|(n, _)| *n);
+    result_stmts.sort_by_key(|(n, _)| exec_order_key(*n));
 
     // Export if-body membership metadata (filtered to valid branches only)
     let mut out_ifbody_true: Vec<(Node, Node)> = Vec::new();
@@ -3002,12 +3135,81 @@ fn walk_next_to_stmt(
 fn compute_sequential_edges(
     stmts: &[(Node, CsharpminorStmt)],
     next_map: &HashMap<Node, Node>,
+    cminor_succs: &HashMap<Node, Vec<Node>>,
+    expansion_sources: &HashSet<Node>,
 ) -> Vec<(Node, Node)> {
     let stmt_nodes: HashSet<Node> = stmts.iter().map(|(n, _)| *n).collect();
     stmts
         .iter()
-        .filter_map(|(n, _)| walk_next_to_stmt(*n, next_map, &stmt_nodes).map(|nxt| (*n, nxt)))
+        .filter_map(|(node, _)| {
+            sequential_stmt_successor(
+                *node,
+                next_map,
+                cminor_succs,
+                expansion_sources,
+                &stmt_nodes,
+            )
+            .map(|next| (*node, next))
+        })
         .collect()
+}
+
+fn sequential_stmt_successor(
+    node: Node,
+    next_map: &HashMap<Node, Node>,
+    cminor_succs: &HashMap<Node, Vec<Node>>,
+    expansion_sources: &HashSet<Node>,
+    stmt_nodes: &HashSet<Node>,
+) -> Option<Node> {
+    // Prefer the post-optimization Cminor CFG whenever it has a successor for
+    // this node. This is also required for an ordinary predecessor retargeted
+    // into stage 1 after an expansion's real stage 0 was optimized away: the
+    // predecessor is not itself an expansion member, while raw `next` still
+    // bypasses the surviving semantic stages. Expansion members with no
+    // semantic successor must not fall back to raw `next` either. Stage ids
+    // remain identity/order only; reachability comes exclusively from CFG
+    // edges.
+    if cminor_succs.contains_key(&node)
+        || expansion_sources.contains(&node)
+        || crate::util::multi_synth_stage(node).is_some()
+    {
+        let mut resolved: Vec<Node> = cminor_succs
+            .get(&node)
+            .into_iter()
+            .flatten()
+            .filter_map(|succ| {
+                if stmt_nodes.contains(succ) {
+                    Some(*succ)
+                } else {
+                    walk_cminor_to_stmt(*succ, cminor_succs, stmt_nodes)
+                }
+            })
+            .collect();
+        resolved.sort_unstable();
+        resolved.dedup();
+        return (resolved.len() == 1).then(|| resolved[0]);
+    }
+    walk_next_to_stmt(node, next_map, stmt_nodes)
+}
+
+fn walk_cminor_to_stmt(
+    start: Node,
+    cminor_succs: &HashMap<Node, Vec<Node>>,
+    stmt_nodes: &HashSet<Node>,
+) -> Option<Node> {
+    let mut current = start;
+    let mut visited = HashSet::new();
+    while visited.insert(current) {
+        if stmt_nodes.contains(&current) {
+            return Some(current);
+        }
+        let successors = cminor_succs.get(&current)?;
+        if successors.len() != 1 {
+            return None;
+        }
+        current = successors[0];
+    }
+    None
 }
 
 fn lift_setcc_arith_to_ite(
@@ -4150,7 +4352,7 @@ fn inline_single_use_temps(
         .into_iter()
         .map(|(reg, (node, exprs))| (reg, node, exprs))
         .collect();
-    candidates.sort_by_key(|(_, node, _)| *node);
+    candidates.sort_by_key(|(_, node, _)| exec_order_key(*node));
 
     // Track modified nodes to avoid stale substitutions in chained temps
     let mut modified_nodes: HashSet<Node> = HashSet::new();

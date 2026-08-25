@@ -676,6 +676,13 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
     // DB cannot retain kills from an earlier run.
     db.rel_set("dead_store", ascent::boxcar::Vec::<(Node,)>::new());
     db.rel_set("copy_eliminated", ascent::boxcar::Vec::<(Node,)>::new());
+    // The optimizer owns the semantic function-entry contract.  Clear it even
+    // for an empty/reused DB so downstream passes can never observe entries
+    // left by an earlier optimization run.
+    db.rel_set(
+        "rtl_function_entry",
+        ascent::boxcar::Vec::<(Address, Node)>::new(),
+    );
 
     let mut ctx = PassContext::load(db);
     if ctx.functions.is_empty() {
@@ -1313,6 +1320,7 @@ impl IRPass for RTLOptimizePass {
         &[
             "rtl_inst_candidate",
             "rtl_succ_candidate",
+            "rtl_expansion_edge",
             "next",
             "instr_in_function",
             "emit_function",
@@ -1334,6 +1342,10 @@ impl IRPass for RTLOptimizePass {
             "rtl_inst",
             "rtl_succ",
             "rtl_next",
+            // Per-function entry after semantic-node normalization, static
+            // branch pruning, and entry-nop collapse.  `emit_function` keeps
+            // the raw machine entry needed by ABI/register analyses.
+            "rtl_function_entry",
             "single_def_const",
             "emit_inline_temp",
             // Exact production optimizer kills, retained after nop collapse so
@@ -1415,6 +1427,10 @@ impl PassContext {
         let rtl_succs: Vec<(Node, Node)> = db
             .rel_iter::<(Node, Node)>("rtl_succ_candidate")
             .cloned()
+            .collect();
+        let expansion_edges: HashSet<(Node, Node)> = db
+            .rel_iter::<(Node, Node)>("rtl_expansion_edge")
+            .copied()
             .collect();
         let mut raw_next: HashMap<Node, Vec<Node>> = HashMap::new();
         for &(src, dst) in db.rel_iter::<(Node, Node)>("next") {
@@ -1706,7 +1722,7 @@ impl PassContext {
 
         let mut functions = BTreeMap::new();
         for (&func_addr, insts) in &func_insts {
-            let entry = match func_entries.get(&func_addr) {
+            let raw_entry = match func_entries.get(&func_addr) {
                 Some(&e) => e,
                 None => continue,
             };
@@ -1757,13 +1773,50 @@ impl PassContext {
                     continue;
                 };
                 let enters_synthetic_expansion = raw_succs.get(&src).is_some_and(|dsts| {
-                    dsts.iter()
-                        .any(|dst| dst & (SYNTH_NODE_BIT | SYNTH_NODE_BIT2) != 0)
+                    dsts.iter().any(|dst| {
+                        dst & (SYNTH_NODE_BIT | SYNTH_NODE_BIT2) != 0
+                            || expansion_edges.contains(&(src, *dst))
+                    })
                 });
                 if !enters_synthetic_expansion {
                     raw_succs.insert(src, vec![structural_dst]);
                 }
             }
+
+            // `emit_function` names the machine entry, which need not itself
+            // survive candidate selection.  Prefer its unique explicit RTL
+            // successor (this preserves an expansion edge into a synthetic
+            // first stage); otherwise walk the structural raw-next chain to
+            // the first semantic node.  No node-id or address ordering decides
+            // which point is reachable from the function entry.
+            let entry = if nodes.contains(&raw_entry) {
+                raw_entry
+            } else {
+                raw_succs
+                    .get(&raw_entry)
+                    .and_then(|dsts| (dsts.len() == 1).then_some(dsts[0]))
+                    .and_then(|dst| {
+                        resolve_next_semantic_node(
+                            func_addr,
+                            dst,
+                            &nodes,
+                            &raw_next,
+                            &all_node_owners,
+                            &mut next_semantic_cache,
+                        )
+                    })
+                    .or_else(|| {
+                        resolve_next_semantic_node(
+                            func_addr,
+                            raw_entry,
+                            &nodes,
+                            &raw_next,
+                            &all_node_owners,
+                            &mut next_semantic_cache,
+                        )
+                    })
+                    .unwrap_or(raw_entry)
+            };
 
             let mut succs: HashMap<Node, Vec<Node>> = HashMap::new();
             for (src, dsts) in raw_succs {
@@ -1997,9 +2050,14 @@ impl PassContext {
 
         let new_insts: ascent::boxcar::Vec<(Node, RTLInst)> = final_insts.into_iter().collect();
         let new_succs: ascent::boxcar::Vec<(Node, Node)> = final_succs.into_iter().collect();
+        let normalized_entries: ascent::boxcar::Vec<(Address, Node)> = functions
+            .iter()
+            .map(|(&func, cfg)| (func, cfg.entry))
+            .collect();
         db.rel_set("rtl_next", new_succs.clone());
         db.rel_set("rtl_inst", new_insts);
         db.rel_set("rtl_succ", new_succs);
+        db.rel_set("rtl_function_entry", normalized_entries);
 
         let inline_vec = ascent::boxcar::Vec::<RTLReg>::new();
         // Sort and recheck the single-def/single-use contract globally: a
@@ -2693,10 +2751,6 @@ pub(crate) fn nop_collapse(func: &mut FunctionCFG) -> usize {
         .map(|(&node, _)| node)
         .collect();
 
-    if nop_nodes.is_empty() {
-        return 0;
-    }
-
     let nop_set: HashSet<Node> = nop_nodes.iter().copied().collect();
 
     let mut nop_target: HashMap<Node, Node> = HashMap::new();
@@ -2722,10 +2776,6 @@ pub(crate) fn nop_collapse(func: &mut FunctionCFG) -> usize {
                 }
             }
         }
-    }
-
-    if nop_target.is_empty() {
-        return 0;
     }
 
     let mut count = 0;
@@ -3215,6 +3265,60 @@ mod tests {
         assert!(!db
             .rel_iter::<(u64,)>("dead_store")
             .any(|&(node,)| node == entry));
+    }
+
+    #[test]
+    fn optimized_function_entry_follows_entry_nop_into_expansion() {
+        let func = 0x5000;
+        let raw_entry = 0x500;
+        // Numeric order is deliberately unrelated to control flow.
+        let expansion_stage = 0x900;
+        let live = 0x100;
+        let base = 1;
+        let value = 2;
+        let mut db = DecompileDB::default();
+
+        for (node, inst) in [
+            (raw_entry, RTLInst::Inop),
+            (
+                expansion_stage,
+                RTLInst::Istore(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed(0),
+                    Arc::new(vec![base]),
+                    value,
+                ),
+            ),
+            (live, RTLInst::Ireturn(value)),
+        ] {
+            db.rel_push("rtl_inst_candidate", (node, inst));
+            db.rel_push("instr_in_function", (node, func));
+        }
+        db.rel_push("emit_function", (func, "entry_expansion", raw_entry));
+        db.rel_push("emit_function_param_candidate", (func, base));
+        db.rel_push("emit_function_param_candidate", (func, value));
+        db.rel_push("rtl_succ_candidate", (raw_entry, expansion_stage));
+        db.rel_push("rtl_succ_candidate", (expansion_stage, live));
+        db.rel_push("rtl_expansion_edge", (raw_entry, expansion_stage));
+        db.rel_push("rtl_expansion_edge", (expansion_stage, live));
+        // This is the stale machine adjacency that previously won in Cshminor
+        // after the optimizer deleted raw_entry.
+        db.rel_push("next", (raw_entry, live));
+
+        optimize_rtl_candidates(&mut db).expect("function must be optimized");
+
+        assert!(db
+            .rel_iter::<(u64, u64)>("rtl_function_entry")
+            .any(|fact| *fact == (func, expansion_stage)));
+        assert!(!db
+            .rel_iter::<(u64, RTLInst)>("rtl_inst")
+            .any(|(node, _)| *node == raw_entry));
+        assert!(db
+            .rel_iter::<(u64, u64)>("rtl_succ")
+            .any(|fact| *fact == (expansion_stage, live)));
+        assert!(db
+            .rel_iter::<(u64, &'static str, u64)>("emit_function")
+            .any(|fact| *fact == (func, "entry_expansion", raw_entry)));
     }
 
     #[test]

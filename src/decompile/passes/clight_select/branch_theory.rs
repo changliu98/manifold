@@ -20,7 +20,7 @@
 use z3::ast::Bool;
 
 use crate::decompile::passes::clight_select::solve::clight_expr_type as expr_type;
-use crate::util::{SYNTH_NODE_BIT, SYNTH_NODE_BIT2};
+use crate::util::semantic_node_address;
 use crate::x86::op::{Comparison, Condition};
 use crate::x86::types::{
     ClightBinaryOp, ClightExpr, ClightSignedness, ClightStmt, ClightType, Node,
@@ -62,7 +62,7 @@ pub fn condition_cmp_class(cond: &Condition) -> Option<CmpClass> {
 /// Node ids carry the two synthetic-node marker bits; instruction facts are
 /// keyed by the real address.
 pub fn node_address(node: Node) -> u64 {
-    node & !(SYNTH_NODE_BIT | SYNTH_NODE_BIT2)
+    semantic_node_address(node)
 }
 
 fn type_class(ty: &ClightType) -> Option<CmpClass> {

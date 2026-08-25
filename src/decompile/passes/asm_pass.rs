@@ -5,6 +5,7 @@ use crate::decompile::passes::pass::IRPass;
 use crate::{declare_io_from, run_pass};
 
 use crate::mreg::Mreg;
+use crate::util::multi_synth_address_is_encodable;
 use crate::x86::asm::{Freg, Ireg, Preg, TestCond};
 use crate::x86::op::{Addressing, Comparison, Condition, Operation};
 use crate::x86::types::*;
@@ -143,6 +144,42 @@ fn simd_hi_from_low_mnem(mnem: &str) -> bool {
     let m = mnem.to_ascii_uppercase();
     let m = m.strip_prefix('V').unwrap_or(&m);
     matches!(m, "PUNPCKLQDQ" | "UNPCKLPD" | "MOVLHPS")
+}
+
+// A packed dword value can be scalarized without changing the memory-access
+// contract only when each 32-bit lane is naturally aligned.  The aligned move
+// forms additionally carry the architectural 16-byte alignment requirement.
+fn simd_dword_load_alignment_ok(mnem: &str, target: Address) -> bool {
+    let upper = mnem.to_ascii_uppercase();
+    let normalized = upper.strip_prefix('V').unwrap_or(&upper);
+    match normalized {
+        "MOVDQA" | "MOVAPS" => target % 16 == 0,
+        "MOVDQU" | "MOVUPS" => target % 4 == 0,
+        _ => false,
+    }
+}
+
+// Exact lane-wise 32-bit operations.  The integer tag crosses the pass
+// boundary; rtl_pass maps it back to the corresponding CompCert operation.
+// Keeping this small, semantic alphabet is preferable to treating every
+// packed mnemonic as if it had dword lanes.
+fn simd_dword_binop_kind(mnem: &str) -> Option<i64> {
+    let upper = mnem.to_ascii_uppercase();
+    let normalized = upper.strip_prefix('V').unwrap_or(&upper);
+    match normalized {
+        "PADDD" => Some(1),
+        "PSUBD" => Some(2),
+        "PAND" => Some(3),
+        "POR" => Some(4),
+        "PXOR" => Some(5),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum SimdDwordDefinition {
+    Unknown,
+    Event(Address),
 }
 
 fn chunk_from_mnem(mnem: &str) -> MemoryChunk {
@@ -348,6 +385,7 @@ ascent_par! {
     pub struct AsmPassProgram;
 
     relation arg_constrained_as_ptr(Node, RTLReg);
+    relation avx_masked_site(Address);
     relation base_ident_to_symbol(Ident, Symbol);
     relation block_in_function(Node, Address);
     relation call_return_reg(Node, RTLReg);
@@ -542,6 +580,15 @@ ascent_par! {
     // compiler's ordinary four-lane integer broadcast.  The point-keyed CFG
     // lattice below recognizes this even across independent instructions.
     relation simd_dword_broadcast_store(Address, Address, &'static str, &'static str, i64, i64, Mreg);
+
+    // Event-time packed-dword provenance consumed by rtl_pass.  kind 0 is a
+    // four-lane global load; kinds 1..5 are the operations documented by
+    // simd_dword_binop_kind.  `input` names the preceding vector-definition
+    // event, and `target` names the memory operand read at THIS event.  The
+    // frame-store relation points at the final definition without moving any
+    // memory read to the later spill.
+    relation simd_dword_lane_event(Address, i64, Address, Address);
+    relation simd_dword_lane_frame_store(Address, i64, Address);
 
 
     relation pand(Address, Symbol, Symbol);
@@ -2885,6 +2932,400 @@ ascent_par! {
         },
         if transl_addressing_rev(addrmode, None).is_ok();
 
+    // Preserve supported packed-dword values as event provenance.  A previous
+    // implementation remembered only the three global addresses and replayed
+    // every read at the eventual frame spill.  That changes behavior whenever
+    // memory is written, a call occurs, or an externally visible object changes
+    // between vector instructions.  Here every definition names the preceding
+    // definition event and the memory operand read at this exact CFG point.
+    #[local] relation simd_dword_frame_spill_site(Address, Mreg, i64);
+    simd_dword_frame_spill_site(*addr, Mreg::x86(src_name), disp - depth) <--
+        instruction(addr, _, _, mnem, src, dst, _, _, _, _),
+        !avx_masked_site(addr),
+        if is_wide_simd_mov_mnem(mnem),
+        op_register(src, src_name),
+        reg_xmm(src_name),
+        op_indirect(dst, _, base, index, _, disp, width),
+        if Mreg::x86(*base) == Mreg::SP,
+        if *index == "NONE" || index.is_empty(),
+        if *width == 16,
+        sp_frame_shift(addr, depth),
+        if (*disp - *depth) % 4 == 0;
+    simd_dword_frame_spill_site(*addr, Mreg::x86(src_name), *disp) <--
+        instruction(addr, _, _, mnem, src, dst, _, _, _, _),
+        !avx_masked_site(addr),
+        if is_wide_simd_mov_mnem(mnem),
+        op_register(src, src_name),
+        reg_xmm(src_name),
+        op_indirect(dst, _, base, index, _, disp, width),
+        if Mreg::x86(*base) == Mreg::BP,
+        if *index == "NONE" || index.is_empty(),
+        if *width == 16,
+        if *disp % 4 == 0,
+        instr_in_function(addr, func),
+        func_has_frame_pointer(func);
+
+    #[local] relation func_has_simd_dword_frame_spill(Address);
+    func_has_simd_dword_frame_spill(func) <--
+        simd_dword_frame_spill_site(addr, _, _),
+        instr_in_function(addr, func);
+
+    #[local] relation simd_dword_global_seed(Address, Mreg, Address);
+    simd_dword_global_seed(*addr, Mreg::x86(dst_name), *target) <--
+        instruction(addr, _, _, mnem, src, dst, _, _, _, _),
+        !avx_masked_site(addr),
+        if matches!(*mnem,
+            "MOVDQA" | "MOVDQU" | "MOVAPS" | "MOVUPS"
+            | "VMOVDQA" | "VMOVDQU" | "VMOVAPS" | "VMOVUPS"),
+        op_indirect(src, _, base, index, _, _, width),
+        reg_ip(*base),
+        if *index == "NONE" || index.is_empty(),
+        if *width == 16,
+        rip_target_addr(addr, target),
+        if simd_dword_load_alignment_ok(mnem, *target),
+        op_register(dst, dst_name),
+        reg_xmm(dst_name),
+        instr_in_function(addr, func),
+        func_has_simd_dword_frame_spill(func);
+
+    // (event, operation, input carrier, destination carrier, memory target).
+    // Legacy packed operations are two-address; AVX is three-address and must
+    // read src1 rather than the previous value of dst.
+    #[local] relation simd_dword_mem_binop(Address, i64, Mreg, Mreg, Address);
+    simd_dword_mem_binop(
+        *addr,
+        kind,
+        Mreg::x86(dst_name),
+        Mreg::x86(dst_name),
+        *target,
+    ) <--
+        instruction(addr, _, _, mnem, src, dst, _, _, _, _),
+        if !mnem.starts_with('V'),
+        if let Some(kind) = simd_dword_binop_kind(mnem),
+        op_indirect(src, _, base, index, _, _, width),
+        reg_ip(*base),
+        if *index == "NONE" || index.is_empty(),
+        if *width == 16,
+        rip_target_addr(addr, target),
+        // Legacy SSE packed arithmetic faults on a misaligned m128 operand.
+        // Preserve that contract rather than silently scalarizing a load that
+        // the original instruction could not perform.
+        if *target % 16 == 0,
+        op_register(dst, dst_name),
+        reg_xmm(dst_name),
+        instr_in_function(addr, func),
+        func_has_simd_dword_frame_spill(func);
+
+    simd_dword_mem_binop(
+        *addr,
+        kind,
+        Mreg::x86(input_name),
+        Mreg::x86(dst_name),
+        *target,
+    ) <--
+        instruction(addr, _, _, mnem, src1, dst, src2, _, _, _),
+        if mnem.starts_with('V'),
+        !avx_masked_site(addr),
+        if let Some(kind) = simd_dword_binop_kind(mnem),
+        op_register(src1, input_name),
+        reg_xmm(input_name),
+        op_indirect(src2, _, base, index, _, _, width),
+        reg_ip(*base),
+        if *index == "NONE" || index.is_empty(),
+        if *width == 16,
+        rip_target_addr(addr, target),
+        // VEX.128 packed arithmetic permits unaligned m128 operands; dword
+        // alignment is enough for the four scalar lane loads we emit.
+        if *target % 4 == 0,
+        op_register(dst, dst_name),
+        reg_xmm(dst_name),
+        instr_in_function(addr, func),
+        func_has_simd_dword_frame_spill(func);
+
+    // A whole-register copy does not read memory and therefore aliases the
+    // same scalar lane definitions.  It changes only which architectural XMM
+    // name carries them.
+    #[local] relation simd_dword_reg_copy(Address, Mreg, Mreg);
+    simd_dword_reg_copy(*addr, Mreg::x86(dst_name), Mreg::x86(src_name)) <--
+        instruction(addr, _, _, mnem, src, dst, _, _, _, _),
+        !avx_masked_site(addr),
+        if is_wide_simd_mov_mnem(mnem),
+        op_register(src, src_name),
+        reg_xmm(src_name),
+        op_register(dst, dst_name),
+        reg_xmm(dst_name);
+
+    #[local] relation simd_dword_call_barrier(Address);
+    simd_dword_call_barrier(*addr) <--
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if mnem.contains("CALL");
+
+    #[local] relation simd_dword_lane_barrier(Address);
+    simd_dword_lane_barrier(addr) <-- simd_dword_call_barrier(addr);
+    // VZEROALL has no explicit operands and the decoder intentionally omits
+    // its implicit XMM definitions.  It still destroys every low 128-bit
+    // carrier.  VZEROUPPER is not a barrier because it preserves those bits.
+    simd_dword_lane_barrier(*addr) <--
+        instruction(addr, _, _, "VZEROALL", _, _, _, _, _, _);
+    // Whole-state restores implicitly redefine some or all XMM registers; the
+    // selected component depends on architectural state/masks that are not
+    // represented as per-register Capstone definitions.
+    simd_dword_lane_barrier(*addr) <--
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem,
+            "FXRSTOR" | "FXRSTOR64"
+            | "XRSTOR" | "XRSTOR64"
+            | "XRSTORS" | "XRSTORS64");
+
+    // A RET does not observe every caller-saved XMM register.  It observes an
+    // XMM value only when that register carries the ABI result.  Prove the
+    // disjoint integer-result case early and structurally: every reachable
+    // return must have some AX definition on every incoming path.  Unknown is
+    // explicit, so a branch bypassing all AX definitions keeps the return
+    // conservative.  This point-keyed lattice avoids both address-order
+    // guesses and a materialized def-to-return relation.
+    #[local] lattice simd_gp_return_in(Address, Set<(Address, SimdDwordDefinition)>);
+    #[local] lattice simd_gp_return_out(Address, Set<(Address, SimdDwordDefinition)>);
+
+    simd_gp_return_in(*func, Set::singleton((*func, SimdDwordDefinition::Unknown))) <--
+        func_has_simd_dword_frame_spill(func),
+        instr_in_function(func, func);
+
+    simd_gp_return_in(*succ, Set::singleton((*func, *definition))) <--
+        simd_gp_return_out(addr, state),
+        for (func, definition) in state.0.iter(),
+        cfg_step(addr, succ),
+        instr_in_function(succ, func);
+
+    simd_gp_return_out(*addr, Set::singleton((*func, *definition))) <--
+        simd_gp_return_in(addr, state),
+        for (func, definition) in state.0.iter(),
+        !reg_def(addr, Mreg::AX);
+
+    simd_gp_return_out(*addr, Set::singleton((*func, SimdDwordDefinition::Event(*addr)))) <--
+        simd_gp_return_in(addr, state),
+        for (func, _) in state.0.iter(),
+        reg_def(addr, Mreg::AX);
+
+    #[local] relation simd_gp_return_site(Address, Address);
+    simd_gp_return_site(*func, *ret) <--
+        mach_inst(ret, ?MachInst::Mreturn),
+        instr_in_function(ret, func),
+        func_has_simd_dword_frame_spill(func);
+
+    #[local] relation simd_gp_return_state_at(Address, Address);
+    simd_gp_return_state_at(*func, *ret) <--
+        simd_gp_return_site(func, ret),
+        simd_gp_return_in(ret, state),
+        for (active_func, _) in state.0.iter(),
+        if active_func == func;
+
+    #[local] relation simd_gp_return_unproven(Address);
+    simd_gp_return_unproven(*func) <--
+        simd_gp_return_site(func, ret),
+        !simd_gp_return_state_at(func, ret);
+    simd_gp_return_unproven(*func) <--
+        simd_gp_return_site(func, ret),
+        simd_gp_return_in(ret, state),
+        for (active_func, definition) in state.0.iter(),
+        if active_func == func && matches!(definition, SimdDwordDefinition::Unknown);
+
+    #[local] relation simd_gp_return_proven(Address);
+    simd_gp_return_proven(*func) <--
+        simd_gp_return_site(func, _),
+        !simd_gp_return_unproven(func);
+
+    // ABI exits and architectural state-save instructions can observe live
+    // XMM values without Capstone listing every carrier as an explicit read.
+    // Keep this separate from barriers: an FXSAVE/XSAVE reads the state but
+    // does not destroy it, while a return has no successor to propagate to.
+    #[local] relation simd_dword_implicit_observer(Address);
+    simd_dword_implicit_observer(addr) <-- simd_dword_call_barrier(addr);
+    simd_dword_implicit_observer(*addr) <--
+        mach_inst(addr, ?MachInst::Mreturn),
+        instr_in_function(addr, func),
+        !simd_gp_return_proven(func);
+    simd_dword_implicit_observer(*addr) <-- mach_inst(addr, ?MachInst::Mtailcall(_));
+    simd_dword_implicit_observer(*addr) <--
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem,
+            "FXSAVE" | "FXSAVE64"
+            | "XSAVE" | "XSAVE64"
+            | "XSAVEC" | "XSAVEC64"
+            | "XSAVEOPT" | "XSAVEOPT64"
+            | "XSAVES" | "XSAVES64");
+
+    // Total per-path state for only the XMM names relevant to a candidate
+    // chain.  `Unknown` is a real lattice element: omitting it would make a CFG
+    // join of {known definition} and {no tracked definition} look spuriously
+    // must-known after set union.  Entry, unsupported definitions, and calls
+    // therefore publish Unknown explicitly.
+    #[local] relation simd_dword_tracked_reg(Address, Mreg);
+    simd_dword_tracked_reg(*func, *dst) <--
+        simd_dword_global_seed(addr, dst, _),
+        instr_in_function(addr, func);
+    simd_dword_tracked_reg(*func, *dst) <--
+        simd_dword_mem_binop(addr, _, _, dst, _),
+        instr_in_function(addr, func);
+    simd_dword_tracked_reg(*func, *input) <--
+        simd_dword_mem_binop(addr, _, input, _, _),
+        instr_in_function(addr, func);
+    simd_dword_tracked_reg(*func, *dst) <--
+        simd_dword_reg_copy(addr, dst, _),
+        instr_in_function(addr, func);
+    simd_dword_tracked_reg(*func, *src) <--
+        simd_dword_reg_copy(addr, _, src),
+        instr_in_function(addr, func);
+    simd_dword_tracked_reg(*func, *xmm) <--
+        simd_dword_frame_spill_site(store, xmm, _),
+        instr_in_function(store, func);
+
+    #[local] relation simd_dword_supported_def(Address, Mreg);
+    simd_dword_supported_def(*addr, *dst) <-- simd_dword_global_seed(addr, dst, _);
+    simd_dword_supported_def(*addr, *dst) <-- simd_dword_mem_binop(addr, _, _, dst, _);
+    simd_dword_supported_def(*addr, *dst) <-- simd_dword_reg_copy(addr, dst, _);
+
+    // Acceptance replaces the ordinary wide definitions with scalar lane
+    // values.  Therefore every architectural read of a tracked carrier must
+    // also belong to the proved chain; otherwise an intervening MOVD/PTEST,
+    // unrelated vector store, or unsupported packed consumer would read a
+    // value whose original definition was removed.
+    #[local] relation simd_dword_supported_use(Address, Mreg);
+    simd_dword_supported_use(*addr, *input) <--
+        simd_dword_mem_binop(addr, _, input, _, _);
+    simd_dword_supported_use(*addr, *src) <--
+        simd_dword_reg_copy(addr, _, src);
+    simd_dword_supported_use(*store, *xmm) <--
+        simd_dword_frame_spill_site(store, xmm, _);
+
+    #[local] relation simd_dword_unsupported_use(Address, Mreg);
+    simd_dword_unsupported_use(*addr, *xmm) <--
+        reg_use(addr, xmm),
+        instr_in_function(addr, func),
+        simd_dword_tracked_reg(func, xmm),
+        !simd_dword_supported_use(addr, xmm);
+
+    // Tuple: (function owner, XMM register, definition state).  The lattice is
+    // keyed by the current CFG point; joins union possible path states.  No
+    // address or node ordering is used.
+    #[local] lattice simd_dword_lane_in(Address, Set<(Address, Mreg, SimdDwordDefinition)>);
+    #[local] lattice simd_dword_lane_out(Address, Set<(Address, Mreg, SimdDwordDefinition)>);
+
+    simd_dword_lane_in(*func, Set::singleton((*func, *xmm, SimdDwordDefinition::Unknown))) <--
+        func_has_simd_dword_frame_spill(func),
+        simd_dword_tracked_reg(func, xmm),
+        instr_in_function(func, func);
+
+    simd_dword_lane_in(*succ, Set::singleton((*func, *xmm, *definition))) <--
+        simd_dword_lane_out(addr, state),
+        for (func, xmm, definition) in state.0.iter(),
+        cfg_step(addr, succ),
+        instr_in_function(succ, func);
+
+    // Every consumer of a concrete event is part of its proof obligation.
+    // The imperative finalizer accepts only a component closed over these
+    // uses, so a recognized-but-unused branch, rejected spill, raw XMM copy,
+    // or unsupported consumer cannot read a definition that scalarization
+    // later removes.  Calls are conservative implicit consumers because ABI
+    // argument reads are not present in Capstone's explicit reg_use facts.
+    #[local] relation simd_dword_event_use(Address, Address);
+    simd_dword_event_use(*addr, *event) <--
+        reg_use(addr, xmm),
+        instr_in_function(addr, func),
+        simd_dword_lane_in(addr, state),
+        for (active_func, active_xmm, definition) in state.0.iter(),
+        if let SimdDwordDefinition::Event(event) = definition,
+        if active_func == func && active_xmm == xmm;
+    simd_dword_event_use(*addr, *event) <--
+        simd_dword_implicit_observer(addr),
+        instr_in_function(addr, func),
+        simd_dword_lane_in(addr, state),
+        for (active_func, _, definition) in state.0.iter(),
+        if let SimdDwordDefinition::Event(event) = definition,
+        if active_func == func;
+
+    simd_dword_lane_out(*addr, Set::singleton((*func, *xmm, *definition))) <--
+        simd_dword_lane_in(addr, state),
+        for (func, xmm, definition) in state.0.iter(),
+        !reg_def(*addr, *xmm),
+        !simd_dword_lane_barrier(addr),
+        !simd_dword_unsupported_use(*addr, *xmm);
+
+    simd_dword_lane_out(*addr, Set::singleton((*func, *xmm, SimdDwordDefinition::Unknown))) <--
+        simd_dword_lane_in(addr, state),
+        for (func, xmm, _) in state.0.iter(),
+        simd_dword_unsupported_use(*addr, *xmm);
+
+    simd_dword_lane_out(*addr, Set::singleton((*func, *xmm, SimdDwordDefinition::Unknown))) <--
+        reg_def(addr, xmm),
+        instr_in_function(addr, func),
+        simd_dword_tracked_reg(func, xmm),
+        !simd_dword_supported_def(addr, xmm),
+        !simd_dword_lane_barrier(addr);
+
+    simd_dword_lane_out(*addr, Set::singleton((*func, *xmm, SimdDwordDefinition::Unknown))) <--
+        simd_dword_lane_barrier(addr),
+        instr_in_function(addr, func),
+        simd_dword_tracked_reg(func, xmm);
+
+    #[local] relation simd_dword_event_candidate(Address, i64, Address, Address);
+    simd_dword_lane_out(*addr, Set::singleton((*func, *dst, SimdDwordDefinition::Event(*addr)))),
+    simd_dword_event_candidate(*addr, 0, 0, *target) <--
+        simd_dword_global_seed(addr, dst, target),
+        instr_in_function(addr, func);
+
+    simd_dword_lane_out(*addr, Set::singleton((*func, *dst, SimdDwordDefinition::Event(*addr)))),
+    simd_dword_event_candidate(*addr, *kind, *input, *target) <--
+        simd_dword_mem_binop(addr, kind, input_xmm, dst, target),
+        instr_in_function(addr, func),
+        simd_dword_lane_in(addr, state),
+        for (active_func, active_xmm, definition) in state.0.iter(),
+        if let SimdDwordDefinition::Event(input) = definition,
+        if active_func == func && active_xmm == input_xmm;
+
+    #[local] relation simd_dword_event_uncertain(Address);
+    simd_dword_lane_out(*addr, Set::singleton((*func, *dst, SimdDwordDefinition::Unknown))),
+    simd_dword_event_uncertain(*addr) <--
+        simd_dword_mem_binop(addr, _, input_xmm, dst, _),
+        instr_in_function(addr, func),
+        simd_dword_lane_in(addr, state),
+        for (active_func, active_xmm, definition) in state.0.iter(),
+        if matches!(definition, SimdDwordDefinition::Unknown),
+        if active_func == func && active_xmm == input_xmm;
+
+    simd_dword_lane_out(*addr, Set::singleton((*func, *dst, *definition))) <--
+        simd_dword_reg_copy(addr, dst, src),
+        instr_in_function(addr, func),
+        simd_dword_lane_in(addr, state),
+        for (active_func, active_xmm, definition) in state.0.iter(),
+        if active_func == func && active_xmm == src;
+
+    #[local] relation simd_dword_frame_store_candidate(Address, i64, Address);
+    simd_dword_frame_store_candidate(*store, *frame_ofs, *definition) <--
+        simd_dword_frame_spill_site(store, xmm, frame_ofs),
+        instr_in_function(store, func),
+        simd_dword_lane_in(store, state),
+        for (active_func, active_xmm, source) in state.0.iter(),
+        if let SimdDwordDefinition::Event(definition) = source,
+        if active_func == func && active_xmm == xmm;
+
+    #[local] relation simd_dword_frame_store_uncertain(Address);
+    simd_dword_frame_store_uncertain(*store) <--
+        simd_dword_frame_spill_site(store, xmm, _),
+        instr_in_function(store, func),
+        simd_dword_lane_in(store, state),
+        for (active_func, active_xmm, definition) in state.0.iter(),
+        if matches!(definition, SimdDwordDefinition::Unknown),
+        if active_func == func && active_xmm == xmm;
+
+    // These projections make the relations pass outputs; Ascent lattice users
+    // can observe improving intermediate values, so AsmPass::run replaces them
+    // with the unique, fully linked chains from the settled state below.
+    simd_dword_lane_event(event, kind, input, target) <--
+        simd_dword_event_candidate(event, kind, input, target);
+    simd_dword_lane_frame_store(store, frame_ofs, definition) <--
+        simd_dword_frame_store_candidate(store, frame_ofs, definition);
+
     // XMM high lane (bits 64..127) of a wide frame move.
     //
     // CompCert's memory model has no 128-bit chunk, so a `movaps [rsp+N], xmm`
@@ -2902,6 +3343,7 @@ ascent_par! {
     #[local] relation sse_wide_frame_store(Address, Mreg, i64);
     sse_wide_frame_store(*addr, Mreg::x86(srcstr), disp - depth) <--
         pmov(addr, dst, src),
+        !avx_masked_site(addr),
         op_register(src, srcstr),
         reg_xmm(srcstr),
         op_indirect(dst, _, base, idx, _, disp, msize),
@@ -2912,6 +3354,7 @@ ascent_par! {
 
     sse_wide_frame_store(*addr, Mreg::x86(srcstr), *disp) <--
         pmov(addr, dst, src),
+        !avx_masked_site(addr),
         op_register(src, srcstr),
         reg_xmm(srcstr),
         op_indirect(dst, _, base, idx, _, disp, msize),
@@ -2931,6 +3374,7 @@ ascent_par! {
     relation sse_wide_mem_store(Address, Mreg, &'static str, &'static str, i64, i64);
     sse_wide_mem_store(*addr, Mreg::x86(srcstr), base, idx, *scale, *disp) <--
         pmov(addr, dst, src),
+        !avx_masked_site(addr),
         op_register(src, srcstr),
         reg_xmm(srcstr),
         op_indirect(dst, _, base, idx, scale, disp, msize),
@@ -2951,6 +3395,7 @@ ascent_par! {
     relation sse_wide_global_store(Address, Mreg, Address);
     sse_wide_global_store(*addr, Mreg::x86(srcstr), *target) <--
         pmov(addr, dst, src),
+        !avx_masked_site(addr),
         op_register(src, srcstr),
         reg_xmm(srcstr),
         op_indirect(dst, _, base, idx, _, _, msize),
@@ -2962,6 +3407,7 @@ ascent_par! {
     relation sse_wide_frame_load(Address, Mreg, i64);
     sse_wide_frame_load(*addr, Mreg::x86(dststr), disp - depth) <--
         pmov(addr, dst, src),
+        !avx_masked_site(addr),
         op_register(dst, dststr),
         reg_xmm(dststr),
         op_indirect(src, _, base, idx, _, disp, msize),
@@ -2972,6 +3418,7 @@ ascent_par! {
 
     sse_wide_frame_load(*addr, Mreg::x86(dststr), *disp) <--
         pmov(addr, dst, src),
+        !avx_masked_site(addr),
         op_register(dst, dststr),
         reg_xmm(dststr),
         op_indirect(src, _, base, idx, _, disp, msize),
@@ -3042,6 +3489,7 @@ ascent_par! {
     #[local] relation xmm_hi_seed(Address, Mreg, i64, Mreg, i64, Address);
     xmm_hi_seed(*addr, Mreg::x86(dststr), 0, Mreg::Unknown, 0, *addr) <--
         instruction(addr, _, _, mnem, _, dst, _, _, _, _),
+        !avx_masked_site(addr),
         if simd_zeroes_high_lane_mnem(mnem),
         op_register(dst, dststr),
         reg_xmm(dststr),
@@ -3050,6 +3498,7 @@ ascent_par! {
 
     xmm_hi_seed(*addr, Mreg::x86(dststr), 0, Mreg::Unknown, 0, *addr) <--
         instruction(addr, _, _, mnem, src, dst, _, _, _, _),
+        !avx_masked_site(addr),
         if simd_self_zero_mnem(mnem),
         op_register(dst, dststr),
         reg_xmm(dststr),
@@ -3063,6 +3512,7 @@ ascent_par! {
     // silently conflated at a CFG join.
     xmm_hi_seed(*addr, Mreg::x86(dststr), 5, Mreg::Unknown, 0, *addr) <--
         instruction(addr, _, _, mnem, src, dst, _, _, _, _),
+        !avx_masked_site(addr),
         if simd_self_all_ones_mnem(mnem),
         op_register(dst, dststr),
         reg_xmm(dststr),
@@ -3076,6 +3526,7 @@ ascent_par! {
     // rtl_pass resolves the value through the def reaching this instruction.
     xmm_hi_seed(*addr, Mreg::x86(dststr), 1, Mreg::x86(srcstr), 0, *addr) <--
         instruction(addr, _, _, mnem, src, dst, _, _, _, _),
+        !avx_masked_site(addr),
         if simd_hi_from_low_mnem(mnem),
         op_register(dst, dststr),
         reg_xmm(dststr),
@@ -3096,6 +3547,7 @@ ascent_par! {
     // a frame offset; rtl_pass loads the high quadword from address+8.
     xmm_hi_seed(*addr, Mreg::x86(dststr), 3, Mreg::Unknown, *target as i64, *addr) <--
         pmov(addr, dst, src),
+        !avx_masked_site(addr),
         op_register(dst, dststr),
         reg_xmm(dststr),
         op_indirect(src, _, base, idx, _, _, msize),
@@ -3119,6 +3571,7 @@ ascent_par! {
     #[local] relation xmm_hi_reg_copy(Address, Mreg, Mreg);
     xmm_hi_reg_copy(*addr, Mreg::x86(dststr), Mreg::x86(srcstr)) <--
         instruction(addr, _, _, mnem, src, dst, _, _, _, _),
+        !avx_masked_site(addr),
         if is_wide_simd_mov_mnem(mnem),
         op_register(dst, dststr),
         reg_xmm(dststr),
@@ -6802,7 +7255,13 @@ ascent_par! {
         let op = if *dst_is_64 { Operation::Oxorl } else { Operation::Oxor },
         let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
 
-    // INDEXED memory-source integer arithmetic, routed through float_load_op whose lowering is operation-agnostic and takes a full Addressing, since arith_load_op excludes indexed addressing.
+    // INDEXED memory-source integer arithmetic, routed through float_load_op
+    // whose lowering is operation-agnostic and takes a full Addressing, since
+    // arith_load_op cannot represent the index register.  Keep SP/BP here too:
+    // rtl_pass classifies a structural frame base and expands it through
+    // Olea(Ainstack) before the indexed load.  Excluding SP made forms such as
+    // `xor -24(%rsp,%rdi,4), %eax` disappear completely; excluding the logical
+    // operations did the same for every non-stack indexed AND/OR/XOR.
     float_load_op(*addr, op, chunk, addressing, Arc::new(vec![base_mreg, idx_mreg]), Mreg::x86(dst_str), false) <--
         padd(addr, dst, src),
         op_register(dst, dst_str),
@@ -6810,7 +7269,6 @@ ascent_par! {
         op_indirect(src, _, base_str, idx_str, scale, disp, _),
         if *idx_str != "NONE" && !idx_str.is_empty(),
         if *base_str != "NONE" && !base_str.is_empty(),
-        !reg_sp(base_str),
         !reg_ip(base_str),
         let base_mreg = Mreg::x86(base_str),
         let idx_mreg = Mreg::x86(idx_str),
@@ -6825,12 +7283,53 @@ ascent_par! {
         op_indirect(src, _, base_str, idx_str, scale, disp, _),
         if *idx_str != "NONE" && !idx_str.is_empty(),
         if *base_str != "NONE" && !base_str.is_empty(),
-        !reg_sp(base_str),
         !reg_ip(base_str),
         let base_mreg = Mreg::x86(base_str),
         let idx_mreg = Mreg::x86(idx_str),
         let addressing = if *scale > 1 { Addressing::Aindexed2scaled(*scale, *disp) } else { Addressing::Aindexed2(*disp) },
         let op = if *dst_is_64 { Operation::Osubl } else { Operation::Osub },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    float_load_op(*addr, op, chunk, addressing, Arc::new(vec![base_mreg, idx_mreg]), Mreg::x86(dst_str), false) <--
+        pand(addr, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_ip(base_str),
+        let base_mreg = Mreg::x86(base_str),
+        let idx_mreg = Mreg::x86(idx_str),
+        let addressing = if *scale > 1 { Addressing::Aindexed2scaled(*scale, *disp) } else { Addressing::Aindexed2(*disp) },
+        let op = if *dst_is_64 { Operation::Oandl } else { Operation::Oand },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    float_load_op(*addr, op, chunk, addressing, Arc::new(vec![base_mreg, idx_mreg]), Mreg::x86(dst_str), false) <--
+        por(addr, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_ip(base_str),
+        let base_mreg = Mreg::x86(base_str),
+        let idx_mreg = Mreg::x86(idx_str),
+        let addressing = if *scale > 1 { Addressing::Aindexed2scaled(*scale, *disp) } else { Addressing::Aindexed2(*disp) },
+        let op = if *dst_is_64 { Operation::Oorl } else { Operation::Oor },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    float_load_op(*addr, op, chunk, addressing, Arc::new(vec![base_mreg, idx_mreg]), Mreg::x86(dst_str), false) <--
+        pxor(addr, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_ip(base_str),
+        let base_mreg = Mreg::x86(base_str),
+        let idx_mreg = Mreg::x86(idx_str),
+        let addressing = if *scale > 1 { Addressing::Aindexed2scaled(*scale, *disp) } else { Addressing::Aindexed2(*disp) },
+        let op = if *dst_is_64 { Operation::Oxorl } else { Operation::Oxor },
         let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
 
     // RIP-relative integer memory-source arithmetic (3.8c): arith_load_op cannot express a global ident and excludes RIP, so routed through float_load_op whose rtl lowering is operation-agnostic.
@@ -9754,6 +10253,303 @@ ascent_par! {
 
 }
 
+// TRACE_FUNC diagnostic for the exact SIMD matcher/dataflow/finalizer
+// boundary.  Local Ascent relations are otherwise swapped out with the pass
+// and invisible to the pipeline-wide trace, which made a rejected chain look
+// identical to a matcher that never fired.  Sorting keeps diagnostic output
+// deterministic and this function never mutates the program.
+fn trace_simd_dword_state(prog: &AsmPassProgram, func: Address, phase: &str) {
+    let in_func = |node: Address| {
+        prog.instr_in_function
+            .iter()
+            .any(|(candidate, owner)| *candidate == node && *owner == func)
+    };
+    let mut seeds: Vec<_> = prog
+        .simd_dword_global_seed
+        .iter()
+        .filter(|(node, _, _)| in_func(*node))
+        .copied()
+        .collect();
+    let mut binops: Vec<_> = prog
+        .simd_dword_mem_binop
+        .iter()
+        .filter(|(node, _, _, _, _)| in_func(*node))
+        .copied()
+        .collect();
+    let mut spills: Vec<_> = prog
+        .simd_dword_frame_spill_site
+        .iter()
+        .filter(|(node, _, _)| in_func(*node))
+        .copied()
+        .collect();
+    let mut candidates: Vec<_> = prog
+        .simd_dword_event_candidate
+        .iter()
+        .filter(|(node, _, _, _)| in_func(*node))
+        .copied()
+        .collect();
+    let mut uncertain_events: Vec<_> = prog
+        .simd_dword_event_uncertain
+        .iter()
+        .filter(|(node,)| in_func(*node))
+        .copied()
+        .collect();
+    let mut store_candidates: Vec<_> = prog
+        .simd_dword_frame_store_candidate
+        .iter()
+        .filter(|(node, _, _)| in_func(*node))
+        .copied()
+        .collect();
+    let mut uncertain_stores: Vec<_> = prog
+        .simd_dword_frame_store_uncertain
+        .iter()
+        .filter(|(node,)| in_func(*node))
+        .copied()
+        .collect();
+    let mut uses: Vec<_> = prog
+        .simd_dword_event_use
+        .iter()
+        .filter(|(node, _)| in_func(*node))
+        .copied()
+        .collect();
+    let mut accepted_events: Vec<_> = prog
+        .simd_dword_lane_event
+        .iter()
+        .filter(|(node, _, _, _)| in_func(*node))
+        .copied()
+        .collect();
+    let mut accepted_stores: Vec<_> = prog
+        .simd_dword_lane_frame_store
+        .iter()
+        .filter(|(node, _, _)| in_func(*node))
+        .copied()
+        .collect();
+    seeds.sort();
+    binops.sort();
+    spills.sort();
+    candidates.sort();
+    uncertain_events.sort();
+    store_candidates.sort();
+    uncertain_stores.sort();
+    uses.sort();
+    accepted_events.sort();
+    accepted_stores.sort();
+    eprintln!(
+        "[simd-dword:{phase}] func={func:#x} gp-proven={} gp-unproven={} seeds={seeds:?} binops={binops:?} spills={spills:?} candidates={candidates:?} uncertain-events={uncertain_events:?} store-candidates={store_candidates:?} uncertain-stores={uncertain_stores:?} uses={uses:?} accepted-events={accepted_events:?} accepted-stores={accepted_stores:?}",
+        prog.simd_gp_return_proven.iter().any(|fact| *fact == (func,)),
+        prog.simd_gp_return_unproven.iter().any(|fact| *fact == (func,)),
+    );
+}
+
+// Relations projected from an improving Ascent lattice may retain transient
+// states observed before the fixpoint settles.  Publish only chains for which
+// every event has one unique predecessor/value and the exact 16-byte operand
+// base is symbol-addressable.  The instruction width itself proves that lanes
+// 1..3 are base+{4,8,12}; requiring independent symbol facts for those interior
+// addresses would reject ordinary anonymous constant tables, for which only
+// the RIP target has a symbol identity.  Walking predecessor links is value
+// provenance, not an address-order or reachability approximation.
+fn finalize_simd_dword_event_chains(prog: &mut AsmPassProgram) {
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+    let resolved_addresses: HashSet<Address> = prog
+        .resolved_addr_to_symbol
+        .iter()
+        .map(|(address, _, _)| *address)
+        .collect();
+
+    let mut event_options: BTreeMap<Address, BTreeSet<(i64, Address, Address)>> = BTreeMap::new();
+    for (event, kind, input, target) in &prog.simd_dword_event_candidate {
+        event_options
+            .entry(*event)
+            .or_default()
+            .insert((*kind, *input, *target));
+    }
+    let uncertain_events: HashSet<Address> = prog
+        .simd_dword_event_uncertain
+        .iter()
+        .map(|(event,)| *event)
+        .collect();
+
+    let mut exact_events = BTreeMap::new();
+    for (event, options) in event_options {
+        if options.len() != 1 || uncertain_events.contains(&event) {
+            continue;
+        }
+        let (kind, input, target) = *options.iter().next().unwrap();
+        let shape_is_valid = (kind == 0 && input == 0) || ((1..=5).contains(&kind) && input != 0);
+        let base_resolves = resolved_addresses.contains(&target);
+        let lane_addresses_fit = target.checked_add(12).is_some();
+        if shape_is_valid
+            && base_resolves
+            && lane_addresses_fit
+            && multi_synth_address_is_encodable(event)
+        {
+            exact_events.insert(event, (kind, input, target));
+        }
+    }
+
+    fn chain_is_complete(
+        event: Address,
+        events: &BTreeMap<Address, (i64, Address, Address)>,
+        visiting: &mut HashSet<Address>,
+        memo: &mut HashMap<Address, bool>,
+    ) -> bool {
+        if let Some(result) = memo.get(&event) {
+            return *result;
+        }
+        if !visiting.insert(event) {
+            memo.insert(event, false);
+            return false;
+        }
+        let complete = match events.get(&event).copied() {
+            Some((0, 0, _)) => true,
+            Some((kind @ 1..=5, input, _)) if input != 0 => {
+                let _ = kind;
+                chain_is_complete(input, events, visiting, memo)
+            }
+            _ => false,
+        };
+        visiting.remove(&event);
+        memo.insert(event, complete);
+        complete
+    }
+
+    let mut store_options: BTreeMap<Address, BTreeSet<(i64, Address)>> = BTreeMap::new();
+    for (store, frame_ofs, definition) in &prog.simd_dword_frame_store_candidate {
+        store_options
+            .entry(*store)
+            .or_default()
+            .insert((*frame_ofs, *definition));
+    }
+    let uncertain_stores: HashSet<Address> = prog
+        .simd_dword_frame_store_uncertain
+        .iter()
+        .map(|(store,)| *store)
+        .collect();
+
+    let mut memo = HashMap::new();
+    let mut accepted_stores = BTreeSet::new();
+    for (store, options) in store_options {
+        if options.len() != 1
+            || uncertain_stores.contains(&store)
+            || !multi_synth_address_is_encodable(store)
+        {
+            continue;
+        }
+        let (frame_ofs, definition) = *options.iter().next().unwrap();
+        if !chain_is_complete(definition, &exact_events, &mut HashSet::new(), &mut memo) {
+            continue;
+        }
+        accepted_stores.insert((store, frame_ofs, definition));
+    }
+
+    let mut event_uses: BTreeMap<Address, BTreeSet<Address>> = BTreeMap::new();
+    for (use_site, definition) in &prog.simd_dword_event_use {
+        event_uses.entry(*definition).or_default().insert(*use_site);
+    }
+
+    let collect_required = |stores: &BTreeSet<(Address, i64, Address)>| {
+        let mut required = BTreeSet::new();
+        for (_, _, definition) in stores {
+            let mut event = *definition;
+            loop {
+                required.insert(event);
+                let (kind, input, _) = exact_events[&event];
+                if kind == 0 {
+                    break;
+                }
+                event = input;
+            }
+        }
+        required
+    };
+
+    // Greatest closed set of valid store chains.  Starting from every exact
+    // candidate and pruning is important: two accepted branches may safely
+    // share one definition, while removing either branch can expose the
+    // other's formerly-supported read as a dangling ordinary XMM consumer.
+    let required_events = loop {
+        let required = collect_required(&accepted_stores);
+        let mut open_events = BTreeSet::new();
+        for event in &required {
+            for use_site in event_uses.get(event).into_iter().flatten() {
+                let consumed_by_required_event = required.contains(use_site)
+                    && exact_events
+                        .get(use_site)
+                        .is_some_and(|(kind, input, _)| *kind != 0 && input == event);
+                let consumed_by_accepted_store = accepted_stores
+                    .iter()
+                    .any(|(store, _, definition)| store == use_site && definition == event);
+                if !consumed_by_required_event && !consumed_by_accepted_store {
+                    open_events.insert(*event);
+                }
+            }
+        }
+        if open_events.is_empty() {
+            break required;
+        }
+
+        accepted_stores = accepted_stores
+            .into_iter()
+            .filter(|(_, _, definition)| {
+                let mut event = *definition;
+                loop {
+                    if open_events.contains(&event) {
+                        return false;
+                    }
+                    let (kind, input, _) = exact_events[&event];
+                    if kind == 0 {
+                        return true;
+                    }
+                    event = input;
+                }
+            })
+            .collect();
+    };
+
+    prog.simd_dword_lane_event = required_events
+        .iter()
+        .map(|event| {
+            let (kind, input, target) = exact_events[event];
+            (*event, kind, input, target)
+        })
+        .collect();
+    prog.simd_dword_lane_frame_store = accepted_stores.iter().copied().collect();
+
+    // Accepted arithmetic is no longer an unmodelled-vector fingerprint, and
+    // its event node must remain self-canonical through Linear so RTL can put
+    // the scalar chain at the original instruction point.
+    prog.packed_alu_addr = prog
+        .packed_alu_addr
+        .iter()
+        .filter(|(address,)| !required_events.contains(address))
+        .copied()
+        .collect();
+    prog.unhandled_reg_def_site = prog
+        .unhandled_reg_def_site
+        .iter()
+        .filter(|(address, _)| !required_events.contains(address))
+        .copied()
+        .collect();
+    let mut preserved_nodes: BTreeSet<(Address,)> =
+        prog.node_unlowered_side_effect.iter().copied().collect();
+    preserved_nodes.extend(required_events.iter().map(|address| (*address,)));
+    prog.node_unlowered_side_effect = preserved_nodes.into_iter().collect();
+
+    // The dword expansion completely replaces a recognized 16-byte frame
+    // store; retaining the independent high-quadword expansion would create a
+    // competing second write at the same machine event.
+    let accepted_store_addresses: HashSet<Address> =
+        accepted_stores.iter().map(|(store, _, _)| *store).collect();
+    prog.xmm_hi_frame_store = prog
+        .xmm_hi_frame_store
+        .iter()
+        .filter(|(store, _, _, _, _, _)| !accepted_store_addresses.contains(store))
+        .copied()
+        .collect();
+}
+
 pub struct AsmPass;
 
 impl IRPass for AsmPass {
@@ -9773,6 +10569,24 @@ impl IRPass for AsmPass {
         let mut prog = AsmPassProgram::default();
         prog.swap_db_fields(db);
         prog.run();
+        let trace_simd_func = std::env::var("TRACE_FUNC").ok().and_then(|value| {
+            let value = value.trim();
+            if let Some(hex) = value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+            {
+                Address::from_str_radix(hex, 16).ok()
+            } else {
+                value.parse::<Address>().ok()
+            }
+        });
+        if let Some(func) = trace_simd_func {
+            trace_simd_dword_state(&prog, func, "pre-finalize");
+        }
+        finalize_simd_dword_event_chains(&mut prog);
+        if let Some(func) = trace_simd_func {
+            trace_simd_dword_state(&prog, func, "post-finalize");
+        }
 
         // Safety diagnostic: warn once per mnemonic for any instruction that wrote a register but produced no mach_inst, since its def still kills the value it overwrote in the reaching-def lattice.
         {
@@ -9817,7 +10631,10 @@ impl IRPass for AsmPass {
 
 #[cfg(test)]
 mod structural_dataflow_tests {
-    use super::{exact_stack_offset, refine_direct_load_chunk, AsmPass, AsmPassProgram};
+    use super::{
+        exact_stack_offset, finalize_simd_dword_event_chains, refine_direct_load_chunk, AsmPass,
+        AsmPassProgram,
+    };
     use crate::decompile::passes::pass::IRPass;
     use crate::mreg::Mreg;
     use crate::x86::asm::TestCond;
@@ -9839,6 +10656,21 @@ mod structural_dataflow_tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    #[ignore = "diagnostic harness; requires MANIFOLD_DIAG_BINARY"]
+    fn trace_pipeline_binary_from_env() {
+        on_large_stack(|| {
+            let binary = std::path::PathBuf::from(
+                std::env::var("MANIFOLD_DIAG_BINARY")
+                    .expect("MANIFOLD_DIAG_BINARY must name an input binary"),
+            );
+            let mut db = crate::decompile::elevator::DecompileDB::default();
+            crate::decompile::disassembly::load_from_binary(&mut db, &binary);
+            crate::decompile::disassembly::load_preset(&mut db);
+            db.run_pipeline(&binary, false, false);
+        });
     }
 
     #[test]
@@ -9904,6 +10736,520 @@ mod structural_dataflow_tests {
                         && matches!(inst, MachInst::Mload(MemoryChunk::MInt32, _, _, _))
                 }));
             }
+        });
+    }
+
+    #[test]
+    fn settled_simd_event_provenance_rejects_ambiguous_cfg_joins() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let load = 0x900;
+            let add = 0x100;
+            let xor = 0x700;
+            let store = 0x200;
+            let base = 0x404040;
+            let addend = 0x402010;
+            let mask = 0x402020;
+
+            prog.simd_dword_event_candidate.extend([
+                (load, 0, 0, base),
+                (add, 1, load, addend),
+                (xor, 5, add, mask),
+            ]);
+            prog.simd_dword_event_use
+                .extend([(add, load), (xor, add), (store, xor)]);
+            prog.simd_dword_frame_store_candidate
+                .push((store, -24, xor));
+            for (ident, target) in [
+                (base as usize, base),
+                (addend as usize, addend),
+                (mask as usize, mask),
+            ] {
+                // Anonymous constant tables normally expose one synthetic symbol
+                // at the instruction's exact RIP target, not four symbols at its
+                // interior dword addresses.
+                prog.resolved_addr_to_symbol.push((target, ident, 0));
+            }
+            prog.packed_alu_addr.extend([(add,), (xor,)]);
+            prog.unhandled_reg_def_site
+                .extend([(add, "PADDD"), (xor, "PXOR")]);
+            prog.xmm_hi_frame_store
+                .push((store, -16, 3, Mreg::Unknown, base as i64, load));
+
+            finalize_simd_dword_event_chains(&mut prog);
+
+            assert_eq!(
+                prog.simd_dword_lane_event,
+                vec![
+                    (add, 1, load, addend),
+                    (xor, 5, add, mask),
+                    (load, 0, 0, base)
+                ]
+            );
+            assert_eq!(prog.simd_dword_lane_frame_store, vec![(store, -24, xor)]);
+            for event in [load, add, xor] {
+                assert!(prog
+                    .node_unlowered_side_effect
+                    .iter()
+                    .any(|fact| fact == &(event,)));
+            }
+            assert!(prog.packed_alu_addr.is_empty());
+            assert!(prog.unhandled_reg_def_site.is_empty());
+            assert!(prog.xmm_hi_frame_store.is_empty());
+
+            let mut ambiguous = AsmPassProgram::default();
+            ambiguous.simd_dword_event_candidate.extend([
+                (load, 0, 0, base),
+                (add, 1, load, addend),
+                // A distinct reaching definition at the same event models a real
+                // CFG join; neither predecessor may be selected arbitrarily.
+                (add, 1, 0x880, addend),
+            ]);
+            ambiguous
+                .simd_dword_frame_store_candidate
+                .push((store, -24, add));
+            for target in [base, addend] {
+                ambiguous
+                    .resolved_addr_to_symbol
+                    .push((target, target as usize, 0));
+            }
+
+            finalize_simd_dword_event_chains(&mut ambiguous);
+            assert!(ambiguous.simd_dword_lane_event.is_empty());
+            assert!(ambiguous.simd_dword_lane_frame_store.is_empty());
+
+            let mut absent_path = AsmPassProgram::default();
+            absent_path
+                .simd_dword_event_candidate
+                .extend([(load, 0, 0, base), (add, 1, load, addend)]);
+            // One predecessor carries `load`; another reaches the operation with
+            // no supported XMM definition.  Explicit Unknown must veto the chain
+            // even though the known option alone is unique.
+            absent_path.simd_dword_event_uncertain.push((add,));
+            absent_path
+                .simd_dword_frame_store_candidate
+                .push((store, -24, add));
+            absent_path
+                .resolved_addr_to_symbol
+                .extend([(base, base as usize, 0), (addend, addend as usize, 0)]);
+            finalize_simd_dword_event_chains(&mut absent_path);
+            assert!(absent_path.simd_dword_lane_event.is_empty());
+            assert!(absent_path.simd_dword_lane_frame_store.is_empty());
+
+            let mut uncertain_store = AsmPassProgram::default();
+            uncertain_store
+                .simd_dword_event_candidate
+                .push((load, 0, 0, base));
+            uncertain_store
+                .simd_dword_frame_store_candidate
+                .push((store, -24, load));
+            uncertain_store
+                .simd_dword_frame_store_uncertain
+                .push((store,));
+            uncertain_store
+                .resolved_addr_to_symbol
+                .push((base, base as usize, 0));
+            finalize_simd_dword_event_chains(&mut uncertain_store);
+            assert!(uncertain_store.simd_dword_lane_event.is_empty());
+            assert!(uncertain_store.simd_dword_lane_frame_store.is_empty());
+
+            let mut open_component = AsmPassProgram::default();
+            let unused_consumer = 0x330;
+            open_component.simd_dword_event_candidate.extend([
+                (load, 0, 0, base),
+                (add, 1, load, addend),
+                // This recognized branch has no accepted spill.  Leaving it as an
+                // ordinary packed instruction while removing LOAD would make it
+                // read an undefined architectural XMM value.
+                (unused_consumer, 5, load, mask),
+            ]);
+            open_component.simd_dword_event_use.extend([
+                (add, load),
+                (unused_consumer, load),
+                (store, add),
+            ]);
+            open_component
+                .simd_dword_frame_store_candidate
+                .push((store, -24, add));
+            open_component.resolved_addr_to_symbol.extend([
+                (base, base as usize, 0),
+                (addend, addend as usize, 0),
+                (mask, mask as usize, 0),
+            ]);
+            finalize_simd_dword_event_chains(&mut open_component);
+            assert!(open_component.simd_dword_lane_event.is_empty());
+            assert!(open_component.simd_dword_lane_frame_store.is_empty());
+        });
+    }
+
+    #[test]
+    fn simd_event_state_rejects_raw_consumers_and_vzeroall() {
+        on_large_stack(|| {
+            let make_program = |intervening: u64, mnemonic: &'static str, raw_use: bool| {
+                let load = 0x900;
+                let add = 0x700;
+                let store = 0x200;
+                let base = 0x404040;
+                let addend = 0x402010;
+                let mut prog = AsmPassProgram::default();
+                prog.simd_dword_global_seed.push((load, Mreg::X0, base));
+                prog.simd_dword_mem_binop
+                    .push((add, 1, Mreg::X0, Mreg::X0, addend));
+                prog.simd_dword_frame_spill_site
+                    .push((store, Mreg::X0, -24));
+                prog.reg_def.extend([(load, Mreg::X0), (add, Mreg::X0)]);
+                prog.reg_use.extend([(add, Mreg::X0), (store, Mreg::X0)]);
+                if raw_use {
+                    prog.reg_use.push((intervening, Mreg::X0));
+                }
+                prog.instruction
+                    .push((intervening, 3, "", mnemonic, "", "", "", "", 0, 0));
+                for node in [load, intervening, add, store] {
+                    prog.instr_in_function.push((node, load));
+                }
+                prog.ddisasm_cfg_edge.extend([
+                    (load, intervening, "fallthrough"),
+                    (intervening, add, "fallthrough"),
+                    (add, store, "fallthrough"),
+                ]);
+                prog.resolved_addr_to_symbol
+                    .extend([(base, base as usize, 0), (addend, addend as usize, 0)]);
+                prog
+            };
+
+            let mut raw_read = make_program(0x100, "PTEST", true);
+            raw_read.run();
+            assert!(raw_read
+                .simd_dword_unsupported_use
+                .iter()
+                .any(|fact| fact == &(0x100, Mreg::X0)));
+            assert!(raw_read
+                .simd_dword_event_uncertain
+                .iter()
+                .any(|fact| fact == &(0x700,)));
+            finalize_simd_dword_event_chains(&mut raw_read);
+            assert!(raw_read.simd_dword_lane_event.is_empty());
+            assert!(raw_read.simd_dword_lane_frame_store.is_empty());
+
+            let mut zero_all = make_program(0x110, "VZEROALL", false);
+            zero_all.run();
+            assert!(zero_all
+                .simd_dword_lane_barrier
+                .iter()
+                .any(|fact| fact == &(0x110,)));
+            assert!(zero_all
+                .simd_dword_event_uncertain
+                .iter()
+                .any(|fact| fact == &(0x700,)));
+            finalize_simd_dword_event_chains(&mut zero_all);
+            assert!(zero_all.simd_dword_lane_event.is_empty());
+            assert!(zero_all.simd_dword_lane_frame_store.is_empty());
+
+            let mut restored = make_program(0x120, "FXRSTOR64", false);
+            restored.run();
+            assert!(restored
+                .simd_dword_lane_barrier
+                .iter()
+                .any(|fact| fact == &(0x120,)));
+            assert!(restored
+                .simd_dword_event_uncertain
+                .iter()
+                .any(|fact| fact == &(0x700,)));
+            finalize_simd_dword_event_chains(&mut restored);
+            assert!(restored.simd_dword_lane_event.is_empty());
+            assert!(restored.simd_dword_lane_frame_store.is_empty());
+
+            let load = 0x900;
+            let store = 0x200;
+            let ret = 0x50;
+            let base = 0x404040;
+            let mut live_at_return = AsmPassProgram::default();
+            live_at_return
+                .simd_dword_global_seed
+                .push((load, Mreg::X0, base));
+            live_at_return
+                .simd_dword_frame_spill_site
+                .push((store, Mreg::X0, -24));
+            live_at_return.reg_def.push((load, Mreg::X0));
+            live_at_return.reg_use.push((store, Mreg::X0));
+            live_at_return.mach_inst.push((ret, MachInst::Mreturn));
+            for node in [load, store, ret] {
+                live_at_return.instr_in_function.push((node, load));
+            }
+            live_at_return
+                .ddisasm_cfg_edge
+                .extend([(load, store, "fallthrough"), (store, ret, "fallthrough")]);
+            live_at_return
+                .resolved_addr_to_symbol
+                .push((base, base as usize, 0));
+
+            live_at_return.run();
+            assert!(live_at_return
+                .simd_dword_event_use
+                .iter()
+                .any(|fact| fact == &(ret, load)));
+            finalize_simd_dword_event_chains(&mut live_at_return);
+            assert!(live_at_return.simd_dword_lane_event.is_empty());
+            assert!(live_at_return.simd_dword_lane_frame_store.is_empty());
+
+            let ax_def = 0x100;
+            let mut integer_return = AsmPassProgram::default();
+            integer_return
+                .simd_dword_global_seed
+                .push((load, Mreg::X0, base));
+            integer_return
+                .simd_dword_frame_spill_site
+                .push((store, Mreg::X0, -24));
+            integer_return
+                .reg_def
+                .extend([(load, Mreg::X0), (ax_def, Mreg::AX)]);
+            integer_return.reg_use.push((store, Mreg::X0));
+            integer_return.mach_inst.push((ret, MachInst::Mreturn));
+            for node in [load, store, ax_def, ret] {
+                integer_return.instr_in_function.push((node, load));
+            }
+            integer_return.ddisasm_cfg_edge.extend([
+                (load, store, "fallthrough"),
+                (store, ax_def, "fallthrough"),
+                (ax_def, ret, "fallthrough"),
+            ]);
+            integer_return
+                .resolved_addr_to_symbol
+                .push((base, base as usize, 0));
+
+            integer_return.run();
+            assert!(integer_return
+                .simd_gp_return_proven
+                .iter()
+                .any(|fact| fact == &(load,)));
+            assert!(!integer_return
+                .simd_dword_event_use
+                .iter()
+                .any(|fact| fact == &(ret, load)));
+            finalize_simd_dword_event_chains(&mut integer_return);
+            assert_eq!(
+                integer_return.simd_dword_lane_event,
+                vec![(load, 0, 0, base)]
+            );
+            assert_eq!(
+                integer_return.simd_dword_lane_frame_store,
+                vec![(store, -24, load)]
+            );
+        });
+    }
+
+    #[test]
+    fn packed_dword_matcher_respects_avx_operands_and_legacy_alignment() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let func = 0x400;
+            let legacy_aligned = 0x900;
+            let legacy_unaligned = 0x100;
+            let avx_unaligned = 0x700;
+            let avx_masked = 0x600;
+            let masked_seed = 0x580;
+            let masked_spill = 0x540;
+            let masked_copy = 0x500;
+            let unmasked_wide_store = 0x480;
+            let spill = 0x200;
+            let aligned_target = 0x404040;
+            let dword_target = 0x404044;
+
+            for (node, mem, dst, target) in [
+                (
+                    legacy_aligned,
+                    "legacy_aligned_mem",
+                    "legacy_aligned_dst",
+                    aligned_target,
+                ),
+                (
+                    legacy_unaligned,
+                    "legacy_unaligned_mem",
+                    "legacy_unaligned_dst",
+                    dword_target,
+                ),
+            ] {
+                prog.instruction
+                    .push((node, 4, "", "PADDD", mem, dst, "", "", 0, 0));
+                prog.op_indirect.push((mem, "", "RIP", "NONE", 1, 0, 16));
+                prog.op_register.push((dst, "XMM0"));
+                prog.rip_target_addr.push((node, target));
+            }
+            // Decoder convention after its operand swap is src1,dst,src2.
+            prog.instruction.push((
+                avx_unaligned,
+                5,
+                "",
+                "VPADDD",
+                "avx_input",
+                "avx_dst",
+                "avx_mem",
+                "",
+                0,
+                0,
+            ));
+            prog.op_register
+                .extend([("avx_input", "XMM1"), ("avx_dst", "XMM2")]);
+            prog.op_indirect
+                .push(("avx_mem", "", "RIP", "NONE", 1, 0, 16));
+            prog.rip_target_addr.push((avx_unaligned, dword_target));
+
+            prog.instruction.push((
+                avx_masked,
+                6,
+                "",
+                "VPADDD",
+                "masked_input",
+                "masked_dst",
+                "masked_mem",
+                "",
+                0,
+                0,
+            ));
+            prog.op_register
+                .extend([("masked_input", "XMM1"), ("masked_dst", "XMM2")]);
+            prog.op_indirect
+                .push(("masked_mem", "", "RIP", "NONE", 1, 0, 16));
+            prog.rip_target_addr.push((avx_masked, dword_target));
+            prog.avx_masked_site.push((avx_masked,));
+
+            // EVEX writemasks make a wide move lane-selective.  Neither a
+            // partial/zero-masked load nor a masked store/copy is an exact
+            // four-lane event, so all exact SIMD models must leave it alone.
+            prog.instruction.push((
+                masked_seed,
+                7,
+                "",
+                "VMOVDQU",
+                "masked_seed_mem",
+                "masked_seed_dst",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.op_indirect
+                .push(("masked_seed_mem", "", "RIP", "NONE", 1, 0, 16));
+            prog.op_register.push(("masked_seed_dst", "XMM3"));
+            prog.rip_target_addr.push((masked_seed, aligned_target));
+
+            prog.instruction.push((
+                masked_spill,
+                8,
+                "",
+                "VMOVDQU",
+                "masked_spill_src",
+                "masked_spill_mem",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.op_register.push(("masked_spill_src", "XMM3"));
+            prog.op_indirect
+                .push(("masked_spill_mem", "", "RSP", "NONE", 1, -40, 16));
+            prog.sp_frame_shift.push((masked_spill, 0));
+
+            prog.instruction.push((
+                masked_copy,
+                9,
+                "",
+                "VMOVDQU",
+                "masked_copy_src",
+                "masked_copy_dst",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.op_register
+                .extend([("masked_copy_src", "XMM3"), ("masked_copy_dst", "XMM4")]);
+
+            // Establish the high-lane analysis demand independently of the
+            // masked store, so the negative seed/copy assertions exercise the
+            // mask guards rather than short-circuiting on no consumer.
+            prog.instruction.push((
+                unmasked_wide_store,
+                10,
+                "",
+                "MOVDQU",
+                "wide_store_src",
+                "wide_store_mem",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.op_register.push(("wide_store_src", "XMM5"));
+            prog.op_indirect
+                .push(("wide_store_mem", "", "RSP", "NONE", 1, -64, 16));
+            prog.sp_frame_shift.push((unmasked_wide_store, 0));
+
+            prog.avx_masked_site
+                .extend([(masked_seed,), (masked_spill,), (masked_copy,)]);
+
+            prog.simd_dword_frame_spill_site
+                .push((spill, Mreg::X2, -24));
+            for node in [
+                legacy_aligned,
+                legacy_unaligned,
+                avx_unaligned,
+                avx_masked,
+                masked_seed,
+                masked_spill,
+                masked_copy,
+                unmasked_wide_store,
+                spill,
+            ] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            prog.run();
+
+            assert!(prog
+                .simd_dword_mem_binop
+                .iter()
+                .any(|fact| { fact == &(legacy_aligned, 1, Mreg::X0, Mreg::X0, aligned_target,) }));
+            assert!(!prog
+                .simd_dword_mem_binop
+                .iter()
+                .any(|(node, ..)| *node == legacy_unaligned));
+            assert!(prog
+                .simd_dword_mem_binop
+                .iter()
+                .any(|fact| { fact == &(avx_unaligned, 1, Mreg::X1, Mreg::X2, dword_target) }));
+            assert!(!prog
+                .simd_dword_mem_binop
+                .iter()
+                .any(|(node, ..)| *node == avx_masked));
+            assert!(!prog
+                .simd_dword_global_seed
+                .iter()
+                .any(|(node, ..)| *node == masked_seed));
+            assert!(!prog
+                .simd_dword_frame_spill_site
+                .iter()
+                .any(|(node, ..)| *node == masked_spill));
+            assert!(!prog
+                .simd_dword_reg_copy
+                .iter()
+                .any(|(node, ..)| *node == masked_copy));
+            assert!(!prog
+                .sse_wide_frame_store
+                .iter()
+                .any(|(node, ..)| *node == masked_spill));
+            assert!(!prog
+                .xmm_hi_seed
+                .iter()
+                .any(|(node, ..)| *node == masked_seed));
+            assert!(!prog
+                .xmm_hi_reg_copy
+                .iter()
+                .any(|(node, ..)| *node == masked_copy));
+            assert!(prog
+                .sse_wide_frame_store
+                .iter()
+                .any(|(node, ..)| *node == unmasked_wide_store));
         });
     }
 
@@ -10973,6 +12319,73 @@ mod structural_dataflow_tests {
                         ) if args.as_slice() == [Mreg::SP, Mreg::AX]
                     )
             }));
+        });
+    }
+
+    #[test]
+    fn indexed_integer_memory_sources_cover_arithmetic_and_logical_ops() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let cases = [
+                (
+                    0x910,
+                    1i64,
+                    "indexed_dst_add",
+                    "indexed_src_add",
+                    Operation::Oadd,
+                ),
+                (
+                    0x920,
+                    2,
+                    "indexed_dst_sub",
+                    "indexed_src_sub",
+                    Operation::Osub,
+                ),
+                (
+                    0x930,
+                    3,
+                    "indexed_dst_and",
+                    "indexed_src_and",
+                    Operation::Oand,
+                ),
+                (0x940, 4, "indexed_dst_or", "indexed_src_or", Operation::Oor),
+                (
+                    0x950,
+                    5,
+                    "indexed_dst_xor",
+                    "indexed_src_xor",
+                    Operation::Oxor,
+                ),
+            ];
+
+            for (addr, kind, dst, src, _) in cases.iter() {
+                match kind {
+                    1 => prog.padd.push((*addr, *dst, *src)),
+                    2 => prog.psub.push((*addr, *dst, *src)),
+                    3 => prog.pand.push((*addr, *dst, *src)),
+                    4 => prog.por.push((*addr, *dst, *src)),
+                    5 => prog.pxor.push((*addr, *dst, *src)),
+                    _ => unreachable!(),
+                };
+                prog.op_register.push((*dst, "EAX"));
+                prog.op_indirect.push((*src, "", "RSP", "RDI", 4, -24, 4));
+            }
+
+            prog.run();
+
+            for (addr, _, _, _, expected_op) in cases {
+                assert!(prog.float_load_op.iter().any(|fact| {
+                    fact == &(
+                        addr,
+                        expected_op.clone(),
+                        MemoryChunk::MInt32,
+                        Addressing::Aindexed2scaled(4, -24),
+                        Arc::new(vec![Mreg::SP, Mreg::DI]),
+                        Mreg::AX,
+                        false,
+                    )
+                }));
+            }
         });
     }
 

@@ -112,8 +112,22 @@ ascent_par! {
 
     relation instr_in_function(Node, Address);
     relation rtl_succ(Node, Node);
+    relation rtl_expansion_edge(Node, Node);
+    #[local] relation rtl_expansion_member(Node);
+    rtl_expansion_member(src) <-- rtl_expansion_edge(src, _);
+    rtl_expansion_member(dst) <-- rtl_expansion_edge(_, dst);
+    #[local] relation rtl_optimized_expansion_edge(Node, Node);
+    rtl_optimized_expansion_edge(src, dst) <--
+        rtl_succ(src, dst),
+        rtl_expansion_member(src);
+    rtl_optimized_expansion_edge(src, dst) <--
+        rtl_succ(src, dst),
+        rtl_expansion_member(dst);
     relation cminor_fallthrough(Node, Node);
     relation emit_function(Address, Symbol, Node);
+    // Post-optimizer semantic entry.  Keep this distinct from emit_function's
+    // raw machine entry, which remains necessary for ABI/register recovery.
+    relation rtl_function_entry(Address, Node);
     relation emit_function_param(Address, RTLReg);
     relation next(Address, Address);
     relation idom(Address, Node, Node);
@@ -254,6 +268,9 @@ ascent_par! {
         rtl_succ(node, dst),
         if (*dst & (3u64 << 62)) != 0,
         active_cminor_stmt(dst, _);
+    synth_rerouted(*node) <--
+        rtl_optimized_expansion_edge(node, dst),
+        active_cminor_stmt(dst, _);
 
     // Fallthrough suppressed when a synth chain carries the real flow; bridge rules below provide node -> synth -> ... -> next instead.
     cminor_succ(node, next) <--
@@ -284,14 +301,37 @@ ascent_par! {
         active_cminor_stmt(node, _),
         active_cminor_stmt(dst, _);
 
+    // Arbitrary-length expansions use their explicit semantic edges.  These
+    // two rules subsume both entering and traversing the chain without using
+    // node-id magnitude as a control-flow predicate.
+    cminor_succ(*node, *dst) <--
+        rtl_optimized_expansion_edge(node, dst),
+        active_cminor_stmt(node, _),
+        active_cminor_stmt(dst, _);
+    cminor_succ(*node, resolved) <--
+        rtl_optimized_expansion_edge(node, dst),
+        active_cminor_stmt(node, _),
+        !active_cminor_stmt(dst, _),
+        next_to_cminor(*dst, resolved);
 
-    // emit_function entry may point at a non-stmt node (first instr like `mov $0x2,%r8d` later trimmed); follow `next` to the first active cminor node so reachable_from_entry/dom cover the full body.
+
+    // Prefer the optimizer-normalized entry.  The emit_function fallback keeps
+    // isolated pass tests and partial pipelines total, but is disabled for a
+    // function as soon as the optimizer publishes its authoritative entry.
+    #[local] relation semantic_function_entry(Address, Node);
+    semantic_function_entry(func, entry) <-- rtl_function_entry(func, entry);
+    semantic_function_entry(func, entry) <-- emit_function(func, _, entry), !rtl_function_entry(func, _);
+
+    // A semantic entry may still point at a statement trimmed by jump-table
+    // cleanup; follow `next` only in that residual case.  Crucially, an entry
+    // removed by RTL nop collapse is already retargeted through rtl_succ, so
+    // raw `next` can no longer bypass its synthetic expansion.
     func_entry_node(func, entry) <--
-        emit_function(func, _, entry),
+        semantic_function_entry(func, entry),
         active_cminor_stmt(entry, _);
 
     func_entry_node(func, resolved) <--
-        emit_function(func, _, entry),
+        semantic_function_entry(func, entry),
         !active_cminor_stmt(entry, _),
         next_to_cminor(entry, resolved);
 
@@ -1221,6 +1261,61 @@ mod tests {
             unique_external_cfg_entry(&implementation_nodes, &ambiguous_edges),
             None
         );
+    }
+
+    #[test]
+    fn retargeted_expansion_tail_survives_nop_collapse() {
+        let tail = 0x900;
+        let collapsed = 0x100;
+        let live = 0x700;
+        let mut prog = CshminorPassProgram::default();
+        prog.cminor_stmt
+            .extend([(tail, CminorStmt::Snop), (live, CminorStmt::Snop)]);
+        prog.rtl_expansion_edge.push((tail, collapsed));
+        prog.rtl_succ.push((tail, live));
+
+        prog.run();
+
+        assert!(prog.cminor_succ.iter().any(|fact| fact == &(tail, live)));
+        assert!(!prog
+            .cminor_succ
+            .iter()
+            .any(|fact| fact == &(tail, collapsed)));
+    }
+
+    #[test]
+    fn optimized_entry_does_not_follow_raw_next_around_expansion() {
+        let raw_entry = 0x900;
+        let expansion_stage = 0x700;
+        let live = 0x100;
+        let mut prog = CshminorPassProgram::default();
+
+        prog.emit_function
+            .push((FUNC, "entry_expansion", raw_entry));
+        prog.rtl_function_entry.push((FUNC, expansion_stage));
+        prog.cminor_stmt.extend([
+            (expansion_stage, CminorStmt::Snop),
+            (live, CminorStmt::Sreturn(0)),
+        ]);
+        prog.rtl_expansion_edge.push((raw_entry, expansion_stage));
+        prog.rtl_succ.push((expansion_stage, live));
+        // The raw instruction stream skips the synthetic semantic stage.
+        prog.next.push((raw_entry, live));
+
+        prog.run();
+
+        assert!(prog
+            .func_entry_node
+            .iter()
+            .any(|fact| fact == &(FUNC, expansion_stage)));
+        assert!(!prog
+            .func_entry_node
+            .iter()
+            .any(|fact| fact == &(FUNC, live)));
+        assert!(prog
+            .cminor_succ
+            .iter()
+            .any(|fact| fact == &(expansion_stage, live)));
     }
 
     #[test]

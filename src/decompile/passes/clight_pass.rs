@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::mreg::Mreg;
+use crate::util::{exec_order_key, is_synthetic_node, semantic_node_address};
 use crate::x86::op::{Addressing, Comparison, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
@@ -1037,16 +1038,16 @@ ascent_par! {
     // Resolve synthetic duplicated-tail nodes to their base address's function, or without a func owner their statement is dropped and the branch arm emits empty.
     clight_stmt_for_func_raw(addr, node, labeled_stmt) <--
         clight_stmt_raw(node, stmt),
-        if (*node & ((1u64 << 62) | (1u64 << 63))) != 0,
-        let base = *node & !((1u64 << 62) | (1u64 << 63)),
+        if is_synthetic_node(*node),
+        let base = semantic_node_address(*node),
         instr_in_function(base, addr),
         if !matches!(stmt, ClightStmt::Slabel(_, _)),
         let labeled_stmt = ClightStmt::Slabel(ident_from_node(*node), Box::new(stmt.clone()));
 
     clight_stmt_for_func_raw(addr, node, stmt) <--
         clight_stmt_raw(node, stmt),
-        if (*node & ((1u64 << 62) | (1u64 << 63))) != 0,
-        let base = *node & !((1u64 << 62) | (1u64 << 63)),
+        if is_synthetic_node(*node),
+        let base = semantic_node_address(*node),
         instr_in_function(base, addr),
         if matches!(stmt, ClightStmt::Slabel(_, _));
 
@@ -1187,6 +1188,11 @@ ascent_par! {
     // an O(functions * nodes) pairwise reachability relation.  In particular,
     // machine-level lazy resolver paths that are no longer successors of a
     // lifted external call are not part of the recovered C function body.
+    // Seed the optimized semantic entry directly.  The raw emit_function seed
+    // remains below because entry-point reg_rtl facts are ABI evidence, but it
+    // is no longer responsible for discovering the executable body.
+    clight_function_owners(*entry, Set::singleton(*func)) <--
+        func_entry_node(func, entry);
     clight_function_owners(*entry, Set::singleton(*func)) <--
         emit_function(func, _, entry);
     // A no-op or selected-away node named by an exact branch remains a
@@ -1284,10 +1290,11 @@ impl IRPass for ClightPass {
         // masked instruction address, at the relations ownership flows over.
         if let Ok(want) = std::env::var("CF3_EDGE_DUMP") {
             if let Ok(addr) = u64::from_str_radix(want.trim_start_matches("0x"), 16) {
-                let mask = !((1u64 << 62) | (1u64 << 63));
                 for rel in ["emit_next", "cminor_succ", "rtl_succ", "clight_succ"] {
                     for (src, dst) in db.rel_iter::<(Node, Node)>(rel) {
-                        if (*src & mask) == addr || (*dst & mask) == addr {
+                        if semantic_node_address(*src) == addr
+                            || semantic_node_address(*dst) == addr
+                        {
                             eprintln!("[EDGE-{rel}] {src:#x} -> {dst:#x}");
                         }
                     }
@@ -7271,7 +7278,7 @@ fn synthesize_struct_construction(
             .filter(|(n, _)| node_to_func.get(n) == Some(func_addr))
             .map(|(n, s)| (*n, s.clone()))
             .collect();
-        stmts_for_func.sort_by_key(|(n, _)| *n);
+        stmts_for_func.sort_by_key(|(n, _)| exec_order_key(*n));
         for (node_val, stmt_val) in &stmts_for_func {
             let node = node_val;
             let stmt = stmt_val;
