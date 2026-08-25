@@ -1974,12 +1974,6 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     };
 
     for global in order_globals_for_aggregate_initializers(globals, &global_aggregate_coalescing) {
-        // An interior identifier is an lvalue coordinate in its owner's
-        // storage, not a separately allocated C object.  Its expression uses
-        // the owner declaration emitted below.
-        if global_lvalue_aliases.contains_key(&global.id) {
-            continue;
-        }
         // String literals emit separately. A read-only scalar can be folded
         // only when it is not also the proven owner of recovered aggregate
         // storage: interior aliases require that one owner declaration and
@@ -1988,6 +1982,15 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             global_aggregate_coalescing.owner_ids.contains(&global.id)
                 || global_struct_decl_ids.contains_key(&global.id)
                 || global_array_decl.contains_key(&global.id);
+        // An interior identifier is an lvalue coordinate in its owner's
+        // storage, not a separately allocated C object. Its expression uses
+        // the owner declaration emitted below. Aggregate owners may also have
+        // an offset-zero alias so scalar accesses at their base retain the
+        // access's Clight type; that alias must never suppress the declaration
+        // which provides the storage.
+        if global_lvalue_aliases.contains_key(&global.id) && !is_recovered_aggregate_owner {
+            continue;
+        }
         if global.is_string
             || (global.scalar_value.is_some()
                 && !global.scalar_writable
@@ -4719,11 +4722,11 @@ fn collect_var_names_from_initializer(
 
 pub struct ConversionContext {
     pub id_to_name: HashMap<usize, String>,
-    /// Exact lvalue coordinates for identifiers that name an interior byte of
-    /// a recovered global object.  Keeping this as CExpr (rather than encoding
-    /// `owner[index]` into a string) preserves aliasing and prevents the name
-    /// sanitizer from turning an address coordinate into an unrelated C
-    /// global.
+    /// Exact lvalue coordinates for identifiers that name a byte of a
+    /// recovered global object, including scalar accesses at offset zero.
+    /// Keeping this as CExpr (rather than encoding `owner[index]` into a
+    /// string) preserves aliasing and prevents the name sanitizer from turning
+    /// an address coordinate into an unrelated C global.
     pub global_lvalue_aliases: HashMap<usize, CExpr>,
     /// The target's C data model, so a 64-bit value gets a 64-bit spelling.
     pub data_model: crate::abi::DataModel,
@@ -7450,6 +7453,7 @@ fn order_nodes_dfs(
 #[cfg(test)]
 mod escaped_stack_array_tests {
     use super::*;
+    use crate::decompile::passes::c_pass::types::FloatSize;
 
     #[test]
     fn stack_buffer_alias_rewrites_address_to_exact_backing_offset() {
@@ -7621,10 +7625,7 @@ mod escaped_stack_array_tests {
         let indexed_address = clight::ClightExpr::Ebinop(
             clight::ClightBinaryOp::Oadd,
             Box::new(clight::ClightExpr::Eaddrof(
-                Box::new(clight::ClightExpr::Evar(
-                    member as Ident,
-                    int_ty.clone(),
-                )),
+                Box::new(clight::ClightExpr::Evar(member as Ident, int_ty.clone())),
                 int_ptr_ty.clone(),
             )),
             Box::new(clight::ClightExpr::Etempvar(index as Ident, int_ty)),
@@ -7887,6 +7888,31 @@ mod escaped_stack_array_tests {
         assert_eq!(
             address,
             CExpr::Unary(UnaryOp::AddrOf, Box::new(typed_alias))
+        );
+    }
+
+    #[test]
+    fn aggregate_base_alias_keeps_scalar_access_type() {
+        let owner_id = 0x26640_usize;
+        let alias = CExpr::Member(
+            Box::new(CExpr::Var("L_26640".to_string())),
+            "ofs_0".to_string(),
+        );
+        let access_ty =
+            clight::ClightType::Tfloat(clight::ClightFloatSize::F32, clight::ClightAttr::default());
+        let mut ctx = ConversionContext::new(HashMap::new(), crate::abi::DataModel::Lp64);
+        ctx.global_lvalue_aliases.insert(owner_id, alias.clone());
+
+        assert_eq!(
+            convert_expr(&clight::ClightExpr::Evar(owner_id, access_ty), &mut ctx),
+            CExpr::Unary(
+                UnaryOp::Deref,
+                Box::new(CExpr::Cast(
+                    CType::ptr(CType::Float(FloatSize::Float)),
+                    Box::new(CExpr::Unary(UnaryOp::AddrOf, Box::new(alias))),
+                )),
+            ),
+            "an overlapping aggregate field type must not replace the scalar machine-access type",
         );
     }
 

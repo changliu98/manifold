@@ -856,7 +856,12 @@ fn type_to_string(ty: &CType) -> String {
         },
         CType::Pointer(inner, quals) => {
             let quals_str = qualifiers_to_string(quals);
-            if matches!(inner.as_ref(), CType::Function(..)) {
+            // Casts and sizeof types use an abstract declarator.  A pointer to
+            // an array needs the same parentheses as a pointer to a function:
+            // `unsigned char (*)[72]`, never the invalid
+            // `unsigned char[72] *` produced by recursively stringifying the
+            // pointee before appending `*`.
+            if matches!(inner.as_ref(), CType::Array(..) | CType::Function(..)) {
                 let (prefix, suffix) = type_to_decl_parts(inner);
                 return format!("{} (*{}){}", prefix, quals_str.trim(), suffix);
             }
@@ -1305,6 +1310,19 @@ mod tests {
             type_to_named_decl(&return_type, &declarator),
             "void (*factory(void))(void)"
         );
+    }
+
+    #[test]
+    fn pointer_to_array_cast_uses_an_abstract_declarator() {
+        let ty = CType::Pointer(
+            Box::new(CType::Array(
+                Box::new(CType::Int(IntSize::Char, Signedness::Unsigned)),
+                Some(72),
+            )),
+            TypeQualifiers::none(),
+        );
+
+        assert_eq!(type_to_string(&ty), "unsigned char (*)[72]");
     }
 
     #[test]

@@ -1830,6 +1830,84 @@ impl IRPass for ClightEmitPass {
                 offsets
             };
 
+            // A scalar machine access at an aggregate's base is still an
+            // access to its first bytes, not a value of the whole C aggregate.
+            // Seed an explicit base lvalue just like the interior aliases
+            // below, so convert_expr can retain the Clight access type as
+            // `*(T *)&owner.first` / `*(T *)&owner[0]`.  The later aggregate
+            // rewrite otherwise turns a bare scalar Evar into `owner.first`
+            // and silently inherits an unrelated winning field type (for
+            // example, an overlapping 8-byte load can make a 4-byte float
+            // access print as assignment from void *).
+            for (base_ident, field_offsets) in &struct_decl_field_offsets {
+                if !field_offsets.contains(&0) || !declared_global_ids.contains(base_ident) {
+                    continue;
+                }
+                let Some(raw_owner_name) = id_to_name.get(base_ident) else {
+                    continue;
+                };
+                if symbol_addrs_by_name
+                    .get(raw_owner_name.as_str())
+                    .is_some_and(|addresses| {
+                        addresses.len() != 1 || !addresses.contains(base_ident)
+                    })
+                {
+                    continue;
+                }
+                let owner_name = crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(raw_owner_name);
+                if known_typed_names.contains(&owner_name)
+                    || globals_by_id
+                        .get(base_ident)
+                        .is_some_and(|global| !global.pointer_init.is_empty())
+                {
+                    continue;
+                }
+                global_lvalue_alias_candidates
+                    .entry(*base_ident)
+                    .or_default()
+                    .insert(CExpr::Member(
+                        Box::new(CExpr::Var(owner_name)),
+                        "ofs_0".to_string(),
+                    ));
+            }
+            for base_ident in array_layouts.keys() {
+                // The declaration builder gives a recovered struct precedence
+                // when the same exact storage extent also admits an array
+                // layout. Mirror that choice instead of inserting both base
+                // coordinates and rejecting the owner as ambiguous below.
+                if struct_decl_field_offsets.contains_key(base_ident)
+                    || !declared_global_ids.contains(base_ident)
+                {
+                    continue;
+                }
+                let Some(raw_owner_name) = id_to_name.get(base_ident) else {
+                    continue;
+                };
+                if symbol_addrs_by_name
+                    .get(raw_owner_name.as_str())
+                    .is_some_and(|addresses| {
+                        addresses.len() != 1 || !addresses.contains(base_ident)
+                    })
+                {
+                    continue;
+                }
+                let owner_name = crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(raw_owner_name);
+                if known_typed_names.contains(&owner_name)
+                    || globals_by_id
+                        .get(base_ident)
+                        .is_some_and(|global| !global.pointer_init.is_empty())
+                {
+                    continue;
+                }
+                global_lvalue_alias_candidates
+                    .entry(*base_ident)
+                    .or_default()
+                    .insert(CExpr::Index(
+                        Box::new(CExpr::Var(owner_name)),
+                        Box::new(CExpr::int(0)),
+                    ));
+            }
+
             for (interior_ident, base_name, offset) in
                 db.rel_iter::<(Ident, Symbol, i64)>("emit_address_as_offset")
             {
@@ -2571,7 +2649,7 @@ impl IRPass for ClightEmitPass {
 #[cfg(test)]
 mod tests {
     use super::{rewrite_recovered_global_expr, ClightEmitPass, ClightSelectPass};
-    use crate::decompile::passes::c_pass::types::CExpr;
+    use crate::decompile::passes::c_pass::types::{CExpr, CType, FloatSize, UnaryOp};
     use crate::decompile::passes::clight_pass::ClightPass;
     use crate::decompile::passes::pass::IRPass;
     use std::collections::{HashMap, HashSet};
@@ -2617,6 +2695,26 @@ mod tests {
             rewrite_recovered_global_expr(&CExpr::Var(owner.clone()), &arrays, &HashMap::new(),),
             CExpr::Index(Box::new(CExpr::Var(owner)), Box::new(CExpr::int(0))),
             "a genuinely bare aggregate use must still select its first element",
+        );
+    }
+
+    #[test]
+    fn typed_aggregate_base_alias_survives_recovered_global_rewrite() {
+        let owner = "L_26640".to_string();
+        let alias = CExpr::Member(Box::new(CExpr::Var(owner.clone())), "ofs_0".to_string());
+        let expr = CExpr::Unary(
+            UnaryOp::Deref,
+            Box::new(CExpr::Cast(
+                CType::ptr(CType::Float(FloatSize::Float)),
+                Box::new(CExpr::Unary(UnaryOp::AddrOf, Box::new(alias))),
+            )),
+        );
+        let structs = HashMap::from([(owner, "ofs_0".to_string())]);
+
+        assert_eq!(
+            rewrite_recovered_global_expr(&expr, &HashSet::new(), &structs),
+            expr,
+            "the aggregate rewrite must preserve the access-specific cast around an exact base coordinate",
         );
     }
 
