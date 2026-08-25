@@ -456,13 +456,17 @@ fn relocation_target_is_representable(
 
 /// Recover the pointer-sized words used to initialize a relocated global.
 ///
-/// The relocation at `base` is authoritative and is therefore the fallback for
-/// every failed aggregate check. Aggregate recovery is deliberately driven by
-/// an existing `is_global_array` layout rather than by the address of an
-/// unrelated later relocation. Candidate extents are tried largest-first and
-/// accepted only when pointer-width aligned, fully backed by initialized bytes,
-/// and completely representable. Targets must have a relocatable C spelling;
-/// an absolute numeric address is never a safe initializer after recompilation.
+/// A relocation at `base` is authoritative and is therefore the scalar
+/// fallback for every failed aggregate check. A validated aggregate may instead
+/// carry its first relocation in an interior word; in that case there is no
+/// scalar fallback, and the whole initialized image is accepted atomically or
+/// not at all. Aggregate recovery is deliberately driven by an existing
+/// `is_global_array` layout rather than by the address of an unrelated later
+/// relocation. Candidate extents are tried largest-first and accepted only when
+/// pointer-width aligned, fully backed by initialized bytes, contain at least
+/// one relocation, and are completely representable. Targets must have a
+/// relocatable C spelling; an absolute numeric address is never a safe
+/// initializer after recompilation.
 fn recover_relocated_pointer_words(
     base: u64,
     pointer_size: usize,
@@ -472,13 +476,15 @@ fn recover_relocated_pointer_words(
     mut target_is_representable: impl FnMut(u64) -> bool,
     mut read_word: impl FnMut(u64, usize) -> Option<u64>,
 ) -> Vec<RelocatedPointerWord> {
-    let Some(&base_target) = reloc_targets.get(&base) else {
-        return Vec::new();
+    let scalar = match reloc_targets.get(&base).copied() {
+        Some(base_target) if target_is_representable(base_target) => {
+            vec![RelocatedPointerWord::Target(base_target)]
+        }
+        // A relocation whose target has no valid C spelling cannot be
+        // reconstructed as either a scalar or part of an aggregate.
+        Some(_) => return Vec::new(),
+        None => Vec::new(),
     };
-    if !target_is_representable(base_target) {
-        return Vec::new();
-    }
-    let scalar = vec![RelocatedPointerWord::Target(base_target)];
 
     if !matches!(pointer_size, 4 | 8) {
         return scalar;
@@ -511,6 +517,7 @@ fn recover_relocated_pointer_words(
     for extent in candidate_extents {
         let mut words = Vec::new();
         let mut complete = true;
+        let mut saw_relocation = false;
         for offset in (0..extent).step_by(pointer_size) {
             let Some(offset) = u64::try_from(offset).ok() else {
                 complete = false;
@@ -525,6 +532,7 @@ fn recover_relocated_pointer_words(
                     complete = false;
                     break;
                 }
+                saw_relocation = true;
                 words.push(RelocatedPointerWord::Target(target));
             } else if let Some(raw) = read_word(slot, pointer_size) {
                 words.push(RelocatedPointerWord::Raw(raw));
@@ -534,7 +542,7 @@ fn recover_relocated_pointer_words(
             }
         }
 
-        if complete && !words.is_empty() {
+        if complete && saw_relocation && !words.is_empty() {
             return words;
         }
     }
@@ -3219,9 +3227,9 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
         let mut is_string = false;
         let mut content = Vec::new();
 
-        // Preserve the authoritative base relocation as a scalar initializer.
-        // A validated is_global_array layout may extend it, but any failed or
-        // incomplete aggregate recovery falls back to that scalar fact.
+        // Preserve an authoritative base relocation as a scalar initializer.
+        // A validated is_global_array layout may also recover relocations in
+        // interior words, but only when its complete initialized image is safe.
         let readable_bytes = data_ranges
             .iter()
             .find(|(start, end, _, _)| addr >= *start && addr < *end)
@@ -5427,6 +5435,65 @@ mod relocated_pointer_tests {
             vec![RelocatedPointerWord::Target(0x2000)],
             "an unrepresentable aggregate target must not erase the safe scalar base"
         );
+    }
+
+    #[test]
+    fn validated_global_array_layout_recovers_interior_relocation() {
+        let reloc_targets = BTreeMap::from([(0x1008, 0x2000)]);
+        let raw_words = BTreeMap::from([(0x1000, 11), (0x1010, 29)]);
+
+        let words = recover_relocated_pointer_words(
+            0x1000,
+            8,
+            &[(8, 3)],
+            Some(24),
+            &reloc_targets,
+            |target| target == 0x2000,
+            |slot, _| raw_words.get(&slot).copied(),
+        );
+
+        assert_eq!(
+            words,
+            vec![
+                RelocatedPointerWord::Raw(11),
+                RelocatedPointerWord::Target(0x2000),
+                RelocatedPointerWord::Raw(29),
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_global_layout_without_relocation_is_not_reclassified() {
+        let raw_words = BTreeMap::from([(0x1000, 11), (0x1008, 17), (0x1010, 29)]);
+
+        let words = recover_relocated_pointer_words(
+            0x1000,
+            8,
+            &[(8, 3)],
+            Some(24),
+            &BTreeMap::new(),
+            |_| true,
+            |slot, _| raw_words.get(&slot).copied(),
+        );
+
+        assert!(words.is_empty());
+    }
+
+    #[test]
+    fn unrepresentable_interior_relocation_rejects_whole_layout() {
+        let reloc_targets = BTreeMap::from([(0x1008, 0x2000)]);
+
+        let words = recover_relocated_pointer_words(
+            0x1000,
+            8,
+            &[(8, 3)],
+            Some(24),
+            &reloc_targets,
+            |_| false,
+            |_, _| Some(0),
+        );
+
+        assert!(words.is_empty());
     }
 
     #[test]
