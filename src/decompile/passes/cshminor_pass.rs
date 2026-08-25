@@ -86,12 +86,9 @@ fn cond_subst_exprs(args: &[CsharpminorExpr], old: RTLReg, new: RTLReg) -> Vec<C
 /// condition and Cminor binary operator that preserve its width/signedness.
 /// Only equality is admitted: ordering unrelated C objects is not a portable
 /// reconstruction of the linked image's numeric address order.
-fn symbolic_pointer_comparison(
-    condition: &Condition,
-) -> Option<(Condition, CminorBinop, i64)> {
-    let equality = |comparison: &Comparison| {
-        matches!(comparison, Comparison::Ceq | Comparison::Cne)
-    };
+fn symbolic_pointer_comparison(condition: &Condition) -> Option<(Condition, CminorBinop, i64)> {
+    let equality =
+        |comparison: &Comparison| matches!(comparison, Comparison::Ceq | Comparison::Cne);
     match condition {
         Condition::Ccompimm(comparison, immediate) if equality(comparison) => Some((
             Condition::Ccomp(*comparison),
@@ -422,8 +419,35 @@ ascent_par! {
 
     relation csharp_stmt_candidate(Node, CsharpminorStmt);
 
+    // Enumerate only immediates that actually participate in a one-register
+    // equality comparison whose operand is already known to be a pointer.
+    // This is also the provenance that binds `immediate` for the range check
+    // below; scanning arbitrary integer constants would conflate ordinary
+    // integers with linked image addresses.
+    #[local] relation pointer_comparison_immediate(i64);
+    pointer_comparison_immediate(immediate) <--
+        active_cminor_stmt(_, ?CminorStmt::Sassign(_, expr)),
+        if let CminorExpr::Eop(Operation::Ocmp(condition), args) = expr,
+        if args.len() == 1,
+        let source = args[0],
+        must_be_ptr(source),
+        if let Some((_, _, immediate)) = symbolic_pointer_comparison(condition);
+    pointer_comparison_immediate(immediate) <--
+        active_cminor_stmt(_, ?CminorStmt::Sifthenelse(condition, regs, _, _)),
+        if regs.len() == 1,
+        let source = regs[0],
+        must_be_ptr(source),
+        if let Some((_, _, immediate)) = symbolic_pointer_comparison(condition);
+    pointer_comparison_immediate(immediate) <--
+        active_cminor_stmt(_, ?CminorStmt::Sbranch(condition, regs, _, _)),
+        if regs.len() == 1,
+        let source = regs[0],
+        must_be_ptr(source),
+        if let Some((_, _, immediate)) = symbolic_pointer_comparison(condition);
+
     #[local] relation absolute_data_immediate(i64);
     absolute_data_immediate(immediate) <--
+        pointer_comparison_immediate(immediate),
         raw_image_addresses_are_absolute(raw_absolute),
         if *raw_absolute,
         if *immediate > 0,
@@ -470,7 +494,7 @@ ascent_par! {
         if let Some((_register_condition, binop, immediate)) = symbolic_pointer_comparison(condition),
         symbolic_data_address(immediate, owner, offset),
         let converted = CsharpminorExpr::Ebinop(
-            binop,
+            binop.clone(),
             Box::new(CsharpminorExpr::Evar(source)),
             Box::new(CsharpminorExpr::Econst(Constant::Oaddrsymbol(*owner, *offset))),
         );
@@ -1393,11 +1417,15 @@ mod tests {
     ) {
         prog.raw_image_addresses_are_absolute.push((raw_absolute,));
         prog.data_section_range.push((owner, owner + 0x100));
-        prog.base_ident_to_symbol.push((owner as usize, "global_words"));
+        prog.base_ident_to_symbol
+            .push((owner as usize, "global_words"));
         prog.base_ident_to_symbol
             .push((interior as usize, "SUB_interior"));
-        prog.interior_to_base_ident
-            .push((interior as usize, owner as usize, (interior - owner) as i64));
+        prog.interior_to_base_ident.push((
+            interior as usize,
+            owner as usize,
+            (interior - owner) as i64,
+        ));
         if hard_pointer {
             prog.must_be_ptr.push((pointer_reg,));
         }
@@ -1414,10 +1442,7 @@ mod tests {
             CminorStmt::Sassign(
                 result,
                 CminorExpr::Eop(
-                    Operation::Ocmp(Condition::Ccomplimm(
-                        Comparison::Ceq,
-                        interior as i64,
-                    )),
+                    Operation::Ocmp(Condition::Ccomplimm(Comparison::Ceq, interior as i64)),
                     Arc::new(vec![pointer]),
                 ),
             ),
@@ -1466,10 +1491,7 @@ mod tests {
             CminorStmt::Sassign(
                 result,
                 CminorExpr::Eop(
-                    Operation::Ocmp(Condition::Ccomplimm(
-                        Comparison::Ceq,
-                        interior as i64,
-                    )),
+                    Operation::Ocmp(Condition::Ccomplimm(Comparison::Ceq, interior as i64)),
                     Arc::new(vec![integer]),
                 ),
             ),
@@ -1478,20 +1500,23 @@ mod tests {
 
         prog.run();
 
-        assert!(prog.csharp_stmt_candidate.iter().any(|(candidate_node, stmt)| {
-            *candidate_node == node
-                && matches!(
-                    stmt,
-                    CsharpminorStmt::Sset(
-                        _,
-                        CsharpminorExpr::Ebinop(_, _, right),
-                    ) if matches!(
-                        right.as_ref(),
-                        CsharpminorExpr::Econst(Constant::Olongconst(value))
-                            if *value == interior as i64
+        assert!(prog
+            .csharp_stmt_candidate
+            .iter()
+            .any(|(candidate_node, stmt)| {
+                *candidate_node == node
+                    && matches!(
+                        stmt,
+                        CsharpminorStmt::Sset(
+                            _,
+                            CsharpminorExpr::Ebinop(_, _, right),
+                        ) if matches!(
+                            right.as_ref(),
+                            CsharpminorExpr::Econst(Constant::Olongconst(value))
+                                if *value == interior as i64
+                        )
                     )
-                )
-        }));
+            }));
         assert!(!prog.csharp_stmt_candidate.iter().any(|(candidate_node, stmt)| {
             *candidate_node == node
                 && matches!(
@@ -1523,10 +1548,7 @@ mod tests {
             CminorStmt::Sassign(
                 result,
                 CminorExpr::Eop(
-                    Operation::Ocmp(Condition::Ccomplimm(
-                        Comparison::Ceq,
-                        interior as i64,
-                    )),
+                    Operation::Ocmp(Condition::Ccomplimm(Comparison::Ceq, interior as i64)),
                     Arc::new(vec![pointer]),
                 ),
             ),
@@ -1545,20 +1567,23 @@ mod tests {
                     ) if matches!(right.as_ref(), CsharpminorExpr::Econst(Constant::Oaddrsymbol(..)))
                 )
         }));
-        assert!(prog.csharp_stmt_candidate.iter().any(|(candidate_node, stmt)| {
-            *candidate_node == node
-                && matches!(
-                    stmt,
-                    CsharpminorStmt::Sset(
-                        _,
-                        CsharpminorExpr::Ebinop(_, _, right),
-                    ) if matches!(
-                        right.as_ref(),
-                        CsharpminorExpr::Econst(Constant::Olongconst(value))
-                            if *value == interior as i64
+        assert!(prog
+            .csharp_stmt_candidate
+            .iter()
+            .any(|(candidate_node, stmt)| {
+                *candidate_node == node
+                    && matches!(
+                        stmt,
+                        CsharpminorStmt::Sset(
+                            _,
+                            CsharpminorExpr::Ebinop(_, _, right),
+                        ) if matches!(
+                            right.as_ref(),
+                            CsharpminorExpr::Econst(Constant::Olongconst(value))
+                                if *value == interior as i64
+                        )
                     )
-                )
-        }));
+            }));
     }
 
     #[test]
@@ -1582,26 +1607,29 @@ mod tests {
 
         prog.run();
 
-        assert!(prog.csharp_stmt_candidate.iter().any(|(candidate_node, stmt)| {
-            *candidate_node == branch
-                && matches!(
-                    stmt,
-                    CsharpminorStmt::Scond(
-                        Condition::Ccomplu(Comparison::Cne),
-                        args,
-                        live_ifso,
-                        live_ifnot,
-                    ) if *live_ifso == ifso
-                        && *live_ifnot == ifnot
-                        && matches!(
-                            args.as_slice(),
-                            [
-                                CsharpminorExpr::Evar(reg),
-                                CsharpminorExpr::Econst(Constant::Oaddrsymbol(ident, 8)),
-                            ] if *reg == pointer && *ident == owner as usize
-                        )
-                )
-        }));
+        assert!(prog
+            .csharp_stmt_candidate
+            .iter()
+            .any(|(candidate_node, stmt)| {
+                *candidate_node == branch
+                    && matches!(
+                        stmt,
+                        CsharpminorStmt::Scond(
+                            Condition::Ccomplu(Comparison::Cne),
+                            args,
+                            live_ifso,
+                            live_ifnot,
+                        ) if *live_ifso == ifso
+                            && *live_ifnot == ifnot
+                            && matches!(
+                                args.as_slice(),
+                                [
+                                    CsharpminorExpr::Evar(reg),
+                                    CsharpminorExpr::Econst(Constant::Oaddrsymbol(ident, 8)),
+                                ] if *reg == pointer && *ident == owner as usize
+                            )
+                    )
+            }));
         assert!(prog
             .global_var_ref
             .iter()

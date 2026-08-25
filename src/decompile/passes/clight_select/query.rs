@@ -3117,16 +3117,15 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
     // A duplicated local-static spelling can map one interior coordinate to
     // several owners.  Such an address has no unambiguous C spelling and must
     // retain the conservative unrepresentable behavior below.
-    let target_coordinates: HashMap<u64, RelocationTargetCoordinate> =
-        target_coordinate_candidates
-            .into_iter()
-            .filter_map(|(target, coordinates)| {
-                (coordinates.len() == 1).then(|| {
-                    let (owner, offset) = *coordinates.first().unwrap();
-                    (target, RelocationTargetCoordinate { owner, offset })
-                })
+    let target_coordinates: HashMap<u64, RelocationTargetCoordinate> = target_coordinate_candidates
+        .into_iter()
+        .filter_map(|(target, coordinates)| {
+            (coordinates.len() == 1).then(|| {
+                let (owner, offset) = *coordinates.first().unwrap();
+                (target, RelocationTargetCoordinate { owner, offset })
             })
-            .collect();
+        })
+        .collect();
     global_var_ids.sort_unstable();
     global_var_ids.dedup();
 
@@ -3311,8 +3310,7 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
             readable_bytes,
             &reloc_targets,
             |target| {
-                let declaration_target =
-                    relocation_declaration_target(target, &target_coordinates);
+                let declaration_target = relocation_declaration_target(target, &target_coordinates);
                 relocation_target_is_representable(
                     declaration_target,
                     addr,
