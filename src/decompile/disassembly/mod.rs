@@ -80,8 +80,7 @@ pub fn load_from_binary(db: &mut DecompileDB, binary_path: &Path) {
     if db.abi().format == crate::abi::BinaryFormat::Elf {
         if let Some(main_addr) = function::detect_main_via_libc_start_main(db, &insns) {
             extra_leaders.push(main_addr);
-            db.rel_push("main_function", (main_addr,));
-            db.rel_push("symbols", (main_addr, "main", "Beg"));
+            function::publish_recovered_main(db, main_addr);
             log::debug!(
                 "Recovered main from __libc_start_main pattern: {:x}",
                 main_addr

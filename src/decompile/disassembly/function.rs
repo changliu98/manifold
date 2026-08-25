@@ -1,6 +1,8 @@
 use super::instruction::DecodedInsn;
+use crate::abi::Arch;
 use crate::decompile::elevator::config::CONFIG;
 use crate::decompile::elevator::DecompileDB;
+use crate::mreg::Mreg;
 use crate::x86::types::*;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -788,35 +790,140 @@ fn seed_tailcall_entries(
     seeds.into_iter().collect()
 }
 
-// Parse `lea rdi, [rip +/- 0xN]` and return the absolute target address, else None. Used to recover main from _start.
-fn parse_lea_rdi_rip_relative(insn: &DecodedInsn) -> Option<u64> {
-    if insn.mnemonic != "LEA" {
-        return None;
-    }
-    let op = insn.op_str;
-    if !op.starts_with("RDI") {
-        return None;
-    }
-    let bracket_start = op.find('[')?;
-    let bracket_end = op.find(']')?;
-    let inner = op[bracket_start + 1..bracket_end].trim();
-    let rest = inner.strip_prefix("RIP")?.trim();
-    let (sign, hex) = if let Some(s) = rest.strip_prefix('-') {
-        (-1i64, s.trim())
-    } else if let Some(s) = rest.strip_prefix('+') {
-        (1i64, s.trim())
-    } else if rest.is_empty() {
-        return Some(insn.address + insn.size as u64);
-    } else {
-        return None;
-    };
-    let hex = hex.strip_prefix("0X").unwrap_or(hex);
-    let disp = i64::from_str_radix(hex, 16).ok()? * sign;
-    Some((insn.address as i64 + insn.size as i64 + disp) as u64)
+type RawInstruction = (
+    Address,
+    usize,
+    &'static str,
+    &'static str,
+    Symbol,
+    Symbol,
+    Symbol,
+    Symbol,
+    usize,
+    usize,
+);
+
+fn raw_instruction_at(db: &DecompileDB, addr: Address) -> Option<&RawInstruction> {
+    db.rel_iter::<RawInstruction>("unrefinedinstruction")
+        .find(|row| row.0 == addr)
 }
 
-// Recover main from _start's `lea main(%rip), %rdi; ...; call __libc_start_main` by scanning CONFIG.main_detect.entry_scan_insns insns from the ELF entry; None if "main" symbol exists or no match.
+fn operand_is_register(db: &DecompileDB, operand: Symbol, expected: &str) -> bool {
+    db.rel_iter::<(Symbol, &'static str)>("op_register")
+        .any(|(candidate, name)| *candidate == operand && *name == expected)
+}
+
+fn exact_main_argument_at(db: &DecompileDB, insn: &DecodedInsn) -> Option<Address> {
+    let (_, _, _, mnemonic, src, dst, _, _, _, _) = raw_instruction_at(db, insn.address)?;
+
+    match *mnemonic {
+        // Position-independent x86-64 CRT startup.
+        "LEA" if operand_is_register(db, *dst, "RDI") => db
+            .rel_iter::<(
+                Symbol,
+                &'static str,
+                &'static str,
+                &'static str,
+                i64,
+                i64,
+                usize,
+            )>("op_indirect")
+            .find_map(|(operand, _, base, index, _, disp, _)| {
+                (*operand == *src && *base == "RIP" && (*index == "NONE" || index.is_empty()))
+                    .then(|| {
+                        insn.address
+                            .checked_add(insn.size as u64)?
+                            .checked_add_signed(*disp)
+                    })
+                    .flatten()
+            }),
+        // Absolute, non-PIE x86-64 CRT startup. A 32-bit EDI write is also
+        // exact for an absolute address representable below 4 GiB because the
+        // architecture zero-extends it into RDI.
+        "MOV" => {
+            let dst_is_rdi = operand_is_register(db, *dst, "RDI");
+            let dst_is_exact_edi = operand_is_register(db, *dst, "EDI");
+            db.rel_iter::<(Symbol, i64, usize)>("op_immediate")
+                .find_map(|(operand, value, _)| {
+                    if *operand != *src || *value < 0 {
+                        return None;
+                    }
+                    let target = Address::try_from(*value).ok()?;
+                    (dst_is_rdi || (dst_is_exact_edi && target <= u32::MAX as u64))
+                        .then_some(target)
+                })
+        }
+        _ => None,
+    }
+}
+
+fn is_libc_start_main_name(name: &str) -> bool {
+    name.split('@').next() == Some("__libc_start_main")
+}
+
+fn is_libc_start_main_call(db: &DecompileDB, insn: &DecodedInsn) -> bool {
+    let Some(raw) = raw_instruction_at(db, insn.address) else {
+        return false;
+    };
+    if raw.3 != "CALL" {
+        return false;
+    }
+    let callee = raw.4;
+
+    // Traditional direct call through a named PLT entry.
+    let direct_match = db
+        .rel_iter::<(Symbol, i64, usize)>("op_immediate")
+        .filter(|(operand, _, _)| *operand == callee)
+        .filter_map(|(_, target, _)| Address::try_from(*target).ok())
+        .any(|target| {
+            db.rel_iter::<(Address, Symbol, Symbol)>("symbols")
+                .any(|(addr, name, _)| *addr == target && is_libc_start_main_name(name))
+                || db
+                    .rel_iter::<(Address, Symbol)>("plt_block")
+                    .any(|(addr, name)| *addr == target && is_libc_start_main_name(name))
+        });
+    if direct_match {
+        return true;
+    }
+
+    // Modern `-fno-plt` startup calls the resolver-owned GOT slot directly.
+    db.rel_iter::<(
+        Symbol,
+        &'static str,
+        &'static str,
+        &'static str,
+        i64,
+        i64,
+        usize,
+    )>("op_indirect")
+        .filter(|(operand, _, base, index, _, _, _)| {
+            *operand == callee && *base == "RIP" && (*index == "NONE" || index.is_empty())
+        })
+        .filter_map(|(_, _, _, _, _, disp, _)| {
+            insn.address
+                .checked_add(insn.size as u64)?
+                .checked_add_signed(*disp)
+        })
+        .any(|slot| {
+            db.rel_iter::<(Address, Symbol)>("pointer_to_external_symbol")
+                .any(|(addr, name)| *addr == slot && is_libc_start_main_name(name))
+        })
+}
+
+fn ends_straight_line_entry_path(mnemonic: &str) -> bool {
+    mnemonic.starts_with('J')
+        || mnemonic.starts_with("LOOP")
+        || matches!(mnemonic, "RET" | "RETF" | "HLT" | "UD2" | "INT" | "INT3")
+}
+
+// Recover main from the x86-64 CRT's first-argument definition followed by an
+// actual __libc_start_main call. The scan follows only physically contiguous
+// fallthrough instructions from the ELF entry and stops at a control transfer;
+// it never treats address or node order as reachability evidence.
 pub fn detect_main_via_libc_start_main(db: &DecompileDB, insns: &[DecodedInsn]) -> Option<u64> {
+    if db.abi().arch != Arch::X86_64 {
+        return None;
+    }
     let has_main_sym = db
         .rel_iter::<(
             Address,
@@ -844,13 +951,197 @@ pub fn detect_main_via_libc_start_main(db: &DecompileDB, insns: &[DecodedInsn]) 
         .ok()?;
     let insn_addrs: HashSet<u64> = insns.iter().map(|i| i.address).collect();
     let end_idx = (start_idx + CONFIG.main_detect.entry_scan_insns).min(insns.len());
+    let mut main_argument = None;
 
     for i in start_idx..end_idx {
-        if let Some(target) = parse_lea_rdi_rip_relative(&insns[i]) {
-            if target != entry_addr && insn_addrs.contains(&target) {
-                return Some(target);
+        let insn = &insns[i];
+        if i > start_idx {
+            let prev = &insns[i - 1];
+            if prev.address.checked_add(prev.size as u64) != Some(insn.address)
+                || ends_straight_line_entry_path(prev.mnemonic)
+            {
+                break;
             }
+        }
+
+        if let Some(target) = exact_main_argument_at(db, insn) {
+            main_argument = Some(target);
+        } else if db
+            .rel_iter::<(Address, Mreg)>("reg_def")
+            .any(|(addr, reg)| *addr == insn.address && *reg == Mreg::DI)
+        {
+            main_argument = None;
+        }
+
+        if insn.mnemonic == "CALL" {
+            if is_libc_start_main_call(db, insn) {
+                return main_argument
+                    .filter(|target| *target != entry_addr && insn_addrs.contains(target));
+            }
+            // An intervening call may clobber the SysV first-argument register.
+            main_argument = None;
         }
     }
     None
+}
+
+pub fn publish_recovered_main(db: &mut DecompileDB, main_addr: Address) {
+    db.rel_set(
+        "main_function",
+        std::iter::once((main_addr,)).collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_push("symbols", (main_addr, "main", "Beg"));
+}
+
+#[cfg(test)]
+mod main_detection_tests {
+    use super::*;
+    use crate::abi::AbiConfig;
+    use crate::decompile::disassembly::branch::PcSource;
+
+    fn decoded(address: Address, size: usize, mnemonic: &'static str) -> DecodedInsn {
+        DecodedInsn {
+            address,
+            size,
+            mnemonic,
+            op_str: "",
+            pc_source: PcSource::NotWritten,
+        }
+    }
+
+    fn raw(
+        address: Address,
+        size: usize,
+        mnemonic: &'static str,
+        src: Symbol,
+        dst: Symbol,
+    ) -> RawInstruction {
+        (address, size, "", mnemonic, src, dst, "", "", 0, 0)
+    }
+
+    fn startup_fixture(
+        use_lea: bool,
+        external_name: &'static str,
+    ) -> (DecompileDB, Vec<DecodedInsn>) {
+        let main = 0x401020;
+        let entry = 0x401090;
+        let setup_size = 7_usize;
+        let call = entry + setup_size as u64;
+        let call_size = 6_usize;
+        let got = 0x403ff0_u64;
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(AbiConfig::sysv_x86_64());
+        db.rel_push("main_function", (entry,));
+        db.rel_push("op_register", ("main_dst", "RDI"));
+        if use_lea {
+            db.rel_push(
+                "unrefinedinstruction",
+                raw(entry, setup_size, "LEA", "main_mem", "main_dst"),
+            );
+            db.rel_push(
+                "op_indirect",
+                (
+                    "main_mem",
+                    "",
+                    "RIP",
+                    "NONE",
+                    1_i64,
+                    main as i64 - (entry + setup_size as u64) as i64,
+                    8_usize,
+                ),
+            );
+        } else {
+            db.rel_push(
+                "unrefinedinstruction",
+                raw(entry, setup_size, "MOV", "main_imm", "main_dst"),
+            );
+            db.rel_push("op_immediate", ("main_imm", main as i64, 8_usize));
+        }
+        db.rel_push(
+            "unrefinedinstruction",
+            raw(call, call_size, "CALL", "libc_got", ""),
+        );
+        db.rel_push(
+            "op_indirect",
+            (
+                "libc_got",
+                "",
+                "RIP",
+                "NONE",
+                1_i64,
+                got as i64 - (call + call_size as u64) as i64,
+                8_usize,
+            ),
+        );
+        db.rel_push("pointer_to_external_symbol", (got, external_name));
+
+        let insns = vec![
+            decoded(main, 1, "RET"),
+            decoded(entry, setup_size, if use_lea { "LEA" } else { "MOV" }),
+            decoded(call, call_size, "CALL"),
+        ];
+        (db, insns)
+    }
+
+    #[test]
+    fn crt_main_detection_accepts_verified_pie_and_absolute_materializations() {
+        for use_lea in [true, false] {
+            let (db, insns) = startup_fixture(use_lea, "__libc_start_main");
+            assert_eq!(detect_main_via_libc_start_main(&db, &insns), Some(0x401020));
+        }
+    }
+
+    #[test]
+    fn crt_main_detection_requires_the_libc_call_and_an_unclobbered_argument() {
+        let (wrong_call, insns) = startup_fixture(false, "ordinary_external");
+        assert_eq!(detect_main_via_libc_start_main(&wrong_call, &insns), None);
+
+        let (mut clobbered, mut insns) = startup_fixture(false, "__libc_start_main");
+        let entry = 0x401090;
+        let clobber = entry + 7;
+        let old_call = entry + 7;
+        let new_call = old_call + 2;
+        clobbered.rel_push(
+            "unrefinedinstruction",
+            raw(clobber, 2, "XOR", "clobber_src", "clobber_dst"),
+        );
+        clobbered.rel_push("reg_def", (clobber, Mreg::DI));
+        clobbered.rel_push(
+            "unrefinedinstruction",
+            raw(new_call, 6, "CALL", "new_libc_got", ""),
+        );
+        let got = 0x404010_u64;
+        clobbered.rel_push(
+            "op_indirect",
+            (
+                "new_libc_got",
+                "",
+                "RIP",
+                "NONE",
+                1_i64,
+                got as i64 - (new_call + 6) as i64,
+                8_usize,
+            ),
+        );
+        clobbered.rel_push("pointer_to_external_symbol", (got, "__libc_start_main"));
+        insns[2] = decoded(clobber, 2, "XOR");
+        insns.push(decoded(new_call, 6, "CALL"));
+        assert_eq!(detect_main_via_libc_start_main(&clobbered, &insns), None);
+    }
+
+    #[test]
+    fn recovered_main_replaces_the_crt_entry_identity() {
+        let mut db = DecompileDB::default();
+        db.rel_push("main_function", (0x401090,));
+        publish_recovered_main(&mut db, 0x401020);
+        assert_eq!(
+            db.rel_iter::<(Address,)>("main_function")
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![(0x401020,)]
+        );
+        assert!(db
+            .rel_iter::<(Address, Symbol, Symbol)>("symbols")
+            .any(|row| *row == (0x401020, "main", "Beg")));
+    }
 }
