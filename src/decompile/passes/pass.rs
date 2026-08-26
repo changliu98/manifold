@@ -636,6 +636,77 @@ mod schedule_tests {
     }
 
     #[test]
+    fn relocation_proofs_consume_final_rtl_before_typing_and_layout_consumers() {
+        let passes = pipeline_passes();
+        let schedule = PassScheduler::build_schedule(&passes);
+        let rtl = passes
+            .iter()
+            .find(|pass| pass.name() == "rtl")
+            .expect("RTL pass must be registered");
+        let points = passes
+            .iter()
+            .find(|pass| pass.name() == "relocation_points_to")
+            .expect("relocation points-to pass must be registered");
+        let arrays = passes
+            .iter()
+            .find(|pass| pass.name() == "relocation_array")
+            .expect("relocation array pass must be registered");
+
+        assert!(rtl.outputs().contains(&"unknown_reg_value_reaches_use"));
+        for input in [
+            "arg_reg_param_live_at",
+            "function_symbol",
+            "main_function",
+            "rtl_inst",
+            "unknown_reg_value_reaches_use",
+            "frame_stack_write_bytes",
+            "unnormalized_frame_stack_write",
+        ] {
+            assert!(
+                points.inputs().contains(&input),
+                "missing points-to input {input}"
+            );
+        }
+        for output in [
+            "relocation_reachable_node",
+            "relocation_pointer_target",
+            "rtl_value_canonical",
+            "must_be_ptr",
+        ] {
+            assert!(
+                points.outputs().contains(&output),
+                "missing points-to output {output}"
+            );
+        }
+        for input in [
+            "relocation_reachable_node",
+            "relocation_pointer_target",
+            "rtl_value_canonical",
+            "retained_initialized_data_range",
+        ] {
+            assert!(
+                arrays.inputs().contains(&input),
+                "missing array input {input}"
+            );
+        }
+        for output in [
+            "relocation_target_array",
+            "is_global_array",
+            "global_var_ref",
+        ] {
+            assert!(
+                arrays.outputs().contains(&output),
+                "missing array output {output}"
+            );
+        }
+
+        assert!(stage_of(&schedule, "rtl_optimize") < stage_of(&schedule, "relocation_points_to"));
+        assert!(stage_of(&schedule, "relocation_points_to") < stage_of(&schedule, "type"));
+        assert!(stage_of(&schedule, "global_array") < stage_of(&schedule, "relocation_array"));
+        assert!(stage_of(&schedule, "relocation_array") < stage_of(&schedule, "struct_recovery"));
+    }
+
+    #[test]
     fn post_emit_audit_checkpoints_cover_every_tree_writer() {
         let passes = pipeline_passes();
         let writers: Vec<_> = passes

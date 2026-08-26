@@ -1999,12 +1999,55 @@ ascent_par! {
     #[local] relation arith_load_uses_stack_var(Node);
     arith_load_uses_stack_var(addr) <-- arith_load_slot(addr, _, _);
 
+    // A frame read whose cell has no scalar stack_var still has concrete
+    // memory semantics.  This occurs when the cell was written through an
+    // escaped frame pointer (for example, a callee fills a caller-local
+    // aggregate) and is later consumed by an integer memory-source operation.
+    // `frame_stack_read_bytes` is the point-keyed authority produced from the
+    // decoder's operand role and the settled SP-coordinate lattice.  Using its
+    // normalized offset retains the load without treating SP as an ordinary
+    // register or guessing when the stack coordinate is unknown.
+    #[local] relation arith_load_exact_frame_read(Node, i64);
+    arith_load_exact_frame_read(*addr, *ofs) <--
+        arith_load_op(addr, _, chunk, base_mreg, _, _),
+        if *base_mreg == Mreg::SP,
+        instr_in_function(addr, func_start),
+        frame_stack_read_bytes(func_start, addr, ofs, width),
+        if *width == crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk),
+        !arith_load_uses_stack_var(addr),
+        !arith_load_uses_stack_param(addr);
+
+    rtl_inst_candidate(addr, load_inst) <--
+        arith_load_op(addr, _, chunk, _, _, _),
+        arith_load_exact_frame_read(addr, ofs),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let load_inst = RTLInst::Iload(
+            *chunk,
+            Addressing::Ainstack(*ofs),
+            Arc::new(vec![]),
+            temp,
+        );
+
+    // A synthetic arithmetic node may consume RTEMP only when the matching
+    // load is constructible.  Previously the op was emitted from dst evidence
+    // alone, so a missing SP/base binding created an undefined RTL value that
+    // survived into C and silently erased one operand of the computation.
+    #[local] relation arith_load_materializes_temp(Node);
+    arith_load_materializes_temp(addr) <-- arith_load_exact_frame_read(addr, _);
+    arith_load_materializes_temp(addr) <--
+        arith_load_op(addr, _, _, base_mreg, _, _),
+        reg_rtl(addr, *base_mreg, _),
+        !arith_load_uses_stack_var(addr),
+        !arith_load_uses_stack_param(addr),
+        !arith_load_exact_frame_read(addr, _);
+
     rtl_inst_candidate(addr, load_inst) <--
         arith_load_op(addr, _op, chunk, base_mreg, disp, _dst_mreg),
         !has_ltl_op(addr),
         reg_rtl(addr, *base_mreg, base_rtl),
         !arith_load_uses_stack_var(addr),
         !arith_load_uses_stack_param(addr),
+        !arith_load_exact_frame_read(addr, _),
         let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp);
 
@@ -2012,8 +2055,7 @@ ascent_par! {
         arith_load_op(addr, op, _chunk, _base_mreg, _disp, dst_mreg),
         !has_ltl_op(addr),
         reg_rtl(addr, *dst_mreg, dst_rtl),
-        !arith_load_uses_stack_var(addr),
-        !arith_load_uses_stack_param(addr),
+        arith_load_materializes_temp(addr),
         let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
         let synthetic_addr = *addr | (1u64 << 62),
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, temp]), *dst_rtl);
@@ -7496,7 +7538,11 @@ ascent_par! {
         asm_block_next(block, succ),
         block_in_function(succ, func);
 
-    #[local] relation unknown_reg_value_reaches_use(Address, Address, Mreg);
+    // Publish the settled absent-value observer so later finalized-RTL
+    // analyses can retain Unknown at joins where the selected value web also
+    // has a concrete origin.  Reconstructing this after RTL lowering loses
+    // entry/live-in and trimmed-definition arms.
+    relation unknown_reg_value_reaches_use(Address, Address, Mreg);
     unknown_reg_value_reaches_use(*func, *use_node, *reg) <--
         function_reg_observer(func, use_node, reg),
         instr_in_function(use_node, func),
@@ -18798,6 +18844,120 @@ mod tests {
                 .rtl_succ_candidate
                 .iter()
                 .any(|fact| fact == &(store_node, stale)));
+        });
+    }
+
+    #[test]
+    fn escaped_frame_arith_read_materializes_the_exact_normalized_load() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let read = 0x900;
+            let next = 0x100;
+            let dst_rtl = 0x2222;
+
+            // The raw machine displacement is 24, while the finalized
+            // point-keyed frame coordinate is 8.  No stack_var exists because
+            // the cell may have been written through an escaped frame pointer.
+            prog.arith_load_op.push((
+                read,
+                Operation::Oxor,
+                MemoryChunk::MInt32,
+                Mreg::SP,
+                24,
+                Mreg::DX,
+            ));
+            prog.frame_stack_read_bytes.push((func, read, 8, 4));
+            prog.reg_rtl.push((read, Mreg::DX, dst_rtl));
+            prog.next.push((read, next));
+            prog.ltl_inst
+                .push((read, LTLInst::Lbranch(Either::Right(next))));
+            prog.ltl_inst.push((next, LTLInst::Lreturn));
+            for node in [read, next] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            prog.run();
+
+            let temp = fresh_xtl_reg(read, Mreg::x86("RTEMP"));
+            let op_node = read | (1u64 << 62);
+            assert!(prog
+                .arith_load_exact_frame_read
+                .iter()
+                .any(|fact| fact == &(read, 8)));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    read,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt32,
+                        Addressing::Ainstack(8),
+                        Arc::new(vec![]),
+                        temp,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    op_node,
+                    RTLInst::Iop(Operation::Oxor, Arc::new(vec![dst_rtl, temp]), dst_rtl),
+                )
+            }));
+            assert!(prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(read, op_node)));
+            assert!(prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(op_node, next)));
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == read && matches!(inst, RTLInst::Iload(_, Addressing::Aindexed(24), _, _))
+            }));
+        });
+    }
+
+    #[test]
+    fn unresolved_sp_arith_read_does_not_emit_an_undefined_temp_use() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let read = 0x900;
+            let next = 0x100;
+            let dst_rtl = 0x2222;
+
+            prog.arith_load_op.push((
+                read,
+                Operation::Oxor,
+                MemoryChunk::MInt32,
+                Mreg::SP,
+                8,
+                Mreg::DX,
+            ));
+            prog.reg_rtl.push((read, Mreg::DX, dst_rtl));
+            prog.next.push((read, next));
+            prog.ltl_inst
+                .push((read, LTLInst::Lbranch(Either::Right(next))));
+            prog.ltl_inst.push((next, LTLInst::Lreturn));
+            for node in [read, next] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            prog.run();
+
+            let temp = fresh_xtl_reg(read, Mreg::x86("RTEMP"));
+            let op_node = read | (1u64 << 62);
+            assert!(!prog
+                .rtl_inst_candidate
+                .iter()
+                .any(|(_, inst)| { matches!(inst, RTLInst::Iload(_, _, _, dst) if *dst == temp) }));
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == op_node
+                    && matches!(
+                        inst,
+                        RTLInst::Iop(Operation::Oxor, args, dst)
+                            if args.as_slice() == [dst_rtl, temp] && *dst == dst_rtl
+                    )
+            }));
         });
     }
 
