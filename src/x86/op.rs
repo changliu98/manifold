@@ -3,6 +3,18 @@ use std::ops::{Add, Div, Mul, Sub};
 
 pub type Ptrofs = i64;
 
+/// Arithmetic operation whose signed x86 overflow flag can be reconstructed
+/// from the post-operation result.  Register forms carry the unchanged source
+/// as a condition argument; immediate forms carry the decoded constant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum OverflowArithmetic {
+    Add,
+    Sub,
+    AddImmediate(i64),
+    SubImmediate(i64),
+    Neg,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Condition {
     Ccomp(Comparison),
@@ -22,6 +34,10 @@ pub enum Condition {
     // OF tests (JO/JNO) have no faithful CompCert encoding; these opaque variants exist to keep both Jcc edges.
     Coverflow,
     Cnotoverflow,
+    // Exact x86 OF tests recovered from a proven flag-producing arithmetic
+    // operation.  The width is the decoded operand width in bytes.
+    Carithoverflow(OverflowArithmetic, i64),
+    Cnarithoverflow(OverflowArithmetic, i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

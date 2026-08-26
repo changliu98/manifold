@@ -25,6 +25,36 @@ fn unique_external_cfg_entry(
     (entries.len() == 1).then(|| *entries.iter().next().unwrap())
 }
 
+/// Every SSA spelling of a physical stack cell whose address escapes the
+/// function.  The canonical relations identify escaped offsets, while
+/// `stack_var` supplies the point-local names used by optimization passes.
+/// Keeping this collection shared prevents one optimizer from respecting the
+/// memory boundary while a later optimizer silently treats the same cell as
+/// an ordinary register copy.
+pub(crate) fn escaped_stack_slot_regs(db: &DecompileDB) -> HashMap<Address, HashSet<RTLReg>> {
+    let mut regs: HashMap<Address, HashSet<RTLReg>> = HashMap::new();
+    let mut offsets: HashMap<Address, HashSet<i64>> = HashMap::new();
+    for &(func, offset, reg) in db.rel_iter::<(Address, i64, RTLReg)>("slot_escaped_canonical") {
+        regs.entry(func).or_default().insert(reg);
+        offsets.entry(func).or_default().insert(offset);
+    }
+    for &(func, offset, reg) in
+        db.rel_iter::<(Address, i64, RTLReg)>("slot_escaped_region_canonical")
+    {
+        regs.entry(func).or_default().insert(reg);
+        offsets.entry(func).or_default().insert(offset);
+    }
+    for &(func, _node, offset, reg) in db.rel_iter::<(Address, Node, i64, RTLReg)>("stack_var") {
+        if offsets
+            .get(&func)
+            .is_some_and(|escaped| escaped.contains(&offset))
+        {
+            regs.entry(func).or_default().insert(reg);
+        }
+    }
+    regs
+}
+
 // Resolve a raw instruction address to the first semantic RTL node reached by
 // the explicit instruction-next chain, without crossing a function boundary.
 // The cache is point-keyed: each skipped address is visited at most once per
@@ -1507,33 +1537,7 @@ impl PassContext {
             }
         }
 
-        // Per function, every SSA name for an address-escaped stack slot whose
-        // stores must not be dead-store-eliminated. The escaped-slot facts
-        // carry one canonical name per offset, but stack_var is point-local and
-        // the same offset can therefore have other SSA names on different CFG
-        // arms. An external alias observes the memory cell, not just its
-        // canonical name, so protect all names structurally joined by
-        // (function, offset). These relations are declared in extra_reads().
-        let mut escaped_slot_regs: HashMap<Address, HashSet<RTLReg>> = HashMap::new();
-        let mut escaped_slot_offsets: HashMap<Address, HashSet<i64>> = HashMap::new();
-        for &(func, ofs, reg) in db.rel_iter::<(Address, i64, RTLReg)>("slot_escaped_canonical") {
-            escaped_slot_regs.entry(func).or_default().insert(reg);
-            escaped_slot_offsets.entry(func).or_default().insert(ofs);
-        }
-        for &(func, ofs, reg) in
-            db.rel_iter::<(Address, i64, RTLReg)>("slot_escaped_region_canonical")
-        {
-            escaped_slot_regs.entry(func).or_default().insert(reg);
-            escaped_slot_offsets.entry(func).or_default().insert(ofs);
-        }
-        for &(func, _node, ofs, reg) in db.rel_iter::<(Address, Node, i64, RTLReg)>("stack_var") {
-            if escaped_slot_offsets
-                .get(&func)
-                .is_some_and(|offsets| offsets.contains(&ofs))
-            {
-                escaped_slot_regs.entry(func).or_default().insert(reg);
-            }
-        }
+        let mut escaped_slot_regs = escaped_stack_slot_regs(db);
 
         // Per function, the frame-slot SSA names whose slot is written by more
         // than one instruction reaching the same read.  StackAnalysis pairs
@@ -2513,6 +2517,13 @@ pub(crate) fn copy_propagation(
         let src = *src;
         let dst = *dst;
         let mut safe = !func.params.contains(&dst)
+            // An Omove into a frame-slot SSA name represents a physical
+            // memory write.  If that slot's address escapes, replacing every
+            // later local use with the source value would also erase the
+            // write observed by an aliased callee.  DSE already preserves
+            // these definitions; copy propagation must honor the same
+            // memory-identity boundary before it turns the store into Inop.
+            && !func.escaped_slot_regs.contains(&dst)
             && !mem_call_addr_regs.contains(&dst)
             && du.defs.get(&dst).map_or(0, |d| d.len()) == 1;
         if safe {
@@ -3096,6 +3107,47 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(subst.get(&dst), Some(&src));
         assert!(eliminated.contains(&copy));
+    }
+
+    #[test]
+    fn copy_propagation_preserves_store_to_escaped_stack_slot() {
+        let [store, use_node, exit] = [0x10, 0x20, 0x30];
+        let [source, escaped_slot, result] = [1, 2, 3];
+        let mut func = synthetic_function(
+            store,
+            vec![
+                (
+                    store,
+                    RTLInst::Iop(Operation::Omove, Arc::new(vec![source]), escaped_slot),
+                ),
+                (
+                    use_node,
+                    RTLInst::Iop(Operation::Oaddimm(1), Arc::new(vec![escaped_slot]), result),
+                ),
+                (exit, RTLInst::Ireturn(result)),
+            ],
+            &[(store, use_node), (use_node, exit)],
+            &[source],
+        );
+        func.escaped_slot_regs.insert(escaped_slot);
+
+        let du = DefUseInfo::build(&func);
+        let liveness = LivenessInfo::build(&func, &du);
+        let (count, subst, eliminated) = copy_propagation(&mut func, &du, &liveness);
+
+        assert_eq!(count, 0);
+        assert!(subst.is_empty());
+        assert!(!eliminated.contains(&store));
+        assert!(matches!(
+            func.inst.get(&store),
+            Some(RTLInst::Iop(Operation::Omove, args, dst))
+                if args.as_slice() == [source] && *dst == escaped_slot
+        ));
+        assert!(matches!(
+            func.inst.get(&use_node),
+            Some(RTLInst::Iop(Operation::Oaddimm(1), args, dst))
+                if args.as_slice() == [escaped_slot] && *dst == result
+        ));
     }
 
     #[test]

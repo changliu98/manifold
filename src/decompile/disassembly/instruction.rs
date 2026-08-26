@@ -723,6 +723,14 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
             .collect::<ascent::boxcar::Vec<_>>(),
     );
 
+    // Preserve the decoder's immutable definition facts separately from
+    // `reg_def`, which later ASM rules augment with synthetic architectural
+    // effects (notably x87 FP0).  Point-keyed proofs that feed Mach emission
+    // must not recursively depend on those derived definitions.
+    db.rel_set(
+        "decoded_reg_def",
+        reg_defs.iter().copied().collect::<ascent::boxcar::Vec<_>>(),
+    );
     db.rel_set(
         "reg_def",
         reg_defs.into_iter().collect::<ascent::boxcar::Vec<_>>(),

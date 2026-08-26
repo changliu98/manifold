@@ -7,10 +7,11 @@ use crate::{declare_io_from, run_pass};
 use crate::mreg::Mreg;
 use crate::util::multi_synth_address_is_encodable;
 use crate::x86::asm::{Freg, Ireg, Preg, TestCond};
-use crate::x86::op::{Addressing, Comparison, Condition, Operation};
+use crate::x86::op::{Addressing, Comparison, Condition, Operation, OverflowArithmetic};
 use crate::x86::types::*;
 use ascent::aggregators;
 use ascent::ascent_par;
+use ascent::lattice::constant_propagation::ConstPropagation;
 use ascent::lattice::set::Set;
 use ascent::Dual;
 use either::Either;
@@ -30,6 +31,231 @@ fn exact_stack_offset(offsets: &Set<i64>) -> Option<i64> {
     } else {
         None
     }
+}
+
+// Exact architectural width of an x86 general-purpose register view.  Mreg
+// and Ireg intentionally canonicalize AL/AX/EAX/RAX to one physical register;
+// value proofs must retain the view width separately or a byte/word write can
+// masquerade as a complete 32-bit definition.
+fn x86_gpr_view_width(reg: &str) -> Option<i64> {
+    match reg {
+        "RAX" | "RBX" | "RCX" | "RDX" | "RSI" | "RDI" | "RBP" | "RSP" | "R8" | "R9" | "R10"
+        | "R11" | "R12" | "R13" | "R14" | "R15" => Some(8),
+        "EAX" | "EBX" | "ECX" | "EDX" | "ESI" | "EDI" | "EBP" | "ESP" | "R8D" | "R9D" | "R10D"
+        | "R11D" | "R12D" | "R13D" | "R14D" | "R15D" => Some(4),
+        "AX" | "BX" | "CX" | "DX" | "SI" | "DI" | "BP" | "SP" | "R8W" | "R9W" | "R10W" | "R11W"
+        | "R12W" | "R13W" | "R14W" | "R15W" => Some(2),
+        "AL" | "BL" | "CL" | "DL" | "AH" | "BH" | "CH" | "DH" | "SIL" | "DIL" | "BPL" | "SPL"
+        | "R8B" | "R9B" | "R10B" | "R11B" | "R12B" | "R13B" | "R14B" | "R15B" => Some(1),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum RawGprValue {
+    LiveIn(Mreg, i64),
+    Definition(Address, Mreg, i64),
+    Constant(u64),
+}
+
+/// A finite non-negative byte-offset family
+/// `{0, stride, 2*stride, ..., (count-1)*stride}`.  The payload is deliberately
+/// constant-sized so the point-keyed dataflow below remains O(V * GPRs).  The
+/// origin is the instruction which established the bound (normally a low-bit
+/// AND); copies and exact scaling preserve it so independent table fields can
+/// share one physical owner without using address proximity as dataflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct BoundedOffsetShape {
+    origin: Address,
+    stride: u64,
+    count: usize,
+    max: u64,
+}
+
+fn contiguous_low_mask_shape(
+    origin: Address,
+    destination: &str,
+    immediate: i64,
+) -> Option<BoundedOffsetShape> {
+    let mask = match x86_gpr_view_width(destination)? {
+        4 => (immediate as u32) as u64,
+        8 => immediate as u64,
+        _ => return None,
+    };
+    let count = mask.checked_add(1)?;
+    if !count.is_power_of_two() {
+        return None;
+    }
+    Some(BoundedOffsetShape {
+        origin,
+        stride: 1,
+        count: usize::try_from(count).ok()?,
+        max: mask,
+    })
+}
+
+fn scale_bounded_offset_state(
+    state: &ConstPropagation<BoundedOffsetShape>,
+    destination: &str,
+    factor: u64,
+) -> ConstPropagation<BoundedOffsetShape> {
+    let bit_width = match x86_gpr_view_width(destination) {
+        Some(4) => 32,
+        Some(8) => 64,
+        _ => return ConstPropagation::Top,
+    };
+    let ConstPropagation::Constant(shape) = state else {
+        return ConstPropagation::Top;
+    };
+    let Some(stride) = shape.stride.checked_mul(factor) else {
+        return ConstPropagation::Top;
+    };
+    let Some(max) = shape.max.checked_mul(factor) else {
+        return ConstPropagation::Top;
+    };
+    if bit_width == 32 && max > u32::MAX as u64 {
+        return ConstPropagation::Top;
+    }
+    ConstPropagation::Constant(BoundedOffsetShape {
+        origin: shape.origin,
+        stride,
+        count: shape.count,
+        max,
+    })
+}
+
+fn shift_bounded_offset_state(
+    state: &ConstPropagation<BoundedOffsetShape>,
+    destination: &str,
+    shift: i64,
+) -> ConstPropagation<BoundedOffsetShape> {
+    let bit_width = match x86_gpr_view_width(destination) {
+        Some(4) => 32,
+        Some(8) => 64,
+        _ => return ConstPropagation::Top,
+    };
+    let Ok(shift) = u32::try_from(shift) else {
+        return ConstPropagation::Top;
+    };
+    if shift >= bit_width {
+        return ConstPropagation::Top;
+    }
+    let Some(factor) = 1_u64.checked_shl(shift) else {
+        return ConstPropagation::Top;
+    };
+    scale_bounded_offset_state(state, destination, factor)
+}
+
+fn copy_bounded_offset_state(
+    state: &ConstPropagation<BoundedOffsetShape>,
+    mnemonic: &str,
+    destination: &str,
+    source: &str,
+) -> ConstPropagation<BoundedOffsetShape> {
+    let destination_width = x86_gpr_view_width(destination);
+    let source_width = x86_gpr_view_width(source);
+    if mnemonic != "MOV"
+        || destination_width != source_width
+        || !matches!(destination_width, Some(4 | 8))
+    {
+        return ConstPropagation::Top;
+    }
+    let ConstPropagation::Constant(shape) = state else {
+        return ConstPropagation::Top;
+    };
+    if destination_width == Some(4) && shape.max > u32::MAX as u64 {
+        return ConstPropagation::Top;
+    }
+    ConstPropagation::Constant(*shape)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct UnsignedAffineValue {
+    holder: Mreg,
+    displacement: i64,
+    holder_value: RawGprValue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct ExactOverflowShape {
+    operation: OverflowArithmetic,
+    width: i64,
+    result: Mreg,
+    source: Option<Mreg>,
+}
+
+fn lower_exact_overflow_condition(
+    shape: ExactOverflowShape,
+    test: TestCond,
+) -> Option<(Condition, Arc<Vec<Mreg>>)> {
+    let args = match shape.operation {
+        OverflowArithmetic::Add | OverflowArithmetic::Sub => {
+            Arc::new(vec![shape.result, shape.source?])
+        }
+        OverflowArithmetic::AddImmediate(_)
+        | OverflowArithmetic::SubImmediate(_)
+        | OverflowArithmetic::Neg => {
+            if shape.source.is_some() {
+                return None;
+            }
+            Arc::new(vec![shape.result])
+        }
+    };
+    let condition = match test {
+        TestCond::CondO => Condition::Carithoverflow(shape.operation, shape.width),
+        TestCond::CondNo => Condition::Cnarithoverflow(shape.operation, shape.width),
+        _ => return None,
+    };
+    Some((condition, args))
+}
+
+// MOV r32,imm32 zero-extends its destination on x86-64, so it is an exact
+// value for both the 32-bit and 64-bit abstract views.  Narrow writes are not.
+fn exact_mov_immediate_value(dst: &str, immediate: i64, tracked_width: i64) -> Option<u64> {
+    match (x86_gpr_view_width(dst)?, tracked_width) {
+        (4, 4 | 8) => Some((immediate as u32) as u64),
+        (8, 4) => Some((immediate as u64) & u32::MAX as u64),
+        (8, 8) => Some(immediate as u64),
+        _ => None,
+    }
+}
+
+fn raw_move_preserves_width(mnem: &str, dst: &str, src: &str, tracked_width: i64) -> bool {
+    let Some(dst_width) = x86_gpr_view_width(dst) else {
+        return false;
+    };
+    let Some(src_width) = x86_gpr_view_width(src) else {
+        return false;
+    };
+    match mnem {
+        "MOV" => dst_width == src_width && dst_width >= tracked_width,
+        // The low dword of a sign extension is exactly its source dword.
+        "MOVSXD" => tracked_width == 4 && dst_width == 8 && src_width == 4,
+        _ => false,
+    }
+}
+
+fn q_participants_with(participants: &Set<Address>, address: Address) -> Option<Set<Address>> {
+    let mut result = participants.clone();
+    result.0.insert(address);
+    (result.len() <= 4).then_some(result)
+}
+
+fn q_participants_merge(
+    left: &Set<Address>,
+    right: &Set<Address>,
+    address: Address,
+) -> Option<Set<Address>> {
+    let mut result = left.clone();
+    result.0.extend(right.0.iter().copied());
+    result.0.insert(address);
+    (result.len() <= 4).then_some(result)
+}
+
+fn participants_with(participants: &Set<Address>, address: Address) -> Set<Address> {
+    let mut result = participants.clone();
+    result.0.insert(address);
+    result
 }
 
 // SETcc writes one low-byte lane, while reg_def deliberately normalizes every
@@ -349,8 +575,8 @@ fn recover_signed_divisor_compensating(magic_signed_i32: i64, total_shift: i64) 
     }
 }
 
-fn recover_unsigned_divisor(magic: i64, total_shift: i64) -> Option<i64> {
-    if total_shift < 32 {
+fn recover_unsigned_divisor(magic: i64, total_shift: i64, input_width: i64) -> Option<i64> {
+    if !matches!(input_width, 32 | 64) || total_shift < input_width || total_shift >= 128 {
         return None;
     }
     let mag = magic as u64 as u128;
@@ -358,23 +584,39 @@ fn recover_unsigned_divisor(magic: i64, total_shift: i64) -> Option<i64> {
         return None;
     }
     let num = 1u128 << total_shift as u32;
-    let d = (num + (mag / 2)) / mag;
+    // The simple lowering q=(n*magic)>>shift requires the upward reciprocal.
+    // A downward-rounded multiplier already fails at n=d.  Recover the only
+    // possible divisor from ceil(2^shift/d), then prove the quotient identity
+    // over the entire unsigned input domain using the exact remainder bound.
+    let d = num.checked_add(mag - 1)?.checked_div(mag)?;
     if d <= 1 || d > i64::MAX as u128 {
         return None;
     }
-    // Verify: |2^total_shift / d - magic| <= 1 (the magic is rounded either way).
-    let check = num / d;
-    let mag_u64 = magic as u64;
-    let check_u64 = check as u64;
-    let diff = if check_u64 >= mag_u64 {
-        check_u64 - mag_u64
-    } else {
-        mag_u64 - check_u64
-    };
-    if diff <= 1 {
-        Some(d as i64)
-    } else {
+    let scaled = mag.checked_mul(d)?;
+    if scaled < num {
         None
+    } else {
+        let error = scaled - num;
+        let max_input = (1u128 << input_width as u32) - 1;
+        let final_q = max_input / d;
+        let final_r = max_input % d;
+        let final_residual = final_q
+            .checked_mul(error)?
+            .checked_add(final_r.checked_mul(mag)?)?;
+
+        // The end of the last complete quotient interval can have a larger
+        // residual than max_input when the domain ends partway through an
+        // interval.  These two extrema cover every n=q*d+r because residual
+        // is monotone in q and r inside their respective ranges.
+        let complete_intervals = (max_input + 1) / d;
+        let complete_residual = if complete_intervals == 0 {
+            0
+        } else {
+            (complete_intervals - 1)
+                .checked_mul(error)?
+                .checked_add((d - 1).checked_mul(mag)?)?
+        };
+        (final_residual.max(complete_residual) < num).then_some(d as i64)
     }
 }
 
@@ -485,8 +727,7 @@ ascent_par! {
     relation block_boundaries(Address, Address, Address);
     relation reg_use(Address, Mreg);
     relation reg_def(Address, Mreg);
-    relation reg_def_used(Address, Mreg, Address);
-
+    relation decoded_reg_def(Address, Mreg);
     relation stack_def(Address, Symbol, i64);
     relation stack_use(Address, Symbol, i64);
     relation stack_def_used(Address, Symbol, i64, Address, Symbol, i64);
@@ -720,6 +961,15 @@ ascent_par! {
 
     pjcc(addr, TestCond::CondG, dst)<--
         instruction(addr, _, _, "JG", dst, _, _, _, _, _);
+
+    // OF-only branches are intentionally separate from comparison JCCs.
+    // Generic CMP/TEST/SUB consumers interpret `pjcc` through CompCert
+    // comparisons, while JO/JNO require the exact flags producer semantics.
+    #[local] relation overflow_jcc(Address, TestCond, Symbol);
+    overflow_jcc(addr, TestCond::CondO, dst)<--
+        instruction(addr, _, _, "JO", dst, _, _, _, _, _);
+    overflow_jcc(addr, TestCond::CondNo, dst)<--
+        instruction(addr, _, _, "JNO", dst, _, _, _, _, _);
 
     relation pcmp(Address, Symbol, Symbol);
     pcmp(addr, dst, src)<--
@@ -1100,6 +1350,7 @@ ascent_par! {
     relation func_stacksz(Address, Address, Symbol, u64);
     relation func_span(Symbol, Address, Address);
     relation resolved_addr_to_symbol(Address, Ident, i64);
+    #[local] relation site_resolved_addr_to_symbol(Address, Address, Ident, i64);
 
     relation type_size(Typ, u64);
     relation ireg_hold_type(String, Typ);
@@ -1122,7 +1373,14 @@ ascent_par! {
     lattice stack_offset(Address, Address, Dual<Set<i64>>);
     relation transl_store_inferred(Address, MemoryChunk, Addrmode, Arc<Vec<Mreg>>, Mreg);
     relation transl_store(Address, MemoryChunk, Addrmode, Arc<Vec<Mreg>>, Mreg);
-    relation addrmode_needs_resolution(Addrmode, Address);
+    // Resolution is site-keyed.  Addrmode is a value shape and can recur at an
+    // unrelated instruction; a proof at one node must never rewrite another.
+    relation addrmode_needs_resolution(Address, Addrmode, Address);
+    // (function, access node, physical owner, field byte offset, index stride,
+    // index count, bound-defining origin, access width).  This is the compact
+    // certificate consumed by global-array recovery after the exact point-
+    // keyed bounded-offset lattice has validated `[gpr + absolute-data]`.
+    relation bounded_absolute_data_access(Address, Address, Ident, i64, u64, usize, Address, usize);
     relation addr_requiring_symbol(Address);
     relation mach_imm_stack_init(Address, i64, i64, Typ);
     // A SETcc whose destination is a scalar frame cell cannot be represented
@@ -1631,6 +1889,20 @@ ascent_par! {
         !plt_entry(target_addr, _),
         !func_entry(_, target_addr),
         let name_string = format!("TABLE_{:x}", target_addr),
+        let name_sym = Box::leak(name_string.into_boxed_str()) as &'static str;
+
+    // Create one anonymous physical owner for every certified bounded-index
+    // family, not one symbol per field coordinate.  Interior fields remain
+    // byte offsets of this owner in `bounded_absolute_data_access`.
+    global_symbol(owner_address, name_sym), synthesized_global_symbol(owner_address) <--
+        bounded_absolute_data_access(_, _, owner, _, _, _, _, _),
+        let owner_address = *owner as Address,
+        if owner_address > 0,
+        !symbol_table(owner_address, _, _, _, _, _, _, _, _),
+        !function_symbol(owner_address, _),
+        !plt_entry(owner_address, _),
+        !func_entry(_, owner_address),
+        let name_string = format!("TABLE_{:x}", owner_address),
         let name_sym = Box::leak(name_string.into_boxed_str()) as &'static str;
 
     symbols(addr, name, name) <--
@@ -2304,19 +2576,41 @@ ascent_par! {
         instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mc = refine_chunk_with_size(chunk_from_mnem(mnem), *msize);
 
-    addrmode_needs_resolution(am, target_addr) <--
-        transl_store(_, _, am, _, _),
+    addrmode_needs_resolution(*addr, *am, target_addr) <--
+        transl_store(addr, _, am, _, _),
         if let Some(target_addr_i64) = addrmode_needs_symbol_resolution(am),
         let target_addr = target_addr_i64 as Address;
 
-    addrmode_needs_resolution(am, target_addr) <--
-        transl_load(_, _, am, _, _),
+    addrmode_needs_resolution(*addr, *am, target_addr) <--
+        transl_load(addr, _, am, _, _),
         if let Some(target_addr_i64) = addrmode_needs_symbol_resolution(am),
         let target_addr = target_addr_i64 as Address;
 
+    addrmode_needs_resolution(*node, *am, target) <--
+        bounded_absolute_data_access(_, node, owner, field_offset, _, _, _, _),
+        transl_load(node, _, am, _, _),
+        if *field_offset >= 0,
+        let owner_address = *owner as Address,
+        if let Some(target) = owner_address.checked_add(*field_offset as u64);
+    addrmode_needs_resolution(*node, *am, target) <--
+        bounded_absolute_data_access(_, node, owner, field_offset, _, _, _, _),
+        transl_store(node, _, am, _, _),
+        if *field_offset >= 0,
+        let owner_address = *owner as Address,
+        if let Some(target) = owner_address.checked_add(*field_offset as u64);
+
+    site_resolved_addr_to_symbol(*node, *target, *ident, *offset) <--
+        addrmode_needs_resolution(node, _, target),
+        resolved_addr_to_symbol(target, ident, offset),
+        !bounded_absolute_data_access(_, node, _, _, _, _, _, _);
+    site_resolved_addr_to_symbol(*node, target, *owner, *field_offset) <--
+        bounded_absolute_data_access(_, node, owner, field_offset, _, _, _, _),
+        if *field_offset >= 0,
+        let owner_address = *owner as Address,
+        if let Some(target) = owner_address.checked_add(*field_offset as u64);
 
     addr_requiring_symbol(target_addr) <--
-        addrmode_needs_resolution(_, target_addr);
+        addrmode_needs_resolution(_, _, target_addr);
 
     addr_requiring_symbol(target_addr) <--
         rip_target_addr(_, target_addr);
@@ -2325,14 +2619,14 @@ ascent_par! {
         abs_target_addr(_, target_addr);
     mach_inst(addr, MachInst::Mstore(*memory_chunk, addressing, Arc::new(args), *src)) <--
         transl_store(addr, memory_chunk, addrmode, regs, src),
-        addrmode_needs_resolution(*addrmode, target_addr),
-        resolved_addr_to_symbol(target_addr, ident, offset),
+        addrmode_needs_resolution(addr, *addrmode, target_addr),
+        site_resolved_addr_to_symbol(addr, target_addr, ident, offset),
         let resolved = Some((*ident, *offset)),
         if let Ok((addressing, args)) = transl_addressing_rev(*addrmode, resolved);
 
     mach_inst(addr, MachInst::Mstore(*memory_chunk, addressing, Arc::new(args), *src)) <--
         transl_store(addr, memory_chunk, addrmode, regs, src),
-        !addrmode_needs_resolution(*addrmode, _),
+        !addrmode_needs_resolution(addr, *addrmode, _),
         if let Ok((addressing, args)) = transl_addressing_rev(*addrmode, None);
 
     mach_inst(addr, MachInst::Msetstack(src_reg, disp - depth, *typ)) <--
@@ -2854,6 +3148,468 @@ ascent_par! {
         ddisasm_cfg_edge(a, b, edge_type),
         if *edge_type != "call" && *edge_type != "indirect" && *edge_type != "indirect_call",
         !noreturn_call_site(a);
+
+    // A compiler strength-reduction idiom is straight-line code.  Raw `next`
+    // is only physical adjacency and can cross blocks/functions; pairing it
+    // with block identity and ownership makes this a structural step without
+    // building a pairwise reachability relation.
+    #[local] relation owned_straightline_step(Address, Address, Address);
+    owned_straightline_step(*func, *a, *b) <--
+        cfg_step(a, b),
+        next(a, b),
+        code_in_block(a, block),
+        code_in_block(b, block),
+        instr_in_function(a, func),
+        instr_in_function(b, func);
+
+    // Preserve each raw memory operand's address-register spelling.  Addrmode
+    // canonicalizes EDI/RDI to the same Ireg, but only the pointer-width view
+    // is admissible for an LP64 symbolic-storage interpretation.
+    #[local] relation raw_memory_operand(Address, &'static str, &'static str, i64, usize);
+    raw_memory_operand(*addr, *base, *index, *disp, *width) <--
+        instruction(addr, _, _, _, operand, _, _, _, _, _),
+        op_indirect(operand, _, base, index, _, disp, width);
+    raw_memory_operand(*addr, *base, *index, *disp, *width) <--
+        instruction(addr, _, _, _, _, operand, _, _, _, _),
+        op_indirect(operand, _, base, index, _, disp, width);
+    raw_memory_operand(*addr, *base, *index, *disp, *width) <--
+        instruction(addr, _, _, _, _, _, operand, _, _, _),
+        op_indirect(operand, _, base, index, _, disp, width);
+    raw_memory_operand(*addr, *base, *index, *disp, *width) <--
+        instruction(addr, _, _, _, _, _, _, operand, _, _),
+        op_indirect(operand, _, base, index, _, disp, width);
+
+    // Candidate sites are deliberately loose: image kind, section membership,
+    // raw pointer-width addressing and a lowering-supported load/store are all
+    // positive facts.  The lattice below supplies the stricter value proof.
+    #[local] relation absolute_data_memory_site(Address, Address, Addrmode, Address, Mreg, usize);
+    absolute_data_memory_site(*func, *node, *am, target, base_reg, *access_width) <--
+        transl_load(node, _, am, _, _),
+        raw_memory_operand(node, base_name, index_name, displacement, access_width),
+        if *access_width > 0,
+        if let Some((target, base_reg)) = pointer_width_absolute_based_operand(
+            am,
+            base_name,
+            index_name,
+            *displacement,
+        ),
+        raw_image_addresses_are_absolute(raw_absolute),
+        if *raw_absolute,
+        data_section_range(section_start, section_end),
+        if target >= *section_start && target < *section_end,
+        instr_in_function(node, func);
+    absolute_data_memory_site(*func, *node, *am, target, base_reg, *access_width) <--
+        transl_store(node, _, am, _, _),
+        raw_memory_operand(node, base_name, index_name, displacement, access_width),
+        if *access_width > 0,
+        if let Some((target, base_reg)) = pointer_width_absolute_based_operand(
+            am,
+            base_name,
+            index_name,
+            *displacement,
+        ),
+        raw_image_addresses_are_absolute(raw_absolute),
+        if *raw_absolute,
+        data_section_range(section_start, section_end),
+        if target >= *section_start && target < *section_end,
+        instr_in_function(node, func);
+
+    #[local] relation bounded_offset_analysis_func(Address);
+    bounded_offset_analysis_func(func) <--
+        absolute_data_memory_site(func, _, _, _, _, _);
+
+    #[local] relation bounded_offset_tracked(Address, Mreg);
+    bounded_offset_tracked(*func, *reg) <--
+        bounded_offset_analysis_func(func),
+        preg_of(reg, preg),
+        ireg_of(preg, _);
+
+    #[local] relation bounded_offset_mask_def(Address, Mreg, BoundedOffsetShape);
+    bounded_offset_mask_def(*addr, dst_reg, shape) <--
+        pand(addr, dst, immediate),
+        op_register(dst, dst_name),
+        op_immediate(immediate, value, _),
+        if let Some(shape) = contiguous_low_mask_shape(*addr, dst_name, *value),
+        let dst_reg = Mreg::x86(dst_name);
+
+    #[local] relation bounded_offset_shift_transfer(Address, Mreg, &'static str, i64);
+    bounded_offset_shift_transfer(*addr, dst_reg, *dst_name, *shift) <--
+        psal(addr, dst, immediate),
+        op_register(dst, dst_name),
+        op_immediate(immediate, shift, _),
+        if matches!(x86_gpr_view_width(dst_name), Some(4 | 8)),
+        let dst_reg = Mreg::x86(dst_name);
+
+    #[local] relation bounded_offset_scale_transfer(Address, Mreg, &'static str, u64);
+    bounded_offset_scale_transfer(*addr, dst_reg, *dst_name, factor) <--
+        pimul(addr, dst, immediate),
+        op_register(dst, dst_name),
+        op_immediate(immediate, factor_signed, _),
+        if *factor_signed > 0,
+        if matches!(x86_gpr_view_width(dst_name), Some(4 | 8)),
+        let factor = *factor_signed as u64,
+        let dst_reg = Mreg::x86(dst_name);
+
+    #[local] relation bounded_offset_copy_transfer(Address, Mreg, Mreg, &'static str, &'static str, &'static str);
+    bounded_offset_copy_transfer(*addr, dst_reg, src_reg, *mnemonic, *dst_name, *src_name) <--
+        pmov(addr, dst, src),
+        instruction(addr, _, _, mnemonic, _, _, _, _, _, _),
+        op_register(dst, dst_name),
+        op_register(src, src_name),
+        if *mnemonic == "MOV",
+        if matches!(x86_gpr_view_width(dst_name), Some(4 | 8)),
+        if x86_gpr_view_width(dst_name) == x86_gpr_view_width(src_name),
+        let dst_reg = Mreg::x86(dst_name),
+        let src_reg = Mreg::x86(src_name);
+
+    #[local] relation bounded_offset_handled_def(Address, Mreg);
+    bounded_offset_handled_def(addr, reg) <-- bounded_offset_mask_def(addr, reg, _);
+    bounded_offset_handled_def(addr, reg) <-- bounded_offset_shift_transfer(addr, reg, _, _);
+    bounded_offset_handled_def(addr, reg) <-- bounded_offset_scale_transfer(addr, reg, _, _);
+    bounded_offset_handled_def(addr, reg) <-- bounded_offset_copy_transfer(addr, reg, _, _, _, _);
+
+    // MUST-state dataflow: every `(function,node,register)` key stores Bottom,
+    // one finite shape, or Top.  Joins on alternate CFG arms are lattice joins;
+    // no pairwise reachability relation or address-order surrogate is used.
+    #[local] lattice bounded_offset_in(Address, Address, Mreg, ConstPropagation<BoundedOffsetShape>);
+    #[local] lattice bounded_offset_out(Address, Address, Mreg, ConstPropagation<BoundedOffsetShape>);
+
+    bounded_offset_in(*func, *func, *reg, ConstPropagation::Top) <--
+        bounded_offset_tracked(func, reg),
+        instr_in_function(func, func);
+
+    bounded_offset_in(*func, *succ, *reg, state.clone()) <--
+        bounded_offset_out(func, node, reg, state),
+        cfg_step(node, succ),
+        instr_in_function(succ, func);
+
+    bounded_offset_out(*func, *node, *reg, ConstPropagation::Constant(*shape)) <--
+        bounded_offset_in(func, node, reg, _),
+        bounded_offset_mask_def(node, reg, shape),
+        !raw_gpr_barrier(node);
+
+    bounded_offset_out(*func, *node, *reg, next_state) <--
+        bounded_offset_in(func, node, reg, state),
+        bounded_offset_shift_transfer(node, reg, dst_name, shift),
+        let next_state = shift_bounded_offset_state(state, dst_name, *shift),
+        !raw_gpr_barrier(node);
+
+    bounded_offset_out(*func, *node, *reg, next_state) <--
+        bounded_offset_in(func, node, reg, state),
+        bounded_offset_scale_transfer(node, reg, dst_name, factor),
+        let next_state = scale_bounded_offset_state(state, dst_name, *factor),
+        !raw_gpr_barrier(node);
+
+    bounded_offset_out(*func, *node, *reg, next_state) <--
+        bounded_offset_in(func, node, reg, _),
+        bounded_offset_copy_transfer(node, reg, source, mnemonic, dst_name, src_name),
+        bounded_offset_in(func, node, source, source_state),
+        let next_state = copy_bounded_offset_state(source_state, mnemonic, dst_name, src_name),
+        !raw_gpr_barrier(node);
+
+    bounded_offset_out(*func, *node, *reg, ConstPropagation::Top) <--
+        bounded_offset_in(func, node, reg, _),
+        decoded_reg_def(node, reg),
+        !bounded_offset_handled_def(node, reg),
+        !raw_gpr_barrier(node);
+
+    bounded_offset_out(*func, *node, *reg, state.clone()) <--
+        bounded_offset_in(func, node, reg, state),
+        !decoded_reg_def(node, reg),
+        !raw_gpr_barrier(node);
+
+    bounded_offset_out(*func, *node, *reg, ConstPropagation::Top) <--
+        bounded_offset_in(func, node, reg, _),
+        raw_gpr_barrier(node);
+
+    #[local] relation bounded_offset_candidate(Address, Address, Mreg, BoundedOffsetShape);
+    bounded_offset_candidate(*func, *node, *reg, *shape) <--
+        bounded_offset_in(func, node, reg, state),
+        if let ConstPropagation::Constant(shape) = state;
+
+    #[local] relation bounded_offset_conflict(Address, Address, Mreg);
+    bounded_offset_conflict(*func, *node, *reg) <--
+        bounded_offset_in(func, node, reg, state),
+        if matches!(state, ConstPropagation::Top);
+
+    #[local] relation bounded_offset_exact(Address, Address, Mreg, BoundedOffsetShape);
+    bounded_offset_exact(*func, *node, *reg, *shape) <--
+        bounded_offset_candidate(func, node, reg, shape),
+        !bounded_offset_conflict(func, node, reg),
+        !raw_gpr_unresolved_owner(func);
+
+    // One row per certified access before physical-owner selection.
+    #[local] relation bounded_data_access_candidate(Address, Address, Addrmode, Address, usize, Address, u64, usize, u64);
+    bounded_data_access_candidate(*func, *node, *am, *target, *access_width,
+                                  shape.origin, shape.stride, shape.count, shape.max) <--
+        absolute_data_memory_site(func, node, am, target, base_reg, access_width),
+        bounded_offset_exact(func, node, base_reg, shape),
+        if shape.count > 0 && shape.stride > 0,
+        if let Ok(access_width_u64) = u64::try_from(*access_width),
+        if let Some(last_start) = target.checked_add(shape.max),
+        if let Some(access_end) = last_start.checked_add(access_width_u64),
+        data_section_range(section_start, section_end),
+        if *target >= *section_start && access_end <= *section_end;
+
+    // A single bounded value may feed several fields of one record.  Admit a
+    // family only when all its absolute coordinates fit in one stride window;
+    // this safely unifies `{base, base+field}` while refusing to guess a
+    // partition when the same index feeds multiple distant tables.
+    #[local] relation bounded_family_target(Address, Address, u64, usize, u64, Address);
+    bounded_family_target(*func, *origin, *stride, *count, *max, *target) <--
+        bounded_data_access_candidate(func, _, _, target, _, origin, stride, count, max);
+
+    #[local] relation bounded_family_min(Address, Address, u64, usize, u64, Address);
+    bounded_family_min(func, origin, stride, count, max, minimum) <--
+        bounded_family_target(func, origin, stride, count, max, _),
+        agg minimum = ascent::aggregators::min(target)
+            in bounded_family_target(func, origin, stride, count, max, target);
+
+    #[local] relation bounded_family_max(Address, Address, u64, usize, u64, Address);
+    bounded_family_max(func, origin, stride, count, max, maximum) <--
+        bounded_family_target(func, origin, stride, count, max, _),
+        agg maximum = ascent::aggregators::max(target)
+            in bounded_family_target(func, origin, stride, count, max, target);
+
+    #[local] relation bounded_family_coherent(Address, Address, u64, usize, u64, Address);
+    bounded_family_coherent(*func, *origin, *stride, *count, *max, *owner) <--
+        bounded_family_min(func, origin, stride, count, max, owner),
+        bounded_family_max(func, origin, stride, count, max, maximum),
+        if let Some(span) = maximum.checked_sub(*owner),
+        if span < *stride;
+
+    #[local] relation bounded_family_field_end(Address, Address, u64, usize, u64, u64);
+    bounded_family_field_end(*func, *origin, *stride, *count, *max, field_end) <--
+        bounded_family_coherent(func, origin, stride, count, max, owner),
+        bounded_data_access_candidate(func, _, _, target, access_width, origin, stride, count, max),
+        if let Some(field_offset) = target.checked_sub(*owner),
+        if let Ok(access_width_u64) = u64::try_from(*access_width),
+        if let Some(field_end) = field_offset.checked_add(access_width_u64);
+
+    #[local] relation bounded_family_max_field_end(Address, Address, u64, usize, u64, u64);
+    bounded_family_max_field_end(func, origin, stride, count, max, maximum) <--
+        bounded_family_field_end(func, origin, stride, count, max, _),
+        agg maximum = ascent::aggregators::max(end)
+            in bounded_family_field_end(func, origin, stride, count, max, end);
+
+    // (key..., coordinate owner, exclusive accessed end)
+    #[local] relation bounded_family_extent(Address, Address, u64, usize, u64, Address, Address);
+    bounded_family_extent(*func, *origin, *stride, *count, *max, *owner, family_end) <--
+        bounded_family_coherent(func, origin, stride, count, max, owner),
+        bounded_family_max_field_end(func, origin, stride, count, max, max_field_end),
+        if let Some(extent) = max.checked_add(*max_field_end),
+        if let Some(family_end) = owner.checked_add(extent),
+        data_section_range(section_start, section_end),
+        if *owner >= *section_start && family_end <= *section_end;
+
+    // Real ELF object symbols are authoritative physical boundaries.  A sized
+    // object may own the family; partial overlaps and interior object starts
+    // reject the anonymous interpretation.
+    #[local] relation authoritative_sized_data_object(Address, usize);
+    authoritative_sized_data_object(*address, *size) <--
+        symbol_table(address, size, symbol_type, _, _, _, _, _, _),
+        if *symbol_type == "OBJECT" && *size > 0;
+
+    #[local] relation bounded_family_authoritative_overlap(Address, Address, u64, usize, u64);
+    bounded_family_authoritative_overlap(*func, *origin, *stride, *count, *max) <--
+        bounded_family_extent(func, origin, stride, count, max, owner, family_end),
+        authoritative_sized_data_object(object_start, object_size),
+        if let Some(object_end) = object_start.checked_add(*object_size as u64),
+        if *object_start < *family_end && object_end > *owner;
+
+    #[local] relation bounded_family_authoritative_owner_candidate(Address, Address, u64, usize, u64, Address);
+    bounded_family_authoritative_owner_candidate(*func, *origin, *stride, *count, *max, *object_start) <--
+        bounded_family_extent(func, origin, stride, count, max, owner, family_end),
+        authoritative_sized_data_object(object_start, object_size),
+        if let Some(object_end) = object_start.checked_add(*object_size as u64),
+        if *object_start <= *owner && *family_end <= object_end;
+
+    #[local] relation bounded_family_authoritative_owner(Address, Address, u64, usize, u64, Address);
+    bounded_family_authoritative_owner(func, origin, stride, count, max, selected) <--
+        bounded_family_authoritative_owner_candidate(func, origin, stride, count, max, _),
+        agg selected = ascent::aggregators::max(owner)
+            in bounded_family_authoritative_owner_candidate(func, origin, stride, count, max, owner);
+
+    #[local] relation bounded_family_owner_candidate(Address, Address, u64, usize, u64, Address);
+    bounded_family_owner_candidate(func, origin, stride, count, max, owner) <--
+        bounded_family_authoritative_owner(func, origin, stride, count, max, owner);
+    bounded_family_owner_candidate(*func, *origin, *stride, *count, *max, *owner) <--
+        bounded_family_extent(func, origin, stride, count, max, owner, _),
+        !bounded_family_authoritative_overlap(func, origin, stride, count, max);
+
+    #[local] relation bounded_family_internal_object_boundary(Address, Address, u64, usize, u64, Address);
+    bounded_family_internal_object_boundary(*func, *origin, *stride, *count, *max, *chosen_owner) <--
+        bounded_family_owner_candidate(func, origin, stride, count, max, chosen_owner),
+        bounded_family_extent(func, origin, stride, count, max, _, family_end),
+        symbol_table(object_start, _, symbol_type, _, _, _, _, _, _),
+        if *symbol_type == "OBJECT",
+        if *object_start > *chosen_owner && *object_start < *family_end;
+
+    bounded_absolute_data_access(*func, *node, chosen_ident, field_offset,
+                                 *stride, *count, *origin, *access_width) <--
+        bounded_family_owner_candidate(func, origin, stride, count, max, chosen_owner),
+        !bounded_family_internal_object_boundary(func, origin, stride, count, max, chosen_owner),
+        bounded_data_access_candidate(func, node, _, target, access_width, origin, stride, count, max),
+        if let Some(field_offset_u64) = target.checked_sub(*chosen_owner),
+        if let Ok(field_offset) = i64::try_from(field_offset_u64),
+        if let Ok(chosen_ident) = Ident::try_from(*chosen_owner);
+
+    // Candidate two-operand unsigned-magic multiplies activate the raw-value
+    // analysis before the magic has itself been validated.  This avoids a
+    // circular bootstrap while keeping the lattice out of functions which
+    // have no relevant multiply at all.
+    #[local] relation raw_magic_imul_candidate(Address, Address, Mreg, Mreg);
+    raw_magic_imul_candidate(*func, *addr, dst_mreg, src_mreg) <--
+        pimul(addr, dst, src),
+        op_register(dst, dst_str),
+        op_register(src, src_str),
+        if x86_gpr_view_width(dst_str) == Some(8),
+        if x86_gpr_view_width(src_str) == Some(8),
+        let dst_mreg = Mreg::x86(dst_str),
+        let src_mreg = Mreg::x86(src_str),
+        if dst_mreg != src_mreg,
+        instr_in_function(addr, func);
+
+    #[local] relation raw_gpr_analysis_width(Address, i64);
+    raw_gpr_analysis_width(*func, 4) <--
+        raw_magic_imul_candidate(func, _, _, _);
+    raw_gpr_analysis_width(*func, 8) <--
+        raw_magic_imul_candidate(func, _, _, _);
+    raw_gpr_analysis_width(*func, 4) <--
+        div_magic_64(magic_load, _, _, _, _, _),
+        instr_in_function(magic_load, func);
+    raw_gpr_analysis_width(*func, 8) <--
+        div_magic_64(magic_load, _, _, _, _, _),
+        instr_in_function(magic_load, func);
+    raw_gpr_analysis_width(*func, 4) <--
+        div_magic_32(addr, _, _, _, _, _),
+        instr_in_function(addr, func);
+    raw_gpr_analysis_width(*func, 4) <--
+        div_magic_32_compensating_gcc(addr, _, _, _, _, _),
+        instr_in_function(addr, func);
+    raw_gpr_analysis_width(*func, 4) <--
+        div_magic_32_compensating(addr, _, _, _, _, _),
+        instr_in_function(addr, func);
+    raw_gpr_analysis_width(*func, 4) <--
+        div_magic_32_signbias_partial(addr, _, _, _, _, _),
+        instr_in_function(addr, func);
+    raw_gpr_analysis_width(*func, 4) <--
+        div_magic_32_signbias(addr, _, _, _, _, _),
+        instr_in_function(addr, func);
+
+    #[local] relation raw_gpr_tracked(Address, Mreg, i64);
+    raw_gpr_tracked(*func, *mreg, *width) <--
+        raw_gpr_analysis_width(func, width),
+        preg_of(mreg, preg),
+        ireg_of(preg, _);
+
+    #[local] relation raw_gpr_barrier(Address);
+    raw_gpr_barrier(*addr) <--
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if mnem.contains("CALL");
+
+    // An unresolved indirect jump has omitted successors by construction.
+    // A MUST value proof in such a function cannot silently treat those arms
+    // as absent.  Resolved jump tables are ordinary `branch` edges and do not
+    // trigger this conservative veto.
+    #[local] relation raw_gpr_unresolved_owner(Address);
+    raw_gpr_unresolved_owner(*func) <--
+        ddisasm_cfg_edge(site, _, "indirect"),
+        instr_in_function(site, func);
+
+    #[local] relation raw_gpr_width(i64);
+    raw_gpr_width(4);
+    raw_gpr_width(8);
+
+    #[local] relation raw_gpr_immediate_def(Address, Mreg, i64, u64);
+    raw_gpr_immediate_def(*addr, dst_mreg, *width, value) <--
+        pmov(addr, dst, src),
+        instruction(addr, _, _, "MOV", _, _, _, _, _, _),
+        op_register(dst, dst_str),
+        op_immediate(src, immediate, _),
+        raw_gpr_width(width),
+        if let Some(value) = exact_mov_immediate_value(dst_str, *immediate, *width),
+        let dst_mreg = Mreg::x86(dst_str);
+
+    #[local] relation raw_gpr_copy_def(Address, Mreg, i64, Mreg);
+    raw_gpr_copy_def(*addr, dst_mreg, *width, src_mreg) <--
+        pmov(addr, dst, src),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        op_register(dst, dst_str),
+        op_register(src, src_str),
+        raw_gpr_width(width),
+        if raw_move_preserves_width(mnem, dst_str, src_str, *width),
+        let dst_mreg = Mreg::x86(dst_str),
+        let src_mreg = Mreg::x86(src_str);
+
+    #[local] relation raw_gpr_exact_def(Address, Mreg, i64);
+    raw_gpr_exact_def(addr, dst, width) <--
+        raw_gpr_immediate_def(addr, dst, width, _);
+    raw_gpr_exact_def(addr, dst, width) <--
+        raw_gpr_copy_def(addr, dst, width, _);
+
+    // Flat exact/unknown value state.  Every key stores one constant-sized
+    // lattice element: Bottom (unreached), one exact symbolic value, or Top
+    // (disagreeing/unknown).  This is O(V * GPRs) per activated width.
+    #[local] lattice raw_gpr_value_in(Address, Address, Mreg, i64, ConstPropagation<RawGprValue>);
+    #[local] lattice raw_gpr_value_out(Address, Address, Mreg, i64, ConstPropagation<RawGprValue>);
+
+    raw_gpr_value_in(*func, *func, *reg, *width,
+                     ConstPropagation::Constant(RawGprValue::LiveIn(*reg, *width))) <--
+        raw_gpr_tracked(func, reg, width),
+        instr_in_function(func, func);
+
+    raw_gpr_value_in(*func, *succ, *reg, *width, state.clone()) <--
+        raw_gpr_value_out(func, addr, reg, width, state),
+        cfg_step(addr, succ),
+        instr_in_function(succ, func);
+
+    raw_gpr_value_out(*func, *addr, *reg, *width,
+                      ConstPropagation::Constant(RawGprValue::Constant(*value))) <--
+        raw_gpr_value_in(func, addr, reg, width, _),
+        raw_gpr_immediate_def(addr, reg, width, value),
+        !raw_gpr_barrier(addr);
+
+    raw_gpr_value_out(*func, *addr, *reg, *width, source_state.clone()) <--
+        raw_gpr_value_in(func, addr, reg, width, _),
+        raw_gpr_copy_def(addr, reg, width, source),
+        raw_gpr_value_in(func, addr, source, width, source_state),
+        !raw_gpr_barrier(addr);
+
+    raw_gpr_value_out(*func, *addr, *reg, *width,
+                      ConstPropagation::Constant(RawGprValue::Definition(*addr, *reg, *width))) <--
+        raw_gpr_value_in(func, addr, reg, width, _),
+        reg_def(addr, reg),
+        !raw_gpr_exact_def(addr, reg, width),
+        !raw_gpr_barrier(addr);
+
+    raw_gpr_value_out(*func, *addr, *reg, *width, state.clone()) <--
+        raw_gpr_value_in(func, addr, reg, width, state),
+        !reg_def(addr, reg),
+        !raw_gpr_barrier(addr);
+
+    raw_gpr_value_out(*func, *addr, *reg, *width, ConstPropagation::Top) <--
+        raw_gpr_value_in(func, addr, reg, width, _),
+        raw_gpr_barrier(addr);
+
+    // Reading a recursively improving lattice directly can leak an early
+    // Constant before a later predecessor joins it to Top.  Project both in a
+    // lower stratum, then publish exactness only through negated conflict.
+    #[local] relation raw_gpr_value_candidate(Address, Address, Mreg, i64, RawGprValue);
+    raw_gpr_value_candidate(*func, *addr, *reg, *width, value) <--
+        raw_gpr_value_in(func, addr, reg, width, state),
+        if let ConstPropagation::Constant(value) = state;
+
+    #[local] relation raw_gpr_value_conflict(Address, Address, Mreg, i64);
+    raw_gpr_value_conflict(*func, *addr, *reg, *width) <--
+        raw_gpr_value_in(func, addr, reg, width, state),
+        if matches!(state, ConstPropagation::Top);
+
+    #[local] relation raw_gpr_exact_value(Address, Address, Mreg, i64, RawGprValue);
+    raw_gpr_exact_value(*func, *addr, *reg, *width, *value) <--
+        raw_gpr_value_candidate(func, addr, reg, width, value),
+        !raw_gpr_value_conflict(func, addr, reg, width),
+        !raw_gpr_unresolved_owner(func);
 
     // Point-keyed may-state for scalar dwords copied into XMM registers.  This
     // follows only structural CFG edges, and each tuple is killed exactly when
@@ -3770,6 +4526,7 @@ ascent_par! {
         unrefinedinstruction(addr, _, _, mnem, _, _, _, _, _, _),
         if !is_flag_setting(mnem);
     flags_flow_transparent(addr) <-- pjcc(addr, _, _);
+    flags_flow_transparent(addr) <-- overflow_jcc(addr, _, _);
     flags_flow_transparent(addr) <-- psetcc(addr, _, _);
 
     // Point-keyed may-state: at each instruction, which compare/test origins
@@ -3818,6 +4575,43 @@ ascent_par! {
     flags_arg(addr, mreg) <--
         ptest(addr, r1, _),
         op_register(r1, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r);
+
+    // Exact JO/JNO recovery re-reads the post-operation destination and, for
+    // register forms, the source whose bits were consumed by the arithmetic.
+    // Register definitions in the flag-transparent shadow invalidate that
+    // reconstruction, so feed those operands through the same point-keyed
+    // redefinition lattice used by relocated compare conditions.
+    flags_arg(addr, mreg) <--
+        padd(addr, dst, _),
+        op_register(dst, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r);
+    flags_arg(addr, mreg) <--
+        padd(addr, _, src),
+        op_register(src, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r);
+    flags_arg(addr, mreg) <--
+        psub(addr, dst, _),
+        op_register(dst, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r);
+    flags_arg(addr, mreg) <--
+        psub(addr, _, src),
+        op_register(src, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r);
+    flags_arg(addr, mreg) <--
+        pneg(addr, dst),
+        op_register(dst, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r);
+    flags_arg(addr, mreg) <--
+        instruction(addr, _, _, mnem, dst, _, _, _, _, _),
+        if *mnem == "INC" || *mnem == "DEC",
+        op_register(dst, reg_str),
         ireg_of(preg_of_r, Ireg::from(reg_str)),
         preg_of(mreg, preg_of_r);
 
@@ -3925,6 +4719,13 @@ ascent_par! {
         if active.0.len() == 1,
         for origin in active.0.iter();
 
+    #[local] relation overflow_jcc_flags_origin(Address, Address);
+    overflow_jcc_flags_origin(*origin, *jcc) <--
+        overflow_jcc(jcc, _, _),
+        active_flags_in(jcc, active),
+        if active.0.len() == 1,
+        for origin in active.0.iter();
+
     // Point-keyed may-state of (flags origin, compared register) pairs that
     // were redefined on an incoming path. Union at merges makes a secondary
     // safe only when every incoming path preserves every compared value.
@@ -3942,6 +4743,202 @@ ascent_par! {
         flags_arg(origin, mreg),
         reg_def(addr, mreg),
         flags_flow_transparent(addr);
+
+    // Signed x86 overflow after ADD/SUB can be reconstructed exactly from the
+    // wrapped result and the unchanged source: the old destination is
+    // `result - source` for ADD and `result + source` for SUB.  Keeping the
+    // branch at the real JCC preserves the arithmetic write and every
+    // flag-transparent instruction in between.  Only full 32/64-bit register
+    // writes participate; partial-register and memory forms retain the opaque
+    // fallback below.
+    #[local] relation overflow_flags_arg_redefined(Address, Address);
+    overflow_flags_arg_redefined(*origin, *jcc) <--
+        overflow_jcc_flags_origin(origin, jcc),
+        redefined_flags_args_in(jcc, redefined),
+        for (redefined_origin, _) in redefined.0.iter(),
+        if redefined_origin == origin;
+
+    #[local] relation exact_overflow_shape_owner(Address, Address, ExactOverflowShape);
+
+    exact_overflow_shape_owner(*func, *jcc, ExactOverflowShape {
+        operation: OverflowArithmetic::Add,
+        width: *width,
+        result: *result,
+        source: Some(*source),
+    }) <--
+        overflow_jcc_flags_origin(origin, jcc),
+        overflow_jcc(jcc, test, _),
+        if matches!(*test, TestCond::CondO | TestCond::CondNo),
+        padd(origin, dst, src),
+        op_register(dst, dst_str),
+        op_register(src, src_str),
+        raw_gpr_width(width),
+        if x86_gpr_view_width(dst_str) == Some(*width),
+        if x86_gpr_view_width(src_str) == Some(*width),
+        ireg_of(dst_preg, Ireg::from(*dst_str)),
+        preg_of(result, dst_preg),
+        ireg_of(src_preg, Ireg::from(*src_str)),
+        preg_of(source, src_preg),
+        if result != source,
+        instr_in_function(origin, func),
+        instr_in_function(jcc, func),
+        !raw_gpr_unresolved_owner(func),
+        !overflow_flags_arg_redefined(origin, jcc);
+
+    exact_overflow_shape_owner(*func, *jcc, ExactOverflowShape {
+        operation: OverflowArithmetic::Sub,
+        width: *width,
+        result: *result,
+        source: Some(*source),
+    }) <--
+        overflow_jcc_flags_origin(origin, jcc),
+        overflow_jcc(jcc, test, _),
+        if matches!(*test, TestCond::CondO | TestCond::CondNo),
+        psub(origin, dst, src),
+        op_register(dst, dst_str),
+        op_register(src, src_str),
+        raw_gpr_width(width),
+        if x86_gpr_view_width(dst_str) == Some(*width),
+        if x86_gpr_view_width(src_str) == Some(*width),
+        ireg_of(dst_preg, Ireg::from(*dst_str)),
+        preg_of(result, dst_preg),
+        ireg_of(src_preg, Ireg::from(*src_str)),
+        preg_of(source, src_preg),
+        if result != source,
+        instr_in_function(origin, func),
+        instr_in_function(jcc, func),
+        !raw_gpr_unresolved_owner(func),
+        !overflow_flags_arg_redefined(origin, jcc);
+
+    exact_overflow_shape_owner(*func, *jcc, ExactOverflowShape {
+        operation: OverflowArithmetic::AddImmediate(*immediate),
+        width: *width,
+        result: *result,
+        source: None,
+    }) <--
+        overflow_jcc_flags_origin(origin, jcc),
+        overflow_jcc(jcc, test, _),
+        if matches!(*test, TestCond::CondO | TestCond::CondNo),
+        padd(origin, dst, src),
+        op_register(dst, dst_str),
+        op_immediate(src, immediate, _),
+        raw_gpr_width(width),
+        if x86_gpr_view_width(dst_str) == Some(*width),
+        ireg_of(dst_preg, Ireg::from(*dst_str)),
+        preg_of(result, dst_preg),
+        instr_in_function(origin, func),
+        instr_in_function(jcc, func),
+        !raw_gpr_unresolved_owner(func),
+        !overflow_flags_arg_redefined(origin, jcc);
+
+    exact_overflow_shape_owner(*func, *jcc, ExactOverflowShape {
+        operation: OverflowArithmetic::SubImmediate(*immediate),
+        width: *width,
+        result: *result,
+        source: None,
+    }) <--
+        overflow_jcc_flags_origin(origin, jcc),
+        overflow_jcc(jcc, test, _),
+        if matches!(*test, TestCond::CondO | TestCond::CondNo),
+        psub(origin, dst, src),
+        op_register(dst, dst_str),
+        op_immediate(src, immediate, _),
+        raw_gpr_width(width),
+        if x86_gpr_view_width(dst_str) == Some(*width),
+        ireg_of(dst_preg, Ireg::from(*dst_str)),
+        preg_of(result, dst_preg),
+        instr_in_function(origin, func),
+        instr_in_function(jcc, func),
+        !raw_gpr_unresolved_owner(func),
+        !overflow_flags_arg_redefined(origin, jcc);
+
+    exact_overflow_shape_owner(*func, *jcc, ExactOverflowShape {
+        operation: OverflowArithmetic::Neg,
+        width: *width,
+        result: *result,
+        source: None,
+    }) <--
+        overflow_jcc_flags_origin(origin, jcc),
+        overflow_jcc(jcc, test, _),
+        if matches!(*test, TestCond::CondO | TestCond::CondNo),
+        pneg(origin, dst),
+        op_register(dst, dst_str),
+        raw_gpr_width(width),
+        if x86_gpr_view_width(dst_str) == Some(*width),
+        ireg_of(dst_preg, Ireg::from(*dst_str)),
+        preg_of(result, dst_preg),
+        instr_in_function(origin, func),
+        instr_in_function(jcc, func),
+        !raw_gpr_unresolved_owner(func),
+        !overflow_flags_arg_redefined(origin, jcc);
+
+    exact_overflow_shape_owner(*func, *jcc, ExactOverflowShape {
+        operation,
+        width: *width,
+        result: *result,
+        source: None,
+    }) <--
+        overflow_jcc_flags_origin(origin, jcc),
+        overflow_jcc(jcc, test, _),
+        if matches!(*test, TestCond::CondO | TestCond::CondNo),
+        instruction(origin, _, _, mnem, dst, _, _, _, _, _),
+        if *mnem == "INC" || *mnem == "DEC",
+        op_register(dst, dst_str),
+        raw_gpr_width(width),
+        if x86_gpr_view_width(dst_str) == Some(*width),
+        ireg_of(dst_preg, Ireg::from(*dst_str)),
+        preg_of(result, dst_preg),
+        instr_in_function(origin, func),
+        instr_in_function(jcc, func),
+        !raw_gpr_unresolved_owner(func),
+        !overflow_flags_arg_redefined(origin, jcc),
+        let operation = if *mnem == "INC" {
+            OverflowArithmetic::AddImmediate(1)
+        } else {
+            OverflowArithmetic::SubImmediate(1)
+        };
+
+    #[local] relation exact_overflow_owner_proved(Address, Address);
+    exact_overflow_owner_proved(func, jcc) <--
+        exact_overflow_shape_owner(func, jcc, _);
+
+    // Addresses may belong to more than one inferred function.  An
+    // address-global condition is exact only if every owner proves one shape
+    // and all proven shapes agree.
+    #[local] relation exact_overflow_owner_missing(Address);
+    exact_overflow_owner_missing(*jcc) <--
+        overflow_jcc(jcc, test, _),
+        if matches!(*test, TestCond::CondO | TestCond::CondNo),
+        instr_in_function(jcc, func),
+        !exact_overflow_owner_proved(func, jcc);
+
+    #[local] relation exact_overflow_shape_conflict(Address);
+    exact_overflow_shape_conflict(*jcc) <--
+        exact_overflow_shape_owner(_, jcc, left),
+        exact_overflow_shape_owner(_, jcc, right),
+        if left != right;
+
+    #[local] relation exact_overflow_shape(Address, ExactOverflowShape);
+    exact_overflow_shape(*jcc, *shape) <--
+        exact_overflow_shape_owner(_, jcc, shape),
+        !exact_overflow_owner_missing(jcc),
+        !exact_overflow_shape_conflict(jcc);
+
+    #[local] relation exact_overflow_condition(Address, Condition, Arc<Vec<Mreg>>, Symbol);
+    exact_overflow_condition(*jcc, condition, args, label) <--
+        exact_overflow_shape(jcc, shape),
+        overflow_jcc(jcc, test, label),
+        if let Some((condition, args)) = lower_exact_overflow_condition(*shape, *test);
+
+    #[local] relation exact_overflow_jcc(Address);
+    exact_overflow_jcc(jcc) <-- exact_overflow_condition(jcc, _, _, _);
+
+    mach_inst(jcc, MachInst::Mcond(condition.clone(), args.clone(), label)) <--
+        exact_overflow_condition(jcc, condition, args, label);
+
+    reg_use(jcc, *arg) <--
+        exact_overflow_condition(jcc, _, args, _),
+        for arg in args.iter();
 
     // When a compared register is redefined on any CFG path to a secondary
     // jcc, re-reading it would test the wrong value. Keep that consumer keyed
@@ -4921,11 +5918,16 @@ ascent_par! {
     mach_inst(addr, MachInst::Mcond(Condition::Ccomplimm(Comparison::Ceq, 0), Arc::new(vec![Mreg::CX]), dst)) <--
         instruction(addr, _, _, "JRCXZ", dst, _, _, _, _, _);
 
-    // ASM-5: JO/JNO lift to the opaque Coverflow/Cnotoverflow, emitted self-contained at the jump's own address so a preceding CMP is never folded into a false comparison.
+    // Unsupported JO/JNO producers retain an opaque condition, preserving both
+    // CFG edges without inventing arithmetic semantics.  A proved arithmetic
+    // shape above owns the JCC exclusively so selection cannot choose this
+    // weaker fallback instead.
     mach_inst(addr, MachInst::Mcond(Condition::Coverflow, Arc::new(vec![]), dst)) <--
-        instruction(addr, _, _, "JO", dst, _, _, _, _, _);
+        instruction(addr, _, _, "JO", dst, _, _, _, _, _),
+        !exact_overflow_jcc(addr);
     mach_inst(addr, MachInst::Mcond(Condition::Cnotoverflow, Arc::new(vec![]), dst)) <--
-        instruction(addr, _, _, "JNO", dst, _, _, _, _, _);
+        instruction(addr, _, _, "JNO", dst, _, _, _, _, _),
+        !exact_overflow_jcc(addr);
 
     // ASM-5: LOOP/LOOPE/LOOPNE branch iff the decremented RCX != 0, which as a function of RCX at the instruction is exactly Ccomplimm(Cne, 1); the RCX write-back and ZF refinement are not modelled.
     mach_inst(addr, MachInst::Mcond(Condition::Ccomplimm(Comparison::Cne, 1), Arc::new(vec![Mreg::CX]), dst)) <--
@@ -5771,100 +6773,115 @@ ascent_par! {
         op_immediate(shr_src, shift_n, _),
         if *shift_n >= 32;
 
-    // Unsigned magic-divide with the magic pre-loaded in a register, bound to the IMUL by REGISTER IDENTITY rather than address order; the |2^k/d - magic| <= 1 recover step is the safety net.
-
-    // reg_loads_magic: a register loaded with a 32-bit immediate, kept as its unsigned low-32 value since capstone may sign-extend it.
-    #[local] relation reg_loads_magic(Ireg, i64);
-    reg_loads_magic(Ireg::from(dst_str), (*magic as u32) as i64) <--
-        pmov(mov_addr, mov_dst, mov_src),
-        instruction(mov_addr, _, _, "MOV", _, _, _, _, _, _),
-        op_register(mov_dst, dst_str),
-        op_immediate(mov_src, magic, _);
-
-    // imul_dst_unwritten_until: cur_addr is reached over the literal next-chain with nothing between writing dst_ireg, bounded to a short window; next is adjacency, not a reachability test.
-    #[local] relation imul2_magic(Address, Ireg, Ireg, i64);
-    imul2_magic(imul_addr, Ireg::from(imul_dst_str), Ireg::from(imul_src_str), *magic_masked) <--
-        pimul(imul_addr, imul_dst, imul_src),
-        op_register(imul_dst, imul_dst_str),
-        reg_is_64(imul_dst_str, true),
-        op_register(imul_src, imul_src_str),
-        if Ireg::from(imul_src_str) != Ireg::from(imul_dst_str),
-        reg_loads_magic(Ireg::from(imul_src_str), magic_masked);
+    // Unsigned magic-divide with the magic pre-loaded in a register.  Query
+    // the exact owner-keyed value reaching the IMUL; projecting a global
+    // `(register, constant)` fact allowed overwritten and cross-function loads
+    // to certify unrelated multiplies.
+    #[local] relation imul2_magic(Address, Address, Ireg, Ireg, i64);
+    imul2_magic(*func, *imul_addr, dst_ireg, src_ireg, magic) <--
+        raw_magic_imul_candidate(func, imul_addr, dst_mreg, src_mreg),
+        raw_gpr_exact_value(func, imul_addr, src_mreg, 8, value),
+        if let RawGprValue::Constant(magic_u64) = value,
+        if *magic_u64 <= u32::MAX as u64,
+        let magic = *magic_u64 as i64,
+        preg_of(dst_mreg, dst_preg),
+        ireg_of(dst_preg, dst_ireg),
+        preg_of(src_mreg, src_preg),
+        ireg_of(src_preg, src_ireg);
 
     // Depth-bounded (<=4 hops): the SHR is at most a couple of interleaved ops past the IMUL.
-    #[local] relation imul2_dst_unwritten(Address, Address, Ireg, usize);
-    imul2_dst_unwritten(imul_addr, next_addr, *dst_ireg, 1) <--
-        imul2_magic(imul_addr, dst_ireg, _, _),
-        next(imul_addr, next_addr);
-    imul2_dst_unwritten(imul_addr, next_addr, *dst_ireg, h+1) <--
-        imul2_dst_unwritten(imul_addr, cur_addr, dst_ireg, h),
+    #[local] relation imul2_dst_unwritten(Address, Address, Address, Ireg, usize);
+    imul2_dst_unwritten(*func, *imul_addr, *next_addr, *dst_ireg, 1) <--
+        imul2_magic(func, imul_addr, dst_ireg, _, _),
+        owned_straightline_step(func, imul_addr, next_addr);
+    imul2_dst_unwritten(*func, *imul_addr, *next_addr, *dst_ireg, h+1) <--
+        imul2_dst_unwritten(func, imul_addr, cur_addr, dst_ireg, h),
         if *h < 4,
         ireg_of(preg, dst_ireg),
         preg_of(dst_mreg, preg),
         !reg_def(cur_addr, dst_mreg),
-        next(cur_addr, next_addr);
+        owned_straightline_step(func, cur_addr, next_addr);
 
     // div_magic_2op: a recovered unsigned magic divide, where quot_ireg is the IMUL/SHR dst and dividend_ireg is the value the IMUL read.
     #[local] relation div_magic_2op(Address, Address, i64, Ireg, Ireg);
 
     // The SHR of the IMUL dst, k>=32, reached without an intervening overwrite of that register.
-    #[local] relation imul2_shr(Address, Address, Ireg, i64);
-    imul2_shr(imul_addr, shr_addr, *dst_ireg, *shift_n) <--
-        imul2_magic(imul_addr, dst_ireg, _, _),
-        next(imul_addr, shr_addr),
+    #[local] relation imul2_shr(Address, Address, Address, Ireg, i64);
+    imul2_shr(*func, *imul_addr, *shr_addr, *dst_ireg, *shift_n) <--
+        imul2_magic(func, imul_addr, dst_ireg, _, _),
+        owned_straightline_step(func, imul_addr, shr_addr),
         pshr(shr_addr, shr_dst, shr_src),
         op_register(shr_dst, shr_dst_str),
         if Ireg::from(shr_dst_str) == *dst_ireg,
+        if x86_gpr_view_width(shr_dst_str) == Some(8),
         op_immediate(shr_src, shift_n, _),
         if *shift_n >= 32;
-    imul2_shr(imul_addr, shr_addr, *dst_ireg, *shift_n) <--
-        imul2_dst_unwritten(imul_addr, cur_addr, dst_ireg, _),
-        next(cur_addr, shr_addr),
+    imul2_shr(*func, *imul_addr, *shr_addr, *dst_ireg, *shift_n) <--
+        imul2_dst_unwritten(func, imul_addr, cur_addr, dst_ireg, _),
+        owned_straightline_step(func, cur_addr, shr_addr),
         ireg_of(preg, dst_ireg),
         preg_of(dst_mreg, preg),
         !reg_def(cur_addr, dst_mreg),
         pshr(shr_addr, shr_dst, shr_src),
         op_register(shr_dst, shr_dst_str),
         if Ireg::from(shr_dst_str) == *dst_ireg,
+        if x86_gpr_view_width(shr_dst_str) == Some(8),
         op_immediate(shr_src, shift_n, _),
         if *shift_n >= 32;
 
     // Dividend feeding the IMUL: SRC when the preceding instruction is a reg-to-reg copy into the IMUL dst, otherwise the IMUL dst already held it.
-    #[local] relation imul2_dividend(Address, Ireg, Ireg);
-    imul2_dividend(imul_addr, Ireg::from(src_str), *quot_ireg) <--
-        imul2_magic(imul_addr, quot_ireg, _, _),
-        prev_instr(imul_addr, prev_addr),
+    #[local] relation imul2_dividend(Address, Address, Ireg, Ireg);
+    imul2_dividend(*func, *imul_addr, Ireg::from(src_str), *quot_ireg) <--
+        imul2_magic(func, imul_addr, quot_ireg, _, _),
+        owned_straightline_step(func, prev_addr, imul_addr),
         pmov(prev_addr, mov_dst, mov_src),
         instruction(prev_addr, _, _, "MOV", _, _, _, _, _, _),
         op_register(mov_dst, mov_dst_str),
         if Ireg::from(mov_dst_str) == *quot_ireg,
+        if x86_gpr_view_width(mov_dst_str) == Some(8),
         op_register(mov_src, src_str),
+        if x86_gpr_view_width(src_str) == Some(8),
         if Ireg::from(src_str) != *quot_ireg;
-    imul2_dividend(imul_addr, *quot_ireg, *quot_ireg) <--
-        imul2_magic(imul_addr, quot_ireg, _, _),
-        prev_instr(imul_addr, prev_addr),
-        !magic_prev_mov_into_dst(imul_addr, prev_addr);
+    imul2_dividend(*func, *imul_addr, *quot_ireg, *quot_ireg) <--
+        imul2_magic(func, imul_addr, quot_ireg, _, _),
+        owned_straightline_step(func, prev_addr, imul_addr),
+        !magic_prev_mov_into_dst(func, imul_addr, prev_addr);
 
     // Helper: the instruction before the IMUL is a reg-to-reg `mov IMUL_DST, SRC`.
-    #[local] relation magic_prev_mov_into_dst(Address, Address);
-    magic_prev_mov_into_dst(imul_addr, prev_addr) <--
-        imul2_magic(imul_addr, quot_ireg, _, _),
-        prev_instr(imul_addr, prev_addr),
+    #[local] relation magic_prev_mov_into_dst(Address, Address, Address);
+    magic_prev_mov_into_dst(*func, *imul_addr, *prev_addr) <--
+        imul2_magic(func, imul_addr, quot_ireg, _, _),
+        owned_straightline_step(func, prev_addr, imul_addr),
         pmov(prev_addr, mov_dst, mov_src),
         instruction(prev_addr, _, _, "MOV", _, _, _, _, _, _),
         op_register(mov_dst, mov_dst_str),
         if Ireg::from(mov_dst_str) == *quot_ireg,
+        if x86_gpr_view_width(mov_dst_str) == Some(8),
         op_register(mov_src, src_str),
+        if x86_gpr_view_width(src_str) == Some(8),
         if Ireg::from(src_str) != *quot_ireg;
 
-    div_magic_2op(imul_addr, shr_addr, divisor, *dividend_ireg, *quot_ireg) <--
-        imul2_magic(imul_addr, quot_ireg, _magic_reg, magic),
-        imul2_shr(imul_addr, shr_addr, _, shift_n),
-        imul2_dividend(imul_addr, dividend_ireg, _),
-        let divisor_opt = recover_unsigned_divisor(*magic, *shift_n),
+    #[local] relation div_magic_2op_owner(Address, Address, Address, i64, Ireg, Ireg);
+    div_magic_2op_owner(*func, *imul_addr, *shr_addr, divisor, *dividend_ireg, *quot_ireg) <--
+        imul2_magic(func, imul_addr, quot_ireg, _magic_reg, magic),
+        imul2_shr(func, imul_addr, shr_addr, _, shift_n),
+        imul2_dividend(func, imul_addr, dividend_ireg, _),
+        let divisor_opt = recover_unsigned_divisor(*magic, *shift_n, 32),
         if divisor_opt.is_some(),
         let divisor = divisor_opt.unwrap(),
         if divisor >= 2 && divisor <= 1_000_000_000;
+
+    // Mach instructions are address-global.  A shared instruction is safe to
+    // rewrite only when every inferred owner proves the same division.
+    #[local] relation div_magic_2op_owner_missing(Address, Address, i64, Ireg, Ireg);
+    div_magic_2op_owner_missing(*imul_addr, *shr_addr, *divisor, *dividend, *quotient) <--
+        div_magic_2op_owner(_, imul_addr, shr_addr, divisor, dividend, quotient),
+        instr_in_function(imul_addr, other_func),
+        !div_magic_2op_owner(other_func, imul_addr, shr_addr, divisor, dividend, quotient);
+
+    div_magic_2op(*imul_addr, *shr_addr, *divisor, *dividend, *quotient) <--
+        div_magic_2op_owner(_, imul_addr, shr_addr, divisor, dividend, quotient),
+        !div_magic_2op_owner_missing(imul_addr, shr_addr, divisor, dividend, quotient);
 
     // Emit Odivuimm at the IMUL address (capstone reg_use there covers the dividend register).
     mach_inst(imul_addr, MachInst::Mop(op.clone(), Arc::new(args.clone()), *quot_mreg)) <--
@@ -5885,10 +6902,6 @@ ascent_par! {
     // Suppress the raw IMUL and SHR; any intervening unrelated instruction stays, since it does not touch the dividend/quotient register.
     div_consumed(imul_addr) <-- div_magic_2op(imul_addr, _, _, _, _);
     div_consumed(shr_addr) <-- div_magic_2op(_, shr_addr, _, _, _);
-
-    // Seed the modulo synthesis chain so an x % K next to the recovered x / K is also lifted; the endpoint is the SHR, where the quotient lands in quot_ireg.
-    divide_q(shr_addr, *quot_ireg, *divisor, *dividend_ireg, false) <--
-        div_magic_2op(_imul_addr, shr_addr, divisor, dividend_ireg, quot_ireg);
 
     // Sign correction: SAR/SHR $31/$63 + SUB (signed division fixup)
     #[local] relation sign_correction(Address, Address, Ireg, Ireg, i64);
@@ -6003,10 +7016,12 @@ ascent_par! {
 
     // Unsigned div: MOV $MAGIC -> IMUL -> SHR (no sign correction).
     mach_inst(imul_addr, MachInst::Mop(op.clone(), Arc::new(args.clone()), *result_mreg)) <--
-        div_magic_64(addr0, _shift_addr, magic, shift_n, input_ireg, result_ireg),
+        div_magic_64(addr0, shift_addr, magic, shift_n, input_ireg, result_ireg),
         next(addr0, imul_addr),
-        // Unsigned: the SHR is logical (already in div_magic_64) and no sign_correction follows
-        let divisor_opt = recover_unsigned_divisor(*magic, *shift_n),
+        // div_magic_64 deliberately recognizes both SAR and SHR for the signed
+        // family; unsigned division requires the logical form explicitly.
+        pshr(shift_addr, _, _),
+        let divisor_opt = recover_unsigned_divisor(*magic, *shift_n, 32),
         if divisor_opt.is_some(),
         let divisor = divisor_opt.unwrap(),
         ireg_of(preg_of_input, input_ireg),
@@ -6059,12 +7074,53 @@ ascent_par! {
 
     // Magic-modulo recognition: x86-64 lowers `n % K` as q = magic-divide(n, K); t = q * K (1-3 LEA/ADD/IMUL); r = n - t. Synthesize one Omodimm/Omodlimm Mop at the SUB; upstream Odivimm/Odivlimm stays for sources using both q and r.
 
-    // divide_q records each div_magic_* chain endpoint and the quotient reg there. Tuple: (end_addr last instr, q_ireg quotient reg, divisor K, input_ireg dividend, is_long false=Omodimm/true=Omodlimm).
-    #[local] relation divide_q(Address, Ireg, i64, Ireg, bool);
+    // Owner and the exact point which reads the dividend remain attached to
+    // every quotient fact.  Downstream modulo recovery compares the value at
+    // that point with the value reaching the final SUB; a register name alone
+    // is not provenance.
+    // (owner, input point, endpoint, quotient, divisor, dividend, width,
+    // unsigned).
+    #[local] relation divide_q(Address, Address, Address, Ireg, i64, Ireg, i64, bool);
+
+    // One provenance shape for every exact unsigned magic divide accepted by
+    // this pass.  GCC commonly uses a preloaded magic register and reaches the
+    // newer div_magic_2op matcher; Clang commonly loads the magic immediately
+    // before IMUL and reaches the older div_magic_64 matcher.  Both produce the
+    // same quotient identity, and downstream remainder recovery must not
+    // depend on which syntactic recognizer happened to find it.
+    // Tuple: (IMUL/use site, quotient endpoint, quotient, divisor, dividend,
+    // result width).
+    #[local] relation unsigned_divide_origin(Address, Address, Address, Ireg, i64, Ireg, bool);
+    unsigned_divide_origin(*func, *imul_addr, *shr_addr, *quotient, *divisor, *dividend, false) <--
+        div_magic_2op_owner(func, imul_addr, shr_addr, divisor, dividend, quotient),
+        !div_magic_2op_owner_missing(imul_addr, shr_addr, divisor, dividend, quotient);
+
+    unsigned_divide_origin(*func, *imul_addr, *shift_addr, *result, divisor, *input, false) <--
+        div_magic_64(magic_load, shift_addr, magic, shift_n, input, result),
+        owned_straightline_step(func, magic_load, imul_addr),
+        owned_straightline_step(func, imul_addr, shift_addr),
+        pimul(imul_addr, imul_dst, imul_src),
+        op_register(imul_dst, imul_dst_str),
+        op_register(imul_src, imul_src_str),
+        if x86_gpr_view_width(imul_dst_str) == Some(8),
+        if x86_gpr_view_width(imul_src_str) == Some(8),
+        pshr(shift_addr, shift_dst, _),
+        op_register(shift_dst, shift_dst_str),
+        if x86_gpr_view_width(shift_dst_str) == Some(8),
+        let divisor_opt = recover_unsigned_divisor(*magic, *shift_n, 32),
+        if divisor_opt.is_some(),
+        let divisor = divisor_opt.unwrap(),
+        if divisor >= 2 && divisor <= 1_000_000_000;
+
+    divide_q(*func, *imul_addr, *endpoint, *quotient, *divisor, *input, width, true) <--
+        unsigned_divide_origin(func, imul_addr, endpoint, quotient, divisor, input, is_long),
+        let width = if *is_long { 8 } else { 4 };
 
     // div_magic_32 variant 1: MOVSXD->IMUL3->SAR->sign_correction(SAR31, SUB).
-    divide_q(sub_addr, *result_ireg, divisor, *input_ireg, false) <--
-        div_magic_32(_addr0, shift_addr, magic, shift_n, input_ireg, result_ireg),
+    divide_q(*func, *addr0, *sub_addr, *result_ireg, divisor, *input_ireg, 4, false) <--
+        div_magic_32(addr0, shift_addr, magic, shift_n, input_ireg, result_ireg),
+        instr_in_function(addr0, func),
+        instr_in_function(sub_addr, func),
         let divisor_opt = recover_signed_divisor(*magic, *shift_n),
         if divisor_opt.is_some(),
         let divisor = divisor_opt.unwrap(),
@@ -6074,8 +7130,10 @@ ascent_par! {
         if sub_dst_ireg == result_ireg;
 
     // div_magic_32 variant 2: MOVSXD->IMUL3->SAR->MOV(copy)->SAR->SUB.
-    divide_q(sub_addr, *result_ireg, divisor, *input_ireg, false) <--
-        div_magic_32(_addr0, shift_addr, magic, shift_n, input_ireg, result_ireg),
+    divide_q(*func, *addr0, *sub_addr, *result_ireg, divisor, *input_ireg, 4, false) <--
+        div_magic_32(addr0, shift_addr, magic, shift_n, input_ireg, result_ireg),
+        instr_in_function(addr0, func),
+        instr_in_function(sub_addr, func),
         let divisor_opt = recover_signed_divisor(*magic, *shift_n),
         if divisor_opt.is_some(),
         let divisor = divisor_opt.unwrap(),
@@ -6091,8 +7149,10 @@ ascent_par! {
         if sub_dst_ireg == result_ireg;
 
     // div_magic_32_compensating_gcc: 7 instructions ending at the SUB.
-    divide_q(addr6, *result_ireg, divisor, *input_ireg, false) <--
+    divide_q(*func, *addr0, addr6, *result_ireg, divisor, *input_ireg, 4, false) <--
         div_magic_32_compensating_gcc(addr0, _, magic, total_shift, input_ireg, result_ireg),
+        instr_in_function(addr0, func),
+        instr_in_function(addr6, func),
         let divisor_opt = recover_signed_divisor_compensating(*magic, *total_shift),
         if divisor_opt.is_some(),
         let divisor = divisor_opt.unwrap(),
@@ -6104,8 +7164,10 @@ ascent_par! {
         next(a5, addr6);
 
     // div_magic_32_compensating (clang): 8 instructions ending at the final ADD.
-    divide_q(addr7, *result_ireg, divisor, *input_ireg, false) <--
+    divide_q(*func, *addr0, addr7, *result_ireg, divisor, *input_ireg, 4, false) <--
         div_magic_32_compensating(addr0, _, magic, total_shift, input_ireg, result_ireg),
+        instr_in_function(addr0, func),
+        instr_in_function(addr7, func),
         let divisor_opt = recover_signed_divisor_compensating(*magic, *total_shift),
         if divisor_opt.is_some(),
         let divisor = divisor_opt.unwrap(),
@@ -6118,8 +7180,10 @@ ascent_par! {
         next(a6, addr7);
 
     // div_magic_32_signbias_partial (clang n/10 partial-reg): 6 instrs (movsxd + 5), end at ADD; q in partial_ireg. The relation's 5th field is MOVSXD's dst; use MOVSXD's src for divide_q so the mod Mop's input is the original param, not the suppressed cast dst.
-    divide_q(addr5, *partial_ireg, divisor, Ireg::from(*movsxd_src_str), false) <--
+    divide_q(*func, *movsxd_addr, addr5, *partial_ireg, divisor, Ireg::from(*movsxd_src_str), 4, false) <--
         div_magic_32_signbias_partial(movsxd_addr, imul_addr, magic, total_shift, _result_ireg, partial_ireg),
+        instr_in_function(movsxd_addr, func),
+        instr_in_function(addr5, func),
         let divisor_opt = recover_signed_divisor(*magic, *total_shift),
         if divisor_opt.is_some(),
         let divisor = divisor_opt.unwrap(),
@@ -6131,8 +7195,10 @@ ascent_par! {
         next(a4, addr5);
 
     // div_magic_32_signbias (clang small magic, n/3 etc.): 6 instrs ending at ADD.
-    divide_q(addr5, *result_ireg, divisor, *input_ireg, false) <--
+    divide_q(*func, *addr0, addr5, *result_ireg, divisor, *input_ireg, 4, false) <--
         div_magic_32_signbias(addr0, _, magic, total_shift, input_ireg, result_ireg),
+        instr_in_function(addr0, func),
+        instr_in_function(addr5, func),
         let divisor_opt = recover_signed_divisor(*magic, *total_shift),
         if divisor_opt.is_some(),
         let divisor = divisor_opt.unwrap(),
@@ -6143,25 +7209,31 @@ ascent_par! {
         next(a4, addr5);
 
     // div_magic_64 (signed): MOV->IMUL->SHR/SAR->sign_correction(SAR63, SUB).
-    divide_q(sub_addr, *result_ireg, divisor, *input_ireg, true) <--
-        div_magic_64(_addr0, shift_addr, magic, shift_n, input_ireg, result_ireg),
+    divide_q(*func, *imul_addr, *sub_addr, *result_ireg, divisor, *input_ireg, 8, false) <--
+        div_magic_64(addr0, shift_addr, magic, shift_n, input_ireg, result_ireg),
+        owned_straightline_step(func, addr0, imul_addr),
+        instr_in_function(sub_addr, func),
         let divisor_opt = recover_signed_divisor(*magic, *shift_n),
         if divisor_opt.is_some(),
         let divisor = divisor_opt.unwrap(),
         next(shift_addr, sign_addr),
         sign_correction(sign_addr, sub_addr, _, _, 63);
 
-    // q_factor(addr, ireg, factor, input_ireg, divisor, is_long): after addr, `ireg` holds factor * (input_ireg / divisor). Invariant carried only through LEA/ADD/IMUL3/MOV; other writers drop the entry.
-    #[local] relation q_factor(Address, Ireg, i64, Ireg, i64, bool);
+    // q_factor(owner, divide endpoint, point, register, factor, input,
+    // divisor, exact value width, unsigned, semantic participants).  Every
+    // transition stays inside one owned basic block.  The small participant
+    // set records only instructions which compute q*K; transparent interleaved
+    // instructions are never deleted when the idiom is replaced.
+    #[local] relation q_factor(Address, Address, Address, Ireg, i64, Ireg, i64, i64, bool, Set<Address>);
 
-    // Bootstrap: divide endpoint contributes q_factor=1 for the q register.
-    q_factor(end_addr, *q_ireg, 1, *input_ireg, *divisor, *is_long) <--
-        divide_q(end_addr, q_ireg, divisor, input_ireg, is_long);
+    q_factor(*func, *end_addr, *end_addr, *q_ireg, 1, *input_ireg, *divisor,
+             *width, *is_unsigned, Set::default()) <--
+        divide_q(func, _, end_addr, q_ireg, divisor, input_ireg, width, is_unsigned);
 
-    // Generation: LEA dst, [r,r,scale] with disp=0  =>  dst = factor * (scale+1).
-    q_factor(lea_addr, dst_ireg, new_factor, *input, *divisor, *is_long) <--
-        q_factor(prev_addr, base_ireg, factor, input, divisor, is_long),
-        next(prev_addr, lea_addr),
+    q_factor(*func, *origin, *lea_addr, dst_ireg, new_factor, *input, *divisor,
+             *width, *is_unsigned, new_participants) <--
+        q_factor(func, origin, prev_addr, base_ireg, factor, input, divisor, width, is_unsigned, participants),
+        owned_straightline_step(func, prev_addr, lea_addr),
         plea(lea_addr, lea_dst, lea_src),
         op_indirect(lea_src, _, base_str, idx_str, scale, 0, _),
         if Ireg::from(*base_str) == *base_ireg,
@@ -6170,151 +7242,421 @@ ascent_par! {
         let new_factor = factor.checked_mul(scale + 1).unwrap_or(0),
         if new_factor != 0,
         op_register(lea_dst, dst_str),
-        let dst_ireg = Ireg::from(*dst_str);
+        if x86_gpr_view_width(dst_str) == Some(*width),
+        let dst_ireg = Ireg::from(*dst_str),
+        if let Some(new_participants) = q_participants_with(participants, *lea_addr);
 
-    // Generation: ADD dst, src (both regs hold q-factors)  =>  dst gets f_dst + f_src.
-    q_factor(add_addr, dst_ireg, new_factor, *input, *divisor, *is_long) <--
-        q_factor(prev_addr, dst_ireg, f_dst, input, divisor, is_long),
-        q_factor(prev_addr, src_ireg, f_src, input, divisor, is_long),
-        next(prev_addr, add_addr),
+    q_factor(*func, *origin, *add_addr, dst_ireg, new_factor, *input, *divisor,
+             *width, *is_unsigned, new_participants) <--
+        q_factor(func, origin, prev_addr, dst_ireg, f_dst, input, divisor, width, is_unsigned, dst_participants),
+        q_factor(func, origin, prev_addr, src_ireg, f_src, input, divisor, width, is_unsigned, src_participants),
+        owned_straightline_step(func, prev_addr, add_addr),
         padd(add_addr, dst_sym, src_sym),
         op_register(dst_sym, dst_str),
         op_register(src_sym, src_str),
+        if x86_gpr_view_width(dst_str) == Some(*width),
+        if x86_gpr_view_width(src_str) == Some(*width),
         if Ireg::from(*dst_str) == *dst_ireg,
         if Ireg::from(*src_str) == *src_ireg,
         let new_factor = f_dst.checked_add(*f_src).unwrap_or(0),
-        if new_factor != 0;
+        if new_factor != 0,
+        if let Some(new_participants) = q_participants_merge(dst_participants, src_participants, *add_addr);
 
-    // Generation: IMUL3 dst, src, imm  =>  dst = f_src * imm.
-    q_factor(imul_addr, dst_ireg, new_factor, *input, *divisor, *is_long) <--
-        q_factor(prev_addr, src_ireg, f_src, input, divisor, is_long),
-        next(prev_addr, imul_addr),
+    q_factor(*func, *origin, *imul_addr, dst_ireg, new_factor, *input, *divisor,
+             *width, *is_unsigned, new_participants) <--
+        q_factor(func, origin, prev_addr, src_ireg, f_src, input, divisor, width, is_unsigned, participants),
+        owned_straightline_step(func, prev_addr, imul_addr),
         pimul3(imul_addr, imul_dst, imul_src, imul_imm),
         op_register(imul_src, src_str),
+        op_register(imul_dst, dst_str),
+        if x86_gpr_view_width(src_str) == Some(*width),
+        if x86_gpr_view_width(dst_str) == Some(*width),
         if Ireg::from(*src_str) == *src_ireg,
         op_immediate(imul_imm, imm, _),
         let new_factor = f_src.checked_mul(*imm).unwrap_or(0),
         if new_factor != 0,
-        op_register(imul_dst, dst_str),
-        let dst_ireg = Ireg::from(*dst_str);
-
-    // Generation: MOV dst, src (reg-to-reg copy)  =>  dst gets f_src.
-    q_factor(mov_addr, dst_ireg, factor, *input, *divisor, *is_long) <--
-        q_factor(prev_addr, src_ireg, factor, input, divisor, is_long),
-        next(prev_addr, mov_addr),
-        pmov(mov_addr, mov_dst, mov_src),
-        op_register(mov_src, src_str),
-        if Ireg::from(*src_str) == *src_ireg,
-        op_register(mov_dst, dst_str),
         let dst_ireg = Ireg::from(*dst_str),
-        if dst_ireg != *src_ireg;
+        if let Some(new_participants) = q_participants_with(participants, *imul_addr);
 
-    // Carry-forward: LEA/ADD/IMUL3/MOV (the four q*K participants) preserve q_factor when they don't overwrite ireg.
-    q_factor(lea_addr, *ireg, factor, *input, *divisor, *is_long) <--
-        q_factor(prev_addr, ireg, factor, input, divisor, is_long),
-        next(prev_addr, lea_addr),
+    q_factor(*func, *origin, *mov_addr, dst_ireg, *factor, *input, *divisor,
+             *width, *is_unsigned, new_participants) <--
+        q_factor(func, origin, prev_addr, src_ireg, factor, input, divisor, width, is_unsigned, participants),
+        owned_straightline_step(func, prev_addr, mov_addr),
+        pmov(mov_addr, mov_dst, mov_src),
+        instruction(mov_addr, _, _, "MOV", _, _, _, _, _, _),
+        op_register(mov_src, src_str),
+        op_register(mov_dst, dst_str),
+        if x86_gpr_view_width(src_str) == Some(*width),
+        if x86_gpr_view_width(dst_str) == Some(*width),
+        if Ireg::from(*src_str) == *src_ireg,
+        let dst_ireg = Ireg::from(*dst_str),
+        if dst_ireg != *src_ireg,
+        if let Some(new_participants) = q_participants_with(participants, *mov_addr);
+
+    // The recognized instruction alphabet may contain unrelated operations.
+    // They preserve a q fact only when their destination is a different
+    // physical register, and are deliberately absent from participants.
+    q_factor(*func, *origin, *lea_addr, *ireg, *factor, *input, *divisor,
+             *width, *is_unsigned, participants.clone()) <--
+        q_factor(func, origin, prev_addr, ireg, factor, input, divisor, width, is_unsigned, participants),
+        owned_straightline_step(func, prev_addr, lea_addr),
         plea(lea_addr, lea_dst, _),
         op_register(lea_dst, dst_str),
         if Ireg::from(*dst_str) != *ireg;
 
-    q_factor(add_addr, *ireg, factor, *input, *divisor, *is_long) <--
-        q_factor(prev_addr, ireg, factor, input, divisor, is_long),
-        next(prev_addr, add_addr),
+    q_factor(*func, *origin, *add_addr, *ireg, *factor, *input, *divisor,
+             *width, *is_unsigned, participants.clone()) <--
+        q_factor(func, origin, prev_addr, ireg, factor, input, divisor, width, is_unsigned, participants),
+        owned_straightline_step(func, prev_addr, add_addr),
         padd(add_addr, add_dst, _),
         op_register(add_dst, dst_str),
         if Ireg::from(*dst_str) != *ireg;
 
-    q_factor(imul_addr, *ireg, factor, *input, *divisor, *is_long) <--
-        q_factor(prev_addr, ireg, factor, input, divisor, is_long),
-        next(prev_addr, imul_addr),
+    q_factor(*func, *origin, *imul_addr, *ireg, *factor, *input, *divisor,
+             *width, *is_unsigned, participants.clone()) <--
+        q_factor(func, origin, prev_addr, ireg, factor, input, divisor, width, is_unsigned, participants),
+        owned_straightline_step(func, prev_addr, imul_addr),
         pimul3(imul_addr, imul_dst, _, _),
         op_register(imul_dst, dst_str),
         if Ireg::from(*dst_str) != *ireg;
 
-    q_factor(mov_addr, *ireg, factor, *input, *divisor, *is_long) <--
-        q_factor(prev_addr, ireg, factor, input, divisor, is_long),
-        next(prev_addr, mov_addr),
+    q_factor(*func, *origin, *mov_addr, *ireg, *factor, *input, *divisor,
+             *width, *is_unsigned, participants.clone()) <--
+        q_factor(func, origin, prev_addr, ireg, factor, input, divisor, width, is_unsigned, participants),
+        owned_straightline_step(func, prev_addr, mov_addr),
         pmov(mov_addr, mov_dst, _),
         op_register(mov_dst, dst_str),
         if Ireg::from(*dst_str) != *ireg;
 
-    // Memory-store MOV (`mov %reg, [mem]`) writes to memory, not to any register, so q_factor for every register is preserved.
-    q_factor(mov_addr, *ireg, factor, *input, *divisor, *is_long) <--
-        q_factor(prev_addr, ireg, factor, input, divisor, is_long),
-        next(prev_addr, mov_addr),
+    q_factor(*func, *origin, *mov_addr, *ireg, *factor, *input, *divisor,
+             *width, *is_unsigned, participants.clone()) <--
+        q_factor(func, origin, prev_addr, ireg, factor, input, divisor, width, is_unsigned, participants),
+        owned_straightline_step(func, prev_addr, mov_addr),
         pmov(mov_addr, mov_dst, _),
         !op_register(mov_dst, _);
 
-    // Modulo synthesis: SUB n, qK_reg where qK_reg holds factor=K * q. Tuple: (sub_addr, dst_mreg, input_mreg, divisor, is_long).
-    #[local] relation mod_synth(Address, Mreg, Mreg, i64, bool);
-
-    // Dividend value tracking: which regs hold input_ireg at sub_addr. Simple sub_dst==input_ireg misses MOVSXD-then-SUB cases (e.g. `movsxd rax,edi; sub eax,ecx` where EAX is a different Ireg from EDI).
-    #[local] relation dividend_holder(Address, Ireg, Ireg, i64, bool);
-
-    dividend_holder(*sub_addr, *input_ireg, *input_ireg, *divisor, *is_long) <--
-        psub(sub_addr, _, _),
-        divide_q(_, _, divisor, input_ireg, is_long);
-
-    // low-32 alias of any MOVSXD/MOV; divide_q drives so the mov_src filter prunes pmov early and psub is crossed LAST, since leading with psub made every subtract multiply the cross-product (36s).
-    dividend_holder(*sub_addr, low32_ireg, *input_ireg, *divisor, *is_long) <--
-        divide_q(_, _, divisor, input_ireg, is_long),
-        pmov(_mov_addr, mov_dst_sym, mov_src_sym),
-        op_register(mov_src_sym, mov_src_str),
-        if Ireg::from(*mov_src_str) == *input_ireg,
-        op_register(mov_dst_sym, mov_dst_str),
-        let low32_ireg = Ireg::from(reg_low32_alias(*mov_dst_str)),
-        psub(sub_addr, _, _);
-
-    // full-width MOVSXD dst (e.g., RAX itself when source is EDI).
-    dividend_holder(*sub_addr, mov_dst_full_ireg, *input_ireg, *divisor, *is_long) <--
-        divide_q(_, _, divisor, input_ireg, is_long),
-        pmov(_mov_addr, mov_dst_sym, mov_src_sym),
-        op_register(mov_src_sym, mov_src_str),
-        if Ireg::from(*mov_src_str) == *input_ireg,
-        op_register(mov_dst_sym, mov_dst_str),
-        let mov_dst_full_ireg = Ireg::from(*mov_dst_str),
-        psub(sub_addr, _, _);
-
-    mod_synth(sub_addr, *result_mreg, *input_mreg, *divisor, *is_long) <--
+    // SUB n,qK is a remainder only when the exact value read by the divide is
+    // also the exact value reaching the SUB destination.  The raw-value
+    // lattice proves this across copies, joins, and definitions; no arbitrary
+    // MOV elsewhere in the binary can lend provenance.
+    #[local] relation mod_synth_owner(Address, Address, Mreg, i64, i64, bool, Set<Address>);
+    mod_synth_owner(*func, *sub_addr, *result_mreg, *divisor, *width,
+                    *is_unsigned, participants.clone()) <--
         psub(sub_addr, sub_dst_sym, sub_src_sym),
         op_register(sub_src_sym, sub_src_str),
         op_register(sub_dst_sym, sub_dst_str),
         let sub_src_ireg = Ireg::from(*sub_src_str),
         let sub_dst_ireg = Ireg::from(*sub_dst_str),
-        prev_instr(sub_addr, prev_addr),
-        q_factor(prev_addr, sub_src_ireg, divisor, input_ireg, divisor_q, is_long),
+        owned_straightline_step(func, prev_addr, sub_addr),
+        q_factor(func, origin, prev_addr, sub_src_ireg, divisor, input_ireg,
+                 divisor_q, width, is_unsigned, participants),
+        if x86_gpr_view_width(sub_src_str) == Some(*width),
+        if x86_gpr_view_width(sub_dst_str) == Some(*width),
         if *divisor == *divisor_q,
-        dividend_holder(*sub_addr, sub_dst_ireg, input_ireg, divisor, is_long),
-        ireg_of(preg_of_input, input_ireg),
-        preg_of(input_mreg, preg_of_input),
-        ireg_of(preg_of_result, &sub_dst_ireg),
-        preg_of(result_mreg, preg_of_result);
+        divide_q(func, input_point, origin, _, divisor, input_ireg, width, is_unsigned),
+        ireg_of(input_preg, input_ireg),
+        preg_of(input_mreg, input_preg),
+        ireg_of(result_preg, &sub_dst_ireg),
+        preg_of(result_mreg, result_preg),
+        raw_gpr_exact_value(func, input_point, input_mreg, width, value),
+        raw_gpr_exact_value(func, sub_addr, result_mreg, width, value);
+
+    #[local] relation mod_synth_owner_missing(Address, Mreg, i64, i64, bool, Set<Address>);
+    mod_synth_owner_missing(*sub_addr, *result, *divisor, *width,
+                            *is_unsigned, participants.clone()) <--
+        mod_synth_owner(_, sub_addr, result, divisor, width, is_unsigned, participants),
+        instr_in_function(sub_addr, other_func),
+        !mod_synth_owner(other_func, sub_addr, result, divisor, width, is_unsigned, participants);
+
+    #[local] relation mod_synth(Address, Mreg, i64, i64, bool, Set<Address>);
+    mod_synth(*sub_addr, *result, *divisor, *width, *is_unsigned, participants.clone()) <--
+        mod_synth_owner(_, sub_addr, result, divisor, width, is_unsigned, participants),
+        !mod_synth_owner_missing(sub_addr, result, divisor, width, is_unsigned, participants);
 
     // Emit the modulus Mop at the SUB address.
     mach_inst(sub_addr, MachInst::Mop(op, Arc::new(args.clone()), *result_mreg)) <--
-        mod_synth(sub_addr, result_mreg, input_mreg, divisor, is_long),
-        let args = vec![*input_mreg],
-        let op = if *is_long { Operation::Omodlimm(*divisor) } else { Operation::Omodimm(*divisor) };
+        mod_synth(sub_addr, result_mreg, divisor, width, is_unsigned, _),
+        let args = vec![*result_mreg],
+        let op = match (*width, *is_unsigned) {
+            (4, false) => Operation::Omodimm(*divisor),
+            (4, true) => Operation::Omoduimm(*divisor),
+            (8, false) => Operation::Omodlimm(*divisor),
+            (8, true) => Operation::Omodluimm(*divisor),
+            _ => unreachable!("modulo proof admits only exact 32/64-bit views"),
+        };
 
     // The synthesized Omod reads a dividend register that is not a capstone operand of the SUB, so register the use here or RTL fabricates an undefined dividend (0 % K).
-    reg_use(sub_addr, *input_mreg) <--
-        mod_synth(sub_addr, _, input_mreg, _, _);
+    reg_use(sub_addr, *result_mreg) <--
+        mod_synth(sub_addr, result_mreg, _, _, _, _);
 
-    // Suppress generic Mop emission for the SUB and the q*K chain back to (but excluding) the divide_q endpoint. Bounded search.
-    div_consumed(sub_addr) <-- mod_synth(sub_addr, _, _, _, _);
+    // Clang also spells an unsigned remainder as
+    //
+    //   input = holder + C
+    //   q = input / K
+    //   qk = q * K
+    //   qk = -qk
+    //   qk += holder
+    //   qk += C
+    //
+    // (DEC is the common final adjustment for C=-1).  This is the same exact
+    // quotient/remainder identity as the SUB form above, but the old matcher
+    // stopped at NEG and emitted the whole strength-reduced expression.  Keep
+    // the divide endpoint in every fact so register reuse by another magic
+    // division cannot cross-pollinate the proof.
+    // The specialized affine proof is another flat lattice: one exact
+    // holder+C description or Top.  Its payload is constant-sized, and the
+    // holder's raw symbolic value is captured at the LEA so the same value can
+    // be required both at the IMUL and at the later ADD.
+    #[local] relation unsigned_affine_tracked_reg(Address, Mreg, i64);
+    unsigned_affine_tracked_reg(*func, *input_mreg, width) <--
+        unsigned_divide_origin(func, imul_addr, _, _, _, input, is_long),
+        let width = if *is_long { 8 } else { 4 },
+        ireg_of(input_preg, input),
+        preg_of(input_mreg, input_preg);
 
-    #[local] relation mod_chain_back(Address, Address, usize);
+    #[local] relation unsigned_affine_seed(Address, Mreg, i64, Mreg, i64);
+    unsigned_affine_seed(*addr, dst_mreg, *width, *holder_mreg, *disp) <--
+        plea(addr, dst, src),
+        op_register(dst, dst_str),
+        raw_gpr_width(width),
+        if x86_gpr_view_width(dst_str) == Some(*width),
+        let dst_mreg = Mreg::x86(dst_str),
+        op_indirect(src, _, base_str, index_str, scale, disp, _),
+        if (*index_str == "NONE" || index_str.is_empty()) && *scale == 1,
+        if *width == 4 || x86_gpr_view_width(base_str) == Some(8),
+        let holder_ireg = Ireg::from(*base_str),
+        if holder_ireg != Ireg::Unknown,
+        ireg_of(holder_preg, holder_ireg),
+        preg_of(holder_mreg, holder_preg),
+        if dst_mreg != *holder_mreg;
 
-    mod_chain_back(sub_addr, sub_addr, 0) <--
-        mod_synth(sub_addr, _, _, _, _);
+    #[local] relation unsigned_affine_seed_value(Address, Address, Mreg, i64, UnsignedAffineValue);
+    unsigned_affine_seed_value(*func, *addr, *tracked, *width,
+                               UnsignedAffineValue { holder: *holder,
+                                                     displacement: *disp,
+                                                     holder_value: *holder_value }) <--
+        unsigned_affine_seed(addr, tracked, width, holder, disp),
+        raw_gpr_exact_value(func, addr, holder, width, holder_value);
 
-    mod_chain_back(sub_addr, prev_addr, h+1) <--
-        mod_chain_back(sub_addr, cur_addr, h),
-        if *h < 6,
-        prev_instr(cur_addr, prev_addr),
-        !divide_q(prev_addr, _, _, _, _);
+    #[local] lattice unsigned_affine_in(Address, Address, Mreg, i64, ConstPropagation<UnsignedAffineValue>);
+    #[local] lattice unsigned_affine_out(Address, Address, Mreg, i64, ConstPropagation<UnsignedAffineValue>);
 
-    div_consumed(addr) <-- mod_chain_back(_, addr, h), if *h > 0;
+    unsigned_affine_in(*func, *func, *tracked, *width,
+                       ConstPropagation::Constant(UnsignedAffineValue {
+                           holder: *tracked,
+                           displacement: 0,
+                           holder_value: RawGprValue::LiveIn(*tracked, *width),
+                       })) <--
+        unsigned_affine_tracked_reg(func, tracked, width),
+        instr_in_function(func, func);
+
+    unsigned_affine_in(*func, *succ, *tracked, *width, state.clone()) <--
+        unsigned_affine_out(func, addr, tracked, width, state),
+        cfg_step(addr, succ),
+        instr_in_function(succ, func);
+
+    unsigned_affine_out(*func, *addr, *tracked, *width,
+                        ConstPropagation::Constant(*value)) <--
+        unsigned_affine_in(func, addr, tracked, width, _),
+        unsigned_affine_seed_value(func, addr, tracked, width, value),
+        !raw_gpr_barrier(addr);
+
+    unsigned_affine_out(*func, *addr, *tracked, *width, ConstPropagation::Top) <--
+        unsigned_affine_in(func, addr, tracked, width, _),
+        reg_def(addr, tracked),
+        !unsigned_affine_seed_value(func, addr, tracked, width, _),
+        !raw_gpr_barrier(addr);
+
+    unsigned_affine_out(*func, *addr, *tracked, *width, state.clone()) <--
+        unsigned_affine_in(func, addr, tracked, width, state),
+        !reg_def(addr, tracked),
+        !raw_gpr_barrier(addr);
+
+    unsigned_affine_out(*func, *addr, *tracked, *width, ConstPropagation::Top) <--
+        unsigned_affine_in(func, addr, tracked, width, _),
+        raw_gpr_barrier(addr);
+
+    #[local] relation unsigned_affine_candidate(Address, Address, Mreg, i64, UnsignedAffineValue);
+    unsigned_affine_candidate(*func, *addr, *tracked, *width, value) <--
+        unsigned_affine_in(func, addr, tracked, width, state),
+        if let ConstPropagation::Constant(value) = state;
+
+    #[local] relation unsigned_affine_conflict(Address, Address, Mreg, i64);
+    unsigned_affine_conflict(*func, *addr, *tracked, *width) <--
+        unsigned_affine_in(func, addr, tracked, width, state),
+        if matches!(state, ConstPropagation::Top);
+
+    #[local] relation unsigned_affine_exact(Address, Address, Mreg, i64, UnsignedAffineValue);
+    unsigned_affine_exact(*func, *addr, *tracked, *width, *value) <--
+        unsigned_affine_candidate(func, addr, tracked, width, value),
+        !unsigned_affine_conflict(func, addr, tracked, width),
+        !raw_gpr_unresolved_owner(func);
+
+    #[local] relation unsigned_dividend_affine_owner(Address, Address, Address, Ireg, Ireg, i64, i64, UnsignedAffineValue);
+    unsigned_dividend_affine_owner(*func, *imul_addr, *endpoint, *quotient,
+                                   *input, *divisor, width, *value) <--
+        unsigned_divide_origin(func, imul_addr, endpoint, quotient, divisor, input, is_long),
+        let width = if *is_long { 8 } else { 4 },
+        ireg_of(input_preg, input),
+        preg_of(input_mreg, input_preg),
+        unsigned_affine_exact(func, imul_addr, input_mreg, width, value),
+        raw_gpr_exact_value(func, imul_addr, &value.holder, width, holder_value),
+        if *holder_value == value.holder_value;
+
+    #[local] relation negated_q_factor(Address, Address, Address, Ireg, i64, Ireg, i64, i64, bool, Set<Address>);
+    negated_q_factor(*func, *origin, *neg_addr, *ireg, *factor, *input,
+                     *divisor, *width, *is_unsigned, new_participants) <--
+        q_factor(func, origin, prev_addr, ireg, factor, input, divisor,
+                 width, is_unsigned, participants),
+        owned_straightline_step(func, prev_addr, neg_addr),
+        pneg(neg_addr, neg_dst),
+        op_register(neg_dst, neg_dst_str),
+        if x86_gpr_view_width(neg_dst_str) == Some(*width),
+        if Ireg::from(*neg_dst_str) == *ireg,
+        let new_participants = participants_with(participants, *neg_addr);
+
+    // Exact immediate change made by one raw integer instruction.  This is
+    // value algebra only; no address/order comparison is used for dataflow.
+    #[local] relation integer_reg_adjust(Address, Ireg, i64, i64);
+    integer_reg_adjust(addr, Ireg::from(*dst_str), *delta, *width) <--
+        padd(addr, dst, src),
+        op_register(dst, dst_str),
+        raw_gpr_width(width),
+        if x86_gpr_view_width(dst_str) == Some(*width),
+        op_immediate(src, delta, _);
+    integer_reg_adjust(addr, Ireg::from(*dst_str), delta, *width) <--
+        psub(addr, dst, src),
+        op_register(dst, dst_str),
+        raw_gpr_width(width),
+        if x86_gpr_view_width(dst_str) == Some(*width),
+        op_immediate(src, amount, _),
+        if let Some(delta) = amount.checked_neg();
+    integer_reg_adjust(addr, Ireg::from(*dst_str), 1, *width) <--
+        instruction(addr, _, _, "INC", dst, _, _, _, _, _),
+        op_register(dst, dst_str),
+        raw_gpr_width(width),
+        if x86_gpr_view_width(dst_str) == Some(*width);
+    integer_reg_adjust(addr, Ireg::from(*dst_str), -1, *width) <--
+        instruction(addr, _, _, "DEC", dst, _, _, _, _, _),
+        op_register(dst, dst_str),
+        raw_gpr_width(width),
+        if x86_gpr_view_width(dst_str) == Some(*width);
+
+    // After the ADD, result = input - K*q - affine_disp.  Therefore the raw
+    // trailing adjustment must equal affine_disp for the chain to be exactly
+    // input % K.
+    #[local] relation negated_q_dividend_sum_owner(Address, Address, Address, Ireg, Ireg, i64, i64, i64, Set<Address>);
+    negated_q_dividend_sum_owner(*func, *origin, *add_addr, *result,
+                                 holder, affine_disp, *divisor, *width,
+                                 new_participants) <--
+        negated_q_factor(func, origin, prev_addr, result, factor, input,
+                         divisor, width, true, participants),
+        if factor == divisor,
+        owned_straightline_step(func, prev_addr, add_addr),
+        padd(add_addr, add_dst, add_src),
+        op_register(add_dst, add_dst_str),
+        op_register(add_src, add_src_str),
+        if x86_gpr_view_width(add_dst_str) == Some(*width),
+        if x86_gpr_view_width(add_src_str) == Some(*width),
+        if Ireg::from(*add_dst_str) == *result,
+        let holder = Ireg::from(*add_src_str),
+        if holder != *result,
+        let holder_mreg = Mreg::x86(add_src_str),
+        unsigned_dividend_affine_owner(func, _, origin, _, input, divisor,
+                                       width, affine),
+        if holder_mreg == affine.holder,
+        raw_gpr_exact_value(func, add_addr, &holder_mreg, width, holder_value),
+        if *holder_value == affine.holder_value,
+        let affine_disp = affine.displacement,
+        let new_participants = participants_with(participants, *add_addr);
+
+    // (add node, final modulo node, result register, affine holder,
+    // affine displacement, divisor, width).  With a nonzero displacement the
+    // ADD node first reconstructs the original dividend from the still-live
+    // holder, and the raw adjustment node becomes the modulo.  Both semantic
+    // definitions therefore remain at real machine definition sites.
+    #[local] relation neg_add_mod_synth_owner(Address, Address, Address, Mreg, Mreg, i64, i64, i64, Set<Address>);
+    neg_add_mod_synth_owner(*func, *add_addr, *add_addr, *result_mreg,
+                            *holder_mreg, 0, *divisor, *width,
+                            participants.clone()) <--
+        negated_q_dividend_sum_owner(func, _, add_addr, result, holder,
+                                     affine_disp, divisor, width, participants),
+        if *affine_disp == 0,
+        ireg_of(result_preg, result),
+        preg_of(result_mreg, result_preg),
+        ireg_of(holder_preg, holder),
+        preg_of(holder_mreg, holder_preg);
+    neg_add_mod_synth_owner(*func, *add_addr, *final_addr, *result_mreg,
+                            *holder_mreg, *affine_disp, *divisor, *width,
+                            final_participants) <--
+        negated_q_dividend_sum_owner(func, _, add_addr, result, holder,
+                                     affine_disp, divisor, width, participants),
+        if *affine_disp != 0,
+        owned_straightline_step(func, add_addr, final_addr),
+        integer_reg_adjust(final_addr, final_reg, correction, width),
+        if final_reg == result && correction == affine_disp,
+        ireg_of(result_preg, result),
+        preg_of(result_mreg, result_preg),
+        ireg_of(holder_preg, holder),
+        preg_of(holder_mreg, holder_preg),
+        let final_participants = participants_with(participants, *final_addr);
+
+    #[local] relation neg_add_mod_synth_owner_missing(Address, Address, Mreg, Mreg, i64, i64, i64, Set<Address>);
+    neg_add_mod_synth_owner_missing(*add_addr, *final_addr, *result,
+                                    *holder, *disp, *divisor, *width,
+                                    participants.clone()) <--
+        neg_add_mod_synth_owner(_, add_addr, final_addr, result, holder, disp,
+                                divisor, width, participants),
+        instr_in_function(final_addr, other_func),
+        !neg_add_mod_synth_owner(other_func, add_addr, final_addr, result,
+                                 holder, disp, divisor, width, participants);
+
+    #[local] relation neg_add_mod_synth(Address, Address, Mreg, Mreg, i64, i64, i64, Set<Address>);
+    neg_add_mod_synth(*add_addr, *final_addr, *result, *holder, *disp,
+                      *divisor, *width, participants.clone()) <--
+        neg_add_mod_synth_owner(_, add_addr, final_addr, result, holder, disp,
+                                divisor, width, participants),
+        !neg_add_mod_synth_owner_missing(add_addr, final_addr, result, holder,
+                                         disp, divisor, width, participants);
+
+    // Zero-displacement form: the still-live holder is already the dividend,
+    // so the ADD's real definition site can directly carry the remainder.
+    mach_inst(add_addr, MachInst::Mop(op, Arc::new(vec![*holder_mreg]), *result_mreg)) <--
+        neg_add_mod_synth(add_addr, final_addr, result_mreg, holder_mreg,
+                          affine_disp, divisor, width, _),
+        if add_addr == final_addr && *affine_disp == 0,
+        let op = if *width == 8 { Operation::Omodluimm(*divisor) } else { Operation::Omoduimm(*divisor) };
+
+    // Nonzero-displacement form: rebuild input=holder+C at the ADD, then use
+    // the following real result definition for the bounded unsigned modulus.
+    mach_inst(add_addr, MachInst::Mop(op, Arc::new(vec![*holder_mreg]), *result_mreg)) <--
+        neg_add_mod_synth(add_addr, final_addr, result_mreg, holder_mreg,
+                          affine_disp, _, width, _),
+        if add_addr != final_addr && *affine_disp != 0,
+        let op = if *width == 8 { Operation::Oaddlimm(*affine_disp) } else { Operation::Oaddimm(*affine_disp) };
+    mach_inst(final_addr, MachInst::Mop(op, Arc::new(vec![*result_mreg]), *result_mreg)) <--
+        neg_add_mod_synth(add_addr, final_addr, result_mreg, _, affine_disp,
+                          divisor, width, _),
+        if add_addr != final_addr && *affine_disp != 0,
+        let op = if *width == 8 { Operation::Omodluimm(*divisor) } else { Operation::Omoduimm(*divisor) };
+
+    reg_use(add_addr, *holder_mreg) <--
+        neg_add_mod_synth(add_addr, _, _, holder_mreg, _, _, _, _);
+    reg_use(final_addr, *result_mreg) <--
+        neg_add_mod_synth(add_addr, final_addr, result_mreg, _, affine_disp, _, _, _),
+        if add_addr != final_addr && *affine_disp != 0;
+
+    // Suppress exactly the semantic participants selected above.  Transparent
+    // MOV/LEA/ADD/IMUL instructions crossed by q propagation remain intact.
+    div_consumed(sub_addr) <-- mod_synth(sub_addr, _, _, _, _, _);
+    div_consumed(*addr) <--
+        mod_synth(_, _, _, _, _, participants),
+        for addr in participants.0.iter();
+    div_consumed(final_addr) <--
+        neg_add_mod_synth(_, final_addr, _, _, _, _, _, _);
+    div_consumed(*addr) <--
+        neg_add_mod_synth(_, _, _, _, _, _, _, participants),
+        for addr in participants.0.iter();
 
     // Two-branch JP+JNE float != on registers: match the pair on a shared resolved TARGET ADDRESS via direct_jump, since the disassembler may give the same target distinct operand symbol strings.
     mach_inst(addr0, MachInst::Mcond(
@@ -6487,14 +7829,14 @@ ascent_par! {
 
     mach_inst(addr, MachInst::Mload(*memory_chunk, addressing, Arc::new(args), *dst)) <--
         transl_load(addr, memory_chunk, addrmode, regs, dst),
-        !addrmode_needs_resolution(*addrmode, _),
+        !addrmode_needs_resolution(addr, *addrmode, _),
         if let Ok((addressing, args)) = transl_addressing_rev(*addrmode, None);
 
     // Resolved load: transl_load whose addrmode needs symbol resolution (e.g., absolute displacement)
     mach_inst(addr, MachInst::Mload(*memory_chunk, addressing, Arc::new(args), *src)) <--
         transl_load(addr, memory_chunk, addrmode, regs, src),
-        addrmode_needs_resolution(*addrmode, target_addr),
-        resolved_addr_to_symbol(target_addr, ident, offset),
+        addrmode_needs_resolution(addr, *addrmode, target_addr),
+        site_resolved_addr_to_symbol(addr, target_addr, ident, offset),
         let resolved = Some((*ident, *offset)),
         if let Ok((addressing, args)) = transl_addressing_rev(*addrmode, resolved);
 
@@ -6854,6 +8196,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Oneg, Arc::new(args), *res)) <--
         pneg(address, r),
+        !div_consumed(address),
         op_register(r, r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
@@ -7186,6 +8529,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(op, Arc::new(args), *res)) <--
         padd(address, r, n),
+        !div_consumed(address),
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, r_str),
@@ -7198,6 +8542,7 @@ ascent_par! {
     // INC reg / DEC reg: capstone emits these as their own mnemonics (not ADD/SUB), so lower them as add of immediate +/-1; without this they emit no Mach op and are silently dropped, corrupting dataflow (e.g. a setcc then inc idiom loses its +1).
     mach_inst(address, MachInst::Mop(op, Arc::new(vec![*res]), *res)) <--
         instruction(address, _, _, "INC", dst, _, _, _, _, _),
+        !div_consumed(address),
         op_register(dst, dst_str),
         ireg_of(preg_of_dst, Ireg::from(dst_str)),
         preg_of(res, preg_of_dst),
@@ -7206,6 +8551,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(op, Arc::new(vec![*res]), *res)) <--
         instruction(address, _, _, "DEC", dst, _, _, _, _, _),
+        !div_consumed(address),
         op_register(dst, dst_str),
         ireg_of(preg_of_dst, Ireg::from(dst_str)),
         preg_of(res, preg_of_dst),
@@ -8567,6 +9913,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(Operation::Onegl, Arc::new(args), *res)) <--
         pneg(address, r),
+        !div_consumed(address),
         op_register(r, r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
@@ -8575,6 +9922,7 @@ ascent_par! {
 
     mach_inst(address, MachInst::Mop(op, Arc::new(args), *res)) <--
         psub(address, r, n),
+        !div_consumed(address),
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, r_str),
@@ -10794,14 +12142,14 @@ impl IRPass for AsmPass {
 #[cfg(test)]
 mod structural_dataflow_tests {
     use super::{
-        exact_stack_offset, finalize_simd_dword_event_chains, refine_direct_load_chunk, AsmPass,
-        AsmPassProgram,
+        exact_stack_offset, finalize_simd_dword_event_chains, recover_unsigned_divisor,
+        refine_direct_load_chunk, AsmPass, AsmPassProgram,
     };
     use crate::decompile::passes::pass::IRPass;
     use crate::mreg::Mreg;
-    use crate::x86::asm::TestCond;
-    use crate::x86::op::{Addressing, Comparison, Condition, Operation};
-    use crate::x86::types::{MachInst, MemoryChunk, Typ};
+    use crate::x86::asm::{Ireg, TestCond};
+    use crate::x86::op::{Addressing, Comparison, Condition, Operation, OverflowArithmetic};
+    use crate::x86::types::{Address, Addrmode, Displacement, Ident, MachInst, MemoryChunk, Typ};
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
@@ -10818,6 +12166,712 @@ mod structural_dataflow_tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[derive(Clone, Copy)]
+    enum AffineInterposed {
+        None,
+        HolderRedefinition,
+        UnrelatedMove,
+    }
+
+    #[derive(Clone, Copy)]
+    struct AffineFixtureNodes {
+        extra: Option<u64>,
+        negate: u64,
+        add: u64,
+        adjust: u64,
+    }
+
+    fn populate_affine_mod_fixture(
+        prog: &mut AsmPassProgram,
+        interposed: AffineInterposed,
+        neg_view: &'static str,
+        adjust_view: &'static str,
+        split_before_neg: bool,
+    ) -> AffineFixtureNodes {
+        let func = 0x2100;
+        let input_def = 0x2110;
+        let bridge = 0x2120;
+        let multiply = 0x2130;
+        let endpoint = 0x2140;
+        let q_times_three = 0x2150;
+        let extra = match interposed {
+            AffineInterposed::None => None,
+            _ => Some(0x2160),
+        };
+        let negate = 0x2170;
+        let add = 0x2180;
+        let adjust = 0x2190;
+
+        prog.unsigned_divide_origin.push((
+            func,
+            multiply,
+            endpoint,
+            Ireg::RCX,
+            3,
+            Ireg::RAX,
+            false,
+        ));
+        prog.raw_gpr_analysis_width.push((func, 4));
+
+        let mut nodes = vec![
+            func,
+            input_def,
+            bridge,
+            multiply,
+            endpoint,
+            q_times_three,
+            negate,
+            add,
+            adjust,
+        ];
+        if let Some(extra) = extra {
+            nodes.push(extra);
+        }
+        for node in nodes {
+            prog.instr_in_function.push((node, func));
+            let block = if split_before_neg && matches!(node, 0x2170 | 0x2180 | 0x2190) {
+                negate
+            } else {
+                func
+            };
+            prog.code_in_block.push((node, block));
+        }
+
+        prog.next.extend([
+            (func, input_def),
+            (input_def, bridge),
+            (bridge, multiply),
+            (multiply, endpoint),
+            (endpoint, q_times_three),
+        ]);
+        let before_neg = extra.unwrap_or(q_times_three);
+        if let Some(extra) = extra {
+            prog.next.push((q_times_three, extra));
+        }
+        prog.next
+            .extend([(before_neg, negate), (negate, add), (add, adjust)]);
+        if split_before_neg {
+            prog.ddisasm_cfg_edge
+                .push((before_neg, negate, "fallthrough"));
+        }
+
+        prog.reg_def.extend([
+            (input_def, Mreg::AX),
+            (q_times_three, Mreg::AX),
+            (negate, Mreg::AX),
+            (add, Mreg::AX),
+            (adjust, Mreg::AX),
+        ]);
+        prog.plea
+            .push((input_def, "fixture_input_dst", "fixture_input_addr"));
+        prog.op_register.push(("fixture_input_dst", "EAX"));
+        prog.op_indirect
+            .push(("fixture_input_addr", "", "RBX", "NONE", 1, -1, 4));
+
+        prog.plea
+            .push((q_times_three, "fixture_q_dst", "fixture_q_addr"));
+        prog.op_register.push(("fixture_q_dst", "EAX"));
+        prog.op_indirect
+            .push(("fixture_q_addr", "", "RCX", "RCX", 2, 0, 4));
+
+        match interposed {
+            AffineInterposed::None => {}
+            AffineInterposed::HolderRedefinition => {
+                let extra = extra.unwrap();
+                prog.instruction.push((
+                    extra,
+                    5,
+                    "",
+                    "MOV",
+                    "fixture_holder_imm",
+                    "fixture_holder_dst",
+                    "",
+                    "",
+                    0,
+                    0,
+                ));
+                prog.op_immediate.push(("fixture_holder_imm", 123, 4));
+                prog.op_register.push(("fixture_holder_dst", "EBX"));
+                prog.reg_def.push((extra, Mreg::BX));
+            }
+            AffineInterposed::UnrelatedMove => {
+                let extra = extra.unwrap();
+                prog.instruction.push((
+                    extra,
+                    2,
+                    "",
+                    "MOV",
+                    "fixture_unrelated_src",
+                    "fixture_unrelated_dst",
+                    "",
+                    "",
+                    0,
+                    0,
+                ));
+                prog.op_register.extend([
+                    ("fixture_unrelated_src", "EDI"),
+                    ("fixture_unrelated_dst", "ESI"),
+                ]);
+                prog.reg_def.push((extra, Mreg::SI));
+            }
+        }
+
+        prog.pneg.push((negate, "fixture_neg_dst"));
+        prog.op_register.push(("fixture_neg_dst", neg_view));
+        prog.padd.push((add, "fixture_add_dst", "fixture_add_src"));
+        prog.op_register
+            .extend([("fixture_add_dst", "EAX"), ("fixture_add_src", "EBX")]);
+        prog.instruction
+            .push((adjust, 2, "", "DEC", "fixture_adjust_dst", "", "", "", 0, 0));
+        prog.op_register.push(("fixture_adjust_dst", adjust_view));
+
+        AffineFixtureNodes {
+            extra,
+            negate,
+            add,
+            adjust,
+        }
+    }
+
+    #[test]
+    fn unsigned_magic_sub_remainder_reads_the_saved_dividend() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            // Deliberately nonmonotone identities: only the explicit `next`
+            // chain establishes the quotient-product and remainder shape.
+            let endpoint = 0x900;
+            let quotient_times_three = 0x100;
+            let remainder = 0x700;
+            let saved_dividend = 0x300;
+            let func = saved_dividend;
+
+            prog.divide_q.push((
+                func,
+                saved_dividend,
+                endpoint,
+                Ireg::RAX,
+                3,
+                Ireg::RAX,
+                4,
+                true,
+            ));
+            prog.raw_gpr_analysis_width.push((func, 4));
+            prog.next.extend([
+                (saved_dividend, endpoint),
+                (endpoint, quotient_times_three),
+                (quotient_times_three, remainder),
+            ]);
+            for node in [saved_dividend, endpoint, quotient_times_three, remainder] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, func));
+            }
+
+            prog.plea.push((
+                quotient_times_three,
+                "q_times_three_dst",
+                "q_times_three_addr",
+            ));
+            prog.op_register.push(("q_times_three_dst", "EAX"));
+            prog.op_indirect
+                .push(("q_times_three_addr", "", "RAX", "RAX", 2, 0, 4));
+
+            // The original dividend was copied to EDX before EAX became q and
+            // then q*3.  The old lowering nevertheless emitted EAX % 3.
+            prog.pmov
+                .push((saved_dividend, "saved_dividend_dst", "saved_dividend_src"));
+            prog.instruction.push((
+                saved_dividend,
+                2,
+                "",
+                "MOV",
+                "saved_dividend_src",
+                "saved_dividend_dst",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.op_register
+                .extend([("saved_dividend_dst", "EDX"), ("saved_dividend_src", "EAX")]);
+            prog.reg_def.push((saved_dividend, Mreg::DX));
+            prog.psub
+                .push((remainder, "remainder_dst", "remainder_src"));
+            prog.op_register
+                .extend([("remainder_dst", "EDX"), ("remainder_src", "EAX")]);
+
+            prog.run();
+
+            assert!(prog.mach_inst.iter().any(|(node, inst)| {
+                *node == remainder
+                    && matches!(
+                        inst,
+                        MachInst::Mop(Operation::Omoduimm(3), args, Mreg::DX)
+                            if args.as_slice() == [Mreg::DX]
+                    )
+            }));
+            assert!(!prog.mach_inst.iter().any(|(node, inst)| {
+                *node == remainder
+                    && matches!(
+                        inst,
+                        MachInst::Mop(
+                            Operation::Omodimm(3) | Operation::Omoduimm(3),
+                            args,
+                            Mreg::DX
+                        ) if args.as_slice() == [Mreg::AX]
+                    )
+            }));
+        });
+    }
+
+    #[test]
+    fn legacy_unsigned_magic_matcher_feeds_shared_remainder_provenance() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let magic_load = 0x500;
+            let multiply = 0x600;
+            let quotient_endpoint = 0x700;
+            let func = magic_load;
+
+            // Clang's common unsigned /3 form is recognized by div_magic_64:
+            // load 0xaaaaaaab, multiply a separate dividend register, then
+            // shift the 64-bit product right by 33.
+            prog.div_magic_64.push((
+                magic_load,
+                quotient_endpoint,
+                0xaaaa_aaab,
+                33,
+                Ireg::RBX,
+                Ireg::RCX,
+            ));
+            prog.next
+                .extend([(magic_load, multiply), (multiply, quotient_endpoint)]);
+            for node in [magic_load, multiply, quotient_endpoint] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, func));
+            }
+            prog.pimul
+                .push((multiply, "legacy_imul_dst", "legacy_imul_src"));
+            prog.pshr
+                .push((quotient_endpoint, "legacy_shr_dst", "legacy_shift"));
+            prog.op_register.extend([
+                ("legacy_imul_dst", "RCX"),
+                ("legacy_imul_src", "RBX"),
+                ("legacy_shr_dst", "RCX"),
+            ]);
+
+            prog.run();
+
+            assert!(prog.unsigned_divide_origin.iter().any(|row| {
+                row == &(
+                    func,
+                    multiply,
+                    quotient_endpoint,
+                    Ireg::RCX,
+                    3,
+                    Ireg::RBX,
+                    false,
+                )
+            }));
+            assert!(prog.divide_q.iter().any(|row| {
+                row == &(
+                    func,
+                    multiply,
+                    quotient_endpoint,
+                    Ireg::RCX,
+                    3,
+                    Ireg::RBX,
+                    4,
+                    true,
+                )
+            }));
+        });
+    }
+
+    #[test]
+    fn unsigned_magic_neg_add_adjust_recovers_modulo_at_real_defs() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let func = 0x600;
+            let input_def = 0x500;
+            let between = 0x400;
+            let multiply = 0x300;
+            let endpoint = 0x900;
+            let quotient_times_three = 0x100;
+            let negate = 0x800;
+            let add_holder = 0x200;
+            let decrement = 0x700;
+
+            // Populate only relations which exist before ASM in the real
+            // pipeline.  In particular, do not inject downstream
+            // `reg_def_used`: the point-keyed affine lattice must carry the
+            // LEA definition to the multiply itself.
+            prog.unsigned_divide_origin.push((
+                func,
+                multiply,
+                endpoint,
+                Ireg::RCX,
+                3,
+                Ireg::RAX,
+                false,
+            ));
+            prog.raw_gpr_analysis_width.push((func, 4));
+            for node in [
+                func,
+                input_def,
+                between,
+                multiply,
+                endpoint,
+                quotient_times_three,
+                negate,
+                add_holder,
+                decrement,
+            ] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, func));
+            }
+            prog.next.extend([
+                (func, input_def),
+                (input_def, between),
+                (between, multiply),
+                (multiply, endpoint),
+            ]);
+            prog.reg_def.push((input_def, Mreg::AX));
+            prog.plea
+                .push((input_def, "clang_input_dst", "clang_input_addr"));
+            prog.op_register.push(("clang_input_dst", "EAX"));
+            prog.op_indirect
+                .push(("clang_input_addr", "", "RBX", "NONE", 1, -1, 4));
+
+            prog.next.extend([
+                (endpoint, quotient_times_three),
+                (quotient_times_three, negate),
+                (negate, add_holder),
+                (add_holder, decrement),
+            ]);
+
+            prog.plea.push((
+                quotient_times_three,
+                "clang_q_times_three_dst",
+                "clang_q_times_three_addr",
+            ));
+            prog.op_register.push(("clang_q_times_three_dst", "EAX"));
+            prog.op_indirect
+                .push(("clang_q_times_three_addr", "", "RCX", "RCX", 2, 0, 4));
+            prog.pneg.push((negate, "clang_neg_dst"));
+            prog.op_register.push(("clang_neg_dst", "EAX"));
+            prog.padd
+                .push((add_holder, "clang_add_dst", "clang_add_src"));
+            prog.op_register
+                .extend([("clang_add_dst", "EAX"), ("clang_add_src", "EBX")]);
+            prog.instruction
+                .push((decrement, 2, "", "DEC", "clang_dec_dst", "", "", "", 0, 0));
+            prog.op_register.push(("clang_dec_dst", "EAX"));
+
+            prog.run();
+
+            assert!(prog.mach_inst.iter().any(|(node, inst)| {
+                *node == add_holder
+                    && matches!(
+                        inst,
+                        MachInst::Mop(Operation::Oaddimm(-1), args, Mreg::AX)
+                            if args.as_slice() == [Mreg::BX]
+                    )
+            }));
+            assert!(prog.mach_inst.iter().any(|(node, inst)| {
+                *node == decrement
+                    && matches!(
+                        inst,
+                        MachInst::Mop(Operation::Omoduimm(3), args, Mreg::AX)
+                            if args.as_slice() == [Mreg::AX]
+                    )
+            }));
+            assert!(prog.div_consumed.iter().any(|row| row == &(negate,)));
+            assert!(prog
+                .div_consumed
+                .iter()
+                .any(|row| row == &(quotient_times_three,)));
+        });
+    }
+
+    #[test]
+    fn unsigned_magic_affine_remainder_rejects_an_unknown_cfg_arm() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let func = 0x100;
+            let affine_def = 0x900;
+            let unknown_def = 0x200;
+            let join = 0x800;
+            let multiply = 0x300;
+            let endpoint = 0x700;
+            let quotient_times_three = 0x400;
+            let negate = 0x600;
+            let add_holder = 0x500;
+            let decrement = 0xa00;
+
+            prog.unsigned_divide_origin.push((
+                func,
+                multiply,
+                endpoint,
+                Ireg::RCX,
+                3,
+                Ireg::RAX,
+                false,
+            ));
+            prog.raw_gpr_analysis_width.push((func, 4));
+            for node in [
+                func,
+                affine_def,
+                unknown_def,
+                join,
+                multiply,
+                endpoint,
+                quotient_times_three,
+                negate,
+                add_holder,
+                decrement,
+            ] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.ddisasm_cfg_edge.extend([
+                (func, affine_def, "branch"),
+                (func, unknown_def, "fallthrough"),
+                (affine_def, join, "fallthrough"),
+                (unknown_def, join, "fallthrough"),
+                (join, multiply, "fallthrough"),
+            ]);
+            for node in [
+                multiply,
+                endpoint,
+                quotient_times_three,
+                negate,
+                add_holder,
+                decrement,
+            ] {
+                prog.code_in_block.push((node, multiply));
+            }
+            prog.reg_def
+                .extend([(affine_def, Mreg::AX), (unknown_def, Mreg::AX)]);
+            prog.plea
+                .push((affine_def, "branch_input_dst", "branch_input_addr"));
+            prog.op_register.push(("branch_input_dst", "EAX"));
+            prog.op_indirect
+                .push(("branch_input_addr", "", "RBX", "NONE", 1, -1, 4));
+
+            prog.next.extend([
+                (multiply, endpoint),
+                (endpoint, quotient_times_three),
+                (quotient_times_three, negate),
+                (negate, add_holder),
+                (add_holder, decrement),
+            ]);
+            prog.plea.push((
+                quotient_times_three,
+                "branch_q_times_three_dst",
+                "branch_q_times_three_addr",
+            ));
+            prog.op_register.push(("branch_q_times_three_dst", "EAX"));
+            prog.op_indirect
+                .push(("branch_q_times_three_addr", "", "RCX", "RCX", 2, 0, 4));
+            prog.pneg.push((negate, "branch_neg_dst"));
+            prog.op_register.push(("branch_neg_dst", "EAX"));
+            prog.padd
+                .push((add_holder, "branch_add_dst", "branch_add_src"));
+            prog.op_register
+                .extend([("branch_add_dst", "EAX"), ("branch_add_src", "EBX")]);
+            prog.instruction
+                .push((decrement, 2, "", "DEC", "branch_dec_dst", "", "", "", 0, 0));
+            prog.op_register.push(("branch_dec_dst", "EAX"));
+
+            prog.run();
+
+            assert!(prog
+                .unsigned_affine_conflict
+                .iter()
+                .any(|row| row == &(func, multiply, Mreg::AX, 4)));
+            assert!(!prog.mach_inst.iter().any(|(_, inst)| matches!(
+                inst,
+                MachInst::Mop(Operation::Omoduimm(3), _, Mreg::AX)
+            )));
+        });
+    }
+
+    #[test]
+    fn unsigned_magic_reciprocal_requires_full_domain_exactness() {
+        assert_eq!(recover_unsigned_divisor(0xaaaa_aaab, 33, 32), Some(3));
+        // floor(2^33/3) looks one unit away from the valid reciprocal but
+        // already under-divides n=3, so proximity is not a proof.
+        assert_eq!(recover_unsigned_divisor(0xaaaa_aaaa, 33, 32), None);
+    }
+
+    #[test]
+    fn unsigned_magic_load_must_reach_the_multiply_in_its_owner() {
+        on_large_stack(|| {
+            for cross_function in [false, true] {
+                let mut prog = AsmPassProgram::default();
+                let func = 0x3100;
+                let prologue = func;
+                let multiply = 0x3110;
+                let magic_load = if cross_function { 0x4100 } else { 0x3120 };
+                let shift = 0x3130;
+                let magic_owner = if cross_function { magic_load } else { func };
+
+                for node in [prologue, multiply, shift] {
+                    prog.instr_in_function.push((node, func));
+                    prog.code_in_block.push((node, func));
+                }
+                prog.instr_in_function.push((magic_load, magic_owner));
+                prog.code_in_block.push((magic_load, magic_owner));
+                prog.next.push((prologue, multiply));
+                if cross_function {
+                    prog.next.push((multiply, shift));
+                } else {
+                    // The matching constant exists only after the IMUL.
+                    prog.next
+                        .extend([(multiply, magic_load), (magic_load, shift)]);
+                }
+
+                prog.instruction.push((
+                    magic_load,
+                    5,
+                    "",
+                    "MOV",
+                    "late_magic_imm",
+                    "late_magic_dst",
+                    "",
+                    "",
+                    0,
+                    0,
+                ));
+                prog.op_immediate.push(("late_magic_imm", 0xaaaa_aaab, 4));
+                prog.op_register.push(("late_magic_dst", "EDX"));
+                prog.reg_def.push((magic_load, Mreg::DX));
+                prog.pimul
+                    .push((multiply, "late_imul_dst", "late_imul_src"));
+                prog.op_register.extend([
+                    ("late_imul_dst", "RAX"),
+                    ("late_imul_src", "RDX"),
+                    ("late_shr_dst", "RAX"),
+                ]);
+                prog.pshr.push((shift, "late_shr_dst", "late_shift_count"));
+                prog.op_immediate.push(("late_shift_count", 33, 1));
+
+                prog.run();
+
+                assert!(prog.imul2_magic.is_empty());
+                assert!(prog.div_magic_2op.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn unsigned_affine_modulo_rejects_holder_redefinition() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let nodes = populate_affine_mod_fixture(
+                &mut prog,
+                AffineInterposed::HolderRedefinition,
+                "EAX",
+                "EAX",
+                false,
+            );
+            prog.run();
+
+            assert!(!prog.mach_inst.iter().any(|(_, inst)| matches!(
+                inst,
+                MachInst::Mop(Operation::Omoduimm(3), _, Mreg::AX)
+            )));
+            assert!(!prog.div_consumed.iter().any(|row| row == &(nodes.negate,)));
+        });
+    }
+
+    #[test]
+    fn unsigned_affine_modulo_rejects_partial_register_steps() {
+        on_large_stack(|| {
+            for (neg_view, adjust_view) in [("AX", "EAX"), ("EAX", "AX")] {
+                let mut prog = AsmPassProgram::default();
+                populate_affine_mod_fixture(
+                    &mut prog,
+                    AffineInterposed::None,
+                    neg_view,
+                    adjust_view,
+                    false,
+                );
+                prog.run();
+                assert!(!prog.mach_inst.iter().any(|(_, inst)| matches!(
+                    inst,
+                    MachInst::Mop(Operation::Omoduimm(3), _, Mreg::AX)
+                )));
+            }
+        });
+    }
+
+    #[test]
+    fn unsigned_affine_modulo_does_not_cross_a_basic_block_boundary() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            populate_affine_mod_fixture(&mut prog, AffineInterposed::None, "EAX", "EAX", true);
+            prog.run();
+            assert!(!prog.mach_inst.iter().any(|(_, inst)| matches!(
+                inst,
+                MachInst::Mop(Operation::Omoduimm(3), _, Mreg::AX)
+            )));
+        });
+    }
+
+    #[test]
+    fn unsigned_affine_modulo_requires_every_shared_owner() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let nodes =
+                populate_affine_mod_fixture(&mut prog, AffineInterposed::None, "EAX", "EAX", false);
+            // The address-global final instruction is shared, but this second
+            // owner has no divide/affine proof.
+            prog.instr_in_function.push((nodes.adjust, 0x5100));
+            prog.run();
+            assert!(!prog.mach_inst.iter().any(|(_, inst)| matches!(
+                inst,
+                MachInst::Mop(Operation::Omoduimm(3), _, Mreg::AX)
+            )));
+        });
+    }
+
+    #[test]
+    fn modulo_suppression_preserves_unrelated_interleaved_move() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let nodes = populate_affine_mod_fixture(
+                &mut prog,
+                AffineInterposed::UnrelatedMove,
+                "EAX",
+                "EAX",
+                false,
+            );
+            prog.run();
+            let extra = nodes.extra.unwrap();
+
+            assert!(prog.mach_inst.iter().any(|(node, inst)| {
+                *node == nodes.adjust
+                    && matches!(inst, MachInst::Mop(Operation::Omoduimm(3), _, Mreg::AX))
+            }));
+            assert!(!prog.div_consumed.iter().any(|row| row == &(extra,)));
+            assert!(prog.mach_inst.iter().any(|(node, inst)| {
+                *node == extra
+                    && matches!(
+                        inst,
+                        MachInst::Mop(Operation::Omove, args, Mreg::SI)
+                            if args.as_slice() == [Mreg::DI]
+                    )
+            }));
+            assert!(!prog.mach_inst.iter().any(|(node, inst)| {
+                *node == nodes.negate && matches!(inst, MachInst::Mop(Operation::Oneg, _, _))
+            }));
+            assert!(!prog.mach_inst.iter().any(|(node, inst)| {
+                *node == nodes.adjust && matches!(inst, MachInst::Mop(Operation::Oaddimm(-1), _, _))
+            }));
+            assert!(prog.div_consumed.iter().any(|row| row == &(nodes.add,)));
+        });
     }
 
     #[test]
@@ -11489,6 +13543,256 @@ mod structural_dataflow_tests {
     }
 
     #[test]
+    fn one_register_absolute_data_displacement_keeps_symbolic_storage_identity() {
+        on_large_stack(|| {
+            const FUNC: Address = 0x900;
+            const MASK: Address = 0x500;
+            const SHIFT: Address = 0x100;
+            const CALL: Address = 0x700;
+            const LOAD_FIRST: Address = 0x300;
+            const LOAD_SECOND: Address = 0x80;
+            const TABLE: Address = 0x4000;
+
+            let build = |raw_absolute: bool,
+                         raw_base: &'static str,
+                         mask_value: Option<i64>,
+                         second_coordinate: Address,
+                         call_barrier: bool| {
+                let mut prog = AsmPassProgram::default();
+                prog.raw_image_addresses_are_absolute.push((raw_absolute,));
+                prog.data_section_range.push((TABLE, 0x6000));
+
+                for node in [FUNC, MASK, SHIFT, LOAD_FIRST, LOAD_SECOND] {
+                    prog.instr_in_function.push((node, FUNC));
+                }
+                if call_barrier {
+                    prog.instr_in_function.push((CALL, FUNC));
+                }
+
+                prog.ddisasm_cfg_edge.push((FUNC, MASK, "fallthrough"));
+                prog.ddisasm_cfg_edge.push((MASK, SHIFT, "fallthrough"));
+                if call_barrier {
+                    prog.ddisasm_cfg_edge.push((SHIFT, CALL, "fallthrough"));
+                    prog.ddisasm_cfg_edge
+                        .push((CALL, LOAD_FIRST, "fallthrough"));
+                    prog.instruction
+                        .push((CALL, 5, "", "CALL", "0", "0", "0", "0", 0, 0));
+                } else {
+                    prog.ddisasm_cfg_edge
+                        .push((SHIFT, LOAD_FIRST, "fallthrough"));
+                }
+                prog.ddisasm_cfg_edge
+                    .push((LOAD_FIRST, LOAD_SECOND, "fallthrough"));
+
+                if let Some(mask_value) = mask_value {
+                    prog.pand.push((MASK, "bounded_dst", "bounded_mask"));
+                    prog.op_register.push(("bounded_dst", "EDI"));
+                    prog.op_immediate.push(("bounded_mask", mask_value, 4));
+                    prog.decoded_reg_def.push((MASK, Mreg::DI));
+                }
+                prog.psal.push((SHIFT, "scaled_dst", "scaled_shift"));
+                prog.op_register.push(("scaled_dst", "EDI"));
+                prog.op_immediate.push(("scaled_shift", 4, 1));
+                prog.decoded_reg_def.push((SHIFT, Mreg::DI));
+
+                for (node, memory, destination, target, result) in [
+                    (
+                        LOAD_FIRST,
+                        "first_field_mem",
+                        "first_field_dst",
+                        TABLE,
+                        Mreg::BX,
+                    ),
+                    (
+                        LOAD_SECOND,
+                        "second_field_mem",
+                        "second_field_dst",
+                        second_coordinate,
+                        Mreg::R14,
+                    ),
+                ] {
+                    prog.instruction.push((
+                        node,
+                        7,
+                        "",
+                        "MOV",
+                        memory,
+                        destination,
+                        "0",
+                        "0",
+                        0,
+                        0,
+                    ));
+                    prog.op_indirect
+                        .push((memory, "", raw_base, "NONE", 1, target as i64, 8));
+                    prog.transl_load.push((
+                        node,
+                        MemoryChunk::MAny64,
+                        Addrmode {
+                            base: Some(Ireg::RDI),
+                            index: None,
+                            disp: Displacement::Const(target as i64),
+                        },
+                        Arc::new(vec![Mreg::DI]),
+                        result,
+                    ));
+                }
+
+                prog.run();
+                prog
+            };
+
+            let exact = build(true, "RDI", Some(3), TABLE + 8, false);
+            let mut certificates: Vec<_> = exact
+                .bounded_absolute_data_access
+                .iter()
+                .filter(|(func, ..)| *func == FUNC)
+                .copied()
+                .collect();
+            certificates.sort_unstable();
+            assert_eq!(
+                certificates,
+                vec![
+                    (FUNC, LOAD_SECOND, TABLE as Ident, 8, 16, 4, MASK, 8,),
+                    (FUNC, LOAD_FIRST, TABLE as Ident, 0, 16, 4, MASK, 8,),
+                ]
+            );
+            assert!(exact
+                .global_symbol
+                .iter()
+                .any(|fact| fact == &(TABLE, "TABLE_4000")));
+            assert!(!exact
+                .global_symbol
+                .iter()
+                .any(|(address, _)| *address == TABLE + 8));
+            for (node, offset, result) in [(LOAD_FIRST, 0, Mreg::BX), (LOAD_SECOND, 8, Mreg::R14)] {
+                assert!(exact.mach_inst.iter().any(|(actual_node, inst)| {
+                    *actual_node == node
+                        && matches!(
+                            inst,
+                            MachInst::Mload(
+                                MemoryChunk::MAny64,
+                                Addressing::Abased(owner, actual_offset),
+                                args,
+                                actual_result,
+                            ) if *owner == TABLE as Ident
+                                && *actual_offset == offset
+                                && args.as_slice() == [Mreg::DI]
+                                && *actual_result == result
+                        )
+                }));
+                assert!(!exact.mach_inst.iter().any(|(actual_node, inst)| {
+                    *actual_node == node
+                        && matches!(inst, MachInst::Mload(_, Addressing::Aindexed(_), _, _))
+                }));
+            }
+
+            // Every negative retains ordinary numeric addressing.  Section
+            // membership alone, an address-size override, a non-contiguous
+            // mask, a call barrier, ET_DYN encoding, or two distant tables is
+            // insufficient to invent storage ownership.
+            for (case, numeric) in [
+                ("no bound", build(true, "RDI", None, TABLE + 8, false)),
+                (
+                    "address-size override",
+                    build(true, "EDI", Some(3), TABLE + 8, false),
+                ),
+                (
+                    "non-contiguous mask",
+                    build(true, "RDI", Some(5), TABLE + 8, false),
+                ),
+                ("call barrier", build(true, "RDI", Some(3), TABLE + 8, true)),
+                (
+                    "position-independent image",
+                    build(false, "RDI", Some(3), TABLE + 8, false),
+                ),
+                ("distant tables", build(true, "RDI", Some(3), 0x5000, false)),
+            ] {
+                assert!(
+                    numeric.bounded_absolute_data_access.is_empty(),
+                    "{case} unexpectedly acquired a bounded owner"
+                );
+                assert!(
+                    numeric.global_symbol.is_empty(),
+                    "{case} unexpectedly acquired a global symbol"
+                );
+                for node in [LOAD_FIRST, LOAD_SECOND] {
+                    assert!(
+                        numeric.mach_inst.iter().any(|(actual_node, inst)| {
+                            *actual_node == node
+                                && matches!(inst, MachInst::Mload(_, Addressing::Aindexed(_), _, _))
+                        }),
+                        "{case} lost its numeric load at {node:#x}"
+                    );
+                }
+            }
+
+            // Two alternate masks establish different provenance tokens.  A
+            // structural CFG join therefore becomes Top even though both
+            // happen to have the same numeric mask and shift.
+            let mut branch_join = AsmPassProgram::default();
+            let left = 0x610;
+            let right = 0x220;
+            branch_join.raw_image_addresses_are_absolute.push((true,));
+            branch_join.data_section_range.push((TABLE, 0x6000));
+            for node in [FUNC, left, right, SHIFT, LOAD_FIRST] {
+                branch_join.instr_in_function.push((node, FUNC));
+            }
+            branch_join.ddisasm_cfg_edge.push((FUNC, left, "branch"));
+            branch_join
+                .ddisasm_cfg_edge
+                .push((FUNC, right, "fallthrough"));
+            branch_join
+                .ddisasm_cfg_edge
+                .push((left, SHIFT, "fallthrough"));
+            branch_join
+                .ddisasm_cfg_edge
+                .push((right, SHIFT, "fallthrough"));
+            branch_join
+                .ddisasm_cfg_edge
+                .push((SHIFT, LOAD_FIRST, "fallthrough"));
+            for (node, dst, immediate) in [
+                (left, "left_mask_dst", "left_mask"),
+                (right, "right_mask_dst", "right_mask"),
+            ] {
+                branch_join.pand.push((node, dst, immediate));
+                branch_join.op_register.push((dst, "EDI"));
+                branch_join.op_immediate.push((immediate, 3, 4));
+                branch_join.decoded_reg_def.push((node, Mreg::DI));
+            }
+            branch_join
+                .psal
+                .push((SHIFT, "join_shift_dst", "join_shift"));
+            branch_join.op_register.push(("join_shift_dst", "EDI"));
+            branch_join.op_immediate.push(("join_shift", 4, 1));
+            branch_join.decoded_reg_def.push((SHIFT, Mreg::DI));
+            branch_join.instruction.push((
+                LOAD_FIRST, 7, "", "MOV", "join_mem", "join_dst", "0", "0", 0, 0,
+            ));
+            branch_join
+                .op_indirect
+                .push(("join_mem", "", "RDI", "NONE", 1, TABLE as i64, 8));
+            branch_join.transl_load.push((
+                LOAD_FIRST,
+                MemoryChunk::MAny64,
+                Addrmode {
+                    base: Some(Ireg::RDI),
+                    index: None,
+                    disp: Displacement::Const(TABLE as i64),
+                },
+                Arc::new(vec![Mreg::DI]),
+                Mreg::BX,
+            ));
+            branch_join.run();
+            assert!(branch_join.bounded_absolute_data_access.is_empty());
+            assert!(branch_join.mach_inst.iter().any(|(node, inst)| {
+                *node == LOAD_FIRST
+                    && matches!(inst, MachInst::Mload(_, Addressing::Aindexed(_), _, _))
+            }));
+        });
+    }
+
+    #[test]
     fn scheduled_setcc_def_is_emitted_at_setcc_not_compare() {
         on_large_stack(|| {
             let mut prog = AsmPassProgram::default();
@@ -11878,6 +14182,184 @@ mod structural_dataflow_tests {
                         ) if args.as_slice() == [Mreg::SI, Mreg::AX]
                     )
             }));
+        });
+    }
+
+    #[test]
+    fn jo_and_jno_recover_exact_wrapping_arithmetic_conditions() {
+        on_large_stack(|| {
+            for (mnemonic, expected) in [
+                ("JO", Condition::Carithoverflow(OverflowArithmetic::Add, 8)),
+                (
+                    "JNO",
+                    Condition::Cnarithoverflow(OverflowArithmetic::Add, 8),
+                ),
+            ] {
+                let mut prog = AsmPassProgram::default();
+                // Reverse numeric order deliberately.  The proof follows the
+                // structural CFG, never an address comparison.
+                let origin = 0x900;
+                let jcc = 0x100;
+                let func = 0x5000;
+                let block = 0x7000;
+
+                prog.padd.push((origin, "sum", "rhs"));
+                prog.op_register.extend([("sum", "RDI"), ("rhs", "RSI")]);
+                prog.instruction
+                    .push((jcc, 2, "", mnemonic, "overflow_target", "", "", "", 0, 0));
+                prog.next.push((origin, jcc));
+                for node in [origin, jcc] {
+                    prog.code_in_block.push((node, block));
+                    prog.instr_in_function.push((node, func));
+                }
+
+                prog.run();
+
+                assert!(prog.mach_inst.iter().any(|(node, inst)| {
+                    *node == jcc
+                        && matches!(
+                            inst,
+                            MachInst::Mcond(condition, args, "overflow_target")
+                                if condition == &expected
+                                    && args.as_slice() == [Mreg::DI, Mreg::SI]
+                        )
+                }));
+                assert!(!prog.mach_inst.iter().any(|(node, inst)| {
+                    *node == jcc
+                        && matches!(
+                            inst,
+                            MachInst::Mcond(Condition::Coverflow | Condition::Cnotoverflow, _, _)
+                        )
+                }));
+                assert!(prog.reg_use.iter().any(|fact| fact == &(jcc, Mreg::DI)));
+                assert!(prog.reg_use.iter().any(|fact| fact == &(jcc, Mreg::SI)));
+            }
+
+            let mut immediate = AsmPassProgram::default();
+            let [origin, jcc, func, block] = synthetic_ids();
+            immediate.psub.push((origin, "difference", "one"));
+            immediate.op_register.push(("difference", "EAX"));
+            immediate.op_immediate.push(("one", 1, 1));
+            immediate
+                .instruction
+                .push((jcc, 2, "", "JNO", "no_overflow_target", "", "", "", 0, 0));
+            immediate.next.push((origin, jcc));
+            for node in [origin, jcc] {
+                immediate.code_in_block.push((node, block));
+                immediate.instr_in_function.push((node, func));
+            }
+
+            immediate.run();
+
+            assert!(immediate.mach_inst.iter().any(|(node, inst)| {
+                *node == jcc
+                    && matches!(
+                        inst,
+                        MachInst::Mcond(
+                            Condition::Cnarithoverflow(
+                                OverflowArithmetic::SubImmediate(1),
+                                4
+                            ),
+                            args,
+                            "no_overflow_target"
+                        ) if args.as_slice() == [Mreg::AX]
+                    )
+            }));
+            assert!(!immediate.mach_inst.iter().any(|(_, inst)| matches!(
+                inst,
+                MachInst::Mcond(Condition::Coverflow | Condition::Cnotoverflow, _, _)
+            )));
+            assert!(
+                !immediate.pjcc.iter().any(|(node, _, _)| *node == jcc),
+                "OF-only jumps must not activate legacy comparison-JCC rules"
+            );
+        });
+    }
+
+    #[test]
+    fn exact_overflow_rejects_redefined_partial_same_register_and_missing_owner_cases() {
+        on_large_stack(|| {
+            #[derive(Clone, Copy)]
+            enum InvalidShape {
+                RedefinedSource,
+                PartialWidth,
+                SameRegister,
+                MissingOwner,
+            }
+
+            for invalid in [
+                InvalidShape::RedefinedSource,
+                InvalidShape::PartialWidth,
+                InvalidShape::SameRegister,
+                InvalidShape::MissingOwner,
+            ] {
+                let mut prog = AsmPassProgram::default();
+                let [origin, shadow, jcc, func, other_func, block] = synthetic_ids();
+                let (dst_view, src_view) = match invalid {
+                    InvalidShape::PartialWidth => ("AX", "BX"),
+                    InvalidShape::SameRegister => ("RDI", "RDI"),
+                    _ => ("RDI", "RSI"),
+                };
+
+                prog.padd.push((origin, "sum", "rhs"));
+                prog.op_register
+                    .extend([("sum", dst_view), ("rhs", src_view)]);
+                prog.instruction
+                    .push((jcc, 2, "", "JO", "overflow_target", "", "", "", 0, 0));
+
+                if matches!(invalid, InvalidShape::RedefinedSource) {
+                    prog.next.extend([(origin, shadow), (shadow, jcc)]);
+                    for node in [origin, shadow, jcc] {
+                        prog.code_in_block.push((node, block));
+                        prog.instr_in_function.push((node, func));
+                    }
+                    prog.unrefinedinstruction.push((
+                        shadow,
+                        3,
+                        "",
+                        "MOV",
+                        "shadow_dst",
+                        "shadow_src",
+                        "",
+                        "",
+                        0,
+                        0,
+                    ));
+                    prog.reg_def.push((shadow, Mreg::SI));
+                } else {
+                    prog.next.push((origin, jcc));
+                    for node in [origin, jcc] {
+                        prog.code_in_block.push((node, block));
+                        prog.instr_in_function.push((node, func));
+                    }
+                }
+
+                if matches!(invalid, InvalidShape::MissingOwner) {
+                    prog.instr_in_function.push((jcc, other_func));
+                }
+
+                prog.run();
+
+                assert!(!prog.mach_inst.iter().any(|(node, inst)| {
+                    *node == jcc
+                        && matches!(
+                            inst,
+                            MachInst::Mcond(
+                                Condition::Carithoverflow(..) | Condition::Cnarithoverflow(..),
+                                _,
+                                _
+                            )
+                        )
+                }));
+                assert!(prog.mach_inst.iter().any(|(node, inst)| {
+                    *node == jcc
+                        && matches!(
+                            inst,
+                            MachInst::Mcond(Condition::Coverflow, args, "overflow_target")
+                                if args.is_empty()
+                        )
+                }));
+            }
         });
     }
 
@@ -13630,6 +16112,7 @@ mod structural_dataflow_tests {
             "ddisasm_cfg_edge",
             "flags_and_jump_pair",
             "unrefinedinstruction",
+            "decoded_reg_def",
         ] {
             assert!(
                 pass.inputs().contains(&relation),
@@ -13904,6 +16387,44 @@ pub fn addrmode_needs_symbol_resolution(am: &Addrmode) -> Option<i64> {
     }
 }
 
+/// Return the absolute data-address displacement from the one-dynamic-register
+/// x86 form `[gpr + absolute]`.  Whether that integer really names image data
+/// is deliberately decided by the Ascent rule joining the loader's section map
+/// and `raw_image_addresses_are_absolute`; this helper only recognizes shape.
+fn absolute_based_data_target(am: &Addrmode) -> Option<Address> {
+    match am {
+        Addrmode {
+            base: Some(base),
+            index: None,
+            disp: Displacement::Const(displacement),
+        } if is_valid_gpr(*base) && !matches!(base, Ireg::RSP | Ireg::RBP) && *displacement > 0 => {
+            Some(*displacement as Address)
+        }
+        _ => None,
+    }
+}
+
+/// Match the raw x86 memory operand back to its canonical Addrmode while
+/// retaining the architectural address-register view discarded by Ireg/Mreg
+/// canonicalization.  LP64 `[rdi+disp]` is eligible; address-size-overridden
+/// `[edi+disp]` is not.
+fn pointer_width_absolute_based_operand(
+    am: &Addrmode,
+    base: &str,
+    index: &str,
+    displacement: i64,
+) -> Option<(Address, Mreg)> {
+    if x86_gpr_view_width(base) != Some(8)
+        || !(index == "NONE" || index.is_empty())
+        || am.base != Some(Ireg::from(base))
+        || am.index.is_some()
+        || am.disp != Displacement::Const(displacement)
+    {
+        return None;
+    }
+    Some((absolute_based_data_target(am)?, Mreg::x86(base)))
+}
+
 // Reverse of CompCert's transl_addressing (see x86/Asmgen.v).
 pub fn transl_addressing_rev(
     am: Addrmode,
@@ -13981,7 +16502,13 @@ fn transl_addressing_rev_inner(
             base: Some(r1),
             index: None,
             disp: Displacement::Const(n),
-        } if is_valid_gpr(r1) && r1 != Ireg::RSP => Ok((Addressing::Aindexed(n), vec![r1.into()])),
+        } if is_valid_gpr(r1) && r1 != Ireg::RSP => {
+            if let Some((ident, offset)) = resolved_symbol {
+                Ok((Addressing::Abased(ident, offset), vec![r1.into()]))
+            } else {
+                Ok((Addressing::Aindexed(n), vec![r1.into()]))
+            }
+        }
 
         Addrmode {
             base: Some(r1),

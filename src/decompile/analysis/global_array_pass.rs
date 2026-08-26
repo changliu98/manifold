@@ -35,6 +35,10 @@ ascent_par! {
     // initializers.
     relation retained_initialized_data_range(Address, Arc<Vec<u8>>);
     relation global_addr_access(Ident, i64, Node, MemoryChunk);
+    // Exact ASM certificate for one bounded byte-index family.  The symbolic
+    // RTL access below still supplies logical type/stride candidates; this
+    // relation supplies the physical minimum extent of anonymous storage.
+    relation bounded_absolute_data_access(Address, Address, Ident, i64, u64, usize, Address, usize);
 
     retained_initialized_data_range(*start, bytes.clone()) <--
         initialized_data_range(start, bytes);
@@ -125,13 +129,65 @@ ascent_par! {
     // exact byte extent even when the observations also admit several array
     // or struct interpretations.  Keep this fact separate so no candidate
     // layout can enlarge storage past the ELF object boundary.
-    relation global_storage_extent(Ident, usize);
+    #[local] relation global_storage_extent_candidate(Ident, usize);
 
-    global_storage_extent(base_ident, *size) <--
+    global_storage_extent_candidate(base_ident, *size) <--
         interior_to_base_ident(_interior_ident, base_ident, _offset),
         symbol_address(base_ident, base_addr),
         symbol_size(base_addr, size, _name),
         if *size > 0;
+
+    // The access at field offset `f` spans every bounded index value, so its
+    // last byte is `(count-1)*stride + f + width`.  Aggregate fields by their
+    // shared bound origin, then take the greatest required extent per physical
+    // owner.  This is a minimum storage proof, not an inferred source type.
+    #[local] relation bounded_absolute_field_end(Address, Ident, Address, u64, usize, u64);
+    bounded_absolute_field_end(*func, *owner, *origin, *stride, *count, field_end) <--
+        bounded_absolute_data_access(func, _, owner, field_offset_signed, stride, count, origin, access_width),
+        if *field_offset_signed >= 0,
+        if let Ok(field_offset) = u64::try_from(*field_offset_signed),
+        if let Ok(width) = u64::try_from(*access_width),
+        if let Some(field_end) = field_offset.checked_add(width);
+
+    #[local] relation bounded_absolute_max_field_end(Address, Ident, Address, u64, usize, u64);
+    bounded_absolute_max_field_end(func, owner, origin, stride, count, maximum) <--
+        bounded_absolute_field_end(func, owner, origin, stride, count, _),
+        agg maximum = ascent::aggregators::max(end)
+            in bounded_absolute_field_end(func, owner, origin, stride, count, end);
+
+    #[local] relation bounded_absolute_min_extent(Ident, usize);
+    bounded_absolute_min_extent(*owner, extent) <--
+        bounded_absolute_max_field_end(_, owner, _, stride, count, max_field_end),
+        if let Some(last_index_usize) = count.checked_sub(1),
+        if let Ok(last_index) = u64::try_from(last_index_usize),
+        if let Some(index_span) = stride.checked_mul(last_index),
+        if let Some(extent_u64) = index_span.checked_add(*max_field_end),
+        if let Ok(extent) = usize::try_from(extent_u64),
+        if extent > 0;
+
+    // A bounded index proves how much storage every represented execution may
+    // touch, but not by itself where the original object ended.  Promote that
+    // minimum to exact physical ownership only when it reaches the next
+    // authoritative object/section boundary.  Exact symbol sizes use the
+    // separate rule below.
+    global_storage_extent_candidate(*owner, *extent) <--
+        bounded_absolute_min_extent(owner, extent),
+        global_gap_extent(owner, gap),
+        if let Ok(exact_gap) = usize::try_from(*gap),
+        if exact_gap == *extent;
+
+    // Preserve an authoritative ELF object size when one exists even if the
+    // bounded accesses touch only a prefix of it.
+    global_storage_extent_candidate(*owner_ident, *size) <--
+        bounded_absolute_data_access(_, _, owner_ident, _, _, _, _, _),
+        let owner_address = *owner_ident as Address,
+        symbol_size(owner_address, size, _),
+        if *size > 0;
+
+    relation global_storage_extent(Ident, usize);
+    global_storage_extent(ident, extent) <--
+        global_storage_extent_candidate(ident, _),
+        agg extent = max_usize(candidate) in global_storage_extent_candidate(ident, candidate);
 
     relation global_distinct_offset(Ident, i64);
 
@@ -553,6 +609,16 @@ ascent_par! {
         symbol_address(ident, addr),
         symbol_size(addr, size, _),
         if *size >= *elem_size;
+    array_count_cand(ident, extent / elem_size) <--
+        inferred_element_size(ident, elem_size),
+        if *elem_size > 0,
+        global_storage_extent(ident, extent),
+        if *extent >= *elem_size && *extent % *elem_size == 0;
+    array_count_cand(ident, extent / elem_size) <--
+        inferred_element_size(ident, elem_size),
+        if *elem_size > 0,
+        bounded_absolute_min_extent(ident, extent),
+        if *extent >= *elem_size && *extent % *elem_size == 0;
     // A table reached through a computed index names no offset past its base, so
     // the constant offsets under-report its extent by construction and the count
     // above collapses to a single element.  The loop that fills the table then
@@ -1016,6 +1082,7 @@ mod relocated_string_array_tests {
         assert!(pass.inputs().contains(&"pointer_in_data"));
         assert!(pass.inputs().contains(&"global_var_ref"));
         assert!(pass.inputs().contains(&"initialized_data_range"));
+        assert!(pass.inputs().contains(&"bounded_absolute_data_access"));
         assert!(pass.outputs().contains(&"retained_initialized_data_range"));
         assert!(pass.outputs().contains(&"is_global_array"));
         assert!(pass.outputs().contains(&"global_storage_extent"));
@@ -1038,5 +1105,41 @@ mod relocated_string_array_tests {
             .global_storage_extent
             .iter()
             .any(|fact| *fact == (owner, 16)));
+    }
+
+    #[test]
+    fn bounded_absolute_fields_publish_one_required_physical_extent() {
+        let func = 0x900;
+        let origin = 0x500;
+        let owner: Ident = 0x404030;
+        let add_certificates = |prog: &mut GlobalArrayPassProgram| {
+            prog.bounded_absolute_data_access
+                .push((func, 0x300, owner, 0, 16, 4, origin, 8));
+            prog.bounded_absolute_data_access
+                .push((func, 0x80, owner, 8, 16, 4, origin, 8));
+        };
+
+        let mut minimum_only = GlobalArrayPassProgram::default();
+        add_certificates(&mut minimum_only);
+        minimum_only.run();
+        assert!(minimum_only.global_storage_extent.is_empty());
+
+        let mut prog = GlobalArrayPassProgram::default();
+        add_certificates(&mut prog);
+        prog.global_addr_access
+            .push((owner, 0, 0x300, MemoryChunk::MAny64));
+        prog.data_section_range
+            .push((owner as Address, owner as Address + 64));
+
+        prog.run();
+
+        assert!(prog
+            .global_storage_extent
+            .iter()
+            .any(|fact| *fact == (owner, 64)));
+        assert!(!prog
+            .global_storage_extent
+            .iter()
+            .any(|fact| fact.0 == owner && fact.1 != 64));
     }
 }

@@ -261,6 +261,24 @@ fn split_sp_indexed_lea(op: &Operation) -> Option<(Operation, Operation, i64)> {
     }
 }
 
+// Scale of the zero-displacement indexed half produced by
+// split_sp_indexed_lea.  Keeping this helper exact prevents an arbitrary
+// pointer-looking arithmetic operation from becoming frame-object evidence.
+fn split_indexed_lea_scale(op: &Operation) -> Option<i64> {
+    match op {
+        Operation::Olea(Addressing::Aindexed2(0)) | Operation::Oleal(Addressing::Aindexed2(0)) => {
+            Some(1)
+        }
+        Operation::Olea(Addressing::Aindexed2scaled(scale, 0))
+        | Operation::Oleal(Addressing::Aindexed2scaled(scale, 0))
+            if *scale > 0 =>
+        {
+            Some(*scale)
+        }
+        _ => None,
+    }
+}
+
 // CompCert RTL has no 128-bit integer store.  A four-dword broadcast therefore
 // occupies the original instruction node plus three private synthetic nodes,
 // connected explicitly below rather than ordered by their numeric values.
@@ -8404,7 +8422,145 @@ ascent_par! {
         let base = args[0],
         instr_in_function(access, func);
 
+    // A runtime-indexed address into the local frame is still one physical C
+    // object when the index has a structural finite bound.  Unsigned immediate
+    // remainder is exact evidence: x % N is in [0,N), independently of x.
+    // Keep the proof at the reaching machine definition used by this LEA; a
+    // same-register operation elsewhere in the function cannot lend a bound.
+    #[local] relation unsigned_index_bound_def(Address, Mreg, i64);
+    unsigned_index_bound_def(node, *dst, *modulus) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Omoduimm(modulus), _, dst)),
+        if *modulus > 0 && *modulus <= (1 << 20);
+    unsigned_index_bound_def(node, *dst, *modulus) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Omodluimm(modulus), _, dst)),
+        if *modulus > 0 && *modulus <= (1 << 20);
+
+    #[local] relation sp_indexed_lea_index_rtl(Address, RTLReg);
+    sp_indexed_lea_index_rtl(addr, idx_rtl) <--
+        sp_indexed_lea(addr),
+        ltl_inst(addr, ?LTLInst::Lop(_, mregs, dst)),
+        if mregs.len() == 2 && mregs[1] != *dst,
+        reg_rtl(addr, mregs[1], idx_rtl);
+    sp_indexed_lea_index_rtl(addr, idx_rtl) <--
+        sp_indexed_lea(addr),
+        ltl_inst(addr, ?LTLInst::Lop(_, mregs, dst)),
+        if mregs.len() == 2 && mregs[1] == *dst,
+        lop_overwrite_use_id(addr, *dst, idx_xtl),
+        xtl_canonical(idx_xtl, idx_rtl);
+
+    #[local] relation sp_index_bound_member(Address, Address, RTLReg, i64);
+    sp_index_bound_member(*func, *use_addr, *idx_rtl, *bound) <--
+        sp_indexed_lea(use_addr),
+        ltl_inst(use_addr, ?LTLInst::Lop(_, mregs, _)),
+        if mregs.len() == 2,
+        let idx_mreg = mregs[1],
+        instr_in_function(use_addr, func),
+        reg_def_used(def_addr, idx_mreg, use_addr),
+        unsigned_index_bound_def(def_addr, idx_mreg, bound),
+        sp_indexed_lea_index_rtl(use_addr, idx_rtl);
+
+    #[local] relation sp_index_bound_has_unbounded_def(Address, Address);
+    sp_index_bound_has_unbounded_def(*func, *use_addr) <--
+        sp_indexed_lea(use_addr),
+        ltl_inst(use_addr, ?LTLInst::Lop(_, mregs, _)),
+        if mregs.len() == 2,
+        let idx_mreg = mregs[1],
+        instr_in_function(use_addr, func),
+        reg_def_used(def_addr, idx_mreg, use_addr),
+        !unsigned_index_bound_def(def_addr, idx_mreg, _);
+    sp_index_bound_has_unbounded_def(*func, *use_addr) <--
+        sp_indexed_lea(use_addr),
+        ltl_inst(use_addr, ?LTLInst::Lop(_, mregs, _)),
+        if mregs.len() == 2,
+        let idx_mreg = mregs[1],
+        instr_in_function(use_addr, func),
+        unknown_reg_value_reaches_use(func, use_addr, idx_mreg);
+
+    #[local] relation sp_index_bound_conflict(Address, Address);
+    sp_index_bound_conflict(func, use_addr) <--
+        sp_index_bound_member(func, use_addr, _, left),
+        sp_index_bound_member(func, use_addr, _, right),
+        if left != right;
+
+    #[local] relation sp_index_bound(Address, Address, RTLReg, i64);
+    sp_index_bound(func, use_addr, idx_rtl, bound) <--
+        sp_index_bound_member(func, use_addr, idx_rtl, bound),
+        !sp_index_bound_has_unbounded_def(func, use_addr),
+        !sp_index_bound_conflict(func, use_addr);
+
+    // One set-valued fact per RTL pointer identity.  Copies and canonical
+    // aliases retain all possible frame-region origins; only a singleton is
+    // projected at a call, so a join cannot manufacture a must-alias object.
+    #[local] lattice bounded_stack_ptr_origins(Address, RTLReg, Set<(i64, i64, i64)>);
+    bounded_stack_ptr_origins(*func, *dst, Set::singleton((*base_ofs, scale, *bound))) <--
+        indexed_synth_stack_base(func, raw_addr, base_ofs, base_rtl),
+        sp_index_bound(func, raw_addr, idx_rtl, bound),
+        let synth = *raw_addr | (1u64 << 62),
+        rtl_inst_candidate(synth, ?RTLInst::Iop(indexed_op, args, dst)),
+        if args.len() == 2 && args[0] == *base_rtl && args[1] == *idx_rtl,
+        if let Some(scale) = split_indexed_lea_scale(indexed_op);
+
+    bounded_stack_ptr_origins(*func, *dst, origins.clone()) <--
+        bounded_stack_ptr_origins(func, src, origins),
+        rtl_move_value_edge(func, src, dst);
+
+    bounded_stack_ptr_origins(*func, *raw, origins.clone()) <--
+        bounded_stack_ptr_origins(func, canonical, origins),
+        xtl_canonical(raw, canonical),
+        if raw != canonical;
+    bounded_stack_ptr_origins(*func, *canonical, origins.clone()) <--
+        bounded_stack_ptr_origins(func, raw, origins),
+        xtl_canonical(raw, canonical),
+        if raw != canonical;
+
+    #[local] relation bounded_stack_ptr_origin_member(Address, RTLReg, i64, i64, i64);
+    bounded_stack_ptr_origin_member(*func, *ptr, *base, *scale, *count) <--
+        bounded_stack_ptr_origins(func, ptr, origins),
+        for (base, scale, count) in origins.0.iter();
+
+    #[local] relation bounded_stack_ptr_origin_conflict(Address, RTLReg);
+    bounded_stack_ptr_origin_conflict(func, ptr) <--
+        bounded_stack_ptr_origin_member(func, ptr, left_base, left_scale, left_count),
+        bounded_stack_ptr_origin_member(func, ptr, right_base, right_scale, right_count),
+        if left_base != right_base || left_scale != right_scale || left_count != right_count;
+
+    #[local] relation bounded_stack_ptr_call(Address, Address, usize, i64, i64, i64);
+    bounded_stack_ptr_call(*caller, *call_addr, *pos, *base, *scale, *count) <--
+        call_arg_mapping(call_addr, pos, ptr),
+        instr_in_function(call_addr, caller),
+        bounded_stack_ptr_origin_member(caller, ptr, base, scale, count),
+        !bounded_stack_ptr_origin_conflict(caller, ptr);
+
+    // Project every exact constant-offset access made through the callee
+    // parameter onto every value admitted by the bounded index.  Validate the
+    // farthest byte against the recovered local frame before publishing any
+    // field; this is a physical allocation bound, never a reachability test.
+    #[local] relation bounded_indexed_stack_call_access(Address, i64, i64, i64, i64, MemoryChunk, i64);
+    bounded_indexed_stack_call_access(*caller, *base, *scale, *count, *callee_field, *chunk, extent) <--
+        bounded_stack_ptr_call(caller, call_addr, pos, base, scale, count),
+        call_target_func(call_addr, callee),
+        param_origin_carrier(callee, pos, current, param_rtl),
+        param_base_field_access(current, param_rtl, callee_field, chunk),
+        if *callee_field >= 0 && *scale > 0 && *count > 0,
+        let width = crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk) as i64,
+        if width > 0,
+        if let Some(last_index) = count.checked_sub(1),
+        if let Some(last_delta) = last_index.checked_mul(*scale),
+        if let Some(field_end) = callee_field.checked_add(width),
+        if let Some(extent) = last_delta.checked_add(field_end),
+        if extent > 0 && extent <= (1 << 20),
+        if let Some(high) = base.checked_add(extent),
+        func_stacksz(caller, _, _, frame_size_u64),
+        if let Ok(frame_size) = i64::try_from(*frame_size_u64),
+        if direct_pointer_interval_within_local_frame(*base, high, frame_size);
+
     relation escaped_stack_region_field(Address, i64, i64, MemoryChunk);
+    escaped_stack_region_field(caller, *base, projected, *chunk) <--
+        bounded_indexed_stack_call_access(caller, base, scale, count, callee_field, chunk, _),
+        for index in 0..*count,
+        if let Some(element_ofs) = index.checked_mul(*scale),
+        if let Some(projected) = element_ofs.checked_add(*callee_field);
+
     escaped_stack_region_field(caller, base_ofs, *field_ofs, *chunk) <--
         reg_holds_slot_addr(caller, def_addr, base_ofs, arg_mreg),
         arg_setup_candidate(def_addr, arg_mreg, call_addr),
@@ -9462,6 +9618,9 @@ ascent_par! {
         let limit = size_i64;
 
     relation escaped_stack_region_extent(Address, i64, i64);
+    escaped_stack_region_extent(caller, *base, *extent) <--
+        bounded_indexed_stack_call_access(caller, base, _, _, _, _, extent);
+
     escaped_stack_region_extent(func, *low, high - low) <--
         stack_pointer_walk_region(func, low, high);
 
@@ -17272,6 +17431,160 @@ mod tests {
                 .rtl_inst_candidate
                 .iter()
                 .any(|(node, inst)| *node == next_arg && matches!(inst, RTLInst::Iop(..))));
+        });
+    }
+
+    #[test]
+    fn bounded_unsigned_stack_index_projects_every_callee_observed_element() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [func, mod_def, indexed_lea, call, callee, callee_param, field_access] =
+                synthetic_ids();
+            let synth = indexed_lea | (1u64 << 62);
+            let base_rtl = 0x8100;
+            let index_rtl = 0x8200;
+            let pointer_rtl = 0x8300;
+            let locals = [0x8400, 0x8401, 0x8402];
+
+            prog.ltl_inst.push((
+                mod_def,
+                LTLInst::Lop(Operation::Omoduimm(3), Arc::new(vec![Mreg::DI]), Mreg::AX),
+            ));
+            prog.ltl_inst.push((
+                indexed_lea,
+                LTLInst::Lop(
+                    Operation::Oleal(Addressing::Aindexed2scaled(4, 0)),
+                    Arc::new(vec![Mreg::SP, Mreg::AX]),
+                    Mreg::SI,
+                ),
+            ));
+            for node in [mod_def, indexed_lea, call] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.reg_def_used.push((mod_def, Mreg::AX, indexed_lea));
+            prog.reg_rtl.push((indexed_lea, Mreg::AX, index_rtl));
+            prog.indexed_synth_stack_base
+                .push((func, indexed_lea, 0, base_rtl));
+            prog.rtl_inst_candidate.push((
+                synth,
+                RTLInst::Iop(
+                    Operation::Oleal(Addressing::Aindexed2scaled(4, 0)),
+                    Arc::new(vec![base_rtl, index_rtl]),
+                    pointer_rtl,
+                ),
+            ));
+            prog.call_arg_mapping.push((call, 1, pointer_rtl));
+            prog.call_target_func.push((call, callee));
+            prog.param_origin_carrier
+                .push((callee, 1, callee, callee_param));
+            prog.param_base_field_access
+                .push((callee, callee_param, 0, MemoryChunk::MInt32));
+            prog.func_stacksz.push((func, func, "bounded", 16));
+            for (index, local) in locals.into_iter().enumerate() {
+                prog.stack_var
+                    .push((func, field_access + index as u64, index as i64 * 4, local));
+            }
+
+            prog.run();
+
+            let fields: BTreeSet<_> = prog
+                .escaped_stack_region_field
+                .iter()
+                .filter(|(owner, base, _, _)| (*owner, *base) == (func, 0))
+                .map(|(_, _, offset, chunk)| (*offset, *chunk))
+                .collect();
+            assert_eq!(
+                fields,
+                BTreeSet::from([
+                    (0, MemoryChunk::MInt32),
+                    (4, MemoryChunk::MInt32),
+                    (8, MemoryChunk::MInt32),
+                ])
+            );
+            assert!(prog
+                .escaped_stack_region_extent
+                .iter()
+                .any(|row| row == &(func, 0, 12)));
+            let protected_offsets: BTreeSet<_> = prog
+                .slot_escaped_region_canonical
+                .iter()
+                .filter(|(owner, _, _)| *owner == func)
+                .map(|(_, offset, _)| *offset)
+                .collect();
+            // The synthetic indexed base aliases the real offset-zero local,
+            // so the canonical RTL identity at that offset is intentionally
+            // chosen by the existing min aggregate.  What DSE requires here
+            // is one canonical protected cell at each projected offset, not a
+            // particular arbitrary test identity.
+            assert_eq!(protected_offsets, BTreeSet::from([0, 4, 8]));
+        });
+    }
+
+    #[test]
+    fn bounded_stack_index_rejects_an_unbounded_reaching_arm() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [func, bounded_def, unbounded_def, indexed_lea, call, callee, callee_param] =
+                synthetic_ids();
+            let synth = indexed_lea | (1u64 << 62);
+            let base_rtl = 0x9100;
+            let index_rtl = 0x9200;
+            let pointer_rtl = 0x9300;
+
+            prog.ltl_inst.extend([
+                (
+                    bounded_def,
+                    LTLInst::Lop(Operation::Omoduimm(3), Arc::new(vec![Mreg::DI]), Mreg::AX),
+                ),
+                (
+                    unbounded_def,
+                    LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::CX]), Mreg::AX),
+                ),
+                (
+                    indexed_lea,
+                    LTLInst::Lop(
+                        Operation::Oleal(Addressing::Aindexed2scaled(4, 0)),
+                        Arc::new(vec![Mreg::SP, Mreg::AX]),
+                        Mreg::SI,
+                    ),
+                ),
+            ]);
+            for node in [bounded_def, unbounded_def, indexed_lea, call] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.reg_def_used.extend([
+                (bounded_def, Mreg::AX, indexed_lea),
+                (unbounded_def, Mreg::AX, indexed_lea),
+            ]);
+            prog.reg_rtl.push((indexed_lea, Mreg::AX, index_rtl));
+            prog.indexed_synth_stack_base
+                .push((func, indexed_lea, 0, base_rtl));
+            prog.rtl_inst_candidate.push((
+                synth,
+                RTLInst::Iop(
+                    Operation::Oleal(Addressing::Aindexed2scaled(4, 0)),
+                    Arc::new(vec![base_rtl, index_rtl]),
+                    pointer_rtl,
+                ),
+            ));
+            prog.call_arg_mapping.push((call, 0, pointer_rtl));
+            prog.call_target_func.push((call, callee));
+            prog.param_origin_carrier
+                .push((callee, 0, callee, callee_param));
+            prog.param_base_field_access
+                .push((callee, callee_param, 0, MemoryChunk::MInt32));
+            prog.func_stacksz.push((func, func, "ambiguous", 16));
+
+            prog.run();
+
+            assert!(prog
+                .sp_index_bound_has_unbounded_def
+                .iter()
+                .any(|row| row == &(func, indexed_lea)));
+            assert!(!prog
+                .escaped_stack_region_field
+                .iter()
+                .any(|(owner, _, _, _)| *owner == func));
         });
     }
 

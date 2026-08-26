@@ -1,5 +1,6 @@
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
+use crate::decompile::passes::rtl_optimize_pass::escaped_stack_slot_regs;
 use crate::util::{exec_order_key, is_synthetic_node, semantic_node_address};
 use crate::x86::op::{Comparison, Condition};
 use crate::x86::types::{
@@ -127,10 +128,18 @@ impl IRPass for StructuringPass {
         );
         let mut working = canonical_working(&candidates);
 
+        // These names denote externally observable memory cells, even though
+        // reverse Stacking represents their writes as Sset.  Every later
+        // scalar optimization must preserve that distinction.
+        let escaped_stack_regs: HashSet<RTLReg> = escaped_stack_slot_regs(db)
+            .into_values()
+            .flatten()
+            .collect();
+
         // Apply optimizations to the representative and all retained
         // alternatives in lockstep.
-        propagate_copies(&mut working, &mut candidates, db);
-        inline_constants(&mut working, &mut candidates, db);
+        propagate_copies(&mut working, &mut candidates, db, &escaped_stack_regs);
+        inline_constants(&mut working, &mut candidates, db, &escaped_stack_regs);
         eliminate_dead_returns(&mut working, &mut candidates, db);
         inline_single_use_temps(&mut working, &mut candidates, db);
         lift_setcc_arith_to_ite(&mut working, &mut candidates, db);
@@ -400,6 +409,9 @@ impl IRPass for StructuringPass {
             "csharp_stmt_candidate",
             "instr_in_function",
             "single_def_const",
+            "slot_escaped_canonical",
+            "slot_escaped_region_canonical",
+            "stack_var",
             "dead_def",
             "code_in_block",
             "next",
@@ -3358,6 +3370,7 @@ fn inline_constants(
     working: &mut HashMap<Node, CsharpminorStmt>,
     candidates: &mut CsharpStmtCandidates,
     db: &DecompileDB,
+    escaped_stack_regs: &HashSet<RTLReg>,
 ) {
     let mut def_count: HashMap<RTLReg, usize> = HashMap::new();
     for (_, stmt) in working.iter() {
@@ -3395,6 +3408,9 @@ fn inline_constants(
             .then_with(|| format!("{:?}", a.1).cmp(&format!("{:?}", b.1)))
     });
     for (reg, cst) in sdc_tuples {
+        if escaped_stack_regs.contains(&reg) {
+            continue;
+        }
         if multi_def.contains(&reg) {
             continue;
         }
@@ -3576,6 +3592,7 @@ fn propagate_copies(
     working: &mut HashMap<Node, CsharpminorStmt>,
     candidates: &mut CsharpStmtCandidates,
     db: &mut DecompileDB,
+    escaped_stack_regs: &HashSet<RTLReg>,
 ) {
     use crate::x86::types::XType;
 
@@ -3589,6 +3606,9 @@ fn propagate_copies(
     }
     for &(_, entry) in db.rel_iter::<(Address, Node)>("func_entry_node") {
         prog.entry.push((entry,));
+    }
+    for &reg in escaped_stack_regs {
+        prog.protected_copy_dst.push((reg,));
     }
 
     prog.run();
@@ -3864,6 +3884,9 @@ ascent_par! {
     // VR-2 inputs: statement-level CFG edges (cminor_succ) and function entry nodes.
     relation edge(Node, Node);
     relation entry(Node);
+    // A reverse-Stacking Sset into an address-escaped cell is a memory store,
+    // not a substitutable register rename.
+    relation protected_copy_dst(RTLReg);
 
     // Registers used (read) at a node. Computed once per stmt.
     relation stmt_uses(Node, RTLReg);
@@ -3876,7 +3899,8 @@ ascent_par! {
     relation copy_intro(Node, RTLReg, RTLReg);
     copy_intro(*n, *dst, *src) <--
         stmt(n, ?CsharpminorStmt::Sset(dst, CsharpminorExpr::Evar(src))),
-        if dst != src;
+        if dst != src,
+        !protected_copy_dst(dst);
 
     // The copy introduced at `intro` is live at use-node `u`. This is derived
     // only from the CFG lattice below; node magnitude is not execution order.
@@ -3903,6 +3927,7 @@ ascent_par! {
     // Cross-block coverage feeds the same active/covered/dead pipeline; tuples materialize only at use sites.
     copy_active_at(*u, *dst, src, intro) <--
         stmt_uses(u, dst),
+        !protected_copy_dst(dst),
         avail_in(u, av),
         for (intro, src) in avail_copies_of(&av.0, *dst);
 
@@ -3923,6 +3948,7 @@ ascent_par! {
     // Chain extension: once a subst introduces mid and avail_in still carries mid = root, mid->root applies at u too, letting the fold chase outer -> mid -> root across call-split blocks.
     applicable_subst(*u, *mid, root) <--
         applicable_subst(u, _, mid),
+        !protected_copy_dst(mid),
         avail_in(u, av),
         for (intro, root) in avail_copies_of(&av.0, *mid),
         !copy_use_uncovered(intro);
@@ -4491,8 +4517,13 @@ mod candidate_handoff_tests {
 
 #[cfg(test)]
 mod copy_propagation_tests {
-    use super::CopyPropagationProgram;
-    use crate::x86::types::{CsharpminorExpr, CsharpminorStmt};
+    use super::{
+        canonical_working, inline_constants, propagate_copies, CopyPropagationProgram,
+        CsharpStmtCandidates,
+    };
+    use crate::decompile::elevator::DecompileDB;
+    use crate::x86::types::{Constant, CsharpminorExpr, CsharpminorStmt};
+    use std::collections::{HashMap, HashSet};
 
     const SRC: u64 = 11;
     const DST: u64 = 22;
@@ -4526,6 +4557,71 @@ mod copy_propagation_tests {
             .iter()
             .any(|fact| fact == &(use_node, DST, SRC)));
         assert!(prog.dead_copy_v2.iter().any(|fact| fact == &(intro,)));
+    }
+
+    #[test]
+    fn escaped_stack_cell_copy_is_not_a_register_rename() {
+        let [intro, use_node] = synthetic_ids();
+
+        let mut prog = CopyPropagationProgram::default();
+        prog.stmt.push((intro, copy_stmt()));
+        prog.stmt.push((use_node, use_stmt()));
+        prog.entry.push((intro,));
+        prog.edge.push((intro, use_node));
+        prog.protected_copy_dst.push((DST,));
+
+        prog.run();
+
+        assert!(!prog
+            .copy_intro
+            .iter()
+            .any(|fact| fact == &(intro, DST, SRC)));
+        assert!(!prog
+            .applicable_subst
+            .iter()
+            .any(|fact| fact == &(use_node, DST, SRC)));
+        assert!(!prog.dead_copy_v2.iter().any(|fact| fact == &(intro,)));
+    }
+
+    #[test]
+    fn escaped_stack_cell_survives_copy_and_constant_folding_pipeline() {
+        let [constant_node, store_node, use_node, func] = synthetic_ids();
+        let escaped = DST;
+        let mut candidates: CsharpStmtCandidates = HashMap::from([
+            (
+                constant_node,
+                vec![CsharpminorStmt::Sset(
+                    SRC,
+                    CsharpminorExpr::Econst(Constant::Olongconst(0x17_0000_000b)),
+                )],
+            ),
+            (store_node, vec![copy_stmt()]),
+            (use_node, vec![use_stmt()]),
+        ]);
+        let mut working = canonical_working(&candidates);
+        let mut db = DecompileDB::default();
+        db.rel_push("func_entry_node", (func, constant_node));
+        db.rel_push("cminor_succ", (constant_node, store_node));
+        db.rel_push("cminor_succ", (store_node, use_node));
+        db.rel_push(
+            "single_def_const",
+            (SRC, Constant::Olongconst(0x17_0000_000b)),
+        );
+        let escaped_regs = HashSet::from([escaped]);
+
+        propagate_copies(&mut working, &mut candidates, &mut db, &escaped_regs);
+        inline_constants(&mut working, &mut candidates, &db, &escaped_regs);
+
+        assert!(matches!(
+            working.get(&store_node),
+            Some(CsharpminorStmt::Sset(dst, CsharpminorExpr::Econst(
+                Constant::Olongconst(0x17_0000_000b)
+            ))) if *dst == escaped
+        ));
+        assert!(matches!(
+            working.get(&use_node),
+            Some(CsharpminorStmt::Sreturn(CsharpminorExpr::Evar(reg))) if *reg == escaped
+        ));
     }
 
     #[test]

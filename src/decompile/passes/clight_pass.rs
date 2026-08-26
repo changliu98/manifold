@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::mreg::Mreg;
 use crate::util::{exec_order_key, is_synthetic_node, semantic_node_address};
-use crate::x86::op::{Addressing, Comparison, Condition, Operation};
+use crate::x86::op::{Addressing, Comparison, Condition, Operation, OverflowArithmetic};
 use crate::x86::types::*;
 use ascent::ascent_par;
 use ascent::lattice::set::Set;
@@ -1332,6 +1332,126 @@ mod tests {
     }
 
     #[test]
+    fn machine_integer_arithmetic_is_emitted_with_defined_wrapping_semantics() {
+        let long_add = build_binop_expr(
+            &CminorBinop::Oaddl,
+            ClightExpr::Etempvar(1, default_long_type()),
+            ClightExpr::Etempvar(2, default_long_type()),
+            8,
+        );
+        assert!(matches!(
+            long_add,
+            ClightExpr::Ebinop(
+                ClightBinaryOp::Oadd,
+                lhs,
+                rhs,
+                ClightType::Tlong(ClightSignedness::Unsigned, _),
+            ) if matches!(
+                lhs.as_ref(),
+                ClightExpr::Ecast(_, ClightType::Tlong(ClightSignedness::Unsigned, _))
+            ) && matches!(
+                rhs.as_ref(),
+                ClightExpr::Etempvar(2, ClightType::Tlong(ClightSignedness::Signed, _))
+            )
+        ));
+
+        let int_mul = build_binop_expr(
+            &CminorBinop::Omul,
+            ClightExpr::Etempvar(3, default_int_type()),
+            ClightExpr::Etempvar(4, default_int_type()),
+            8,
+        );
+        assert!(matches!(
+            int_mul,
+            ClightExpr::Ebinop(
+                ClightBinaryOp::Omul,
+                lhs,
+                rhs,
+                ClightType::Tint(
+                    ClightIntSize::I32,
+                    ClightSignedness::Unsigned,
+                    _,
+                ),
+            ) if matches!(
+                lhs.as_ref(),
+                ClightExpr::Ecast(
+                    _,
+                    ClightType::Tint(
+                        ClightIntSize::I32,
+                        ClightSignedness::Unsigned,
+                        _,
+                    ),
+                )
+            ) && matches!(
+                rhs.as_ref(),
+                ClightExpr::Etempvar(
+                    4,
+                    ClightType::Tint(
+                        ClightIntSize::I32,
+                        ClightSignedness::Signed,
+                        _,
+                    ),
+                )
+            )
+        ));
+
+        let int_add_wide_rhs = build_binop_expr(
+            &CminorBinop::Oadd,
+            ClightExpr::Etempvar(7, default_int_type()),
+            ClightExpr::Etempvar(8, default_long_type()),
+            8,
+        );
+        assert!(matches!(
+            int_add_wide_rhs,
+            ClightExpr::Ebinop(
+                ClightBinaryOp::Oadd,
+                _,
+                rhs,
+                ClightType::Tint(
+                    ClightIntSize::I32,
+                    ClightSignedness::Unsigned,
+                    _,
+                ),
+            ) if matches!(
+                rhs.as_ref(),
+                ClightExpr::Ecast(
+                    _,
+                    ClightType::Tint(
+                        ClightIntSize::I32,
+                        ClightSignedness::Unsigned,
+                        _,
+                    ),
+                )
+            )
+        ));
+
+        let pointer_ty = pointer_to(default_int_type());
+        let pointer_add = build_binop_expr(
+            &CminorBinop::Oadd,
+            ClightExpr::Etempvar(5, pointer_ty.clone()),
+            ClightExpr::Etempvar(6, default_int_type()),
+            8,
+        );
+        fn contains_unsigned_integer_cast(expr: &ClightExpr) -> bool {
+            match expr {
+                ClightExpr::Ecast(inner, ty) => {
+                    matches!(
+                        ty,
+                        ClightType::Tlong(ClightSignedness::Unsigned, _)
+                            | ClightType::Tint(ClightIntSize::I32, ClightSignedness::Unsigned, _,)
+                    ) || contains_unsigned_integer_cast(inner)
+                }
+                ClightExpr::Ebinop(_, lhs, rhs, _) => {
+                    contains_unsigned_integer_cast(lhs) || contains_unsigned_integer_cast(rhs)
+                }
+                _ => false,
+            }
+        }
+        assert_eq!(clight_expr_type(&pointer_add), pointer_ty);
+        assert!(!contains_unsigned_integer_cast(&pointer_add));
+    }
+
+    #[test]
     fn nested_integer_to_float_conversion_gets_pointer_bridge_candidate() {
         let node = 0x5ea6;
         let float_value = 0x8000_0000_005e_900f;
@@ -2433,6 +2553,7 @@ mod tests {
             "slot_escaped_region_canonical",
             "pmov",
             "op_indirect",
+            "single_def_const",
             "stack_var",
             "stack_var_chunk",
             "stack_pointer_walk_region",
@@ -2496,6 +2617,63 @@ mod tests {
                 default_attr(),
             )
         );
+    }
+
+    #[test]
+    fn escaped_region_splits_register_loaded_wide_constant_across_exact_fields() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x1800;
+        let init: Address = 0x1810;
+        let base_ofs = 4_i64;
+        let base_local: RTLReg = 0x7300;
+        let constant_reg: RTLReg = 0x7400;
+
+        for field_ofs in [0_i64, 4, 8] {
+            db.rel_push(
+                "escaped_stack_region_field",
+                (func, base_ofs, field_ofs, MemoryChunk::MInt32),
+            );
+        }
+        db.rel_push("slot_escaped_canonical", (func, base_ofs, base_local));
+        db.rel_push("pmov", (init, "wide_mem_dst", "wide_reg_src"));
+        db.rel_push(
+            "op_indirect",
+            ("wide_mem_dst", "", "RSP", "NONE", 1_i64, base_ofs, 8_usize),
+        );
+        db.rel_push(
+            "single_def_const",
+            (constant_reg, Constant::Olongconst(0x17_0000_000b)),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                init,
+                RTLInst::Iop(Operation::Omove, Arc::new(vec![constant_reg]), base_local),
+            ),
+        );
+        db.rel_push("stack_var", (func, init, base_ofs, base_local));
+
+        let mut result = StructConstructionResult {
+            new_stmts: Vec::new(),
+            new_emit_stmts: Vec::new(),
+            rewritten_stmts: HashMap::new(),
+            stack_buffers: Vec::new(),
+        };
+        synthesize_escaped_stack_region_construction(&db, &HashMap::new(), &mut result);
+
+        assert!(result.new_stmts.is_empty());
+        assert!(result.new_emit_stmts.is_empty());
+        let Some(ClightStmt::Ssequence(stores)) = result.rewritten_stmts.get(&init) else {
+            panic!("expected the physical qword store to become one two-cell sequence");
+        };
+        let values: Vec<i32> = stores
+            .iter()
+            .map(|stmt| match stmt {
+                ClightStmt::Sassign(_, ClightExpr::EconstInt(value, _)) => *value,
+                other => panic!("unexpected split initializer statement: {other:?}"),
+            })
+            .collect();
+        assert_eq!(values, vec![11, 23]);
     }
 
     #[test]
@@ -2823,6 +3001,7 @@ impl IRPass for ClightFieldPass {
             "call_target_func",
             "reg_to_struct_id",
             "rtl_inst",
+            "single_def_const",
             "op_produces_ptr",
             "canonical_exact_stack_addr_ptr_result",
             "stack_pointer_walk_region",
@@ -3722,6 +3901,8 @@ pub(crate) fn invert_condition(cond: &Condition) -> Condition {
         // OF-set <-> OF-clear is an exact logical negation (the flag is a single bit).
         Condition::Coverflow => Condition::Cnotoverflow,
         Condition::Cnotoverflow => Condition::Coverflow,
+        Condition::Carithoverflow(op, width) => Condition::Cnarithoverflow(*op, *width),
+        Condition::Cnarithoverflow(op, width) => Condition::Carithoverflow(*op, *width),
     }
 }
 
@@ -4400,7 +4581,66 @@ pub fn build_binop_expr(
             e
         }
     };
+    // CompCert integer add/sub/mul values are fixed-width machine words, so
+    // their low bits wrap modulo 2^32 or 2^64.  Signed C arithmetic instead
+    // has undefined behavior on overflow.  Force the operation itself to the
+    // matching unsigned width (including an explicit narrowing cast when a
+    // recovered variable type is wider); the destination may still carry a
+    // signed source-level type, but the computation that produces its bits is
+    // now defined and modular.
+    let to_wrapping_unsigned = |e: ClightExpr, target: ClightType| -> ClightExpr {
+        let ety = clight_expr_type(&e);
+        if !is_integral_type(&ety) {
+            return e;
+        }
+        if ety == target || types_equal_ignoring_attr(&ety, &target) {
+            e
+        } else {
+            ClightExpr::Ecast(Box::new(e), target)
+        }
+    };
+    // One operand at the machine width is sufficient to make the usual C
+    // arithmetic conversions choose that unsigned width.  Leave an equal-or-
+    // narrower RHS in its natural type (so `u + 1` stays legible), but narrow a
+    // wider RHS explicitly: `uint32 + int64` would otherwise promote to signed
+    // 64-bit arithmetic and reintroduce overflow/width drift.
+    let wrapping_operands = |lhs: ClightExpr,
+                             rhs: ClightExpr,
+                             target: ClightType|
+     -> (ClightExpr, ClightExpr, ClightType) {
+        let lhs = to_wrapping_unsigned(lhs, target.clone());
+        let rhs_ty = clight_expr_type(&rhs);
+        let rhs_requires_narrowing = match (
+            get_inner_type_size(&rhs_ty, ptr_size),
+            get_inner_type_size(&target, ptr_size),
+        ) {
+            (Some(rhs_size), Some(target_size)) => rhs_size > target_size,
+            _ => true,
+        };
+        let rhs = if rhs_requires_narrowing {
+            to_wrapping_unsigned(rhs, target.clone())
+        } else {
+            rhs
+        };
+        (lhs, rhs, target)
+    };
     let (lhs_scaled, rhs_scaled, unsigned_result_ty) = match op {
+        CminorBinop::Oadd | CminorBinop::Osub | CminorBinop::Omul
+            if is_integral_type(&clight_expr_type(&lhs_scaled))
+                && is_integral_type(&clight_expr_type(&rhs_scaled)) =>
+        {
+            let (lhs, rhs, result_ty) =
+                wrapping_operands(lhs_scaled, rhs_scaled, default_uint_type());
+            (lhs, rhs, Some(result_ty))
+        }
+        CminorBinop::Oaddl | CminorBinop::Osubl | CminorBinop::Omull
+            if is_integral_type(&clight_expr_type(&lhs_scaled))
+                && is_integral_type(&clight_expr_type(&rhs_scaled)) =>
+        {
+            let (lhs, rhs, result_ty) =
+                wrapping_operands(lhs_scaled, rhs_scaled, default_ulong_type());
+            (lhs, rhs, Some(result_ty))
+        }
         CminorBinop::Odivu | CminorBinop::Omodu => (
             to_unsigned(lhs_scaled, default_uint_type()),
             to_unsigned(rhs_scaled, default_uint_type()),
@@ -5322,6 +5562,165 @@ fn is_int32_type(ty: &ClightType) -> bool {
     matches!(ty, ClightType::Tint(ClightIntSize::I32, _, _))
 }
 
+fn overflow_unsigned_type(width: i64) -> Option<ClightType> {
+    match width {
+        4 => Some(default_uint_type()),
+        8 => Some(default_ulong_type()),
+        _ => None,
+    }
+}
+
+fn overflow_unsigned_constant(value: i64, width: i64, ty: &ClightType) -> ClightExpr {
+    let raw = if width == 4 {
+        ClightExpr::EconstInt(value as i32, default_int_type())
+    } else {
+        ClightExpr::EconstLong(value, default_long_type())
+    };
+    ClightExpr::Ecast(Box::new(raw), ty.clone())
+}
+
+fn overflow_sign_bit(width: i64, ty: &ClightType) -> ClightExpr {
+    let one = ClightExpr::Ecast(
+        Box::new(ClightExpr::EconstInt(1, default_int_type())),
+        ty.clone(),
+    );
+    ClightExpr::Ebinop(
+        ClightBinaryOp::Oshl,
+        Box::new(one),
+        Box::new(ClightExpr::EconstInt(
+            (width * 8 - 1) as i32,
+            default_int_type(),
+        )),
+        ty.clone(),
+    )
+}
+
+/// Reconstruct x86 signed OF without performing signed overflowing arithmetic
+/// in C.  All arithmetic is explicitly unsigned at the decoded machine width.
+/// For ADD, old_dst = result - rhs (mod 2^N); for SUB, old_dst = result + rhs.
+fn clight_arithmetic_overflow_expr(
+    operation: OverflowArithmetic,
+    width: i64,
+    args: &[CsharpminorExpr],
+    var_types: &MultiVarTypeMap,
+    ptr_size: i64,
+    negate: bool,
+) -> Option<ClightExpr> {
+    let unsigned_ty = overflow_unsigned_type(width)?;
+    let result_raw = args.first()?;
+    let result = ClightExpr::Ecast(
+        Box::new(clight_expr_from_csharp_with_multi_types(
+            result_raw, var_types, ptr_size,
+        )),
+        unsigned_ty.clone(),
+    );
+    let sign_bit = overflow_sign_bit(width, &unsigned_ty);
+
+    let overflow = match operation {
+        OverflowArithmetic::Neg => {
+            if args.len() != 1 {
+                return None;
+            }
+            ClightExpr::Ebinop(
+                ClightBinaryOp::Oeq,
+                Box::new(result),
+                Box::new(sign_bit),
+                default_bool_type(),
+            )
+        }
+        OverflowArithmetic::Add
+        | OverflowArithmetic::Sub
+        | OverflowArithmetic::AddImmediate(_)
+        | OverflowArithmetic::SubImmediate(_) => {
+            let rhs = match operation {
+                OverflowArithmetic::Add | OverflowArithmetic::Sub => {
+                    if args.len() != 2 {
+                        return None;
+                    }
+                    ClightExpr::Ecast(
+                        Box::new(clight_expr_from_csharp_with_multi_types(
+                            &args[1], var_types, ptr_size,
+                        )),
+                        unsigned_ty.clone(),
+                    )
+                }
+                OverflowArithmetic::AddImmediate(value)
+                | OverflowArithmetic::SubImmediate(value) => {
+                    if args.len() != 1 {
+                        return None;
+                    }
+                    overflow_unsigned_constant(value, width, &unsigned_ty)
+                }
+                OverflowArithmetic::Neg => unreachable!("handled above"),
+            };
+
+            let is_add = matches!(
+                operation,
+                OverflowArithmetic::Add | OverflowArithmetic::AddImmediate(_)
+            );
+            let old_dst = ClightExpr::Ebinop(
+                if is_add {
+                    ClightBinaryOp::Osub
+                } else {
+                    ClightBinaryOp::Oadd
+                },
+                Box::new(result.clone()),
+                Box::new(rhs.clone()),
+                unsigned_ty.clone(),
+            );
+            let old_xor_rhs = ClightExpr::Ebinop(
+                ClightBinaryOp::Oxor,
+                Box::new(old_dst.clone()),
+                Box::new(rhs),
+                unsigned_ty.clone(),
+            );
+            let old_xor_result = ClightExpr::Ebinop(
+                ClightBinaryOp::Oxor,
+                Box::new(old_dst),
+                Box::new(result),
+                unsigned_ty.clone(),
+            );
+            let sign_relation = if is_add {
+                ClightExpr::Eunop(
+                    ClightUnaryOp::Onotint,
+                    Box::new(old_xor_rhs),
+                    unsigned_ty.clone(),
+                )
+            } else {
+                old_xor_rhs
+            };
+            let overflow_bits = ClightExpr::Ebinop(
+                ClightBinaryOp::Oand,
+                Box::new(sign_relation),
+                Box::new(old_xor_result),
+                unsigned_ty.clone(),
+            );
+            let masked = ClightExpr::Ebinop(
+                ClightBinaryOp::Oand,
+                Box::new(overflow_bits),
+                Box::new(sign_bit),
+                unsigned_ty.clone(),
+            );
+            ClightExpr::Ebinop(
+                ClightBinaryOp::One,
+                Box::new(masked),
+                Box::new(overflow_unsigned_constant(0, width, &unsigned_ty)),
+                default_bool_type(),
+            )
+        }
+    };
+
+    if negate {
+        Some(ClightExpr::Eunop(
+            ClightUnaryOp::Onotbool,
+            Box::new(overflow),
+            default_bool_type(),
+        ))
+    } else {
+        Some(overflow)
+    }
+}
+
 pub(crate) fn clight_condition_expr_with_types(
     cond: &Condition,
     args: &[CsharpminorExpr],
@@ -5572,6 +5971,12 @@ pub(crate) fn clight_condition_expr_with_types(
                 Box::new(inner),
                 default_bool_type(),
             ))
+        }
+        Condition::Carithoverflow(operation, width) => {
+            clight_arithmetic_overflow_expr(*operation, *width, args, var_types, ptr_size, false)
+        }
+        Condition::Cnarithoverflow(operation, width) => {
+            clight_arithmetic_overflow_expr(*operation, *width, args, var_types, ptr_size, true)
         }
         // x86 OF from JO/JNO has no portable C expression, so emit a marked opaque builtin rather than inventing a wrong comparison; both CFG successor edges survive regardless.
         Condition::Coverflow => Some(ClightExpr::EvarSymbol(
@@ -7651,10 +8056,11 @@ fn unsigned_chunk_for_byte_width(size: usize) -> Option<MemoryChunk> {
     }
 }
 
-/// Recover the exact destination width of each raw immediate MOV.  `Typ` on
-/// `mach_imm_stack_init` is a register class and deliberately cannot
-/// distinguish byte/word/dword stack stores; the memory operand size can.
-fn exact_immediate_stack_init_chunks(db: &DecompileDB) -> HashMap<Address, MemoryChunk> {
+/// Recover the exact destination width of each raw MOV.  `Typ` on
+/// `mach_imm_stack_init` and a constant register's RTL type are value classes;
+/// neither can distinguish byte/word/dword stack stores, while the physical
+/// memory operand size can.
+fn exact_stack_store_chunks(db: &DecompileDB) -> HashMap<Address, MemoryChunk> {
     use std::collections::{BTreeMap, BTreeSet};
 
     let mut operand_sizes: HashMap<Symbol, BTreeSet<usize>> = HashMap::new();
@@ -7787,6 +8193,81 @@ fn raw_stack_buffer_store(
     ClightStmt::Sassign(lhs, immediate_value_expr(value, chunk))
 }
 
+/// Split one physical constant store into the exact escaped-region cells that
+/// tile it.  This is deliberately stricter than merely asking whether the
+/// store falls inside the region span: every byte must be owned by one
+/// recovered field, fields may neither overlap nor leave a gap, and the raw
+/// MOV width remains the authority for the total number of bytes written.
+fn exact_tiled_stack_buffer_store(
+    base_local: Ident,
+    region_size: i64,
+    relative_start: i64,
+    value: i64,
+    store_chunk: &MemoryChunk,
+    owned_fields: &BTreeMap<i64, BTreeSet<MemoryChunk>>,
+) -> Option<ClightStmt> {
+    use crate::decompile::analysis::struct_recovery_pass::chunk_byte_size;
+
+    let store_width = i64::try_from(chunk_byte_size(store_chunk)).ok()?;
+    if relative_start < 0 || store_width <= 0 || store_width > 8 {
+        return None;
+    }
+    let store_end = relative_start.checked_add(store_width)?;
+    if store_end > region_size {
+        return None;
+    }
+
+    let mut cursor = relative_start;
+    let mut stores = Vec::new();
+    while cursor < store_end {
+        let chunks = owned_fields.get(&cursor)?;
+        if chunks.len() != 1 {
+            return None;
+        }
+        let chunk = chunks.iter().next()?;
+        let field_width = i64::try_from(chunk_byte_size(chunk)).ok()?;
+        if field_width <= 0 {
+            return None;
+        }
+        let field_end = cursor.checked_add(field_width)?;
+        if field_end > store_end {
+            return None;
+        }
+        // An independently recovered field beginning inside this cell is
+        // overlapping evidence, not an exact tiling.
+        if owned_fields
+            .keys()
+            .any(|offset| *offset > cursor && *offset < field_end)
+        {
+            return None;
+        }
+
+        let byte_delta = cursor.checked_sub(relative_start)?;
+        let shift = u32::try_from(byte_delta.checked_mul(8)?).ok()?;
+        let bit_width = u32::try_from(field_width.checked_mul(8)?).ok()?;
+        let mask = if bit_width == 64 {
+            u64::MAX
+        } else {
+            (1_u64.checked_shl(bit_width)?).checked_sub(1)?
+        };
+        let field_value = ((value as u64).checked_shr(shift)? & mask) as i64;
+        stores.push(raw_stack_buffer_store(
+            base_local,
+            region_size,
+            cursor,
+            field_value,
+            chunk,
+        ));
+        cursor = field_end;
+    }
+
+    match stores.len() {
+        0 => None,
+        1 => stores.pop(),
+        _ => Some(ClightStmt::Ssequence(stores)),
+    }
+}
+
 /// Materialize initializers into one backing object only when RTL has proven
 /// that a pointer to the base escapes and a callee (possibly through wrapper
 /// calls) accesses at least two exact constant-offset fields.  This restores C
@@ -7799,25 +8280,70 @@ fn synthesize_escaped_stack_region_construction(
     use crate::decompile::analysis::struct_recovery_pass::chunk_byte_size;
     use std::collections::{BTreeMap, BTreeSet};
 
-    if std::env::var("TMPDUMP_ESCAPED").is_ok() {
-        for r in [
-            "escaped_stack_region_field",
-            "escaped_stack_region_caller_field",
-        ] {
-            for (f, b, o, c) in db.rel_iter::<(Address, i64, i64, MemoryChunk)>(r) {
-                eprintln!("TMPDUMP {r} func={f:#x} base={b} fofs={o} chunk={c:?}");
-            }
-        }
-        for (f, b, e) in db.rel_iter::<(Address, i64, i64)>("escaped_stack_region_extent") {
-            eprintln!("TMPDUMP extent func={f:#x} base={b} extent={e}");
-        }
-        for (f, o, l) in db.rel_iter::<(Address, i64, RTLReg)>("slot_escaped_canonical") {
-            eprintln!("TMPDUMP slot_escaped_canonical func={f:#x} ofs={o} local={l:#x}");
-        }
-    }
+    let exact_chunks = exact_stack_store_chunks(db);
+    let mut escaped_stack_inits = func_stack_inits.clone();
+    let mut rtl_backed_inits: BTreeSet<(Address, Node)> = BTreeSet::new();
 
-    let exact_chunks = exact_immediate_stack_init_chunks(db);
+    // A compiler may first materialize a multi-field constant in a register
+    // and then issue one wide store.  Such a store is not represented by
+    // mach_imm_stack_init, whose contract is immediate-to-memory only.  Recover
+    // it from finalized RTL, but only when both the source value and the raw
+    // memory width are unique and the destination is the stack SSA cell at
+    // this exact instruction.
+    let mut constant_values: BTreeMap<RTLReg, BTreeSet<i64>> = BTreeMap::new();
+    for (reg, constant) in db.rel_iter::<(RTLReg, Constant)>("single_def_const") {
+        let value = match constant {
+            Constant::Ointconst(value) | Constant::Olongconst(value) => *value,
+            _ => continue,
+        };
+        constant_values.entry(*reg).or_default().insert(value);
+    }
+    let mut stack_cells: BTreeMap<(Node, RTLReg), BTreeSet<(Address, i64)>> = BTreeMap::new();
+    for (func, node, offset, reg) in db.rel_iter::<(Address, Node, i64, RTLReg)>("stack_var") {
+        stack_cells
+            .entry((*node, *reg))
+            .or_default()
+            .insert((*func, *offset));
+    }
+    for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+        let RTLInst::Iop(Operation::Omove, args, dst) = inst else {
+            continue;
+        };
+        if args.len() != 1 || !exact_chunks.contains_key(node) {
+            continue;
+        }
+        let Some(values) = constant_values.get(&args[0]) else {
+            continue;
+        };
+        if values.len() != 1 {
+            continue;
+        }
+        let Some(cells) = stack_cells.get(&(*node, *dst)) else {
+            continue;
+        };
+        if cells.len() != 1 {
+            continue;
+        }
+        let &(func, offset) = cells.iter().next().unwrap();
+        let value = *values.iter().next().unwrap();
+        let chunk = &exact_chunks[node];
+        let typ = if chunk_byte_size(chunk) == 8 {
+            Typ::Tany64
+        } else {
+            Typ::Tint
+        };
+        escaped_stack_inits
+            .entry(func)
+            .or_default()
+            .push((*node, offset, value, typ));
+        rtl_backed_inits.insert((func, *node));
+    }
+    for inits in escaped_stack_inits.values_mut() {
+        inits.sort();
+        inits.dedup();
+    }
     let owned_fields = escaped_stack_region_owned_fields(db);
+    let mut proposed_rewrites: HashMap<Node, Option<ClightStmt>> = HashMap::new();
 
     let mut base_locals: BTreeMap<(Address, i64), RTLReg> = BTreeMap::new();
     for (func, ofs, local) in db.rel_iter::<(Address, i64, RTLReg)>("slot_escaped_canonical") {
@@ -7911,49 +8437,45 @@ fn synthesize_escaped_stack_region_construction(
                 .push((func, base_local as Ident, region_size));
         }
 
-        let Some(inits) = func_stack_inits.get(&func) else {
+        let Some(inits) = escaped_stack_inits.get(&func) else {
             continue;
-        };
-        let region_end = match base_ofs.checked_add(region_size) {
-            Some(end) => end,
-            None => continue,
         };
         for (addr, ofs, value, _) in inits {
             let Some(chunk) = exact_chunks.get(addr) else {
                 continue;
             };
-            let width = chunk_byte_size(chunk) as i64;
-            let Some(store_end) = ofs.checked_add(width) else {
-                continue;
-            };
-            if *ofs < base_ofs || store_end > region_end {
-                continue;
-            }
-            // The span is a size bound, not an ownership proof.  Only a field
-            // observed at this exact offset and physical width belongs to the
-            // backing object.  Otherwise keep the ordinary scalar stack-SSA
-            // candidate, which is also what subsequent reloads consume.
             let Some(field_ofs) = ofs.checked_sub(base_ofs) else {
                 continue;
             };
-            let Some(field_chunks) = region_owned_fields.get(&field_ofs) else {
-                continue;
-            };
-            let field_widths: BTreeSet<_> = field_chunks.iter().map(chunk_byte_size).collect();
-            if field_widths.len() != 1
-                || field_widths.iter().next().copied() != Some(width as usize)
-            {
-                continue;
-            }
-            let stmt = raw_stack_buffer_store(
+            let Some(stmt) = exact_tiled_stack_buffer_store(
                 base_local as Ident,
                 region_size,
-                *ofs - base_ofs,
+                field_ofs,
                 *value,
                 chunk,
-            );
-            result.new_stmts.push((*addr, stmt.clone()));
-            result.new_emit_stmts.push((func, *addr, stmt));
+                region_owned_fields,
+            ) else {
+                continue;
+            };
+            if rtl_backed_inits.contains(&(func, *addr)) {
+                proposed_rewrites
+                    .entry(*addr)
+                    .and_modify(|current| {
+                        if current.as_ref() != Some(&stmt) {
+                            *current = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(stmt));
+            } else {
+                result.new_stmts.push((*addr, stmt.clone()));
+                result.new_emit_stmts.push((func, *addr, stmt));
+            }
+        }
+    }
+
+    for (node, stmt) in proposed_rewrites {
+        if let Some(stmt) = stmt {
+            result.rewritten_stmts.insert(node, stmt);
         }
     }
 }
