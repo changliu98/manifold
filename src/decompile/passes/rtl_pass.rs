@@ -15,6 +15,7 @@ use crate::x86::mach::X86Mreg;
 use crate::x86::op::{Addressing, Comparison, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
+use ascent::lattice::constant_propagation::ConstPropagation;
 use ascent::lattice::set::Set;
 use either::Either;
 use std::collections::HashMap;
@@ -35,6 +36,274 @@ enum StackAddrOrigin {
     // same frame byte.
     Slot(i64, i64),
     NonStack,
+}
+
+const NO_AFFINE_INDEX: usize = usize::MAX;
+const MAX_BOUNDED_INTEGER: i64 = 1 << 20;
+
+/// A finite integer interval carried at one CFG point.  `ConstPropagation`
+/// supplies the MUST join: two incoming paths keep a range only when their
+/// complete intervals agree, while an unknown path raises the point to Top.
+/// The payload is constant-sized, so the analysis below remains O(V * GPRs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct BoundedIntegerRange {
+    min: i64,
+    max: i64,
+}
+
+impl BoundedIntegerRange {
+    fn checked(min: i64, max: i64) -> Option<Self> {
+        let span = max.checked_sub(min)?;
+        (min <= max
+            && span <= MAX_BOUNDED_INTEGER
+            && min >= -MAX_BOUNDED_INTEGER
+            && max <= MAX_BOUNDED_INTEGER)
+            .then_some(Self { min, max })
+    }
+
+    fn exact(value: i64) -> Option<Self> {
+        Self::checked(value, value)
+    }
+}
+
+fn bounded_integer_constant(op: &Operation) -> Option<BoundedIntegerRange> {
+    match op {
+        Operation::Ointconst(value) | Operation::Olongconst(value) => {
+            BoundedIntegerRange::exact(*value)
+        }
+        _ => None,
+    }
+}
+
+fn bounded_integer_low_mask(op: &Operation) -> Option<BoundedIntegerRange> {
+    let mask = match op {
+        Operation::Oandimm(mask) | Operation::Oandlimm(mask) => *mask,
+        _ => return None,
+    };
+    let count = mask.checked_add(1)?;
+    (mask >= 0 && (count as u64).is_power_of_two())
+        .then(|| BoundedIntegerRange::checked(0, mask))?
+}
+
+fn bounded_integer_unary_offset(op: &Operation) -> Option<i64> {
+    match op {
+        Operation::Omove => Some(0),
+        Operation::Oaddimm(delta) | Operation::Oaddlimm(delta) => Some(*delta),
+        Operation::Olea(Addressing::Aindexed(delta))
+        | Operation::Oleal(Addressing::Aindexed(delta)) => Some(*delta),
+        _ => None,
+    }
+}
+
+fn bounded_integer_binary_coefficients(op: &Operation) -> Option<(i64, i64, i64)> {
+    match op {
+        Operation::Oadd | Operation::Oaddl => Some((1, 1, 0)),
+        Operation::Osub | Operation::Osubl => Some((1, -1, 0)),
+        Operation::Olea(Addressing::Aindexed2(displacement))
+        | Operation::Oleal(Addressing::Aindexed2(displacement)) => Some((1, 1, *displacement)),
+        Operation::Olea(Addressing::Aindexed2scaled(scale, displacement))
+        | Operation::Oleal(Addressing::Aindexed2scaled(scale, displacement)) => {
+            Some((1, *scale, *displacement))
+        }
+        _ => None,
+    }
+}
+
+fn bounded_integer_definition_is_handled(op: &Operation, argument_count: usize) -> bool {
+    bounded_integer_constant(op).is_some()
+        || bounded_integer_low_mask(op).is_some()
+        || (argument_count == 1 && bounded_integer_unary_offset(op).is_some())
+        || (argument_count == 2 && bounded_integer_binary_coefficients(op).is_some())
+}
+
+fn add_bounded_integer_offset(
+    state: &ConstPropagation<BoundedIntegerRange>,
+    delta: i64,
+) -> ConstPropagation<BoundedIntegerRange> {
+    match state {
+        ConstPropagation::Bottom => ConstPropagation::Bottom,
+        ConstPropagation::Top => ConstPropagation::Top,
+        ConstPropagation::Constant(range) => range
+            .min
+            .checked_add(delta)
+            .zip(range.max.checked_add(delta))
+            .and_then(|(min, max)| BoundedIntegerRange::checked(min, max))
+            .map(ConstPropagation::Constant)
+            .unwrap_or(ConstPropagation::Top),
+    }
+}
+
+fn combine_bounded_integer_ranges(
+    left: &ConstPropagation<BoundedIntegerRange>,
+    right: &ConstPropagation<BoundedIntegerRange>,
+    left_coefficient: i64,
+    right_coefficient: i64,
+    displacement: i64,
+) -> ConstPropagation<BoundedIntegerRange> {
+    let (ConstPropagation::Constant(left), ConstPropagation::Constant(right)) = (left, right)
+    else {
+        return if matches!(left, ConstPropagation::Bottom)
+            || matches!(right, ConstPropagation::Bottom)
+        {
+            ConstPropagation::Bottom
+        } else {
+            ConstPropagation::Top
+        };
+    };
+
+    let scale = |range: &BoundedIntegerRange, coefficient: i64| {
+        let first = range.min.checked_mul(coefficient)?;
+        let second = range.max.checked_mul(coefficient)?;
+        Some((first.min(second), first.max(second)))
+    };
+    let Some((left_min, left_max)) = scale(left, left_coefficient) else {
+        return ConstPropagation::Top;
+    };
+    let Some((right_min, right_max)) = scale(right, right_coefficient) else {
+        return ConstPropagation::Top;
+    };
+    left_min
+        .checked_add(right_min)
+        .and_then(|value| value.checked_add(displacement))
+        .zip(
+            left_max
+                .checked_add(right_max)
+                .and_then(|value| value.checked_add(displacement)),
+        )
+        .and_then(|(min, max)| BoundedIntegerRange::checked(min, max))
+        .map(ConstPropagation::Constant)
+        .unwrap_or(ConstPropagation::Top)
+}
+
+/// `(base argument, index argument, scale, displacement)` for a complete
+/// affine pointer return.  `NO_AFFINE_INDEX` denotes a constant displacement.
+fn affine_return_shape(
+    op: &Operation,
+    argument_count: usize,
+    pointer_width: i64,
+) -> Option<(usize, usize, i64, i64)> {
+    let addressing = match (pointer_width, op) {
+        (4, Operation::Olea(addressing)) | (8, Operation::Oleal(addressing)) => addressing,
+        _ => return None,
+    };
+    match (addressing, argument_count) {
+        (Addressing::Aindexed(displacement), 1) => Some((0, NO_AFFINE_INDEX, 0, *displacement)),
+        (Addressing::Aindexed2(displacement), 2) => Some((0, 1, 1, *displacement)),
+        (Addressing::Aindexed2scaled(scale, displacement), 2)
+            if *scale != 0 && scale.unsigned_abs() <= MAX_BOUNDED_INTEGER as u64 =>
+        {
+            Some((0, 1, *scale, *displacement))
+        }
+        _ => None,
+    }
+}
+
+fn is_pointer_identity_observer(op: &Operation, pointer_width: i64) -> bool {
+    let equality =
+        |comparison: &Comparison| matches!(comparison, Comparison::Ceq | Comparison::Cne);
+    match (pointer_width, op) {
+        (4, Operation::Ocmp(Condition::Ccomp(comparison) | Condition::Ccompu(comparison))) => {
+            equality(comparison)
+        }
+        (8, Operation::Ocmp(Condition::Ccompl(comparison) | Condition::Ccomplu(comparison))) => {
+            equality(comparison)
+        }
+        _ => false,
+    }
+}
+
+/// A value derived from one exact caller-frame root.  The delta interval is
+/// relative to that root; retaining the root separately lets a comparison at
+/// an affine endpoint prove physical layout without pretending the endpoint
+/// is a second allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct AffineStackOrigin {
+    root: i64,
+    min_delta: i64,
+    max_delta: i64,
+}
+
+fn affine_stack_origin_within_frame(origin: &AffineStackOrigin, frame_size: i64) -> bool {
+    if frame_size <= 0 || origin.min_delta > origin.max_delta {
+        return false;
+    }
+    let Some(minimum) = origin.root.checked_add(origin.min_delta) else {
+        return false;
+    };
+    let Some(maximum) = origin.root.checked_add(origin.max_delta) else {
+        return false;
+    };
+    (minimum >= 0 && maximum <= frame_size)
+        || (minimum >= frame_size.saturating_neg() && maximum <= 0)
+}
+
+fn transform_affine_stack_origin(
+    origin: &AffineStackOrigin,
+    index: Option<&BoundedIntegerRange>,
+    scale: i64,
+    displacement: i64,
+    frame_size: i64,
+) -> Option<AffineStackOrigin> {
+    let (index_min, index_max) = match index {
+        Some(range) => {
+            let first = range.min.checked_mul(scale)?;
+            let second = range.max.checked_mul(scale)?;
+            (first.min(second), first.max(second))
+        }
+        None if scale == 0 => (0, 0),
+        None => return None,
+    };
+    let transformed = AffineStackOrigin {
+        root: origin.root,
+        min_delta: origin
+            .min_delta
+            .checked_add(index_min)?
+            .checked_add(displacement)?,
+        max_delta: origin
+            .max_delta
+            .checked_add(index_max)?
+            .checked_add(displacement)?,
+    };
+    let span = transformed.max_delta.checked_sub(transformed.min_delta)?;
+    (span <= MAX_BOUNDED_INTEGER && affine_stack_origin_within_frame(&transformed, frame_size))
+        .then_some(transformed)
+}
+
+/// If two structurally transported stack values can denote the same byte in a
+/// pointer equality observer, their machine-frame coordinates must live in one
+/// C backing allocation.  Return `(owner, extent)` for the conservative suffix
+/// of the local frame beginning at the lowest observed root.
+fn observed_affine_stack_region(
+    left: &AffineStackOrigin,
+    right: &AffineStackOrigin,
+    frame_size: i64,
+) -> Option<(i64, i64)> {
+    if left.root == right.root
+        || !affine_stack_origin_within_frame(left, frame_size)
+        || !affine_stack_origin_within_frame(right, frame_size)
+    {
+        return None;
+    }
+    let left_min = left.root.checked_add(left.min_delta)?;
+    let left_max = left.root.checked_add(left.max_delta)?;
+    let right_min = right.root.checked_add(right.min_delta)?;
+    let right_max = right.root.checked_add(right.max_delta)?;
+    if left_max < right_min || right_max < left_min {
+        return None;
+    }
+
+    let owner = left.root.min(right.root);
+    let positive = left_min >= 0 && right_min >= 0;
+    let negative = left_max <= 0 && right_max <= 0;
+    let end = if positive {
+        frame_size
+    } else if negative {
+        0
+    } else {
+        return None;
+    };
+    let extent = end.checked_sub(owner)?;
+    (extent > 0 && extent <= MAX_BOUNDED_INTEGER).then_some((owner, extent))
 }
 
 /// Exact byte width of an x86 GPR *view* as spelled by Capstone. `Mreg`
@@ -535,6 +804,10 @@ ascent_par! {
     relation rip_target_addr(Address, Address);
     relation resolved_addr_to_symbol(Address, Ident, i64);
     relation psub(Address, Symbol, Symbol);
+    // Immutable decoder definitions.  `reg_def` is intentionally extended by
+    // later ASM rules (for example FP0), while the bounded CFG transfer below
+    // needs the physical write set exactly as decoded.
+    relation decoded_reg_def(Address, Mreg);
     relation reg_def(Address, Mreg);
     relation reg_def_used(Address, Mreg, Address);
     relation reg_use(Address, Mreg);
@@ -8606,6 +8879,16 @@ ascent_par! {
         instr_in_function(load_addr, func),
         let hi_ofs = ofs + 8;
 
+    // A wide frame store's upper cell is synthesized only in RTL, so there is
+    // no Lsetstack row from which the generic stack_var_chunk rules below can
+    // recover its width.  Keep the machine-authoritative eight-byte lane on
+    // the synthetic local as well.  Besides producing the right declaration,
+    // this lets escaped-region ownership protect the lane's defining load from
+    // RTL DSE when its only observation is through an aliased frame pointer.
+    stack_var_chunk(*func, *hi_ofs, MemoryChunk::MAny64) <--
+        xmm_hi_frame_store(store_addr, hi_ofs, _, _, _, _),
+        instr_in_function(store_addr, func);
+
     #[local] relation escaped_base_slot(Address, i64);
     escaped_base_slot(func, *ofs) <-- slot_addr_escaped(func, _, ofs);
 
@@ -11832,6 +12115,345 @@ ascent_par! {
         if seen_src_rtl == src_rtl,
         reg_rtl(copy, *dst_mreg, dst_rtl);
 
+    // A finite scalar range is a point property, not a value-web guess.  Track
+    // each architectural GPR over the structural instruction CFG and make
+    // every unsupported definition/call arm Top.  This recognizes common
+    // compiler bounds such as `(x & 1) + 3` and `4 - (x & 1)` without using
+    // node/address order or materializing pairwise reachability.
+    #[local] relation bounded_integer_reachable_node(Address, Address);
+    bounded_integer_reachable_node(*func, *node) <--
+        instr_in_function(node, func),
+        code_in_block(node, block),
+        settled_block_dom_set(func, block, _);
+
+    #[local] relation bounded_integer_cfg_step(Address, Address, Address);
+    bounded_integer_cfg_step(*func, *src, *dst) <--
+        next(src, dst),
+        code_in_block(src, block),
+        code_in_block(dst, block),
+        bounded_integer_reachable_node(func, src),
+        bounded_integer_reachable_node(func, dst),
+        !call_targets_noreturn(src);
+    bounded_integer_cfg_step(*func, *src, *dst) <--
+        ddisasm_cfg_edge(src, dst, edge_type),
+        if *edge_type != "call" && *edge_type != "indirect" && *edge_type != "indirect_call",
+        bounded_integer_reachable_node(func, src),
+        bounded_integer_reachable_node(func, dst),
+        !call_targets_noreturn(src);
+
+    #[local] relation bounded_integer_tracked(Address, Mreg);
+    bounded_integer_tracked(*func, *reg) <--
+        bounded_integer_reachable_node(func, node),
+        decoded_reg_def(node, reg),
+        if reg.reg_class() == Some(RegClass::Gpr);
+    bounded_integer_tracked(*func, *reg) <--
+        bounded_integer_reachable_node(func, node),
+        reg_use(node, reg),
+        if reg.reg_class() == Some(RegClass::Gpr);
+
+    #[local] lattice bounded_integer_in(Address, Address, Mreg, ConstPropagation<BoundedIntegerRange>);
+    #[local] lattice bounded_integer_out(Address, Address, Mreg, ConstPropagation<BoundedIntegerRange>);
+
+    bounded_integer_in(*func, *entry, *reg, ConstPropagation::Top) <--
+        emit_function(func, _, entry),
+        bounded_integer_reachable_node(func, entry),
+        bounded_integer_tracked(func, reg);
+
+    bounded_integer_in(*func, *succ, *reg, state.clone()) <--
+        bounded_integer_out(func, node, reg, state),
+        bounded_integer_cfg_step(func, node, succ);
+
+    #[local] relation bounded_integer_handled_def(Address, Mreg);
+    bounded_integer_handled_def(node, *dst) <--
+        ltl_inst(node, ?LTLInst::Lop(op, args, dst)),
+        if bounded_integer_definition_is_handled(op, args.len());
+
+    bounded_integer_out(*func, *node, *dst, ConstPropagation::Constant(range)) <--
+        bounded_integer_in(func, node, tracked_dst, _),
+        ltl_inst(node, ?LTLInst::Lop(op, args, dst)),
+        if tracked_dst == dst,
+        if args.is_empty(),
+        if let Some(range) = bounded_integer_constant(op);
+
+    bounded_integer_out(*func, *node, *dst, ConstPropagation::Constant(range)) <--
+        bounded_integer_in(func, node, tracked_dst, _),
+        ltl_inst(node, ?LTLInst::Lop(op, args, dst)),
+        if tracked_dst == dst,
+        if args.len() == 1,
+        if let Some(range) = bounded_integer_low_mask(op);
+
+    bounded_integer_out(*func, *node, *dst, next_state) <--
+        bounded_integer_in(func, node, tracked_dst, _),
+        ltl_inst(node, ?LTLInst::Lop(op, args, dst)),
+        if tracked_dst == dst,
+        if args.len() == 1,
+        if let Some(delta) = bounded_integer_unary_offset(op),
+        bounded_integer_in(func, node, args[0], source_state),
+        let next_state = add_bounded_integer_offset(source_state, delta);
+
+    bounded_integer_out(*func, *node, *dst, next_state) <--
+        bounded_integer_in(func, node, tracked_dst, _),
+        ltl_inst(node, ?LTLInst::Lop(op, args, dst)),
+        if tracked_dst == dst,
+        if args.len() == 2,
+        if let Some((left_coefficient, right_coefficient, displacement)) =
+            bounded_integer_binary_coefficients(op),
+        bounded_integer_in(func, node, args[0], left_state),
+        bounded_integer_in(func, node, args[1], right_state),
+        let next_state = combine_bounded_integer_ranges(
+            left_state,
+            right_state,
+            left_coefficient,
+            right_coefficient,
+            displacement,
+        );
+
+    bounded_integer_out(*func, *node, *reg, ConstPropagation::Top) <--
+        bounded_integer_in(func, node, reg, _),
+        decoded_reg_def(node, reg),
+        !bounded_integer_handled_def(node, reg);
+
+    bounded_integer_out(*func, *node, *reg, state.clone()) <--
+        bounded_integer_in(func, node, reg, state),
+        !decoded_reg_def(node, reg);
+
+    #[local] relation bounded_call_arg_range(Node, usize, BoundedIntegerRange);
+    bounded_call_arg_range(*call, *position, *range) <--
+        instr_in_function(call, func),
+        abi_int_arg_position(arg_reg, position),
+        bounded_integer_in(func, call, arg_reg, state),
+        if let ConstPropagation::Constant(range) = state;
+
+    // Summarize only complete internal functions whose every return is the
+    // same parameter-preserving affine form.  Identity returns are the
+    // zero-displacement case; scaled LEA returns retain the exact index
+    // parameter position.  Any uncovered return or conflicting form rejects
+    // the summary instead of selecting one by relation order.
+    #[local] relation param_position_value(Address, usize, RTLReg);
+    param_position_value(*func, *position, *value) <--
+        func_param_validated(func, mreg),
+        abi_int_arg_position(mreg, position),
+        param_value_canon(func, mreg, value);
+
+    #[local] relation returned_param_affine_point(Address, Node, usize, usize, i64, i64);
+    returned_param_affine_point(*func, *return_point, *base_position,
+                                NO_AFFINE_INDEX, 0, 0) <--
+        function_return_point_reg(func, return_point, returned),
+        param_position_value(func, base_position, returned);
+
+    returned_param_affine_point(*func, *return_point, *base_position,
+                                NO_AFFINE_INDEX, scale, displacement) <--
+        function_return_point_reg(func, return_point, returned),
+        ltl_inst(definition, ?LTLInst::Lop(op, mregs, dst_mreg)),
+        instr_in_function(definition, func),
+        reg_rtl(definition, *dst_mreg, produced),
+        if *produced == *returned,
+        abi_pointer_size(pointer_width),
+        if let Some((base_index, index_index, scale, displacement)) =
+            affine_return_shape(op, mregs.len(), *pointer_width),
+        if index_index == NO_AFFINE_INDEX,
+        let base_mreg = mregs[base_index],
+        reg_rtl(definition, base_mreg, base_value),
+        param_position_value(func, base_position, base_value);
+
+    returned_param_affine_point(*func, *return_point, *base_position,
+                                *index_position, scale, displacement) <--
+        function_return_point_reg(func, return_point, returned),
+        ltl_inst(definition, ?LTLInst::Lop(op, mregs, dst_mreg)),
+        instr_in_function(definition, func),
+        reg_rtl(definition, *dst_mreg, produced),
+        if *produced == *returned,
+        abi_pointer_size(pointer_width),
+        if let Some((base_index, index_index, scale, displacement)) =
+            affine_return_shape(op, mregs.len(), *pointer_width),
+        if index_index != NO_AFFINE_INDEX,
+        let base_mreg = mregs[base_index],
+        let index_mreg = mregs[index_index],
+        reg_rtl(definition, base_mreg, base_value),
+        reg_rtl(definition, index_mreg, index_value),
+        param_position_value(func, base_position, base_value),
+        param_position_value(func, index_position, index_value),
+        if *base_position != *index_position;
+
+    #[local] relation returned_param_affine_missing(Address);
+    returned_param_affine_missing(*func) <--
+        function_return_point_reg(func, return_point, _),
+        !returned_param_affine_point(func, return_point, _, _, _, _);
+
+    #[local] relation returned_param_affine_conflict(Address);
+    returned_param_affine_conflict(*func) <--
+        returned_param_affine_point(func, _, left_base, left_index, left_scale, left_displacement),
+        returned_param_affine_point(func, _, right_base, right_index, right_scale, right_displacement),
+        if (*left_base, *left_index, *left_scale, *left_displacement)
+            != (*right_base, *right_index, *right_scale, *right_displacement);
+
+    #[local] relation returned_param_affine(Address, usize, usize, i64, i64);
+    returned_param_affine(*func, *base_position, *index_position, *scale, *displacement) <--
+        returned_param_affine_point(func, _, base_position, index_position, scale, displacement),
+        function_has_ltl_body(func),
+        !function_has_uncovered_block(func),
+        !function_unknown_terminal(func, _),
+        !function_unresolved_control(func, _),
+        !returned_param_affine_missing(func),
+        !returned_param_affine_conflict(func);
+
+    // One set-valued fact per caller value.  Exact local LEAs seed roots;
+    // explicit moves/canonical aliases preserve them; a summarized call adds
+    // its bounded affine delta.  Ambiguous origins remain in the set and are
+    // rejected only by the final observer projection, so this recursive SCC is
+    // monotone and never publishes a transient MUST fact.
+    #[local] lattice stack_value_origins(Address, RTLReg, Set<AffineStackOrigin>);
+    stack_value_origins(*func, *raw,
+                        Set::singleton(AffineStackOrigin {
+                            root: *offset,
+                            min_delta: 0,
+                            max_delta: 0,
+                        })) <--
+        exact_local_stack_addr_lea_def(func, node, dst_mreg, offset, width),
+        exact_stack_addr_lea_result(func, node, dst_mreg, offset, width, raw),
+        abi_pointer_size(width);
+
+    stack_value_origins(*func, *canonical, origins.clone()) <--
+        stack_value_origins(func, raw, origins),
+        xtl_canonical(raw, canonical),
+        if *raw != *canonical;
+    stack_value_origins(*func, *raw, origins.clone()) <--
+        stack_value_origins(func, canonical, origins),
+        xtl_canonical(raw, canonical),
+        if *raw != *canonical;
+
+    #[local] relation structural_stack_value_move_edge(Address, RTLReg, RTLReg);
+    structural_stack_value_move_edge(*func, source, destination) <--
+        ltl_inst(copy, ?LTLInst::Lop(Operation::Omove, mregs, dst_mreg)),
+        if mregs.len() == 1 && mregs[0] != *dst_mreg,
+        instr_in_function(copy, func),
+        reg_rtl(copy, mregs[0], source),
+        reg_rtl(copy, *dst_mreg, destination);
+
+    stack_value_origins(*func, *dst, origins.clone()) <--
+        stack_value_origins(func, src, origins),
+        structural_stack_value_move_edge(func, src, dst);
+
+    stack_value_origins(*caller, *result, Set::singleton(transformed)) <--
+        instr_in_function(call, caller),
+        call_target_func(call, callee),
+        returned_param_affine(callee, base_position, index_position, scale, displacement),
+        if *index_position == NO_AFFINE_INDEX,
+        call_arg_mapping(call, base_position, base_argument),
+        stack_value_origins(caller, base_argument, origins),
+        for origin in origins.0.iter(),
+        call_result_rtl(call, result),
+        func_stacksz(caller, _, _, frame_size_u64),
+        if let Ok(frame_size) = i64::try_from(*frame_size_u64),
+        if let Some(transformed) = transform_affine_stack_origin(
+            origin,
+            None,
+            *scale,
+            *displacement,
+            frame_size,
+        );
+
+    stack_value_origins(*caller, *result, Set::singleton(transformed)) <--
+        instr_in_function(call, caller),
+        call_target_func(call, callee),
+        returned_param_affine(callee, base_position, index_position, scale, displacement),
+        if *index_position != NO_AFFINE_INDEX,
+        call_arg_mapping(call, base_position, base_argument),
+        stack_value_origins(caller, base_argument, origins),
+        for origin in origins.0.iter(),
+        bounded_call_arg_range(call, index_position, index_range),
+        call_result_rtl(call, result),
+        func_stacksz(caller, _, _, frame_size_u64),
+        if let Ok(frame_size) = i64::try_from(*frame_size_u64),
+        if let Some(transformed) = transform_affine_stack_origin(
+            origin,
+            Some(index_range),
+            *scale,
+            *displacement,
+            frame_size,
+        );
+
+    #[local] relation returned_param_affine_has_stack_evidence(Address, usize);
+    returned_param_affine_has_stack_evidence(*callee, *base_position) <--
+        instr_in_function(call, caller),
+        call_target_func(call, callee),
+        returned_param_affine(callee, base_position, _, _, _),
+        call_arg_mapping(call, base_position, base_argument),
+        stack_value_origins(caller, base_argument, _);
+
+    // The stack-root proof is pointer-class evidence at every interface edge.
+    // Even if a generic equality also contributes scalar evidence, the
+    // existing conflict rule retains a pointer-width `long` rather than
+    // truncating the machine return to int.
+    is_ptr(*parameter) <--
+        returned_param_affine_has_stack_evidence(func, base_position),
+        param_position_value(func, base_position, parameter);
+    is_ptr(*returned) <--
+        returned_param_affine_has_stack_evidence(func, _),
+        function_return_point_reg(func, _, returned);
+    is_ptr(*value) <-- stack_value_origins(_, value, _);
+
+    #[local] relation param_identity_observer(Address, usize, usize);
+    param_identity_observer(*func, *left_position, *right_position) <--
+        ltl_inst(compare, ?LTLInst::Lop(op, mregs, _)),
+        instr_in_function(compare, func),
+        abi_pointer_size(pointer_width),
+        if mregs.len() == 2 && is_pointer_identity_observer(op, *pointer_width),
+        reg_rtl(compare, mregs[0], left_value),
+        reg_rtl(compare, mregs[1], right_value),
+        param_position_value(func, left_position, left_value),
+        param_position_value(func, right_position, right_value),
+        if *left_position != *right_position,
+        function_has_ltl_body(func),
+        !function_has_uncovered_block(func),
+        !function_unknown_terminal(func, _),
+        !function_unresolved_control(func, _);
+
+    #[local] relation stack_value_origin_member(Address, RTLReg, AffineStackOrigin);
+    stack_value_origin_member(*func, *value, *origin) <--
+        stack_value_origins(func, value, origins),
+        for origin in origins.0.iter();
+
+    #[local] relation stack_value_origin_conflict(Address, RTLReg);
+    stack_value_origin_conflict(func, value) <--
+        stack_value_origin_member(func, value, left),
+        stack_value_origin_member(func, value, right),
+        if left != right;
+
+    #[local] relation exact_stack_value_origin(Address, RTLReg, AffineStackOrigin);
+    exact_stack_value_origin(func, value, *origin) <--
+        stack_value_origin_member(func, value, origin),
+        !stack_value_origin_conflict(func, value);
+
+    #[local] relation observed_stack_layout_region(Address, i64, i64);
+    observed_stack_layout_region(*caller, owner, extent) <--
+        instr_in_function(call, caller),
+        call_target_func(call, observer),
+        param_identity_observer(observer, left_position, right_position),
+        call_arg_mapping(call, left_position, left_argument),
+        call_arg_mapping(call, right_position, right_argument),
+        exact_stack_value_origin(caller, left_argument, left_origin),
+        exact_stack_value_origin(caller, right_argument, right_origin),
+        func_stacksz(caller, _, _, frame_size_u64),
+        if let Ok(frame_size) = i64::try_from(*frame_size_u64),
+        if let Some((owner, extent)) =
+            observed_affine_stack_region(left_origin, right_origin, frame_size),
+        function_has_ltl_body(caller),
+        !function_has_uncovered_block(caller),
+        !function_unknown_terminal(caller, _),
+        !function_unresolved_control(caller, _);
+
+    escaped_stack_region_extent(func, *owner, *extent) <--
+        observed_stack_layout_region(func, owner, extent);
+
+    escaped_stack_region_caller_field(func, *owner, field_offset, *chunk) <--
+        observed_stack_layout_region(func, owner, extent),
+        frame_slot_offset(func, slot),
+        if let Some(end) = owner.checked_add(*extent),
+        if *slot >= *owner && *slot < end,
+        stack_var_chunk(func, slot, chunk),
+        let field_offset = *slot - *owner;
+
     // Value-web deref evidence: any register sharing a param value canonical used as a load/store BASE proves the param is a pointer, subsuming the -O0 spill/reload case.
     param_used_in_deref(func_start, *arg_reg) <--
         param_value_canon(func_start, arg_reg, canon),
@@ -13347,9 +13969,10 @@ mod tests {
         direct_pointer_loop_continues_toward_endpoint, fresh_call_input_reg,
         fresh_simd_dword_lane_reg, fresh_simd_dword_operand_reg, fresh_stack_param_reg,
         fresh_stack_slot_reg, fresh_xmm_hi_value_reg, fresh_xtl_reg, indexed_store_ends_at_extent,
-        simd_broadcast_lane_node, simd_dword_event_stage_node, simd_dword_reg_event,
-        xmm_hi_lane_node, xmm_hi_store_node, FrameWriteOrigin, RTLPassProgram, StackAddrOrigin,
-        FRESH_NS_SP_BASE,
+        observed_affine_stack_region, simd_broadcast_lane_node, simd_dword_event_stage_node,
+        simd_dword_reg_event, transform_affine_stack_origin, xmm_hi_lane_node, xmm_hi_store_node,
+        AffineStackOrigin, BoundedIntegerRange, FrameWriteOrigin, RTLPassProgram, StackAddrOrigin,
+        FRESH_NS_SP_BASE, NO_AFFINE_INDEX,
     };
     use crate::aarch64::mach::A64Mreg;
     use crate::mreg::Mreg;
@@ -17431,6 +18054,141 @@ mod tests {
                 .rtl_inst_candidate
                 .iter()
                 .any(|(node, inst)| *node == next_arg && matches!(inst, RTLInst::Iop(..))));
+        });
+    }
+
+    #[test]
+    fn affine_internal_returns_preserve_observable_frame_identity() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [caller, base0_node, base16_node, advance_call, identity_call, compare_call, advance, identity, compare, stack0, stack8, stack16, stack24] =
+                synthetic_ids();
+            let base0 = 0x8100;
+            let base16 = 0x8110;
+            let advanced = 0x8200;
+            let identical = 0x8300;
+
+            prog.abi_pointer_size.push((8,));
+            prog.function_has_ltl_body.push((caller,));
+            prog.func_stacksz.push((caller, caller, "affine", 40));
+
+            for (node, register, offset, value) in [
+                (base0_node, Mreg::DI, 0_i64, base0),
+                (base16_node, Mreg::DI, 16_i64, base16),
+            ] {
+                prog.exact_local_stack_addr_lea_def
+                    .push((caller, node, register, offset, 8));
+                prog.exact_stack_addr_lea_result
+                    .push((caller, node, register, offset, 8, value));
+            }
+
+            prog.returned_param_affine.push((advance, 0, 1, 4, 0));
+            prog.returned_param_affine
+                .push((identity, 0, NO_AFFINE_INDEX, 0, 0));
+            prog.bounded_call_arg_range.push((
+                advance_call,
+                1,
+                BoundedIntegerRange { min: 3, max: 4 },
+            ));
+
+            for (call, callee) in [
+                (advance_call, advance),
+                (identity_call, identity),
+                (compare_call, compare),
+            ] {
+                prog.instr_in_function.push((call, caller));
+                prog.call_target_func.push((call, callee));
+            }
+            prog.call_arg_mapping.extend([
+                (advance_call, 0, base0),
+                (identity_call, 0, base16),
+                (compare_call, 0, advanced),
+                (compare_call, 1, identical),
+            ]);
+            prog.call_result_rtl
+                .extend([(advance_call, advanced), (identity_call, identical)]);
+            prog.param_identity_observer.push((compare, 0, 1));
+
+            for (node, offset, local) in [
+                (stack0, 0_i64, 0x9000),
+                (stack8, 8_i64, 0x9008),
+                (stack16, 16_i64, 0x9010),
+                (stack24, 24_i64, 0x9018),
+            ] {
+                prog.stack_var.push((caller, node, offset, local));
+                if offset != 8 {
+                    prog.stack_var_chunk
+                        .push((caller, offset, MemoryChunk::MAny64));
+                }
+            }
+            // Unlike an ordinary Lsetstack, the high half of a 16-byte store
+            // exists first as an RTL-only synthetic cell.  Its exact lane
+            // width must enter stack_var_chunk at that producer boundary or
+            // the escaped region cannot protect the definition from DSE.
+            prog.xmm_hi_frame_store
+                .push((stack8, 8, 3, Mreg::Unknown, 0x4000, 0x3ff0));
+            prog.instr_in_function.push((stack8, caller));
+            prog.resolved_addr_to_symbol.push((0x4000, 0x4000, 0));
+
+            prog.run();
+
+            assert!(prog
+                .observed_stack_layout_region
+                .iter()
+                .any(|row| row == &(caller, 0, 40)));
+            assert!(prog
+                .escaped_stack_region_extent
+                .iter()
+                .any(|row| row == &(caller, 0, 40)));
+            let protected: BTreeSet<_> = prog
+                .slot_escaped_region_canonical
+                .iter()
+                .filter(|(func, _, _)| *func == caller)
+                .map(|(_, offset, _)| *offset)
+                .collect();
+            assert_eq!(protected, BTreeSet::from([0, 8, 16, 24]));
+            assert!(prog
+                .stack_var_chunk
+                .iter()
+                .any(|row| row == &(caller, 8, MemoryChunk::MAny64)));
+            assert!(prog.is_ptr.iter().any(|(value,)| *value == identical));
+
+            let origin = AffineStackOrigin {
+                root: 0,
+                min_delta: 0,
+                max_delta: 0,
+            };
+            assert_eq!(
+                transform_affine_stack_origin(
+                    &origin,
+                    Some(&BoundedIntegerRange { min: 3, max: 4 }),
+                    4,
+                    0,
+                    40,
+                ),
+                Some(AffineStackOrigin {
+                    root: 0,
+                    min_delta: 12,
+                    max_delta: 16,
+                })
+            );
+            assert_eq!(
+                observed_affine_stack_region(
+                    &AffineStackOrigin {
+                        root: 0,
+                        min_delta: 12,
+                        max_delta: 16,
+                    },
+                    &AffineStackOrigin {
+                        root: 16,
+                        min_delta: 0,
+                        max_delta: 0,
+                    },
+                    40,
+                ),
+                Some((0, 40))
+            );
+            assert!(transform_affine_stack_origin(&origin, None, 4, 0, 40).is_none());
         });
     }
 

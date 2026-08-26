@@ -363,8 +363,8 @@ struct GlobalAggregateCoalescing {
     owner_initializers: HashMap<Ident, crate::decompile::passes::c_pass::types::Initializer>,
 }
 
-/// Coalesce synthetic labels that name exact fields inside one recovered
-/// global aggregate.
+/// Materialize one recovered global aggregate owner and coalesce any synthetic
+/// labels that name its exact interior fields.
 ///
 /// Machine globals occupy byte ranges; C globals do not overlap. Emitting a
 /// struct at `base` and an independent pointer at `base + 8` therefore loses
@@ -583,7 +583,13 @@ fn derive_global_aggregate_coalescing(
             }
             member_rows.push((member, offset, field_name, chunk));
         }
-        if !valid || (member_rows.is_empty() && owner.aggregate_relocation_init.is_empty()) {
+        // A direct Aglobal(owner, nonzero_offset) access does not create a
+        // second GlobalData row, but the owner's validated field layout still
+        // needs the original image bytes.  Requiring an interior label here
+        // emitted a correctly shaped yet zero-filled aggregate.  The same
+        // bounds, padding, and relocation checks above make a label-free owner
+        // just as exact as one which happens to have a named interior field.
+        if !valid {
             continue;
         }
 
@@ -7876,6 +7882,66 @@ mod escaped_stack_array_tests {
                 && item.init
                     == Initializer::Expr(CExpr::Cast(CType::long(), Box::new(target_expr.clone())))
         }));
+    }
+
+    #[test]
+    fn initialized_aggregate_owner_needs_no_synthetic_member_global() {
+        use crate::decompile::passes::c_pass::types::{Designator, Initializer};
+
+        let owner_id = 0xe200_usize;
+        let low = (11_u64 << 32) | 7;
+        let high = (17_u64 << 32) | 13;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&low.to_le_bytes());
+        bytes.extend_from_slice(&high.to_le_bytes());
+
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
+        db.rel_push(
+            "retained_initialized_data_range",
+            (owner_id as Address, Arc::new(bytes)),
+        );
+
+        let globals = vec![GlobalData {
+            id: owner_id,
+            name: format!("L_{owner_id:x}"),
+            is_string: false,
+            content: Vec::new(),
+            is_pointer: false,
+            scalar_value: None,
+            scalar_writable: false,
+            pointer_init: Vec::new(),
+            aggregate_relocation_init: BTreeMap::new(),
+        }];
+        let layouts = HashMap::from([(
+            owner_id,
+            (
+                0x5938_usize,
+                vec![
+                    (0_i64, 0_usize, MemoryChunk::MAny64),
+                    (8_i64, 8_usize, MemoryChunk::MAny64),
+                ],
+            ),
+        )]);
+
+        let ownership = derive_global_aggregate_coalescing(&db, &globals, &layouts);
+
+        assert!(ownership.owner_ids.contains(&owner_id));
+        assert!(ownership.member_ids.is_empty());
+        let Some(Initializer::List(items)) = ownership.owner_initializers.get(&owner_id) else {
+            panic!("direct aggregate owner lost its initialized image")
+        };
+        for (field, value) in [("ofs_0", low as i128), ("ofs_8", high as i128)] {
+            assert!(items.iter().any(|item| {
+                item.designator == Some(Designator::Field(field.to_string()))
+                    && item.init
+                        == Initializer::Expr(CExpr::IntLit(IntLiteral {
+                            value,
+                            suffix: IntLiteralSuffix::L,
+                            base: IntLiteralBase::Decimal,
+                        }))
+            }));
+        }
     }
 
     #[test]

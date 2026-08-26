@@ -3732,8 +3732,9 @@ mod tests {
             "rtl_inst_candidate",
             (
                 entry,
-                RTLInst::Iop(
-                    Operation::Olongconst(7),
+                RTLInst::Iload(
+                    MemoryChunk::MInt64,
+                    Addressing::Aglobal(0xe200, 8),
                     Arc::new(vec![]),
                     point_local_alias,
                 ),
@@ -3748,6 +3749,50 @@ mod tests {
         let roots = &ctx.functions[&func].escaped_slot_regs;
         assert!(roots.contains(&canonical));
         assert!(roots.contains(&point_local_alias));
+
+        optimize_rtl_candidates(&mut db).expect("escaped synthetic lane must be optimized");
+        assert!(db
+            .rel_iter::<(u64, RTLInst)>("rtl_inst")
+            .any(|(node, inst)| {
+                *node == entry
+                    && matches!(
+                        inst,
+                        RTLInst::Iload(MemoryChunk::MInt64, Addressing::Aglobal(0xe200, 8), args, dst)
+                            if args.is_empty() && *dst == point_local_alias
+                    )
+            }));
+        assert!(!db
+            .rel_iter::<(u64,)>("dead_store")
+            .any(|&(node,)| node == entry));
+
+        // The escape proof, not the synthetic shape itself, is what preserves
+        // the otherwise unused definition.  A genuinely unobserved upper lane
+        // must remain eligible for ordinary DSE.
+        let mut unescaped = DecompileDB::default();
+        unescaped.rel_push(
+            "rtl_inst_candidate",
+            (
+                entry,
+                RTLInst::Iload(
+                    MemoryChunk::MInt64,
+                    Addressing::Aglobal(0xe200, 8),
+                    Arc::new(vec![]),
+                    point_local_alias,
+                ),
+            ),
+        );
+        unescaped.rel_push("instr_in_function", (entry, func));
+        unescaped.rel_push("emit_function", (func, "synthetic", entry));
+        unescaped.rel_push("stack_var", (func, entry, 40_i64, point_local_alias));
+
+        optimize_rtl_candidates(&mut unescaped)
+            .expect("unescaped synthetic lane must be optimized");
+        assert!(unescaped
+            .rel_iter::<(u64,)>("dead_store")
+            .any(|&(node,)| node == entry));
+        assert!(!unescaped
+            .rel_iter::<(u64, RTLInst)>("rtl_inst")
+            .any(|(node, inst)| *node == entry && matches!(inst, RTLInst::Iload(..))));
     }
 
     // A slot written on two paths keeps only the definitions whose frame
