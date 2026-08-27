@@ -174,6 +174,9 @@ ascent_par! {
     relation stack_var(Address, Address, i64, RTLReg);
     // rtl_pass export: the single escaped canonical local per (func, offset), used to resolve synthetic-only stack loads that have no per-node stack_var.
     relation slot_escaped_canonical(Address, i64, RTLReg);
+    // rtl_pass export: a conflict-free physical owner for a frame read that
+    // begins inside a wider reaching write or escaped object.
+    relation frame_read_storage_owner(Address, Address, i64, i64, RTLReg);
     // Noreturn recognition inputs: the always-noreturn symbol set, single-def constants for resolving an error-family status arg, and function_noreturn for user-defined wrappers.
     relation is_known_noreturn_function(Symbol);
     relation single_def_const(RTLReg, Constant);
@@ -536,6 +539,11 @@ ascent_par! {
     // Track nodes where a stack address was resolved to Eaddrof via stack_var.
     #[local] relation stack_addr_resolved(Node);
 
+    #[local] relation frame_read_has_interior_owner(Node);
+    frame_read_has_interior_owner(*node) <--
+        frame_read_storage_owner(_, node, read_ofs, base_ofs, _),
+        if read_ofs != base_ofs;
+
     // Per-function stack offset -> canonical local, so a memory operand materialized only at cminor (a CMP's [rsp+ofs]) resolves to the slot's local instead of a bare *(const).
     #[local] relation stack_local_at(Address, i64, RTLReg);
     stack_local_at(func, ofs, reg) <-- stack_var(func, _, ofs, reg);
@@ -568,6 +576,31 @@ ascent_par! {
         let var_ident = ident_from_reg(*stack_rtl),
         let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Eaddrof(var_ident));
 
+    // A narrow read can start inside a wider scalar/object without having an
+    // exact stack_var root of its own.  Use RTL's structural owner handoff and
+    // retain the byte delta from that object.  Without this rule the generic
+    // Ainstack conversion treats the displacement as an absolute integer and
+    // emits invalid C such as `*5`.
+    csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Eload(chunk, addr, args))),
+        if let Addressing::Ainstack(ofs) = addr,
+        if args.is_empty(),
+        instr_in_function(node, func_start),
+        frame_read_storage_owner(func_start, node, *ofs, base_ofs, owner_rtl),
+        if *base_ofs != *ofs,
+        if let Some(delta) = ofs.checked_sub(*base_ofs),
+        let owner_ident = ident_from_reg(*owner_rtl),
+        let owner_addr = CsharpminorExpr::Eaddrof(owner_ident),
+        let addr_expr = CsharpminorExpr::Ebinop(
+            CminorBinop::Oaddl,
+            Box::new(owner_addr),
+            Box::new(CsharpminorExpr::Econst(Constant::Olongconst(delta))),
+        ),
+        let stmt = CsharpminorStmt::Sset(
+            *dst,
+            CsharpminorExpr::Eload(*chunk, Box::new(addr_expr)),
+        );
+
     // Resolve an untracked stack Eload to the function's local for that offset; an address-escaped slot uses rtl_pass's single slot_escaped_canonical, not the multi-valued fallback.
     csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Eload(_chunk, addr, args))),
@@ -583,6 +616,7 @@ ascent_par! {
         if args.is_empty(),
         instr_in_function(node, func_start),
         !slot_escaped_canonical(func_start, *ofs, _),
+        !frame_read_has_interior_owner(node),
         stack_local_at(func_start, *ofs, stack_rtl),
         let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Evar(*stack_rtl));
 
@@ -593,6 +627,7 @@ ascent_par! {
         if args.is_empty(),
         instr_in_function(node, func_start),
         !slot_escaped_canonical(func_start, *ofs, _),
+        !frame_read_has_interior_owner(node),
         !stack_local_at(func_start, *ofs, _),
         stack_local_at(func_start, *ofs - 8, stack_rtl),
         let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Evar(*stack_rtl));
@@ -1393,7 +1428,7 @@ impl IRPass for CshminorPass {
 
 #[cfg(test)]
 mod tests {
-    use super::{unique_external_cfg_entry, CshminorPassProgram};
+    use super::{ident_from_reg, unique_external_cfg_entry, CshminorPassProgram};
     use crate::x86::op::{Addressing, Comparison, Condition, Operation};
     use crate::x86::types::{
         CminorBinop, CminorExpr, CminorStmt, Constant, CsharpminorExpr, CsharpminorStmt,
@@ -1788,6 +1823,66 @@ mod tests {
             ) if matches!(address.as_ref(), CsharpminorExpr::Ebinop(_, _, _))
                 && matches!(args.as_slice(), [CsharpminorExpr::Evar(value)] if *value == arg)
         ));
+    }
+
+    #[test]
+    fn interior_frame_read_uses_its_structural_storage_owner() {
+        let [node, dst, owner, stale_exact_local] = synthetic_ids();
+        let mut prog = CshminorPassProgram::default();
+        prog.cminor_stmt.push((
+            node,
+            CminorStmt::Sassign(
+                dst,
+                CminorExpr::Eload(
+                    MemoryChunk::MInt8Unsigned,
+                    Addressing::Ainstack(5),
+                    Arc::new(vec![]),
+                ),
+            ),
+        ));
+        prog.instr_in_function.push((node, FUNC));
+        prog.stack_var.push((FUNC, node, 5, stale_exact_local));
+        prog.frame_read_storage_owner
+            .push((FUNC, node, 5, 4, owner));
+
+        prog.run();
+
+        assert!(prog.csharp_stmt_candidate.iter().any(|(candidate, stmt)| {
+            *candidate == node
+                && matches!(
+                    stmt,
+                    CsharpminorStmt::Sset(
+                        value,
+                        CsharpminorExpr::Eload(
+                            MemoryChunk::MInt8Unsigned,
+                            address,
+                        ),
+                    ) if *value == dst
+                        && matches!(
+                            address.as_ref(),
+                            CsharpminorExpr::Ebinop(
+                                CminorBinop::Oaddl,
+                                base,
+                                offset,
+                            ) if matches!(
+                                base.as_ref(),
+                                CsharpminorExpr::Eaddrof(ident)
+                                    if *ident == ident_from_reg(owner)
+                            ) && matches!(
+                                offset.as_ref(),
+                                CsharpminorExpr::Econst(Constant::Olongconst(1))
+                            )
+                        )
+                )
+        }));
+        assert!(!prog.csharp_stmt_candidate.iter().any(|(candidate, stmt)| {
+            *candidate == node
+                && matches!(
+                    stmt,
+                    CsharpminorStmt::Sset(value, CsharpminorExpr::Evar(stale))
+                        if *value == dst && *stale == stale_exact_local
+                )
+        }));
     }
 
     #[test]

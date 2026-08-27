@@ -1,6 +1,6 @@
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
-use crate::decompile::passes::rtl_optimize_pass::escaped_stack_slot_regs;
+use crate::decompile::passes::rtl_optimize_pass::observable_stack_storage_regs;
 use crate::util::{exec_order_key, is_synthetic_node, semantic_node_address};
 use crate::x86::op::{Comparison, Condition};
 use crate::x86::types::{
@@ -131,17 +131,17 @@ impl IRPass for StructuringPass {
         // These names denote externally observable memory cells, even though
         // reverse Stacking represents their writes as Sset.  Every later
         // scalar optimization must preserve that distinction.
-        let escaped_stack_regs: HashSet<RTLReg> = escaped_stack_slot_regs(db)
+        let protected_stack_regs: HashSet<RTLReg> = observable_stack_storage_regs(db)
             .into_values()
             .flatten()
             .collect();
 
         // Apply optimizations to the representative and all retained
         // alternatives in lockstep.
-        propagate_copies(&mut working, &mut candidates, db, &escaped_stack_regs);
-        inline_constants(&mut working, &mut candidates, db, &escaped_stack_regs);
+        propagate_copies(&mut working, &mut candidates, db, &protected_stack_regs);
+        inline_constants(&mut working, &mut candidates, db, &protected_stack_regs);
         eliminate_dead_returns(&mut working, &mut candidates, db);
-        inline_single_use_temps(&mut working, &mut candidates, db);
+        inline_single_use_temps(&mut working, &mut candidates, db, &protected_stack_regs);
         lift_setcc_arith_to_ite(&mut working, &mut candidates, db);
 
         // instr_in_function is multi-valued: shared nodes (e.g. PLT trampolines) belong to every reaching function.
@@ -411,6 +411,7 @@ impl IRPass for StructuringPass {
             "single_def_const",
             "slot_escaped_canonical",
             "slot_escaped_region_canonical",
+            "frame_read_storage_owner",
             "stack_var",
             "dead_def",
             "code_in_block",
@@ -4292,6 +4293,7 @@ fn inline_single_use_temps(
     working: &mut HashMap<Node, CsharpminorStmt>,
     stmt_candidates: &mut CsharpStmtCandidates,
     db: &DecompileDB,
+    protected_stack_regs: &HashSet<RTLReg>,
 ) {
     let inline_regs: HashSet<RTLReg> = db.rel_iter::<RTLReg>("emit_inline_temp").copied().collect();
     if inline_regs.is_empty() {
@@ -4313,7 +4315,7 @@ fn inline_single_use_temps(
         let Some(CsharpminorStmt::Sset(reg, _)) = stmts.first() else {
             continue;
         };
-        if !inline_regs.contains(reg) {
+        if !inline_regs.contains(reg) || protected_stack_regs.contains(reg) {
             continue;
         }
         let mut exprs = Vec::with_capacity(stmts.len());
@@ -4453,7 +4455,9 @@ mod candidate_handoff_tests {
     use super::{stable_stmt_candidates, StructuringPass};
     use crate::decompile::elevator::DecompileDB;
     use crate::decompile::passes::pass::IRPass;
-    use crate::x86::types::{CsharpminorExpr, CsharpminorStmt, Node};
+    use crate::x86::types::{
+        CminorBinop, Constant, CsharpminorExpr, CsharpminorStmt, MemoryChunk, Node,
+    };
 
     fn alternatives() -> Vec<CsharpminorStmt> {
         vec![
@@ -4512,6 +4516,68 @@ mod candidate_handoff_tests {
 
         assert_eq!(forward, reverse);
         assert_eq!(forward.len(), 3);
+    }
+
+    #[test]
+    fn structuring_keeps_a_definition_observed_as_overlapping_stack_storage() {
+        let func: u64 = 0x1000;
+        let writer: Node = 0x1010;
+        let read: Node = 0x1020;
+        let owner: u64 = 0x7000;
+        let read_value: u64 = 0x7100;
+        let initial = Constant::Ointconst(0xa1a0);
+        let mut db = DecompileDB::default();
+
+        db.rel_push(
+            "csharp_stmt_candidate",
+            (
+                writer,
+                CsharpminorStmt::Sset(owner, CsharpminorExpr::Econst(initial.clone())),
+            ),
+        );
+        db.rel_push(
+            "csharp_stmt_candidate",
+            (
+                read,
+                CsharpminorStmt::Sset(
+                    read_value,
+                    CsharpminorExpr::Eload(
+                        MemoryChunk::MInt8Unsigned,
+                        Box::new(CsharpminorExpr::Ebinop(
+                            CminorBinop::Oaddl,
+                            Box::new(CsharpminorExpr::Eaddrof(owner as usize)),
+                            Box::new(CsharpminorExpr::Econst(Constant::Olongconst(1))),
+                        )),
+                    ),
+                ),
+            ),
+        );
+        db.rel_push("single_def_const", (owner, initial));
+        db.rel_push("emit_inline_temp", owner);
+        db.rel_push(
+            "frame_read_storage_owner",
+            (func, read, 5_i64, 4_i64, owner),
+        );
+        db.rel_push("instr_in_function", (writer, func));
+        db.rel_push("instr_in_function", (read, func));
+        db.rel_push("emit_function", (func, "observed_storage", writer));
+        db.rel_push("next", (writer, read));
+        db.rel_push("cminor_succ", (writer, read));
+
+        StructuringPass.run(&mut db);
+
+        let writer_stmts: Vec<_> = db
+            .rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt")
+            .filter_map(|(node, stmt)| (*node == writer).then_some(stmt))
+            .collect();
+        assert!(writer_stmts.iter().any(|stmt| matches!(
+            stmt,
+            CsharpminorStmt::Sset(reg, CsharpminorExpr::Econst(Constant::Ointconst(0xa1a0)))
+                if *reg == owner
+        )));
+        assert!(!writer_stmts
+            .iter()
+            .any(|stmt| matches!(stmt, CsharpminorStmt::Snop)));
     }
 }
 

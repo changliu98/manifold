@@ -4,7 +4,9 @@ use crate::run_pass;
 use crate::decompile::passes::asm_pass::transl_addressing_rev;
 use crate::decompile::passes::cminor_pass::*;
 use crate::decompile::passes::csh_pass::*;
-use crate::decompile::passes::frame_write_pass::{frame_origin_overlaps, FrameWriteOrigin};
+use crate::decompile::passes::frame_write_pass::{
+    frame_interval_contains, frame_origin_overlaps, FrameWriteOrigin,
+};
 use crate::decompile::passes::pass::IRPass;
 use crate::mreg::{Mreg, RegClass};
 use crate::util::{
@@ -9944,6 +9946,113 @@ ascent_par! {
     slot_escaped_region_canonical(func, ofs, local) <--
         slot_escaped_region_canonical_raw(func, ofs, _),
         agg local = ascent::aggregators::min(c) in slot_escaped_region_canonical_raw(func, ofs, c);
+
+    // A stack read may begin inside a wider scalar/object rather than at a
+    // stack_var root.  Preserve the physical owner as an explicit handoff to
+    // Csharpminor so Ainstack(n) never degenerates into a dereference of the
+    // integer literal n.  Reachability comes exclusively from the point-keyed
+    // frame-write Set lattice; the interval comparisons below only establish
+    // byte containment inside that structurally reaching write.
+    #[local] relation frame_read_origin(Address, Address, i64, usize, FrameWriteOrigin);
+    frame_read_origin(*func, *read, *read_ofs, *read_width, *origin) <--
+        frame_stack_read_bytes(func, read, read_ofs, read_width),
+        settled_frame_write_state(func, read, state),
+        for origin in state.0.iter(),
+        if frame_origin_overlaps(origin, *read_ofs, *read_width);
+
+    #[local] relation frame_read_reaching_owner_raw(Address, Address, i64, i64, RTLReg);
+    frame_read_reaching_owner_raw(*func, *read, *read_ofs, *owner_ofs, *owner) <--
+        frame_read_origin(func, read, read_ofs, read_width, origin),
+        if let FrameWriteOrigin::Write(write, owner_ofs, owner_width) = origin,
+        if frame_interval_contains(*owner_ofs, *owner_width, *read_ofs, *read_width),
+        stack_var(func, write, owner_ofs, owner);
+
+    // Every overlapping may-origin must be a full covering write with a
+    // canonical local.  An unwritten/unknown join arm, a partial overwrite, or
+    // an unmodeled writer makes the owner ambiguous and suppresses the handoff.
+    #[local] relation frame_read_bad_reaching_state(Address, Address);
+    frame_read_bad_reaching_state(*func, *read) <--
+        frame_read_origin(func, read, _, _, origin),
+        if !matches!(origin, FrameWriteOrigin::Write(..));
+
+    frame_read_bad_reaching_state(*func, *read) <--
+        frame_read_origin(func, read, read_ofs, read_width, origin),
+        if let FrameWriteOrigin::Write(_, owner_ofs, owner_width) = origin,
+        if !frame_interval_contains(*owner_ofs, *owner_width, *read_ofs, *read_width);
+
+    frame_read_bad_reaching_state(*func, *read) <--
+        frame_read_origin(func, read, read_ofs, read_width, origin),
+        if let FrameWriteOrigin::Write(write, owner_ofs, owner_width) = origin,
+        if frame_interval_contains(*owner_ofs, *owner_width, *read_ofs, *read_width),
+        !stack_var(func, write, owner_ofs, _);
+
+    #[local] relation frame_read_reaching_owner_conflict(Address, Address);
+    frame_read_reaching_owner_conflict(*func, *read) <--
+        frame_read_reaching_owner_raw(func, read, _, left_ofs, left),
+        frame_read_reaching_owner_raw(func, read, _, right_ofs, right),
+        if (*left_ofs, *left) != (*right_ofs, *right);
+
+    // Calls through a proven escaped object can overwrite a caller initializer
+    // without appearing as a direct frame write.  The exact escaped field is
+    // therefore stronger ownership evidence than a pre-call reaching write.
+    #[local] relation frame_read_escaped_owner_raw(Address, Address, i64, i64, RTLReg);
+    frame_read_escaped_owner_raw(*func, *read, *read_ofs, *base_ofs, *owner) <--
+        frame_stack_read_bytes(func, read, read_ofs, read_width),
+        escaped_stack_region_caller_field(func, base_ofs, field_ofs, chunk),
+        slot_escaped_canonical(func, base_ofs, owner),
+        if let Some(field_start) = base_ofs.checked_add(*field_ofs),
+        let field_width = crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk),
+        if frame_interval_contains(field_start, field_width, *read_ofs, *read_width);
+
+    // When the callee body is visible, its projected dereference is the
+    // authoritative field-width source and caller_field deliberately stays
+    // empty at that offset.  Consume the two evidence channels symmetrically.
+    frame_read_escaped_owner_raw(*func, *read, *read_ofs, *base_ofs, *owner) <--
+        frame_stack_read_bytes(func, read, read_ofs, read_width),
+        escaped_stack_region_field(func, base_ofs, field_ofs, chunk),
+        slot_escaped_canonical(func, base_ofs, owner),
+        if let Some(field_start) = base_ofs.checked_add(*field_ofs),
+        let field_width = crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk),
+        if frame_interval_contains(field_start, field_width, *read_ofs, *read_width);
+
+    #[local] relation frame_read_escaped_owner_conflict(Address, Address);
+    frame_read_escaped_owner_conflict(*func, *read) <--
+        frame_read_escaped_owner_raw(func, read, _, left_ofs, left),
+        frame_read_escaped_owner_raw(func, read, _, right_ofs, right),
+        if (*left_ofs, *left) != (*right_ofs, *right);
+
+    relation frame_read_storage_owner(Address, Address, i64, i64, RTLReg);
+    frame_read_storage_owner(*func, *read, *read_ofs, *base_ofs, *owner) <--
+        frame_read_escaped_owner_raw(func, read, read_ofs, base_ofs, owner),
+        !frame_read_escaped_owner_conflict(func, read);
+
+    frame_read_storage_owner(*func, *read, *read_ofs, *base_ofs, *owner) <--
+        frame_read_reaching_owner_raw(func, read, read_ofs, base_ofs, owner),
+        !frame_read_bad_reaching_state(func, read),
+        !frame_read_reaching_owner_conflict(func, read),
+        !frame_read_escaped_owner_raw(func, read, _, _, _);
+
+    // Retain the exact writer behind a direct subcell owner.  Clight uses this
+    // to rematerialize an initializer that SSA constant propagation is allowed
+    // to erase as a value assignment but which remains observable as storage
+    // through the interior byte read.
+    relation frame_read_reaching_storage(Address, Address, i64, Address, i64, usize, RTLReg);
+    frame_read_reaching_storage(
+        *func,
+        *read,
+        *read_ofs,
+        *write,
+        *base_ofs,
+        *write_width,
+        *owner,
+    ) <--
+        frame_read_storage_owner(func, read, read_ofs, base_ofs, owner),
+        !frame_read_escaped_owner_raw(func, read, _, _, _),
+        frame_read_origin(func, read, read_ofs, read_width, origin),
+        if let FrameWriteOrigin::Write(write, write_ofs, write_width) = origin,
+        if write_ofs == base_ofs,
+        if frame_interval_contains(*write_ofs, *write_width, *read_ofs, *read_width),
+        stack_var(func, write, write_ofs, owner);
 
     stack_var_chunk(*func, ofs, chunk) <--
         ltl_inst(node, ?LTLInst::Lload(chunk, Addressing::Ainstack(ofs), _, _)),
@@ -19984,6 +20093,86 @@ mod tests {
             assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
                 *node == read && matches!(inst, RTLInst::Iload(_, Addressing::Aindexed(24), _, _))
             }));
+        });
+    }
+
+    #[test]
+    fn frame_subcell_owner_requires_complete_structural_write_or_escape_evidence() {
+        on_large_stack(|| {
+            let func = 0x500;
+            let write = 0x510;
+            let read = 0x520;
+            let owner = 0x9000;
+
+            let mut reaching = RTLPassProgram::default();
+            reaching.frame_stack_read_bytes.push((func, read, 5, 1));
+            reaching.settled_frame_write_state.push((
+                func,
+                read,
+                Set::singleton(FrameWriteOrigin::Write(write, 4, 4)),
+            ));
+            reaching.stack_var.push((func, write, 4, owner));
+            reaching.run();
+            assert!(reaching
+                .frame_read_storage_owner
+                .iter()
+                .any(|fact| fact == &(func, read, 5, 4, owner)));
+            assert!(reaching
+                .frame_read_reaching_storage
+                .iter()
+                .any(|fact| fact == &(func, read, 5, write, 4, 4, owner)));
+            drop(reaching);
+
+            let mut ambiguous = RTLPassProgram::default();
+            ambiguous.frame_stack_read_bytes.push((func, read, 5, 1));
+            ambiguous.settled_frame_write_state.push((
+                func,
+                read,
+                Set(BTreeSet::from([
+                    FrameWriteOrigin::Write(write, 4, 4),
+                    FrameWriteOrigin::Unwritten(5, 1),
+                ])),
+            ));
+            ambiguous.stack_var.push((func, write, 4, owner));
+            ambiguous.run();
+            assert!(ambiguous.frame_read_storage_owner.is_empty());
+            drop(ambiguous);
+
+            let escaped_read = 0x530;
+            let escaped_owner = 0x9100;
+            let mut escaped = RTLPassProgram::default();
+            escaped
+                .frame_stack_read_bytes
+                .push((func, escaped_read, 9, 1));
+            escaped.escaped_stack_region_caller_field.push((
+                func,
+                8,
+                0,
+                MemoryChunk::MInt16Unsigned,
+            ));
+            escaped
+                .slot_escaped_canonical
+                .push((func, 8, escaped_owner));
+            let projected_read = 0x540;
+            let projected_owner = 0x9200;
+            escaped
+                .frame_stack_read_bytes
+                .push((func, projected_read, 17, 1));
+            escaped
+                .escaped_stack_region_field
+                .push((func, 16, 0, MemoryChunk::MInt64));
+            escaped
+                .slot_escaped_canonical
+                .push((func, 16, projected_owner));
+            escaped.run();
+            assert!(escaped
+                .frame_read_storage_owner
+                .iter()
+                .any(|fact| fact == &(func, escaped_read, 9, 8, escaped_owner)));
+            assert!(escaped
+                .frame_read_storage_owner
+                .iter()
+                .any(|fact| fact == &(func, projected_read, 17, 16, projected_owner)));
         });
     }
 

@@ -55,6 +55,25 @@ pub(crate) fn escaped_stack_slot_regs(db: &DecompileDB) -> HashMap<Address, Hash
     regs
 }
 
+/// Every SSA spelling whose value is also a physical stack-storage object.
+///
+/// Address escape is one way a stack cell becomes observable outside ordinary
+/// SSA uses.  A structurally proven interior read of a wider frame write is
+/// another: substituting or deleting that wider definition changes the bytes
+/// seen by the overlapping load even when the destination register itself has
+/// no ordinary value use.  Keep both sources behind one optimizer contract so
+/// RTL DSE/copy propagation and later Csharp scalar folding agree on which
+/// definitions are stores rather than disposable register values.
+pub(crate) fn observable_stack_storage_regs(db: &DecompileDB) -> HashMap<Address, HashSet<RTLReg>> {
+    let mut regs = escaped_stack_slot_regs(db);
+    for &(func, _read, _read_ofs, _base_ofs, owner) in
+        db.rel_iter::<(Address, Address, i64, i64, RTLReg)>("frame_read_storage_owner")
+    {
+        regs.entry(func).or_default().insert(owner);
+    }
+    regs
+}
+
 // Resolve a raw instruction address to the first semantic RTL node reached by
 // the explicit instruction-next chain, without crossing a function boundary.
 // The cache is point-keyed: each skipped address is visited at most once per
@@ -1395,7 +1414,7 @@ impl IRPass for RTLOptimizePass {
     }
 
     fn extra_reads(&self) -> &'static [&'static str] {
-        // Read imperatively in PassContext::load: call_through_memory_load (keeps a vtable Iload alive), jump_table_* (protects an in-loop dispatch entry), escaped-slot/stack_var relations (protect every SSA alias observed through escaped pointers from DSE), and stack_def_used (the slot's real reaching-definition count, which bounds constant folding).
+        // Read imperatively in PassContext::load: call_through_memory_load (keeps a vtable Iload alive), jump_table_* (protects an in-loop dispatch entry), escaped/overlapping stack-storage relations (protect every SSA alias observed through memory from DSE), and stack_def_used (the slot's real reaching-definition count, which bounds constant folding).
         &[
             "call_through_memory_load",
             "jump_table_impl",
@@ -1403,6 +1422,7 @@ impl IRPass for RTLOptimizePass {
             "jump_table_target",
             "slot_escaped_canonical",
             "slot_escaped_region_canonical",
+            "frame_read_storage_owner",
             "stack_var",
             "stack_def_used",
         ]
@@ -1537,7 +1557,7 @@ impl PassContext {
             }
         }
 
-        let mut escaped_slot_regs = escaped_stack_slot_regs(db);
+        let mut escaped_slot_regs = observable_stack_storage_regs(db);
 
         // Per function, the frame-slot SSA names whose slot is written by more
         // than one instruction reaching the same read.  StackAnalysis pairs
@@ -2952,9 +2972,10 @@ pub(crate) fn find_inline_temps(
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_propagation, find_inline_temps, fold_static_eq_branches, optimize_rtl_candidates,
-        reachable_from, unique_external_cfg_entry, DefUseInfo, FunctionCFG, LivenessInfo,
-        PassContext, RTLOptimizePass,
+        copy_propagation, find_inline_temps, fold_static_eq_branches,
+        observable_stack_storage_regs, optimize_rtl_candidates, reachable_from,
+        unique_external_cfg_entry, DefUseInfo, FunctionCFG, LivenessInfo, PassContext,
+        RTLOptimizePass,
     };
     use crate::decompile::elevator::DecompileDB;
     use crate::decompile::passes::pass::IRPass;
@@ -3001,6 +3022,21 @@ mod tests {
         let du = DefUseInfo::build(&func);
         let liveness = LivenessInfo::build(&func, &du);
         copy_propagation(&mut func, &du, &liveness)
+    }
+
+    #[test]
+    fn overlapping_frame_read_marks_its_storage_owner_observable() {
+        let func: u64 = 0x1000;
+        let read: u64 = 0x1020;
+        let owner: u64 = 0x7000;
+        let mut db = DecompileDB::default();
+        db.rel_push(
+            "frame_read_storage_owner",
+            (func, read, 5_i64, 4_i64, owner),
+        );
+
+        let protected = observable_stack_storage_regs(&db);
+        assert_eq!(protected.get(&func), Some(&HashSet::from([owner])));
     }
 
     #[test]

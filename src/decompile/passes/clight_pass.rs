@@ -2557,9 +2557,79 @@ mod tests {
             "stack_var",
             "stack_var_chunk",
             "stack_pointer_walk_region",
+            "frame_read_reaching_storage",
         ] {
             assert!(pass.inputs().contains(&input));
         }
+    }
+
+    #[test]
+    fn direct_subcell_observation_rematerializes_folded_stack_initializer() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x1400;
+        let init: Address = 0x1410;
+        let read: Address = 0x1420;
+        let base_ofs = 4_i64;
+        let owner: RTLReg = 0x7500;
+
+        db.rel_push(
+            "frame_read_reaching_storage",
+            (func, read, base_ofs + 1, init, base_ofs, 2_usize, owner),
+        );
+        db.rel_push("pmov", (init, "subcell_mem_dst", "subcell_imm_src"));
+        db.rel_push(
+            "op_indirect",
+            (
+                "subcell_mem_dst",
+                "",
+                "RSP",
+                "NONE",
+                1_i64,
+                base_ofs,
+                2_usize,
+            ),
+        );
+        db.rel_push(
+            "clight_stmt",
+            (
+                init,
+                ClightStmt::Sset(
+                    owner as Ident,
+                    ClightExpr::EconstInt(0xa1a0, default_int_type()),
+                ),
+            ),
+        );
+
+        let func_stack_inits =
+            HashMap::from([(func, vec![(init, base_ofs, 0xa1a0_i64, Typ::Tint)])]);
+        let mut result = StructConstructionResult {
+            new_stmts: Vec::new(),
+            new_emit_stmts: Vec::new(),
+            rewritten_stmts: HashMap::new(),
+            stack_buffers: Vec::new(),
+        };
+        synthesize_escaped_stack_region_construction(&db, &func_stack_inits, &mut result);
+
+        assert_eq!(result.stack_buffers, vec![(func, owner as Ident, 2)]);
+        assert!(result.new_stmts.is_empty());
+        assert!(result.new_emit_stmts.is_empty());
+        let Some(stmt) = result.rewritten_stmts.get(&init) else {
+            panic!("expected the live writer to be rewritten as a storage initializer");
+        };
+        let ClightStmt::Sassign(ClightExpr::Ederef(_, field_ty), ClightExpr::EconstInt(value, _)) =
+            stmt
+        else {
+            panic!("expected an exact-width rematerialized word initializer");
+        };
+        assert_eq!(*value as u16, 0xa1a0);
+        assert_eq!(
+            field_ty,
+            &ClightType::Tint(
+                ClightIntSize::I16,
+                ClightSignedness::Unsigned,
+                default_attr(),
+            )
+        );
     }
 
     #[test]
@@ -3007,6 +3077,7 @@ impl IRPass for ClightFieldPass {
             "stack_pointer_walk_region",
             "stack_var",
             "stack_var_chunk",
+            "frame_read_reaching_storage",
             "slot_escaped_canonical",
             "escaped_stack_region_field",
             // Both were read by the escaped-region sizing below without being
@@ -8163,6 +8234,22 @@ fn raw_stack_buffer_store(
     value: i64,
     chunk: &MemoryChunk,
 ) -> ClightStmt {
+    raw_stack_buffer_store_expr(
+        base_local,
+        buffer_size,
+        byte_offset,
+        immediate_value_expr(value, chunk),
+        chunk,
+    )
+}
+
+fn raw_stack_buffer_store_expr(
+    base_local: Ident,
+    buffer_size: i64,
+    byte_offset: i64,
+    value: ClightExpr,
+    chunk: &MemoryChunk,
+) -> ClightStmt {
     let char_ty = ClightType::Tint(
         ClightIntSize::I8,
         ClightSignedness::Unsigned,
@@ -8190,7 +8277,7 @@ fn raw_stack_buffer_store(
         )),
         field_ty,
     );
-    ClightStmt::Sassign(lhs, immediate_value_expr(value, chunk))
+    ClightStmt::Sassign(lhs, value)
 }
 
 /// Split one physical constant store into the exact escaped-region cells that
@@ -8342,8 +8429,105 @@ fn synthesize_escaped_stack_region_construction(
         inits.sort();
         inits.dedup();
     }
-    let owned_fields = escaped_stack_region_owned_fields(db);
+    let existing_clight_nodes: BTreeSet<Node> = db
+        .rel_iter::<(Node, ClightStmt)>("clight_stmt")
+        .map(|(node, _)| *node)
+        .collect();
+    let mut clight_owner_values: BTreeMap<(Node, Ident), Vec<ClightExpr>> = BTreeMap::new();
+    for (node, stmt) in db.rel_iter::<(Node, ClightStmt)>("clight_stmt") {
+        let ClightStmt::Sset(owner, value) = stmt else {
+            continue;
+        };
+        let values = clight_owner_values.entry((*node, *owner)).or_default();
+        if !values.contains(value) {
+            values.push(value.clone());
+        }
+    }
     let mut proposed_rewrites: HashMap<Node, Option<ClightStmt>> = HashMap::new();
+
+    // Reverse Stacking represents a physical frame write as Sset, but an
+    // interior read observes its bytes rather than merely the SSA value.  RTL
+    // optimization and Structuring keep these owner definitions live; rewrite
+    // only such a live writer into an exact-width byte-buffer store.  Distinct
+    // lifetimes at one numeric frame offset remain separate because the writer
+    // node and canonical local are part of the claim.
+    let mut direct_storage_claims: BTreeMap<(Address, Node), BTreeSet<(i64, usize, RTLReg)>> =
+        BTreeMap::new();
+    for (func, _read, _read_ofs, write, base_ofs, write_width, owner) in
+        db.rel_iter::<(Address, Address, i64, Address, i64, usize, RTLReg)>(
+            "frame_read_reaching_storage",
+        )
+    {
+        direct_storage_claims
+            .entry((*func, *write))
+            .or_default()
+            .insert((*base_ofs, *write_width, *owner));
+    }
+
+    for ((func, write), claims) in direct_storage_claims {
+        if claims.len() != 1 {
+            continue;
+        }
+        let &(base_ofs, write_width, owner) = claims.iter().next().unwrap();
+        let Some(chunk) = exact_chunks.get(&write) else {
+            continue;
+        };
+        if chunk_byte_size(chunk) != write_width {
+            continue;
+        }
+        let Ok(buffer_size) = i64::try_from(write_width) else {
+            continue;
+        };
+        if buffer_size <= 0 || buffer_size > 8 {
+            continue;
+        }
+        // Adding a candidate after Structuring cannot make a bypassed node
+        // reachable again.  Observable-storage owners are protected upstream,
+        // so absence here is a contract violation and must stay conservative.
+        if !existing_clight_nodes.contains(&write) {
+            continue;
+        }
+
+        let mut init_values = BTreeSet::new();
+        if let Some(inits) = escaped_stack_inits.get(&func) {
+            for (addr, ofs, value, _) in inits {
+                if *addr == write && *ofs == base_ofs {
+                    init_values.insert(*value);
+                }
+            }
+        }
+        let stmt = if init_values.len() == 1 {
+            raw_stack_buffer_store(
+                owner as Ident,
+                buffer_size,
+                0,
+                *init_values.iter().next().unwrap(),
+                chunk,
+            )
+        } else {
+            let Some(values) = clight_owner_values.get(&(write, owner as Ident)) else {
+                continue;
+            };
+            if values.len() != 1 {
+                continue;
+            }
+            raw_stack_buffer_store_expr(owner as Ident, buffer_size, 0, values[0].clone(), chunk)
+        };
+
+        result
+            .stack_buffers
+            .push((func, owner as Ident, buffer_size));
+        proposed_rewrites
+            .entry(write)
+            .and_modify(|current| {
+                if current.as_ref() != Some(&stmt) {
+                    *current = None;
+                }
+            })
+            .or_insert_with(|| Some(stmt));
+    }
+
+    let owned_fields = escaped_stack_region_owned_fields(db);
 
     let mut base_locals: BTreeMap<(Address, i64), RTLReg> = BTreeMap::new();
     for (func, ofs, local) in db.rel_iter::<(Address, i64, RTLReg)>("slot_escaped_canonical") {

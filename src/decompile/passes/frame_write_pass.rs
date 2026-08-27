@@ -31,6 +31,32 @@ pub(crate) fn frame_intervals_overlap(
     Some(write_ofs < cell_end && cell_ofs < write_end)
 }
 
+/// Whether one exact byte interval fully contains another.  These are frame
+/// coordinates, not program points: the comparisons describe physical bytes
+/// inside one recovered stack frame and never stand in for CFG reachability.
+pub(crate) fn frame_interval_contains(
+    outer_ofs: i64,
+    outer_width: usize,
+    inner_ofs: i64,
+    inner_width: usize,
+) -> bool {
+    let (Ok(outer_width), Ok(inner_width)) =
+        (i64::try_from(outer_width), i64::try_from(inner_width))
+    else {
+        return false;
+    };
+    if outer_width <= 0 || inner_width <= 0 {
+        return false;
+    }
+    let (Some(outer_end), Some(inner_end)) = (
+        outer_ofs.checked_add(outer_width),
+        inner_ofs.checked_add(inner_width),
+    ) else {
+        return false;
+    };
+    outer_ofs <= inner_ofs && inner_end <= outer_end
+}
+
 fn exact_stack_byte_interval(offset: i64, width: usize) -> bool {
     let Ok(width) = i64::try_from(width) else {
         return false;
@@ -263,11 +289,23 @@ ascent_par! {
         if *edge_type != "call" && *edge_type != "indirect" && *edge_type != "indirect_call",
         !call_targets_noreturn(src);
 
-    #[local] relation tracked_pointer_cell(Address, i64, usize);
-    tracked_pointer_cell(*func, *ofs, *width) <--
+    // Pointer reads remain the provenance queries this pass was introduced
+    // for.  Add a narrow query only when some exact write in the same frame
+    // physically contains it; the lattice will still decide structurally
+    // whether that write reaches the read.  This avoids multiplying every CFG
+    // point by unrelated byte reads on large functions.  Escaped-only objects
+    // have their own object proof in RTL and do not need a write-state cell.
+    #[local] relation tracked_frame_cell(Address, i64, usize);
+    tracked_frame_cell(*func, *ofs, *width) <--
         frame_stack_read_bytes(func, _, ofs, width),
         abi_pointer_size(pointer_width),
         if i64::try_from(*width).ok() == Some(*pointer_width);
+
+    tracked_frame_cell(*func, *read_ofs, *read_width) <--
+        frame_stack_read_bytes(func, _, read_ofs, read_width),
+        frame_stack_write_bytes(func, _, write_ofs, write_width),
+        if (*write_ofs, *write_width) != (*read_ofs, *read_width),
+        if frame_interval_contains(*write_ofs, *write_width, *read_ofs, *read_width);
 
     #[local] relation node_has_cfg_predecessor(Address, Address);
     node_has_cfg_predecessor(*func, *node) <--
@@ -300,13 +338,13 @@ ascent_par! {
 
     frame_write_in(*func, *root, Set::singleton(FrameWriteOrigin::Unwritten(*cell_ofs, *cell_width))) <--
         reachable_frame_node(func, root),
-        tracked_pointer_cell(func, cell_ofs, cell_width),
+        tracked_frame_cell(func, cell_ofs, cell_width),
         !node_has_cfg_predecessor(func, root);
 
     frame_write_in(*func, *entry, Set::singleton(FrameWriteOrigin::Unwritten(*cell_ofs, *cell_width))) <--
         reachable_frame_node(func, entry),
         if func == entry,
-        tracked_pointer_cell(func, cell_ofs, cell_width);
+        tracked_frame_cell(func, cell_ofs, cell_width);
 
     frame_write_in(*func, *succ, state.clone()) <--
         frame_write_out(func, node, state),
@@ -333,7 +371,7 @@ ascent_par! {
         frame_write_in(func, write, _),
         frame_stack_write_bytes(func, write, write_ofs, write_width),
         !opaque_frame_stack_write(func, write),
-        tracked_pointer_cell(func, cell_ofs, cell_width),
+        tracked_frame_cell(func, cell_ofs, cell_width),
         if let Ok(cell_width_i64) = i64::try_from(*cell_width),
         if matches!(frame_intervals_overlap(*write_ofs, *write_width, *cell_ofs, cell_width_i64), Some(true));
 
@@ -343,7 +381,7 @@ ascent_par! {
     frame_write_out(*func, *write, Set::singleton(FrameWriteOrigin::Unknown(*write, *cell_ofs, *cell_width))) <--
         frame_write_in(func, write, _),
         opaque_frame_stack_write(func, write),
-        tracked_pointer_cell(func, cell_ofs, cell_width);
+        tracked_frame_cell(func, cell_ofs, cell_width);
 }
 
 pub struct FrameWritePass;
@@ -360,15 +398,9 @@ impl IRPass for FrameWritePass {
 
         // Read only settled lattice rows. Publishing an ordinary relation from
         // inside the recursive SCC would retain transient, incomplete states.
-        let pointer_widths: std::collections::HashSet<usize> = prog
-            .abi_pointer_size
-            .iter()
-            .filter_map(|(width,)| usize::try_from(*width).ok())
-            .collect();
         let reads: std::collections::HashSet<(Address, Address)> = prog
             .frame_stack_read_bytes
             .iter()
-            .filter(|(_, _, _, width)| pointer_widths.contains(width))
             .map(|(func, node, _, _)| (*func, *node))
             .collect();
         let mut settled: Vec<(Address, Address, Set<FrameWriteOrigin>)> = prog
@@ -422,12 +454,22 @@ impl IRPass for FrameWritePass {
 
 #[cfg(test)]
 mod tests {
-    use super::{frame_origin_overlaps, FrameWriteOrigin, FrameWritePass};
+    use super::{frame_interval_contains, frame_origin_overlaps, FrameWriteOrigin, FrameWritePass};
     use crate::decompile::elevator::DecompileDB;
     use crate::decompile::passes::pass::IRPass;
     use ascent::lattice::set::Set;
 
     fn settled_at(db: &DecompileDB, func: u64, reload: u64, slot: i64) -> Set<FrameWriteOrigin> {
+        settled_at_width(db, func, reload, slot, 8)
+    }
+
+    fn settled_at_width(
+        db: &DecompileDB,
+        func: u64,
+        reload: u64,
+        slot: i64,
+        width: usize,
+    ) -> Set<FrameWriteOrigin> {
         let state = db
             .rel_iter::<(u64, u64, Set<FrameWriteOrigin>)>("settled_frame_write_state")
             .find_map(|(owner, node, state)| {
@@ -437,8 +479,36 @@ mod tests {
         Set(state
             .0
             .into_iter()
-            .filter(|origin| frame_origin_overlaps(origin, slot, 8))
+            .filter(|origin| frame_origin_overlaps(origin, slot, width))
             .collect())
+    }
+
+    #[test]
+    fn narrow_read_retains_its_structurally_covering_wide_write() {
+        let func = 0x8000_u64;
+        let write = 0x8010_u64;
+        let read = 0x8020_u64;
+        let mut db = DecompileDB::default();
+        db.rel_push("abi_pointer_size", (8_i64,));
+        for node in [func, write, read] {
+            db.rel_push("instr_in_function", (node, func));
+            db.rel_push("code_in_block", (node, node));
+            db.rel_push("settled_sp_frame_shift", (func, node, 0_i64));
+            db.rel_push("settled_block_dom_set", (func, node, Set::singleton(node)));
+        }
+        db.rel_push("ddisasm_cfg_edge", (func, write, "branch"));
+        db.rel_push("ddisasm_cfg_edge", (write, read, "branch"));
+        db.rel_push("decoded_stack_write_bytes", (write, "RSP", 4_i64, 4_usize));
+        db.rel_push("decoded_stack_read_bytes", (read, "RSP", 5_i64, 1_usize));
+
+        FrameWritePass.run(&mut db);
+
+        assert_eq!(
+            settled_at_width(&db, func, read, 5, 1).0,
+            std::collections::BTreeSet::from([FrameWriteOrigin::Write(write, 4, 4)])
+        );
+        assert!(frame_interval_contains(4, 4, 5, 1));
+        assert!(!frame_interval_contains(4, 1, 4, 4));
     }
 
     #[test]
