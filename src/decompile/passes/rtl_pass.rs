@@ -475,6 +475,20 @@ fn direct_pointer_interval_within_local_frame(low: i64, high: i64, frame_size: i
     (low >= 0 && high <= frame_size) || (low >= frame_size.saturating_neg() && high <= 0)
 }
 
+// A point-local Ainstack address can be rendered as C frame storage when its
+// exact normalized coordinate lies inside either convention StackAnalysis
+// publishes for local frames.  This is a physical-layout check only; it never
+// stands in for CFG reachability.  The positive frame top is excluded because
+// it is either caller storage or a one-past endpoint, which needs a separate
+// object-extent proof before it can name a C local.
+fn stack_address_within_local_frame(offset: i64, frame_size: i64) -> bool {
+    if frame_size <= 0 {
+        return false;
+    }
+    (offset >= 0 && offset < frame_size)
+        || (offset >= frame_size.saturating_neg() && offset < 0)
+}
+
 fn typ_is_pointer_width(typ: &Typ, pointer_width: i64) -> bool {
     matches!(
         (pointer_width, typ),
@@ -7721,6 +7735,24 @@ ascent_par! {
         !function_unresolved_control(func_start, _),
         !incoming_stack_tail_base(func_start, node, _, dst);
 
+    // Rendering authority is deliberately weaker than escape/provenance
+    // authority.  A closed body retains the established exact-local route.
+    // When some unrelated CFG arm is incomplete, a full-width LEA with an
+    // exact settled frame coordinate can still name local C storage if that
+    // coordinate is bounded by the function's unambiguous frame size.  Do not
+    // feed this relation into reg_stack_addr_origins: copies, escapes and
+    // interprocedural summaries continue to require exact_local above.
+    #[local] relation renderable_frame_stack_addr_lea_def(Address, Address, Mreg, i64, i64);
+    renderable_frame_stack_addr_lea_def(*func, *node, *dst, *ofs, *width) <--
+        exact_local_stack_addr_lea_def(func, node, dst, ofs, width);
+
+    renderable_frame_stack_addr_lea_def(*func, *node, *dst, *ofs, *width) <--
+        exact_stack_addr_lea_def(func, node, dst, ofs, width),
+        exact_frame_stack_lea(func, node, ofs),
+        direct_pointer_local_frame_size(func, frame_size),
+        if stack_address_within_local_frame(*ofs, *frame_size),
+        !incoming_stack_tail_base(func, node, _, dst);
+
     // Bind pointer authority to the raw definition identity for this exact
     // decoded machine destination.  `fresh_xtl_reg` is the same definition id
     // used by ordinary register lifting; deriving this fact from the settled
@@ -8523,7 +8555,7 @@ ascent_par! {
         let rtlreg = fresh_stack_slot_reg(*addr);
 
     stack_xtl(func_start, addr, ofs, rtlreg) <--
-        exact_local_stack_addr_lea_def(func_start, addr, _, ofs, width),
+        renderable_frame_stack_addr_lea_def(func_start, addr, _, ofs, width),
         abi_pointer_size(width),
         let rtlreg = fresh_stack_slot_reg(*addr);
 
@@ -16645,6 +16677,57 @@ mod tests {
                 .reg_holds_slot_addr
                 .iter()
                 .any(|(_, node, _, _)| *node == lea));
+        });
+    }
+
+    #[test]
+    fn incomplete_cfg_renders_bounded_exact_stack_lea_without_escape_authority() {
+        on_large_stack(|| {
+            let [func, bounded, outside, unresolved] = synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+            prog.abi_pointer_size.push((8,));
+            prog.function_has_ltl_body.push((func,));
+            prog.function_unresolved_control.push((func, unresolved));
+            prog.func_stacksz.push((func, unresolved, "partial_frame", 128));
+
+            for (node, offset, dst) in [
+                (bounded, 32_i64, Mreg::AX),
+                (outside, 128_i64, Mreg::CX),
+            ] {
+                prog.instr_in_function.push((node, func));
+                prog.ltl_inst.push((
+                    node,
+                    LTLInst::Lop(
+                        Operation::Oleal(Addressing::Ainstack(offset)),
+                        Arc::new(vec![]),
+                        dst,
+                    ),
+                ));
+                prog.exact_frame_stack_lea.push((func, node, offset));
+            }
+
+            prog.run();
+
+            assert!(prog
+                .renderable_frame_stack_addr_lea_def
+                .iter()
+                .any(|fact| fact == &(func, bounded, Mreg::AX, 32, 8)));
+            assert!(prog
+                .stack_var
+                .iter()
+                .any(|(owner, node, offset, _)| (*owner, *node, *offset) == (func, bounded, 32)));
+            assert!(!prog
+                .exact_local_stack_addr_lea_def
+                .iter()
+                .any(|(_, node, _, _, _)| *node == bounded));
+            assert!(!prog
+                .reg_holds_slot_addr
+                .iter()
+                .any(|(_, node, _, _)| *node == bounded));
+            assert!(!prog
+                .stack_var
+                .iter()
+                .any(|(_, node, _, _)| *node == outside));
         });
     }
 

@@ -272,13 +272,14 @@ ascent_par! {
         exact_frame_stack_lea_member(func, addr, right),
         if left != right;
 
+    // Point-local frame-coordinate authority.  This fact depends only on the
+    // decoded full-width stack base and the settled SP state at this
+    // instruction.  An unrelated uncovered arm may veto whole-function MUST
+    // provenance later, but it cannot turn this machine address into an
+    // absolute integer.
     relation exact_frame_stack_lea(Address, Address, i64);
     exact_frame_stack_lea(*func, *addr, *ofs) <--
         exact_frame_stack_lea_member(func, addr, ofs),
-        function_has_ltl_body(func),
-        !function_has_uncovered_block(func),
-        !function_unknown_terminal(func, _),
-        !function_unresolved_control(func, _),
         !exact_frame_stack_lea_conflict(func, addr);
 
     // Consume the already-settled dominator summary as the structural
@@ -870,5 +871,30 @@ mod tests {
         assert!(!exact_leas.iter().any(|(_, node, _)| *node == esp_lea));
         assert!(!exact_leas.iter().any(|(_, node, _)| *node == missing_mov));
         assert!(!exact_leas.iter().any(|(_, node, _)| *node == narrow_mov));
+    }
+
+    #[test]
+    fn point_local_stack_lea_survives_unrelated_body_incompleteness() {
+        let func = 0x4000_u64;
+        let lea = 0x4010_u64;
+        let unresolved = 0x4020_u64;
+        let mut db = DecompileDB::default();
+
+        db.rel_push("abi_pointer_size", (8_i64,));
+        db.rel_push("instr_in_function", (lea, func));
+        db.rel_push("settled_sp_frame_shift", (func, lea, 8_i64));
+        db.rel_push("function_has_ltl_body", (func,));
+        db.rel_push("function_unresolved_control", (func, unresolved));
+        db.rel_push("plea", (lea, "point_dst", "point_mem"));
+        db.rel_push(
+            "op_indirect",
+            ("point_mem", "", "RSP", "NONE", 1_i64, 40_i64, 8_usize),
+        );
+
+        FrameWritePass.run(&mut db);
+
+        assert!(db
+            .rel_iter::<(u64, u64, i64)>("exact_frame_stack_lea")
+            .any(|fact| fact == &(func, lea, 32)));
     }
 }
