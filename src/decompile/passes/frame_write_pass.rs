@@ -138,6 +138,7 @@ ascent_par! {
     relation function_unknown_terminal(Address, Node);
     relation function_unresolved_control(Address, Node);
     relation instr_in_function(Node, Address);
+    relation instruction(Address, usize, &'static str, &'static str, Symbol, Symbol, Symbol, Symbol, usize, usize);
     relation next(Address, Address);
     relation op_indirect(Symbol, &'static str, &'static str, &'static str, i64, i64, usize);
     relation op_register(Symbol, &'static str);
@@ -344,6 +345,13 @@ ascent_par! {
         unnormalized_frame_stack_write(func, write);
     opaque_frame_stack_write(func, write) <--
         ambiguous_frame_stack_write(func, write);
+    // Until frame-address escape and callee-memory effects are available at
+    // this earlier pass boundary, every returning call may overwrite any
+    // tracked cell through an alias.  A later exact write can restore a cell;
+    // preserving the pre-call value would manufacture MUST spill provenance.
+    opaque_frame_stack_write(*func, *call) <--
+        instruction(call, _, _, "CALL", _, _, _, _, _, _),
+        reachable_frame_node(func, call);
 
     // Exactly one lattice row per (function, CFG point).  The set can contain
     // write facts for several frame intervals, but no interval participates in
@@ -695,6 +703,43 @@ mod tests {
                 FrameWriteOrigin::Write(spill, 24, 8, 24, 8),
             ])
         );
+    }
+
+    #[test]
+    fn intervening_call_invalidates_spilled_pointer_cell() {
+        let func = 0x2400_u64;
+        let spill = 0x2410_u64;
+        let call = 0x2420_u64;
+        let reload = 0x2430_u64;
+        let mut db = DecompileDB::default();
+        db.rel_push("abi_pointer_size", (8_i64,));
+        for node in [func, spill, call, reload] {
+            db.rel_push("instr_in_function", (node, func));
+            db.rel_push("code_in_block", (node, node));
+            db.rel_push("settled_sp_frame_shift", (func, node, 0_i64));
+            db.rel_push("settled_block_dom_set", (func, node, Set::singleton(node)));
+        }
+        for (src, dst) in [(func, spill), (spill, call), (call, reload)] {
+            db.rel_push("ddisasm_cfg_edge", (src, dst, "fallthrough"));
+        }
+        db.rel_push("decoded_stack_write_bytes", (spill, "RSP", 0_i64, 8_usize));
+        db.rel_push("decoded_stack_read_bytes", (reload, "RSP", 0_i64, 8_usize));
+        db.rel_push(
+            "instruction",
+            (
+                call, 5_usize, "", "CALL", "callee", "", "", "", 0_usize, 0_usize,
+            ),
+        );
+
+        FrameWritePass.run(&mut db);
+
+        assert_eq!(
+            settled_at(&db, func, reload, 0).0,
+            std::collections::BTreeSet::from([FrameWriteOrigin::Unknown(call, 0, 8)])
+        );
+        assert!(!db
+            .rel_iter::<(u64, u64, i64, usize, u64, i64, usize)>("settled_frame_storage_origin")
+            .any(|fact| fact.0 == func && fact.1 == reload));
     }
 
     #[test]

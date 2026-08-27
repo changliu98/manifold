@@ -58,7 +58,9 @@ __attribute__((noinline)) long frame_user(long n) {
 }
 typedef long (*unary_fn)(long);
 __attribute__((noinline)) long add_one(long x) { return x + 1; }
-__attribute__((noinline)) long apply_tail(unary_fn fn, long x) { return fn(x); }
+__attribute__((naked, noinline)) long apply_tail(unary_fn fn, long x) {
+    __asm__("mov x16, x0\n\tmov x0, x1\n\tbr x16");
+}
 void _start(void) { (void)frame_user(3); (void)apply_tail(add_one, 4); }
 "#,
     )

@@ -807,12 +807,19 @@ fn selected_temp_types(
             .or_insert_with(|| wt_audit::candtype_to_clight(*candidate));
     }
     for (&reg, param) in func.param_regs.iter().zip(&func.param_types) {
-        let param_ty = override_param
+        let overridden_param_ty = override_param
+            .as_ref()
             .filter(|(wanted, _)| *wanted == reg)
-            .map(|(_, xtype)| wt_audit::xtype_to_clight(&xtype))
-            .unwrap_or_else(|| wt_audit::param_type_to_clight(param));
+            .map(|(_, xtype)| wt_audit::xtype_to_clight(&xtype));
+        let has_explicit_override = overridden_param_ty.is_some();
+        let param_ty = overridden_param_ty.unwrap_or_else(|| wt_audit::param_type_to_clight(param));
         match temps.get(&(reg as Ident)) {
-            Some(_) if matches!(param_ty, ClightType::Tlong(ClightSignedness::Signed, _)) => {}
+            // A rank-0 `long` parameter may retain a more refined selected
+            // temp declaration.  An explicit marginal-cost alternative may
+            // not: it must be checked as the declaration it proposes.
+            Some(_)
+                if !has_explicit_override
+                    && matches!(param_ty, ClightType::Tlong(ClightSignedness::Signed, _)) => {}
             _ => {
                 temps.insert(reg as Ident, param_ty);
             }
@@ -1854,6 +1861,106 @@ mod tests {
             InterfaceClass::PtrInt
         );
         assert!(outcome.dirty_functions.contains(&address));
+    }
+
+    fn pointer_parameter_fixture() -> (FunctionData, ProgramSelectionState, RTLReg, Node) {
+        let [address] = synthetic_ids();
+        let reg = 9;
+        let node = 3;
+        let mut func = FunctionData::new(
+            address,
+            "pointer_parameter".into(),
+            vec![reg],
+            vec![ParamType::Typed(XType::Xlong)],
+            None,
+            0,
+            node,
+            true,
+        );
+        func.used_regs.insert(reg);
+        func.var_type_candidates.insert(reg, vec![CandType::PtrInt]);
+        let pointer_ty = ClightType::Tpointer(Arc::new(int_ty()), ClightAttr::default());
+        func.node_statements.insert(
+            node,
+            vec![ClightStmt::Sassign(
+                ClightExpr::Ederef(
+                    Box::new(ClightExpr::Etempvar(reg as Ident, pointer_ty)),
+                    int_ty(),
+                ),
+                ClightExpr::EconstInt(1, int_ty()),
+            )],
+        );
+        let state = ProgramSelectionState {
+            candidate_idx: [((address, node), Some(0))].into_iter().collect(),
+            var_decl_idx: [((address, reg), 0)].into_iter().collect(),
+            var_type_override: HashMap::new(),
+        };
+        (func, state, reg, node)
+    }
+
+    #[test]
+    fn explicit_param_override_replaces_refined_pointer_temp() {
+        let (func, state, reg, _) = pointer_parameter_fixture();
+        let selected = selected_temp_types(&func, &state, None);
+        assert!(matches!(
+            selected[&(reg as Ident)],
+            ClightType::Tpointer(..)
+        ));
+
+        let overridden = selected_temp_types(&func, &state, Some((reg, XType::Xlong)));
+        assert!(matches!(
+            overridden[&(reg as Ident)],
+            ClightType::Tlong(ClightSignedness::Signed, _)
+        ));
+    }
+
+    #[test]
+    fn pointer_dereference_prices_long_param_alternative() {
+        let (func, state, reg, _) = pointer_parameter_fixture();
+        let var = InterfaceVar {
+            id: InterfaceVarId::Param {
+                function: func.address as Ident,
+                position: 0,
+            },
+            domain: vec![
+                InterfaceAlternative {
+                    class: InterfaceClass::PtrInt,
+                    xtype: XType::Xintptr,
+                },
+                InterfaceAlternative {
+                    class: InterfaceClass::Int,
+                    xtype: XType::Xlong,
+                },
+            ],
+            hard_rank0: false,
+        };
+        let signature = CalleeSignature {
+            param_count: 1,
+            return_type: XType::Xvoid,
+            param_types: vec![XType::Xintptr],
+            is_varargs: false,
+        };
+        let mut committed = CommittedInterfaces::default();
+        committed.functions.insert(
+            func.address as Ident,
+            CommittedFunctionInterface {
+                signature,
+                authority: InterfaceAuthority::Reconciled,
+            },
+        );
+        let by_addr = [(func.address, 0usize)].into_iter().collect();
+
+        let costs = marginal_costs(
+            &var,
+            &[func],
+            &state,
+            &committed,
+            &[],
+            &HashMap::new(),
+            &by_addr,
+        );
+        assert_eq!(costs[0].0, 0);
+        assert!(costs[1].0 > costs[0].0, "costs={costs:?}, reg={reg}");
     }
 
     #[test]

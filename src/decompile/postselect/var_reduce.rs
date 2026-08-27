@@ -29,8 +29,61 @@ fn visit_expr(e: &CExpr, f: &mut dyn FnMut(&CExpr)) {
             visit_expr(g, f);
             args.iter().for_each(|a| visit_expr(a, f));
         }
+        CExpr::CompoundLit(_, inits) => inits
+            .iter()
+            .for_each(|init| visit_initializer_exprs(init, f)),
+        CExpr::Generic(selector, arms) => {
+            visit_expr(selector, f);
+            arms.iter().for_each(|(_, arm)| visit_expr(arm, f));
+        }
+        CExpr::StmtExpr(stmts, tail) => {
+            stmts.iter().for_each(|stmt| visit_stmt_exprs(stmt, f));
+            visit_expr(tail, f);
+        }
         _ => {}
     }
+}
+
+fn visit_initializer_exprs(init: &Initializer, f: &mut dyn FnMut(&CExpr)) {
+    match init {
+        Initializer::Expr(expr) => visit_expr(expr, f),
+        Initializer::List(items) => items.iter().for_each(|item| {
+            if let Some(designator) = &item.designator {
+                visit_designator_exprs(designator, f);
+            }
+            visit_initializer_exprs(&item.init, f);
+        }),
+        Initializer::String(_) => {}
+    }
+}
+
+fn visit_designator_exprs(designator: &Designator, f: &mut dyn FnMut(&CExpr)) {
+    match designator {
+        Designator::Field(_) => {}
+        Designator::Index(expr) => visit_expr(expr, f),
+        Designator::Range(first, last) => {
+            visit_expr(first, f);
+            visit_expr(last, f);
+        }
+    }
+}
+
+fn visit_stmt_exprs(stmt: &CStmt, f: &mut dyn FnMut(&CExpr)) {
+    stmt_top_exprs(stmt, &mut |expr| visit_expr(expr, f));
+    if let CStmt::Block(items) = stmt {
+        for item in items {
+            if let CBlockItem::Decl(decls) = item {
+                for decl in decls {
+                    if let Some(init) = &decl.init {
+                        visit_initializer_exprs(init, f);
+                    }
+                }
+            }
+        }
+    }
+    stmt_children(stmt)
+        .into_iter()
+        .for_each(|child| visit_stmt_exprs(child, f));
 }
 
 // Every top-level expr directly in statement `s` (NOT recursing into child statements).
@@ -153,8 +206,61 @@ fn collect_vars(e: &CExpr, out: &mut Vec<String>) {
             collect_vars(g, out);
             args.iter().for_each(|a| collect_vars(a, out));
         }
+        CExpr::CompoundLit(_, inits) => inits
+            .iter()
+            .for_each(|init| collect_initializer_vars(init, out)),
+        CExpr::Generic(selector, arms) => {
+            collect_vars(selector, out);
+            arms.iter().for_each(|(_, arm)| collect_vars(arm, out));
+        }
+        CExpr::StmtExpr(stmts, tail) => {
+            stmts.iter().for_each(|stmt| collect_stmt_vars(stmt, out));
+            collect_vars(tail, out);
+        }
         _ => {}
     }
+}
+
+fn collect_initializer_vars(init: &Initializer, out: &mut Vec<String>) {
+    match init {
+        Initializer::Expr(expr) => collect_vars(expr, out),
+        Initializer::List(items) => items.iter().for_each(|item| {
+            if let Some(designator) = &item.designator {
+                collect_designator_vars(designator, out);
+            }
+            collect_initializer_vars(&item.init, out);
+        }),
+        Initializer::String(_) => {}
+    }
+}
+
+fn collect_designator_vars(designator: &Designator, out: &mut Vec<String>) {
+    match designator {
+        Designator::Field(_) => {}
+        Designator::Index(expr) => collect_vars(expr, out),
+        Designator::Range(first, last) => {
+            collect_vars(first, out);
+            collect_vars(last, out);
+        }
+    }
+}
+
+fn collect_stmt_vars(stmt: &CStmt, out: &mut Vec<String>) {
+    stmt_top_exprs(stmt, &mut |expr| collect_vars(expr, out));
+    if let CStmt::Block(items) = stmt {
+        for item in items {
+            if let CBlockItem::Decl(decls) = item {
+                for decl in decls {
+                    if let Some(init) = &decl.init {
+                        collect_initializer_vars(init, out);
+                    }
+                }
+            }
+        }
+    }
+    stmt_children(stmt)
+        .into_iter()
+        .for_each(|child| collect_stmt_vars(child, out));
 }
 
 fn vars(e: &CExpr) -> Vec<String> {
@@ -210,10 +316,11 @@ fn for_init_vars(init: &Option<ForInit>) -> Vec<String> {
 }
 
 fn decl_init_vars(d: &VarDecl) -> Vec<String> {
-    match &d.init {
-        Some(Initializer::Expr(e)) => vars(e),
-        _ => Vec::new(),
+    let mut result = Vec::new();
+    if let Some(init) = &d.init {
+        collect_initializer_vars(init, &mut result);
     }
+    result
 }
 
 /// Normalize so every block item is a `Stmt` (Decl items -> `Stmt(Decl)`), used only for the analysis clone so the CFG builder can treat blocks uniformly.
@@ -916,6 +1023,23 @@ fn rewrite_expr(e: &CExpr, plan: &Plan) -> CExpr {
         ),
         CExpr::Paren(a) => CExpr::Paren(Box::new(rewrite_expr(a, plan))),
         CExpr::SizeofExpr(a) => CExpr::SizeofExpr(Box::new(rewrite_expr(a, plan))),
+        CExpr::CompoundLit(ty, inits) => CExpr::CompoundLit(
+            ty.clone(),
+            inits.iter().map(|init| rewrite_init(init, plan)).collect(),
+        ),
+        CExpr::Generic(selector, arms) => CExpr::Generic(
+            Box::new(rewrite_expr(selector, plan)),
+            arms.iter()
+                .map(|(ty, arm)| (ty.clone(), rewrite_expr(arm, plan)))
+                .collect(),
+        ),
+        CExpr::StmtExpr(stmts, tail) => CExpr::StmtExpr(
+            stmts
+                .iter()
+                .map(|stmt| apply_plan_stmt(stmt, plan))
+                .collect(),
+            Box::new(rewrite_expr(tail, plan)),
+        ),
         _ => e.clone(),
     }
 }
@@ -927,12 +1051,25 @@ fn rewrite_init(init: &Initializer, plan: &Plan) -> Initializer {
             items
                 .iter()
                 .map(|it| InitItem {
-                    designator: it.designator.clone(),
+                    designator: it
+                        .designator
+                        .as_ref()
+                        .map(|designator| rewrite_designator(designator, plan)),
                     init: rewrite_init(&it.init, plan),
                 })
                 .collect(),
         ),
         Initializer::String(s) => Initializer::String(s.clone()),
+    }
+}
+
+fn rewrite_designator(designator: &Designator, plan: &Plan) -> Designator {
+    match designator {
+        Designator::Field(field) => Designator::Field(field.clone()),
+        Designator::Index(expr) => Designator::Index(rewrite_expr(expr, plan)),
+        Designator::Range(first, last) => {
+            Designator::Range(rewrite_expr(first, plan), rewrite_expr(last, plan))
+        }
     }
 }
 
@@ -1043,8 +1180,8 @@ fn mark_complex_stmt(s: &CStmt, out: &mut HashSet<String>) {
             match i {
                 Some(ForInit::Expr(e)) => mark_complex_expr(e, out),
                 Some(ForInit::Decl(ds)) => ds.iter().for_each(|d| {
-                    if let Some(Initializer::Expr(e)) = &d.init {
-                        mark_complex_expr(e, out)
+                    if let Some(init) = &d.init {
+                        mark_complex_initializer(init, out)
                     }
                 }),
                 None => {}
@@ -1060,16 +1197,16 @@ fn mark_complex_stmt(s: &CStmt, out: &mut HashSet<String>) {
         CStmt::Block(items) => items.iter().for_each(|it| match it {
             CBlockItem::Stmt(st) => mark_complex_stmt(st, out),
             CBlockItem::Decl(ds) => ds.iter().for_each(|d| {
-                if let Some(Initializer::Expr(e)) = &d.init {
-                    mark_complex_expr(e, out)
+                if let Some(init) = &d.init {
+                    mark_complex_initializer(init, out)
                 }
             }),
         }),
         CStmt::Sequence(ss) => ss.iter().for_each(|x| mark_complex_stmt(x, out)),
         CStmt::Labeled(_, b) => mark_complex_stmt(b, out),
         CStmt::Decl(ds) => ds.iter().for_each(|d| {
-            if let Some(Initializer::Expr(e)) = &d.init {
-                mark_complex_expr(e, out)
+            if let Some(init) = &d.init {
+                mark_complex_initializer(init, out)
             }
         }),
         _ => {}
@@ -1111,6 +1248,19 @@ fn mark_complex_expr(e: &CExpr, out: &mut HashSet<String>) {
             mark_complex_expr(g, out);
             args.iter().for_each(|a| mark_complex_expr(a, out));
         }
+        CExpr::CompoundLit(_, inits) => inits
+            .iter()
+            .for_each(|init| mark_complex_initializer(init, out)),
+        CExpr::Generic(selector, arms) => {
+            mark_complex_expr(selector, out);
+            arms.iter().for_each(|(_, arm)| mark_complex_expr(arm, out));
+        }
+        CExpr::StmtExpr(stmts, tail) => {
+            stmts
+                .iter()
+                .for_each(|stmt| mark_stmt_expr_writes_complex(stmt, out));
+            mark_complex_expr(tail, out);
+        }
         CExpr::Cast(_, a)
         | CExpr::Member(a, _)
         | CExpr::MemberPtr(a, _)
@@ -1120,18 +1270,59 @@ fn mark_complex_expr(e: &CExpr, out: &mut HashSet<String>) {
     }
 }
 
-// Locals whose address is taken (`&v`) anywhere - excluded from coalescing because aliasing breaks the scalar liveness model. Reuses the shared statement/expression visitors.
-fn collect_addr_taken_stmt(s: &CStmt, out: &mut HashSet<String>) {
-    visit_stmts(s, &mut |st| {
-        stmt_top_exprs(st, &mut |e| {
-            visit_expr(e, &mut |x| {
-                if let CExpr::Unary(UnaryOp::AddrOf, inner) = x {
-                    if let Some(n) = paren_var(inner) {
-                        out.insert(n.to_string());
+fn mark_complex_initializer(init: &Initializer, out: &mut HashSet<String>) {
+    match init {
+        Initializer::Expr(expr) => mark_complex_expr(expr, out),
+        Initializer::List(items) => items.iter().for_each(|item| {
+            if let Some(designator) = &item.designator {
+                mark_complex_designator(designator, out);
+            }
+            mark_complex_initializer(&item.init, out);
+        }),
+        Initializer::String(_) => {}
+    }
+}
+
+fn mark_complex_designator(designator: &Designator, out: &mut HashSet<String>) {
+    match designator {
+        Designator::Field(_) => {}
+        Designator::Index(expr) => mark_complex_expr(expr, out),
+        Designator::Range(first, last) => {
+            mark_complex_expr(first, out);
+            mark_complex_expr(last, out);
+        }
+    }
+}
+
+// A statement expression is embedded in one CFG expression node, so writes in
+// its internal statements have no separate FlowNode definitions.  Excluding
+// those locals from coalescing is conservative and preserves evaluation order.
+fn mark_stmt_expr_writes_complex(stmt: &CStmt, out: &mut HashSet<String>) {
+    stmt_top_exprs(stmt, &mut |expr| mark_complex_expr(expr, out));
+    if let CStmt::Block(items) = stmt {
+        for item in items {
+            if let CBlockItem::Decl(decls) = item {
+                for decl in decls {
+                    if let Some(init) = &decl.init {
+                        mark_complex_initializer(init, out);
                     }
                 }
-            })
-        })
+            }
+        }
+    }
+    stmt_children(stmt)
+        .into_iter()
+        .for_each(|child| mark_stmt_expr_writes_complex(child, out));
+}
+
+// Locals whose address is taken (`&v`) anywhere - excluded from coalescing because aliasing breaks the scalar liveness model. Reuses the shared statement/expression visitors.
+fn collect_addr_taken_stmt(s: &CStmt, out: &mut HashSet<String>) {
+    visit_stmt_exprs(s, &mut |expr| {
+        if let CExpr::Unary(UnaryOp::AddrOf, inner) = expr {
+            if let Some(name) = paren_var(inner) {
+                out.insert(name.to_string());
+            }
+        }
     });
 }
 
@@ -1150,7 +1341,8 @@ fn const_pure_expr(e: &CExpr) -> bool {
         | CExpr::Unary(UnaryOp::PostInc, _)
         | CExpr::Unary(UnaryOp::PostDec, _)
         | CExpr::MemberPtr(..)
-        | CExpr::Index(..) => ok = false,
+        | CExpr::Index(..)
+        | CExpr::StmtExpr(..) => ok = false,
         _ => {}
     });
     ok
@@ -1263,7 +1455,59 @@ fn demote_pointer_counters(func: &mut FuncDef) -> usize {
                 collect_uncast_address_vars(b, out);
                 collect_uncast_address_vars(c, out);
             }
+            CExpr::CompoundLit(_, inits) => inits
+                .iter()
+                .for_each(|init| collect_uncast_initializer_vars(init, out)),
+            CExpr::Generic(selector, arms) => {
+                collect_uncast_address_vars(selector, out);
+                arms.iter()
+                    .for_each(|(_, arm)| collect_uncast_address_vars(arm, out));
+            }
+            CExpr::StmtExpr(stmts, tail) => {
+                for stmt in stmts {
+                    collect_uncast_stmt_address_vars(stmt, out);
+                }
+                collect_uncast_address_vars(tail, out);
+            }
             _ => {}
+        }
+    }
+
+    fn collect_uncast_initializer_vars(init: &Initializer, out: &mut HashSet<String>) {
+        match init {
+            Initializer::Expr(expr) => collect_uncast_address_vars(expr, out),
+            Initializer::List(items) => items.iter().for_each(|item| {
+                if let Some(designator) = &item.designator {
+                    match designator {
+                        Designator::Field(_) => {}
+                        Designator::Index(expr) => collect_uncast_address_vars(expr, out),
+                        Designator::Range(first, last) => {
+                            collect_uncast_address_vars(first, out);
+                            collect_uncast_address_vars(last, out);
+                        }
+                    }
+                }
+                collect_uncast_initializer_vars(&item.init, out);
+            }),
+            Initializer::String(_) => {}
+        }
+    }
+
+    fn collect_uncast_stmt_address_vars(stmt: &CStmt, out: &mut HashSet<String>) {
+        stmt_top_exprs(stmt, &mut |expr| collect_uncast_address_vars(expr, out));
+        if let CStmt::Block(items) = stmt {
+            for item in items {
+                if let CBlockItem::Decl(decls) = item {
+                    for decl in decls {
+                        if let Some(init) = &decl.init {
+                            collect_uncast_initializer_vars(init, out);
+                        }
+                    }
+                }
+            }
+        }
+        for child in stmt_children(stmt) {
+            collect_uncast_stmt_address_vars(child, out);
         }
     }
 
@@ -1458,6 +1702,25 @@ mod tests {
 
     fn add(a: CExpr, b: CExpr) -> CExpr {
         CExpr::Binary(BinaryOp::Add, Box::new(a), Box::new(b))
+    }
+
+    fn exact_memcpy_store(dst: &str, value: CExpr) -> CStmt {
+        let access_ty = CType::long();
+        let source = CExpr::CompoundLit(
+            access_ty.clone(),
+            vec![Initializer::Expr(CExpr::Cast(
+                access_ty.clone(),
+                Box::new(value),
+            ))],
+        );
+        CStmt::Expr(CExpr::call(
+            CExpr::var("__builtin_memcpy"),
+            vec![
+                CExpr::Cast(CType::ptr(CType::Void), Box::new(CExpr::var(dst))),
+                CExpr::Unary(UnaryOp::AddrOf, Box::new(source)),
+                CExpr::SizeofType(access_ty),
+            ],
+        ))
     }
 
     fn fd(locals: Vec<VarDecl>, body: Vec<CStmt>) -> FuncDef {
@@ -2330,5 +2593,89 @@ mod tests {
 
         assert_eq!(demote_pointer_counters(&mut f), 0);
         assert_eq!(f.local_vars[0].ty, pointer_ty);
+    }
+
+    #[test]
+    fn compound_literal_memcpy_value_remains_live_across_another_definition() {
+        let mut f = fd(
+            vec![lv("saved"), lv("scratch")],
+            vec![
+                assign("saved", CExpr::var("source")),
+                assign("scratch", CExpr::call(CExpr::var("produce"), vec![])),
+                exact_memcpy_store("destination", CExpr::var("saved")),
+                CStmt::Return(Some(CExpr::var("scratch"))),
+            ],
+        );
+        let original = f.clone();
+
+        assert_eq!(run_coalesce(&mut f), 0);
+        assert_eq!(f, original);
+    }
+
+    #[test]
+    fn compound_literal_reads_are_renamed_after_safe_coalescing() {
+        let mut f = fd(
+            vec![lv("first"), lv("second")],
+            vec![
+                assign("first", CExpr::int(1)),
+                exact_memcpy_store("destination", CExpr::var("first")),
+                assign("second", CExpr::int(2)),
+                exact_memcpy_store("destination", add(CExpr::var("second"), CExpr::int(3))),
+                CStmt::Return(Some(CExpr::int(0))),
+            ],
+        );
+
+        assert_eq!(run_coalesce(&mut f), 1);
+        assert_eq!(f.local_vars.len(), 1);
+        let survivor = f.local_vars[0].name.clone();
+        let mut referenced = Vec::new();
+        visit_stmt_exprs(&f.body, &mut |expr| collect_vars(expr, &mut referenced));
+        assert!(referenced.iter().any(|name| name == &survivor));
+        assert!(!referenced
+            .iter()
+            .any(|name| name != &survivor && matches!(name.as_str(), "first" | "second")));
+    }
+
+    #[test]
+    fn statement_expression_block_initializer_keeps_its_source_live() {
+        let nested = CStmt::Block(vec![CBlockItem::Decl(vec![
+            lv("nested").with_init(Initializer::Expr(CExpr::var("saved")))
+        ])]);
+        let stmt_expr = CExpr::StmtExpr(vec![nested], Box::new(CExpr::int(0)));
+        let mut f = fd(
+            vec![lv("saved"), lv("scratch")],
+            vec![
+                assign("saved", CExpr::var("source")),
+                assign("scratch", CExpr::call(CExpr::var("produce"), vec![])),
+                callstmt("consume", stmt_expr),
+                CStmt::Return(Some(CExpr::var("scratch"))),
+            ],
+        );
+        let original = f.clone();
+
+        assert_eq!(run_coalesce(&mut f), 0);
+        assert_eq!(f, original);
+    }
+
+    #[test]
+    fn nested_block_initializer_address_take_excludes_the_local() {
+        let nested = CStmt::Block(vec![CBlockItem::Decl(vec![VarDecl::new(
+            "pointer",
+            CType::ptr(CType::long()),
+        )
+        .with_init(Initializer::Expr(CExpr::addr_of(CExpr::var("addressed"))))])]);
+        let mut f = fd(
+            vec![lv("addressed"), lv("other")],
+            vec![
+                assign("addressed", CExpr::int(1)),
+                nested,
+                assign("other", CExpr::int(2)),
+                CStmt::Return(Some(CExpr::var("other"))),
+            ],
+        );
+        let original = f.clone();
+
+        assert_eq!(run_coalesce(&mut f), 0);
+        assert_eq!(f, original);
     }
 }

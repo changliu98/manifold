@@ -2694,6 +2694,7 @@ mod tests {
         let mut db = DecompileDB::default();
         let func: Address = 0x1800;
         let init: Address = 0x1810;
+        let read: Address = 0x1820;
         let base_ofs = 4_i64;
         let base_local: RTLReg = 0x7300;
         let constant_reg: RTLReg = 0x7400;
@@ -2722,6 +2723,28 @@ mod tests {
             ),
         );
         db.rel_push("stack_var", (func, init, base_ofs, base_local));
+        db.rel_push(
+            "frame_read_reaching_storage",
+            (
+                func,
+                read,
+                base_ofs + 1,
+                init,
+                base_ofs,
+                8_usize,
+                base_local,
+            ),
+        );
+        db.rel_push(
+            "clight_stmt",
+            (
+                init,
+                ClightStmt::Sset(
+                    base_local as Ident,
+                    ClightExpr::EconstLong(0x17_0000_000b, default_long_type()),
+                ),
+            ),
+        );
 
         let mut result = StructConstructionResult {
             new_stmts: Vec::new(),
@@ -2744,6 +2767,95 @@ mod tests {
             })
             .collect();
         assert_eq!(values, vec![11, 23]);
+        assert_eq!(
+            result.stack_buffers,
+            vec![(func, base_local as Ident, 12)],
+            "the region-aware rewrite must publish the whole exact field extent",
+        );
+    }
+
+    #[test]
+    fn conflicting_exact_region_rewrites_do_not_fall_back_to_direct_storage() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x1a00;
+        let init: Address = 0x1a10;
+        let read: Address = 0x1a20;
+        let outer_ofs = 4_i64;
+        let inner_ofs = 8_i64;
+        let outer_local: RTLReg = 0x7500;
+        let inner_local: RTLReg = 0x7600;
+        let constant_reg: RTLReg = 0x7700;
+
+        for field_ofs in [0_i64, 4, 8] {
+            db.rel_push(
+                "escaped_stack_region_field",
+                (func, outer_ofs, field_ofs, MemoryChunk::MInt32),
+            );
+        }
+        for field_ofs in [0_i64, 4] {
+            db.rel_push(
+                "escaped_stack_region_field",
+                (func, inner_ofs, field_ofs, MemoryChunk::MInt32),
+            );
+        }
+        db.rel_push("slot_escaped_canonical", (func, outer_ofs, outer_local));
+        db.rel_push("slot_escaped_canonical", (func, inner_ofs, inner_local));
+        db.rel_push("pmov", (init, "wide_mem_dst", "wide_reg_src"));
+        db.rel_push(
+            "op_indirect",
+            ("wide_mem_dst", "", "RSP", "NONE", 1_i64, inner_ofs, 8_usize),
+        );
+        db.rel_push(
+            "single_def_const",
+            (constant_reg, Constant::Olongconst(0x2_0000_0001)),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                init,
+                RTLInst::Iop(Operation::Omove, Arc::new(vec![constant_reg]), inner_local),
+            ),
+        );
+        db.rel_push("stack_var", (func, init, inner_ofs, inner_local));
+        db.rel_push(
+            "frame_read_reaching_storage",
+            (
+                func,
+                read,
+                inner_ofs + 1,
+                init,
+                inner_ofs,
+                8_usize,
+                inner_local,
+            ),
+        );
+        db.rel_push(
+            "clight_stmt",
+            (
+                init,
+                ClightStmt::Sset(
+                    inner_local as Ident,
+                    ClightExpr::EconstLong(0x2_0000_0001, default_long_type()),
+                ),
+            ),
+        );
+
+        let mut result = StructConstructionResult {
+            new_stmts: Vec::new(),
+            new_emit_stmts: Vec::new(),
+            rewritten_stmts: HashMap::new(),
+            stack_buffers: Vec::new(),
+        };
+        synthesize_escaped_stack_region_construction(&db, &HashMap::new(), &mut result);
+
+        assert!(
+            !result.rewritten_stmts.contains_key(&init),
+            "two incompatible exact region owners must suppress the physical rewrite",
+        );
+        assert!(
+            result.stack_buffers.is_empty(),
+            "a rejected rewrite must not leave an undersized direct-storage declaration",
+        );
     }
 
     #[test]
@@ -8443,7 +8555,75 @@ fn synthesize_escaped_stack_region_construction(
             values.push(value.clone());
         }
     }
-    let mut proposed_rewrites: HashMap<Node, Option<ClightStmt>> = HashMap::new();
+    #[derive(Clone, Debug, PartialEq)]
+    struct StorageRewriteProposal {
+        stmt: ClightStmt,
+        func: Address,
+        owner: Ident,
+        backing_extent: i64,
+        access_end: i64,
+    }
+
+    impl StorageRewriteProposal {
+        fn new(
+            stmt: ClightStmt,
+            func: Address,
+            owner: Ident,
+            backing_extent: i64,
+            access_end: i64,
+        ) -> Option<Self> {
+            (backing_extent > 0 && access_end > 0 && access_end <= backing_extent).then_some(Self {
+                stmt,
+                func,
+                owner,
+                backing_extent,
+                access_end,
+            })
+        }
+    }
+
+    fn merge_peer_rewrite(
+        proposals: &mut HashMap<Node, Option<StorageRewriteProposal>>,
+        node: Node,
+        proposal: StorageRewriteProposal,
+    ) {
+        proposals
+            .entry(node)
+            .and_modify(|current| {
+                if current.as_ref() != Some(&proposal) {
+                    *current = None;
+                }
+            })
+            .or_insert_with(|| Some(proposal));
+    }
+
+    fn publish_backing_extent(
+        result: &mut StructConstructionResult,
+        func: Address,
+        owner: Ident,
+        extent: i64,
+    ) {
+        if let Some((_, _, current)) =
+            result
+                .stack_buffers
+                .iter_mut()
+                .find(|(candidate_func, candidate_owner, _)| {
+                    (*candidate_func, *candidate_owner) == (func, owner)
+                })
+        {
+            *current = (*current).max(extent);
+        } else {
+            result.stack_buffers.push((func, owner, extent));
+        }
+    }
+
+    // Standalone frame-subcell evidence is useful when it is the only storage
+    // proof for a writer.  A complete escaped-region tiling is stronger: it
+    // names the same physical write inside the one object that all observed
+    // fields share.  Keep the authorities separate so a legitimate difference
+    // between those two spellings is not mistaken for peer ambiguity.
+    let mut direct_rewrites: HashMap<Node, Option<StorageRewriteProposal>> = HashMap::new();
+    let mut region_rewrites: HashMap<Node, Option<StorageRewriteProposal>> = HashMap::new();
 
     // Reverse Stacking represents a physical frame write as Sset, but an
     // interior read observes its bytes rather than merely the SSA value.  RTL
@@ -8514,17 +8694,12 @@ fn synthesize_escaped_stack_region_construction(
             raw_stack_buffer_store_expr(owner as Ident, buffer_size, 0, values[0].clone(), chunk)
         };
 
-        result
-            .stack_buffers
-            .push((func, owner as Ident, buffer_size));
-        proposed_rewrites
-            .entry(write)
-            .and_modify(|current| {
-                if current.as_ref() != Some(&stmt) {
-                    *current = None;
-                }
-            })
-            .or_insert_with(|| Some(stmt));
+        let Some(proposal) =
+            StorageRewriteProposal::new(stmt, func, owner as Ident, buffer_size, buffer_size)
+        else {
+            continue;
+        };
+        merge_peer_rewrite(&mut direct_rewrites, write, proposal);
     }
 
     let owned_fields = escaped_stack_region_owned_fields(db);
@@ -8616,9 +8791,7 @@ fn synthesize_escaped_stack_region_construction(
                         .all(|(idx, ofs)| *ofs == idx as i64 * width)
             });
         if !uniform_array {
-            result
-                .stack_buffers
-                .push((func, base_local as Ident, region_size));
+            publish_backing_extent(result, func, base_local as Ident, region_size);
         }
 
         let Some(inits) = escaped_stack_inits.get(&func) else {
@@ -8641,26 +8814,59 @@ fn synthesize_escaped_stack_region_construction(
             ) else {
                 continue;
             };
+            let Some(access_end) = field_ofs.checked_add(chunk_byte_size(chunk) as i64) else {
+                continue;
+            };
             if rtl_backed_inits.contains(&(func, *addr)) {
-                proposed_rewrites
-                    .entry(*addr)
-                    .and_modify(|current| {
-                        if current.as_ref() != Some(&stmt) {
-                            *current = None;
-                        }
-                    })
-                    .or_insert_with(|| Some(stmt));
+                let Some(proposal) = StorageRewriteProposal::new(
+                    stmt,
+                    func,
+                    base_local as Ident,
+                    region_size,
+                    access_end,
+                ) else {
+                    continue;
+                };
+                merge_peer_rewrite(&mut region_rewrites, *addr, proposal);
             } else {
+                // A raw region store carries a char-array annotation even for
+                // uniform fields.  Publish its exact enclosing extent here so
+                // a directly accessed base rejected by heuristic array sizing
+                // cannot leave the emitted access beyond the C declaration.
+                publish_backing_extent(result, func, base_local as Ident, region_size);
                 result.new_stmts.push((*addr, stmt.clone()));
                 result.new_emit_stmts.push((func, *addr, stmt));
             }
         }
     }
 
-    for (node, stmt) in proposed_rewrites {
-        if let Some(stmt) = stmt {
-            result.rewritten_stmts.insert(node, stmt);
+    let rewrite_nodes: BTreeSet<Node> = direct_rewrites
+        .keys()
+        .chain(region_rewrites.keys())
+        .copied()
+        .collect();
+    for node in rewrite_nodes {
+        let proposal = match region_rewrites.remove(&node) {
+            // A peer conflict at the stronger region authority is terminal;
+            // falling back to a standalone subcell spelling would silently
+            // choose one of the incompatible physical owners.
+            Some(None) => None,
+            Some(Some(proposal)) => Some(proposal),
+            None => direct_rewrites.remove(&node).flatten(),
+        };
+        let Some(proposal) = proposal else {
+            continue;
+        };
+        if proposal.access_end > proposal.backing_extent {
+            continue;
         }
+        publish_backing_extent(
+            result,
+            proposal.func,
+            proposal.owner,
+            proposal.backing_extent,
+        );
+        result.rewritten_stmts.insert(node, proposal.stmt);
     }
 }
 

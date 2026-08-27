@@ -4707,9 +4707,15 @@ ascent_par! {
         instruction(addr, _, _, mnem, _, _, _, _, _, _),
         if *mnem == "INC" || *mnem == "DEC";
 
-    #[local] lattice active_flags_in(Address, Set<Address>);
-    #[local] lattice active_flags_out(Address, Set<Address>);
-    active_flags_out(*origin, Set::singleton(*origin)) <--
+    // `None` is an explicit unknown-flags predecessor.  Without it an
+    // unmodeled clobber arm disappears at a merge and a sibling producer can
+    // masquerade as the unique MUST origin.
+    #[local] lattice active_flags_in(Address, Set<Option<Address>>);
+    #[local] lattice active_flags_out(Address, Set<Option<Address>>);
+    active_flags_in(*func, Set::singleton(None)) <--
+        func_span(_, func, _),
+        instr_in_function(func, func);
+    active_flags_out(*origin, Set::singleton(Some(*origin))) <--
         linked_flags_origin(origin);
     active_flags_in(*succ, active.clone()) <--
         active_flags_out(addr, active),
@@ -4717,6 +4723,10 @@ ascent_par! {
     active_flags_out(*addr, active.clone()) <--
         active_flags_in(addr, active),
         flags_flow_transparent(addr);
+    active_flags_out(*addr, Set::singleton(None)) <--
+        active_flags_in(addr, _),
+        !flags_flow_transparent(addr),
+        !linked_flags_origin(addr);
 
     // A CMOV is usable only when every incoming CFG path agrees on one flags
     // origin.  A may-set with more than one origin represents path-dependent
@@ -4726,21 +4736,24 @@ ascent_par! {
         pcmov(cmov, _, _, _),
         active_flags_in(cmov, active),
         if active.0.len() == 1,
-        for origin in active.0.iter();
+        for member in active.0.iter(),
+        if let Some(origin) = member;
 
     #[local] relation jcc_flags_origin(Address, Address);
     jcc_flags_origin(*origin, *jcc) <--
         pjcc(jcc, _, _),
         active_flags_in(jcc, active),
         if active.0.len() == 1,
-        for origin in active.0.iter();
+        for member in active.0.iter(),
+        if let Some(origin) = member;
 
     #[local] relation overflow_jcc_flags_origin(Address, Address);
     overflow_jcc_flags_origin(*origin, *jcc) <--
         overflow_jcc(jcc, _, _),
         active_flags_in(jcc, active),
         if active.0.len() == 1,
-        for origin in active.0.iter();
+        for member in active.0.iter(),
+        if let Some(origin) = member;
 
     // Point-keyed may-state of (flags origin, compared register) pairs that
     // were redefined on an incoming path. Union at merges makes a secondary
@@ -4755,7 +4768,8 @@ ascent_par! {
         flags_flow_transparent(addr);
     redefined_flags_args_out(*addr, Set::singleton((*origin, *mreg))) <--
         active_flags_in(addr, active),
-        for origin in active.0.iter(),
+        for member in active.0.iter(),
+        if let Some(origin) = member,
         flags_arg(origin, mreg),
         reg_def(addr, mreg),
         flags_flow_transparent(addr);
@@ -14639,6 +14653,60 @@ mod structural_dataflow_tests {
                         )
                 }));
             }
+        });
+    }
+
+    #[test]
+    fn unknown_flags_arm_vetoes_exact_overflow_origin() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let [origin, unknown_kill, jcc, func, left_block, right_block, join_block] =
+                synthetic_ids();
+
+            prog.padd.push((origin, "sum", "rhs"));
+            prog.op_register.extend([("sum", "RDI"), ("rhs", "RSI")]);
+            prog.instruction
+                .push((jcc, 2, "", "JO", "overflow_target", "", "", "", 0, 0));
+            // MUL is deliberately not one of linked_flags_origin's modeled
+            // producers.  It clobbers flags, so this path must contribute
+            // explicit Unknown rather than disappear at the join.
+            prog.unrefinedinstruction.push((
+                unknown_kill,
+                3,
+                "",
+                "MUL",
+                "factor",
+                "",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.ddisasm_cfg_edge.extend([
+                (origin, jcc, "branch"),
+                (origin, unknown_kill, "fallthrough"),
+                (unknown_kill, jcc, "branch"),
+            ]);
+            for (node, block) in [
+                (origin, left_block),
+                (unknown_kill, right_block),
+                (jcc, join_block),
+            ] {
+                prog.code_in_block.push((node, block));
+                prog.instr_in_function.push((node, func));
+            }
+
+            prog.run();
+
+            assert!(!prog.exact_overflow_condition.iter().any(|row| row.0 == jcc));
+            assert!(prog.mach_inst.iter().any(|(node, inst)| {
+                *node == jcc
+                    && matches!(
+                        inst,
+                        MachInst::Mcond(Condition::Coverflow, args, "overflow_target")
+                            if args.is_empty()
+                    )
+            }));
         });
     }
 

@@ -26,30 +26,6 @@ fn chunk_xtype(chunk: &MemoryChunk) -> XType {
     }
 }
 
-/// Resolve a direct symbolic memory operand to the exact byte coordinate it
-/// reads.  Aglobal/Abased offsets are byte offsets; keeping the checked signed
-/// addition here avoids treating a wrapped coordinate as relocation evidence.
-fn direct_global_slot(addressing: &Addressing) -> Option<Address> {
-    let (ident, offset) = match addressing {
-        Addressing::Aglobal(ident, offset) | Addressing::Abased(ident, offset) => (*ident, *offset),
-        _ => return None,
-    };
-    Address::try_from(ident).ok()?.checked_add_signed(offset)
-}
-
-fn chunk_is_pointer_sized_integer(chunk: &MemoryChunk, pointer_bytes: i64) -> bool {
-    let Some(pointer_bits) = usize::try_from(pointer_bytes)
-        .ok()
-        .and_then(|bytes| bytes.checked_mul(8))
-    else {
-        return false;
-    };
-    matches!(
-        chunk,
-        MemoryChunk::MInt32 | MemoryChunk::MAny32 | MemoryChunk::MInt64 | MemoryChunk::MAny64
-    ) && usize::from(crate::decompile::passes::rtl_pass::chunk_size_bits(chunk)) == pointer_bits
-}
-
 /// Map an operation to its output register's XType, returning None for unclassified operations.
 fn op_output_xtype(op: &Operation) -> Option<XType> {
     use Operation::*;
@@ -223,7 +199,6 @@ ascent_par! {
     relation func_param_position_type(Address, usize, XType);
     relation emit_function(Address, Symbol, Node);
     relation main_function(Address);
-    relation abi_pointer_size(i64);
     relation abi_int_arg_position(Mreg, usize);
     relation emit_function_return_type_xtype_candidate(Address, XType);
     relation emit_function_return(Address, RTLReg);
@@ -1102,19 +1077,6 @@ ascent_par! {
     relation emit_global_is_char_ptr(Ident);
     // Ground-truth pointer evidence from ELF relocations: a data slot relocated to a data target is unconditionally a pointer, which the access-based signals miss for never-dereferenced tables.
     relation pointer_in_data(Address, Address);
-    // A direct pointer-sized load from the exact byte coordinate of an ELF
-    // relocation reads a pointer value even when the load was introduced by
-    // an RTL expansion (for example the high lane of a 16-byte SIMD copy).
-    #[local] relation relocated_pointer_value(RTLReg);
-    relocated_pointer_value(*dst) <--
-        rtl_inst(_, ?RTLInst::Iload(chunk, addressing, args, dst)),
-        if args.is_empty(),
-        if let Some(slot) = direct_global_slot(addressing),
-        pointer_in_data(slot, _),
-        abi_pointer_size(pointer_bytes),
-        if chunk_is_pointer_sized_integer(chunk, *pointer_bytes);
-    must_be_ptr(reg) <-- relocated_pointer_value(reg);
-
     #[local] relation global_value_reg(Ident, RTLReg);
     // Integer counter-evidence: the loaded value participates in an integer comparison or non-pointer arithmetic, fed from the same global_value_reg so it weighs against the pointer signals.
     #[local] relation global_used_as_int(Ident);
@@ -1330,13 +1292,12 @@ mod tests {
     }
 
     #[test]
-    fn exact_relocation_slot_types_only_a_pointer_sized_direct_load() {
+    fn direct_relocation_load_does_not_bypass_conflict_checked_pointer_proof() {
         let [exact_node, adjacent_node, narrow_node] = synthetic_ids();
         let [exact, adjacent, narrow] = [201, 202, 203];
         let base = 0x4000_usize;
         let slot = base as Address + 8;
         let mut prog = TypePassProgram::default();
-        prog.abi_pointer_size.push((8,));
         prog.pointer_in_data.push((slot, 0x5000));
         prog.rtl_inst.extend([
             (
@@ -1370,14 +1331,13 @@ mod tests {
 
         prog.run();
 
-        assert!(prog.must_be_ptr.iter().any(|row| *row == (exact,)));
+        for value in [exact, adjacent, narrow] {
+            assert!(!prog.must_be_ptr.iter().any(|row| *row == (value,)));
+        }
         assert!(prog
             .emit_var_type_candidate
             .iter()
-            .any(|row| *row == (exact, XType::Xptr)));
-        for non_pointer in [adjacent, narrow] {
-            assert!(!prog.must_be_ptr.iter().any(|row| *row == (non_pointer,)));
-        }
+            .any(|row| *row == (exact, XType::Xany64)));
     }
 
     #[test]

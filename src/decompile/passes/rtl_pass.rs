@@ -10,7 +10,8 @@ use crate::decompile::passes::frame_write_pass::{
 use crate::decompile::passes::pass::IRPass;
 use crate::mreg::{Mreg, RegClass};
 use crate::util::{
-    multi_synth_address_is_encodable, DEFAULT_VAR, MULTI_SYNTH_NODE_BIT, MULTI_SYNTH_STAGE_SHIFT,
+    multi_synth_address_is_encodable, semantic_node_address, DEFAULT_VAR, MULTI_SYNTH_NODE_BIT,
+    MULTI_SYNTH_STAGE_SHIFT,
 };
 use crate::x86::asm::{Ireg, TestCond};
 use crate::x86::mach::X86Mreg;
@@ -31,7 +32,7 @@ const ENDBR64_LEN: u64 = 4;
 // into a pointer to the caller's frame. Retain the complete finite origin set
 // in a lattice and expose a slot only when that set is exactly one Slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum StackAddrOrigin {
+pub(crate) enum StackAddrOrigin {
     // Normalized frame offset plus the defining operation's result width.
     // Width stays attached to provenance so a 32-bit LEA cannot become a
     // machine pointer on a 64-bit target merely because both forms name the
@@ -271,43 +272,6 @@ fn transform_affine_stack_origin(
         .then_some(transformed)
 }
 
-/// If two structurally transported stack values can denote the same byte in a
-/// pointer equality observer, their machine-frame coordinates must live in one
-/// C backing allocation.  Return `(owner, extent)` for the conservative suffix
-/// of the local frame beginning at the lowest observed root.
-fn observed_affine_stack_region(
-    left: &AffineStackOrigin,
-    right: &AffineStackOrigin,
-    frame_size: i64,
-) -> Option<(i64, i64)> {
-    if left.root == right.root
-        || !affine_stack_origin_within_frame(left, frame_size)
-        || !affine_stack_origin_within_frame(right, frame_size)
-    {
-        return None;
-    }
-    let left_min = left.root.checked_add(left.min_delta)?;
-    let left_max = left.root.checked_add(left.max_delta)?;
-    let right_min = right.root.checked_add(right.min_delta)?;
-    let right_max = right.root.checked_add(right.max_delta)?;
-    if left_max < right_min || right_max < left_min {
-        return None;
-    }
-
-    let owner = left.root.min(right.root);
-    let positive = left_min >= 0 && right_min >= 0;
-    let negative = left_max <= 0 && right_max <= 0;
-    let end = if positive {
-        frame_size
-    } else if negative {
-        0
-    } else {
-        return None;
-    };
-    let extent = end.checked_sub(owner)?;
-    (extent > 0 && extent <= MAX_BOUNDED_INTEGER).then_some((owner, extent))
-}
-
 /// Exact byte width of an x86 GPR *view* as spelled by Capstone. `Mreg`
 /// intentionally aliases EAX/AX/AL to AX, so this must run before that
 /// normalization; a boolean `reg_is_64` is likewise insufficient because its
@@ -485,8 +449,7 @@ fn stack_address_within_local_frame(offset: i64, frame_size: i64) -> bool {
     if frame_size <= 0 {
         return false;
     }
-    (offset >= 0 && offset < frame_size)
-        || (offset >= frame_size.saturating_neg() && offset < 0)
+    (offset >= 0 && offset < frame_size) || (offset >= frame_size.saturating_neg() && offset < 0)
 }
 
 fn typ_is_pointer_width(typ: &Typ, pointer_width: i64) -> bool {
@@ -8719,6 +8682,16 @@ ascent_par! {
         reg_stack_addr_origins(func_start, def_addr, reg, origins),
         for origin in origins.0.iter();
 
+    // Compact definition-keyed projection for proof consumers which run after
+    // RTL alias closure.  Keeping the defining node distinguishes a legitimate
+    // affine call-result seed from a different scalar definition in the same
+    // canonical web; dropping that key would make one positive seed hide the
+    // competing arm again.
+    relation canonical_stack_addr_def_origin(Node, RTLReg, StackAddrOrigin);
+    canonical_stack_addr_def_origin(*def_addr, *canonical, *origin) <--
+        reg_stack_addr_origin_member(_, def_addr, mreg, origin),
+        reg_rtl(def_addr, mreg, canonical);
+
     #[local] relation reg_stack_addr_origin_conflict(Address, Address, Mreg);
     reg_stack_addr_origin_conflict(*func_start, *def_addr, *reg) <--
         reg_stack_addr_origin_member(func_start, def_addr, reg, ?StackAddrOrigin::NonStack);
@@ -8960,17 +8933,29 @@ ascent_par! {
         !sp_index_bound_has_unbounded_def(func, use_addr),
         !sp_index_bound_conflict(func, use_addr);
 
-    // One set-valued fact per RTL pointer identity.  Copies and canonical
-    // aliases retain all possible frame-region origins; only a singleton is
-    // projected at a call, so a join cannot manufacture a must-alias object.
-    #[local] lattice bounded_stack_ptr_origins(Address, RTLReg, Set<(i64, i64, i64)>);
-    bounded_stack_ptr_origins(*func, *dst, Set::singleton((*base_ofs, scale, *bound))) <--
+    // One set-valued fact per RTL pointer identity.  `None` records a concrete
+    // non-stack definition in the same canonical web; without it that arm
+    // disappears and a surviving stack seed becomes a false MUST origin.
+    #[local] relation bounded_stack_ptr_seed_raw(Address, Node, RTLReg, i64, i64, i64);
+    bounded_stack_ptr_seed_raw(*func, synth, *dst, *base_ofs, scale, *bound) <--
         indexed_synth_stack_base(func, raw_addr, base_ofs, base_rtl),
         sp_index_bound(func, raw_addr, idx_rtl, bound),
         let synth = *raw_addr | (1u64 << 62),
         rtl_inst_candidate(synth, ?RTLInst::Iop(indexed_op, args, dst)),
         if args.len() == 2 && args[0] == *base_rtl && args[1] == *idx_rtl,
         if let Some(scale) = split_indexed_lea_scale(indexed_op);
+
+    #[local] relation bounded_stack_ptr_seed(Address, Node, RTLReg, i64, i64, i64);
+    bounded_stack_ptr_seed(func, node, *canonical, base, scale, count) <--
+        bounded_stack_ptr_seed_raw(func, node, raw, base, scale, count),
+        xtl_canonical(raw, canonical);
+    bounded_stack_ptr_seed(func, node, *raw, base, scale, count) <--
+        bounded_stack_ptr_seed_raw(func, node, raw, base, scale, count),
+        !xtl_canonical(raw, _);
+
+    #[local] lattice bounded_stack_ptr_origins(Address, RTLReg, Set<Option<(i64, i64, i64)>>);
+    bounded_stack_ptr_origins(*func, *dst, Set::singleton(Some((*base_ofs, *scale, *bound)))) <--
+        bounded_stack_ptr_seed(func, _, dst, base_ofs, scale, bound);
 
     bounded_stack_ptr_origins(*func, *dst, origins.clone()) <--
         bounded_stack_ptr_origins(func, src, origins),
@@ -8985,12 +8970,22 @@ ascent_par! {
         xtl_canonical(raw, canonical),
         if raw != canonical;
 
+    bounded_stack_ptr_origins(*func, *ptr, Set::singleton(None)) <--
+        bounded_stack_ptr_seed(func, seed, ptr, _, _, _),
+        canonical_stack_addr_def_origin(def, ptr, ?StackAddrOrigin::NonStack),
+        instr_in_function(def, func),
+        if semantic_node_address(*def) != semantic_node_address(*seed);
+
     #[local] relation bounded_stack_ptr_origin_member(Address, RTLReg, i64, i64, i64);
     bounded_stack_ptr_origin_member(*func, *ptr, *base, *scale, *count) <--
         bounded_stack_ptr_origins(func, ptr, origins),
-        for (base, scale, count) in origins.0.iter();
+        for origin in origins.0.iter(),
+        if let Some((base, scale, count)) = origin;
 
     #[local] relation bounded_stack_ptr_origin_conflict(Address, RTLReg);
+    bounded_stack_ptr_origin_conflict(*func, *ptr) <--
+        bounded_stack_ptr_origins(func, ptr, origins),
+        if origins.0.contains(&None);
     bounded_stack_ptr_origin_conflict(func, ptr) <--
         bounded_stack_ptr_origin_member(func, ptr, left_base, left_scale, left_count),
         bounded_stack_ptr_origin_member(func, ptr, right_base, right_scale, right_count),
@@ -9088,8 +9083,42 @@ ascent_par! {
         xmm_hi_frame_store(store_addr, hi_ofs, _, _, _, _),
         instr_in_function(store_addr, func);
 
+    // An escaped interior address can be a view into a structurally proven
+    // enclosing object.  Reconcile it only from exact physical evidence: an
+    // endpoint-bounded pointer walk, or one settled reaching write whose byte
+    // interval contains the escaped coordinate.  Both candidates must fit the
+    // recovered frame; numeric node/address order never participates.
+    #[local] relation escaped_enclosing_span_candidate(Address, i64, i64, i64);
+    escaped_enclosing_span_candidate(*func, *base, *low, *high) <--
+        slot_addr_escaped(func, _, base),
+        stack_pointer_walk_region(func, low, high),
+        if *low < *base && *base < *high,
+        func_stacksz(func, _, _, frame_size_u64),
+        if let Ok(frame_size) = i64::try_from(*frame_size_u64),
+        if direct_pointer_interval_within_local_frame(*low, *high, frame_size);
+    escaped_enclosing_span_candidate(*func, *base, *write_ofs, write_end) <--
+        slot_addr_escaped(func, _, base),
+        settled_frame_storage_origin(func, _, _, _, _, write_ofs, write_width),
+        if let Ok(write_width_i64) = i64::try_from(*write_width),
+        if let Some(write_end) = write_ofs.checked_add(write_width_i64),
+        if *write_ofs < *base && *base < write_end,
+        func_stacksz(func, _, _, frame_size_u64),
+        if let Ok(frame_size) = i64::try_from(*frame_size_u64),
+        if direct_pointer_interval_within_local_frame(*write_ofs, write_end, frame_size);
+
+    #[local] relation escaped_reconciled_owner(Address, i64, i64);
+    escaped_reconciled_owner(func, base, owner) <--
+        escaped_enclosing_span_candidate(func, base, _, _),
+        agg owner = ascent::aggregators::min(low)
+            in escaped_enclosing_span_candidate(func, base, low, _);
+
     #[local] relation escaped_base_slot(Address, i64);
-    escaped_base_slot(func, *ofs) <-- slot_addr_escaped(func, _, ofs);
+    escaped_base_slot(func, *owner) <--
+        slot_addr_escaped(func, _, base),
+        escaped_reconciled_owner(func, base, owner);
+    escaped_base_slot(func, *ofs) <--
+        slot_addr_escaped(func, _, ofs),
+        !escaped_reconciled_owner(func, ofs, _);
 
     // Nearest enclosing escaped base, as a per-slot aggregate rather than a
     // pairwise shadowing relation: the pairwise form is quadratic in the number
@@ -10231,10 +10260,35 @@ ascent_par! {
         ltl_inst(node, ?LTLInst::Lstore(chunk, Addressing::Ainstack(ofs), _, _)),
         instr_in_function(node, func);
 
+    #[local] relation frame_stack_read_shape_conflict(Address, Address);
+    frame_stack_read_shape_conflict(*func, *node) <--
+        frame_stack_read_bytes(func, node, left_ofs, left_width),
+        frame_stack_read_bytes(func, node, right_ofs, right_width),
+        if left_ofs != right_ofs || left_width != right_width;
+
+    #[local] relation exact_lgetstack_read_chunk(Address, Address, i64, MemoryChunk);
+    exact_lgetstack_read_chunk(*func, *node, *ofs, chunk) <--
+        ltl_inst(node, ?LTLInst::Lgetstack(_, ofs, _, _)),
+        instr_in_function(node, func),
+        frame_stack_read_bytes(func, node, physical_ofs, width),
+        if physical_ofs == ofs,
+        !frame_stack_read_shape_conflict(func, node),
+        if let Some(chunk) = match *width {
+            1 => Some(MemoryChunk::MInt8Unsigned),
+            2 => Some(MemoryChunk::MInt16Unsigned),
+            4 => Some(MemoryChunk::MAny32),
+            8 => Some(MemoryChunk::MAny64),
+            _ => None,
+        };
+
+    stack_var_chunk(*func, *ofs, *chunk) <--
+        exact_lgetstack_read_chunk(func, _, ofs, chunk);
+
     stack_var_chunk(*func, ofs, chunk) <--
         ltl_inst(node, ?LTLInst::Lgetstack(_, ofs, typ, _)),
         let chunk = typ_to_chunk(*typ),
-        instr_in_function(node, func);
+        instr_in_function(node, func),
+        !exact_lgetstack_read_chunk(func, node, ofs, _);
 
     stack_var_chunk(*func, ofs, chunk) <--
         ltl_inst(node, ?LTLInst::Lsetstack(_, _, ofs, typ)),
@@ -12575,21 +12629,72 @@ ascent_par! {
         !returned_param_affine_missing(func),
         !returned_param_affine_conflict(func);
 
-    // One set-valued fact per caller value.  Exact local LEAs seed roots;
-    // explicit moves/canonical aliases preserve them; a summarized call adds
-    // its bounded affine delta.  Ambiguous origins remain in the set and are
-    // rejected only by the final observer projection, so this recursive SCC is
-    // monotone and never publishes a transient MUST fact.
-    #[local] lattice stack_value_origins(Address, RTLReg, Set<AffineStackOrigin>);
-    stack_value_origins(*func, *raw,
-                        Set::singleton(AffineStackOrigin {
+    // One set-valued fact per caller value.  Exact local LEAs and summarized
+    // calls are definition-keyed seeds; `None` records every competing
+    // non-stack definition or unresolved input in the same canonical web.
+    #[local] relation affine_stack_value_seed_raw(Address, Node, RTLReg, AffineStackOrigin);
+    affine_stack_value_seed_raw(*func, *node, *raw,
+                        AffineStackOrigin {
                             root: *offset,
                             min_delta: 0,
                             max_delta: 0,
-                        })) <--
+                        }) <--
         exact_local_stack_addr_lea_def(func, node, dst_mreg, offset, width),
         exact_stack_addr_lea_result(func, node, dst_mreg, offset, width, raw),
         abi_pointer_size(width);
+
+    affine_stack_value_seed_raw(*caller, *call, *result, transformed) <--
+        instr_in_function(call, caller),
+        call_target_func(call, callee),
+        returned_param_affine(callee, base_position, index_position, scale, displacement),
+        if *index_position == NO_AFFINE_INDEX,
+        call_arg_mapping(call, base_position, base_argument),
+        stack_value_origins(caller, base_argument, origins),
+        for origin_option in origins.0.iter(),
+        if let Some(origin) = origin_option,
+        call_result_rtl(call, result),
+        func_stacksz(caller, _, _, frame_size_u64),
+        if let Ok(frame_size) = i64::try_from(*frame_size_u64),
+        if let Some(transformed) = transform_affine_stack_origin(
+            origin,
+            None,
+            *scale,
+            *displacement,
+            frame_size,
+        );
+
+    affine_stack_value_seed_raw(*caller, *call, *result, transformed) <--
+        instr_in_function(call, caller),
+        call_target_func(call, callee),
+        returned_param_affine(callee, base_position, index_position, scale, displacement),
+        if *index_position != NO_AFFINE_INDEX,
+        call_arg_mapping(call, base_position, base_argument),
+        stack_value_origins(caller, base_argument, origins),
+        for origin_option in origins.0.iter(),
+        if let Some(origin) = origin_option,
+        bounded_call_arg_range(call, index_position, index_range),
+        call_result_rtl(call, result),
+        func_stacksz(caller, _, _, frame_size_u64),
+        if let Ok(frame_size) = i64::try_from(*frame_size_u64),
+        if let Some(transformed) = transform_affine_stack_origin(
+            origin,
+            Some(index_range),
+            *scale,
+            *displacement,
+            frame_size,
+        );
+
+    #[local] relation affine_stack_value_seed(Address, Node, RTLReg, AffineStackOrigin);
+    affine_stack_value_seed(func, node, *canonical, origin) <--
+        affine_stack_value_seed_raw(func, node, raw, origin),
+        xtl_canonical(raw, canonical);
+    affine_stack_value_seed(func, node, *raw, origin) <--
+        affine_stack_value_seed_raw(func, node, raw, origin),
+        !xtl_canonical(raw, _);
+
+    #[local] lattice stack_value_origins(Address, RTLReg, Set<Option<AffineStackOrigin>>);
+    stack_value_origins(*func, *value, Set::singleton(Some(*origin))) <--
+        affine_stack_value_seed(func, _, value, origin);
 
     stack_value_origins(*func, *canonical, origins.clone()) <--
         stack_value_origins(func, raw, origins),
@@ -12612,44 +12717,23 @@ ascent_par! {
         stack_value_origins(func, src, origins),
         structural_stack_value_move_edge(func, src, dst);
 
-    stack_value_origins(*caller, *result, Set::singleton(transformed)) <--
-        instr_in_function(call, caller),
-        call_target_func(call, callee),
-        returned_param_affine(callee, base_position, index_position, scale, displacement),
-        if *index_position == NO_AFFINE_INDEX,
-        call_arg_mapping(call, base_position, base_argument),
-        stack_value_origins(caller, base_argument, origins),
-        for origin in origins.0.iter(),
-        call_result_rtl(call, result),
-        func_stacksz(caller, _, _, frame_size_u64),
-        if let Ok(frame_size) = i64::try_from(*frame_size_u64),
-        if let Some(transformed) = transform_affine_stack_origin(
-            origin,
-            None,
-            *scale,
-            *displacement,
-            frame_size,
-        );
+    stack_value_origins(*func, *value, Set::singleton(None)) <--
+        affine_stack_value_seed(func, seed, value, _),
+        canonical_stack_addr_def_origin(def, value, ?StackAddrOrigin::NonStack),
+        instr_in_function(def, func),
+        if semantic_node_address(*def) != semantic_node_address(*seed);
 
-    stack_value_origins(*caller, *result, Set::singleton(transformed)) <--
+    // An unknown base arm is transported as unknown through an otherwise
+    // summarized affine call; omitting it would let the call result regain a
+    // singleton origin from the known sibling arm.
+    stack_value_origins(*caller, *result, Set::singleton(None)) <--
         instr_in_function(call, caller),
         call_target_func(call, callee),
-        returned_param_affine(callee, base_position, index_position, scale, displacement),
-        if *index_position != NO_AFFINE_INDEX,
+        returned_param_affine(callee, base_position, _, _, _),
         call_arg_mapping(call, base_position, base_argument),
         stack_value_origins(caller, base_argument, origins),
-        for origin in origins.0.iter(),
-        bounded_call_arg_range(call, index_position, index_range),
-        call_result_rtl(call, result),
-        func_stacksz(caller, _, _, frame_size_u64),
-        if let Ok(frame_size) = i64::try_from(*frame_size_u64),
-        if let Some(transformed) = transform_affine_stack_origin(
-            origin,
-            Some(index_range),
-            *scale,
-            *displacement,
-            frame_size,
-        );
+        if origins.0.contains(&None),
+        call_result_rtl(call, result);
 
     #[local] relation returned_param_affine_has_stack_evidence(Address, usize);
     returned_param_affine_has_stack_evidence(*callee, *base_position) <--
@@ -12657,7 +12741,7 @@ ascent_par! {
         call_target_func(call, callee),
         returned_param_affine(callee, base_position, _, _, _),
         call_arg_mapping(call, base_position, base_argument),
-        stack_value_origins(caller, base_argument, _);
+        exact_stack_value_origin(caller, base_argument, _);
 
     // The stack-root proof is pointer-class evidence at every interface edge.
     // Even if a generic equality also contributes scalar evidence, the
@@ -12669,7 +12753,7 @@ ascent_par! {
     is_ptr(*returned) <--
         returned_param_affine_has_stack_evidence(func, _),
         function_return_point_reg(func, _, returned);
-    is_ptr(*value) <-- stack_value_origins(_, value, _);
+    is_ptr(*value) <-- exact_stack_value_origin(_, value, _);
 
     #[local] relation param_identity_observer(Address, usize, usize);
     param_identity_observer(*func, *left_position, *right_position) <--
@@ -12690,9 +12774,13 @@ ascent_par! {
     #[local] relation stack_value_origin_member(Address, RTLReg, AffineStackOrigin);
     stack_value_origin_member(*func, *value, *origin) <--
         stack_value_origins(func, value, origins),
-        for origin in origins.0.iter();
+        for member in origins.0.iter(),
+        if let Some(origin) = member;
 
     #[local] relation stack_value_origin_conflict(Address, RTLReg);
+    stack_value_origin_conflict(*func, *value) <--
+        stack_value_origins(func, value, origins),
+        if origins.0.contains(&None);
     stack_value_origin_conflict(func, value) <--
         stack_value_origin_member(func, value, left),
         stack_value_origin_member(func, value, right),
@@ -12703,34 +12791,10 @@ ascent_par! {
         stack_value_origin_member(func, value, origin),
         !stack_value_origin_conflict(func, value);
 
-    #[local] relation observed_stack_layout_region(Address, i64, i64);
-    observed_stack_layout_region(*caller, owner, extent) <--
-        instr_in_function(call, caller),
-        call_target_func(call, observer),
-        param_identity_observer(observer, left_position, right_position),
-        call_arg_mapping(call, left_position, left_argument),
-        call_arg_mapping(call, right_position, right_argument),
-        exact_stack_value_origin(caller, left_argument, left_origin),
-        exact_stack_value_origin(caller, right_argument, right_origin),
-        func_stacksz(caller, _, _, frame_size_u64),
-        if let Ok(frame_size) = i64::try_from(*frame_size_u64),
-        if let Some((owner, extent)) =
-            observed_affine_stack_region(left_origin, right_origin, frame_size),
-        function_has_ltl_body(caller),
-        !function_has_uncovered_block(caller),
-        !function_unknown_terminal(caller, _),
-        !function_unresolved_control(caller, _);
-
-    escaped_stack_region_extent(func, *owner, *extent) <--
-        observed_stack_layout_region(func, owner, extent);
-
-    escaped_stack_region_caller_field(func, *owner, field_offset, *chunk) <--
-        observed_stack_layout_region(func, owner, extent),
-        frame_slot_offset(func, slot),
-        if let Some(end) = owner.checked_add(*extent),
-        if *slot >= *owner && *slot < end,
-        stack_var_chunk(func, slot, chunk),
-        let field_offset = *slot - *owner;
+    // Pointer equality remains useful type evidence, but it is not storage
+    // ownership evidence: distinct C objects may be compared for equality.
+    // Allocation extents are published only by the independent exact walk,
+    // ABI-capacity, or reaching-storage proofs above.
 
     // Value-web deref evidence: any register sharing a param value canonical used as a load/store BASE proves the param is a pointer, subsuming the -O0 spill/reload case.
     param_used_in_deref(func_start, *arg_reg) <--
@@ -14247,10 +14311,10 @@ mod tests {
         direct_pointer_loop_continues_toward_endpoint, fresh_call_input_reg,
         fresh_simd_dword_lane_reg, fresh_simd_dword_operand_reg, fresh_stack_param_reg,
         fresh_stack_slot_reg, fresh_xmm_hi_value_reg, fresh_xtl_reg, indexed_store_ends_at_extent,
-        observed_affine_stack_region, simd_broadcast_lane_node, simd_dword_event_stage_node,
-        simd_dword_reg_event, transform_affine_stack_origin, xmm_hi_lane_node, xmm_hi_store_node,
-        AffineStackOrigin, BoundedIntegerRange, FrameWriteOrigin, RTLPassProgram, StackAddrOrigin,
-        FRESH_NS_SP_BASE, NO_AFFINE_INDEX,
+        simd_broadcast_lane_node, simd_dword_event_stage_node, simd_dword_reg_event,
+        transform_affine_stack_origin, xmm_hi_lane_node, xmm_hi_store_node, AffineStackOrigin,
+        BoundedIntegerRange, FrameWriteOrigin, RTLPassProgram, StackAddrOrigin, FRESH_NS_SP_BASE,
+        NO_AFFINE_INDEX,
     };
     use crate::aarch64::mach::A64Mreg;
     use crate::mreg::Mreg;
@@ -15578,6 +15642,61 @@ mod tests {
     }
 
     #[test]
+    fn movzx_word_reload_uses_exact_physical_frame_width() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [func, reload] = synthetic_ids();
+            let offset = 12_i64;
+            prog.ltl_inst.push((
+                reload,
+                LTLInst::Lgetstack(Slot::Local, offset, Typ::Tint, Mreg::AX),
+            ));
+            prog.instr_in_function.push((reload, func));
+            prog.frame_stack_read_bytes
+                .push((func, reload, offset, 2_usize));
+            prog.instruction.push((
+                reload,
+                4,
+                "",
+                "MOVZX",
+                "word_frame_source",
+                "reload_destination",
+                "",
+                "",
+                0,
+                0,
+            ));
+
+            prog.run();
+
+            assert!(prog
+                .stack_var_chunk
+                .iter()
+                .any(|fact| fact == &(func, offset, MemoryChunk::MInt16Unsigned)));
+            assert!(!prog
+                .stack_var_chunk
+                .iter()
+                .any(|fact| fact == &(func, offset, MemoryChunk::MInt32)));
+        });
+    }
+
+    #[test]
+    fn exact_enclosing_frame_span_rebases_interior_escape() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [func, lea] = synthetic_ids();
+            prog.func_stacksz.push((func, func, "frame_owner", 32));
+            prog.slot_addr_escaped.push((func, lea, 3));
+            prog.stack_pointer_walk_region.push((func, 0, 32));
+
+            prog.run();
+
+            assert!(prog.escaped_base_slot.iter().any(|fact| fact == &(func, 0)));
+            assert!(!prog.escaped_base_slot.iter().any(|fact| fact == &(func, 3)));
+        });
+    }
+
+    #[test]
     fn memory_immediate_setcc_uses_normalized_operands_and_flags_origin() {
         on_large_stack(|| {
             let mut prog = RTLPassProgram::default();
@@ -16688,12 +16807,10 @@ mod tests {
             prog.abi_pointer_size.push((8,));
             prog.function_has_ltl_body.push((func,));
             prog.function_unresolved_control.push((func, unresolved));
-            prog.func_stacksz.push((func, unresolved, "partial_frame", 128));
+            prog.func_stacksz
+                .push((func, unresolved, "partial_frame", 128));
 
-            for (node, offset, dst) in [
-                (bounded, 32_i64, Mreg::AX),
-                (outside, 128_i64, Mreg::CX),
-            ] {
+            for (node, offset, dst) in [(bounded, 32_i64, Mreg::AX), (outside, 128_i64, Mreg::CX)] {
                 prog.instr_in_function.push((node, func));
                 prog.ltl_inst.push((
                     node,
@@ -18393,7 +18510,7 @@ mod tests {
     }
 
     #[test]
-    fn affine_internal_returns_preserve_observable_frame_identity() {
+    fn affine_pointer_equality_does_not_create_frame_ownership() {
         on_large_stack(|| {
             let mut prog = RTLPassProgram::default();
             let [caller, base0_node, base16_node, advance_call, identity_call, compare_call, advance, identity, compare, stack0, stack8, stack16, stack24] =
@@ -18467,11 +18584,7 @@ mod tests {
 
             prog.run();
 
-            assert!(prog
-                .observed_stack_layout_region
-                .iter()
-                .any(|row| row == &(caller, 0, 40)));
-            assert!(prog
+            assert!(!prog
                 .escaped_stack_region_extent
                 .iter()
                 .any(|row| row == &(caller, 0, 40)));
@@ -18481,7 +18594,7 @@ mod tests {
                 .filter(|(func, _, _)| *func == caller)
                 .map(|(_, offset, _)| *offset)
                 .collect();
-            assert_eq!(protected, BTreeSet::from([0, 8, 16, 24]));
+            assert!(protected.is_empty());
             assert!(prog
                 .stack_var_chunk
                 .iter()
@@ -18507,23 +18620,40 @@ mod tests {
                     max_delta: 16,
                 })
             );
-            assert_eq!(
-                observed_affine_stack_region(
-                    &AffineStackOrigin {
-                        root: 0,
-                        min_delta: 12,
-                        max_delta: 16,
-                    },
-                    &AffineStackOrigin {
-                        root: 16,
-                        min_delta: 0,
-                        max_delta: 0,
-                    },
-                    40,
-                ),
-                Some((0, 40))
-            );
             assert!(transform_affine_stack_origin(&origin, None, 4, 0, 40).is_none());
+        });
+    }
+
+    #[test]
+    fn affine_stack_origin_keeps_scalar_definition_explicit() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [func, stack_def, scalar_def] = synthetic_ids();
+            let value = 0xa100_u64;
+            prog.affine_stack_value_seed_raw.push((
+                func,
+                stack_def,
+                value,
+                AffineStackOrigin {
+                    root: 0,
+                    min_delta: 0,
+                    max_delta: 0,
+                },
+            ));
+            prog.canonical_stack_addr_def_origin.push((
+                scalar_def,
+                value,
+                StackAddrOrigin::NonStack,
+            ));
+            prog.instr_in_function.push((scalar_def, func));
+
+            prog.run();
+
+            assert!(!prog
+                .exact_stack_value_origin
+                .iter()
+                .any(|(owner, candidate, _)| (*owner, *candidate) == (func, value)));
+            assert!(!prog.is_ptr.iter().any(|fact| fact == &(value,)));
         });
     }
 
@@ -18610,6 +18740,42 @@ mod tests {
             // is one canonical protected cell at each projected offset, not a
             // particular arbitrary test identity.
             assert_eq!(protected_offsets, BTreeSet::from([0, 4, 8]));
+        });
+    }
+
+    #[test]
+    fn bounded_stack_pointer_keeps_scalar_definition_explicit() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let [func, seed, scalar_def, call, callee, callee_param] = synthetic_ids();
+            let pointer = 0xb100_u64;
+            prog.bounded_stack_ptr_seed_raw
+                .push((func, seed, pointer, 0, 4, 3));
+            prog.canonical_stack_addr_def_origin.push((
+                scalar_def,
+                pointer,
+                StackAddrOrigin::NonStack,
+            ));
+            prog.instr_in_function
+                .extend([(scalar_def, func), (call, func)]);
+            prog.call_arg_mapping.push((call, 0, pointer));
+            prog.call_target_func.push((call, callee));
+            prog.param_origin_carrier
+                .push((callee, 0, callee, callee_param));
+            prog.param_base_field_access
+                .push((callee, callee_param, 0, MemoryChunk::MInt32));
+            prog.func_stacksz.push((func, func, "bounded_conflict", 16));
+
+            prog.run();
+
+            assert!(!prog
+                .bounded_stack_ptr_call
+                .iter()
+                .any(|row| row.0 == func && row.3 == 0));
+            assert!(!prog
+                .escaped_stack_region_field
+                .iter()
+                .any(|row| row.0 == func));
         });
     }
 

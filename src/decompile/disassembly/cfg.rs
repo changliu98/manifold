@@ -1325,10 +1325,24 @@ pub fn classify_indirect_tailcalls(db: &mut DecompileDB, insns: &[DecodedInsn]) 
             (*id, (*segment, *base, *index, *scale, *disp))
         })
         .collect();
-    let owned: HashSet<Address> = db
+    let mut owned: HashSet<Address> = db
         .rel_iter::<(Address, Address)>("instr_in_function")
         .map(|(addr, _)| *addr)
         .collect();
+    // Architecture frontends publish instr_in_function only after this
+    // disassembly-stage classifier runs.  Function inference has already
+    // established block ownership, however, and code_in_block is the exact
+    // instruction-to-block map consumed by those frontends.  Join the two
+    // here so real binaries receive the same ownership evidence as callers
+    // that happen to pre-populate instr_in_function.
+    let owned_blocks: HashSet<Address> = db
+        .rel_iter::<(Node, Address)>("block_in_function")
+        .map(|(block, _)| *block)
+        .collect();
+    owned.extend(
+        db.rel_iter::<(Address, Address)>("code_in_block")
+            .filter_map(|(addr, block)| owned_blocks.contains(block).then_some(*addr)),
+    );
     let table_dispatches: HashSet<Node> = db
         .rel_iter::<(Node, usize, Node)>("jump_table_target")
         .map(|(node, _, _)| *node)
@@ -1386,92 +1400,56 @@ pub fn classify_indirect_tailcalls(db: &mut DecompileDB, insns: &[DecodedInsn]) 
     );
 }
 
-// Every address this stage already knows to begin a function. ELF contributes
-// one FDE start per function and PE one RUNTIME_FUNCTION, both recorded as
-// known_function_range; a stripped binary keeps both, which is what makes this
-// a fact rather than a guess. A FUNC symbol and a PLT stub are entries by
-// definition. Both ends of a range are taken: the ELF brackets run start to
-// next start, so the end names the following function, and a PE range's end is
-// the address just past the last instruction, which nothing falls into either.
+// Every entry accepted by function inference, plus PLT stubs.  Raw FDE starts
+// and PE RUNTIME_FUNCTION fragments are only block/range evidence: cold and
+// chained fragments are not independent function entries.  Cutting incoming
+// edges at those raw boundaries can erase real reaching definitions and make
+// an arbitrary ABI argument look like a stable computed target.
 fn function_entry_addrs(db: &DecompileDB) -> HashSet<u64> {
-    let mut entries: HashSet<u64> = HashSet::new();
-    for (start, end) in db.rel_iter::<(Address, Address)>("known_function_range") {
-        entries.insert(*start);
-        entries.insert(*end);
-    }
-    for (addr, _size, sym_type, ..) in db.rel_iter::<(
-        Address,
-        usize,
-        Symbol,
-        Symbol,
-        Symbol,
-        usize,
-        Symbol,
-        usize,
-        Symbol,
-    )>("symbol_table")
-    {
-        if *sym_type == "FUNC" && *addr > 0 {
-            entries.insert(*addr);
-        }
-    }
+    let mut entries: HashSet<u64> = db
+        .rel_iter::<(Symbol, Address)>("func_entry")
+        .map(|(_, addr)| *addr)
+        .collect();
     for (addr, _name) in db.rel_iter::<(Address, Symbol)>("plt_block") {
         entries.insert(*addr);
     }
     entries
 }
 
-// For each instruction, the index of the entry of the function it belongs to.
-// The extents come from the frame descriptions and FUNC symbols this stage
-// already holds, and are read as what they declare -- which instructions belong
-// to which function -- not as a claim that anything reaches anything. Where the
-// extents nest, the innermost wins, and an instruction no extent covers gets no
-// entry rather than a guessed one.
+// For each instruction, the index of its uniquely inferred function entry.
+// Function inference already assigned exact blocks by CFG reachability.  Use
+// that ownership rather than replaying coarse/nested unwind ranges here; a
+// shared block with multiple owners is ambiguous and receives no dominance
+// root instead of an arbitrary one.
 fn entry_of_each(db: &DecompileDB, insns: &[DecodedInsn]) -> Vec<Option<u32>> {
-    let mut ranges: Vec<(u64, u64)> = db
-        .rel_iter::<(Address, Address)>("known_function_range")
-        .map(|(s, e)| (*s, *e))
-        .collect();
-    ranges.extend(
-        db.rel_iter::<(
-            Address,
-            usize,
-            Symbol,
-            Symbol,
-            Symbol,
-            usize,
-            Symbol,
-            usize,
-            Symbol,
-        )>("symbol_table")
-            .filter(|(addr, size, sym_type, ..)| *sym_type == "FUNC" && *size > 0 && *addr > 0)
-            .map(|(addr, size, ..)| (*addr, *addr + *size as u64)),
-    );
-    ranges.sort();
-    ranges.dedup();
-
     let index_of: HashMap<u64, u32> = insns
         .iter()
         .enumerate()
         .map(|(i, d)| (d.address, i as u32))
         .collect();
-
-    let mut out: Vec<Option<u32>> = vec![None; insns.len()];
-    let mut open: Vec<(u64, u64)> = Vec::new();
-    let mut next = 0usize;
-    for (i, d) in insns.iter().enumerate() {
-        while next < ranges.len() && ranges[next].0 <= d.address {
-            open.push(ranges[next]);
-            next += 1;
-        }
-        open.retain(|(_, end)| *end > d.address);
-        // The innermost extent among those still open: the one that starts
-        // latest, and the tightest of those.
-        if let Some((start, _)) = open.iter().min_by_key(|(s, e)| (std::cmp::Reverse(*s), *e)) {
-            out[i] = index_of.get(start).copied();
-        }
+    let mut block_owners = HashMap::<Address, HashSet<Address>>::new();
+    for (block, owner) in db.rel_iter::<(Address, Address)>("block_in_function") {
+        block_owners.entry(*block).or_default().insert(*owner);
     }
-    out
+    let mut instruction_blocks = HashMap::<Address, HashSet<Address>>::new();
+    for (addr, block) in db.rel_iter::<(Address, Address)>("code_in_block") {
+        instruction_blocks.entry(*addr).or_default().insert(*block);
+    }
+
+    insns
+        .iter()
+        .map(|insn| {
+            let blocks = instruction_blocks.get(&insn.address)?;
+            let owners: HashSet<Address> = blocks
+                .iter()
+                .filter_map(|block| block_owners.get(block))
+                .flat_map(|owners| owners.iter().copied())
+                .collect();
+            (owners.len() == 1)
+                .then(|| index_of.get(owners.iter().next().unwrap()).copied())
+                .flatten()
+        })
+        .collect()
 }
 
 // Entry addresses of callees that never return, so a call to one can be seen
@@ -2370,7 +2348,17 @@ mod tests {
 
         fn function_entry(mut self, start: u64, end: u64) -> Layout {
             self.db
-                .rel_push("known_function_range", (start as Address, end as Address));
+                .rel_push("func_entry", ("fixture", start as Address));
+            self.db
+                .rel_push("block_in_function", (start as Address, start as Address));
+            for insn in self
+                .insns
+                .iter()
+                .filter(|insn| insn.address >= start && insn.address < end)
+            {
+                self.db
+                    .rel_push("code_in_block", (insn.address, start as Address));
+            }
             self
         }
 
@@ -2408,6 +2396,34 @@ mod tests {
         let mut df = l.dataflow();
         let at = df.index_of[&0x23];
         assert!(df.reaching_defs(at, Mreg::BX).is_empty());
+    }
+
+    #[test]
+    fn raw_unwind_fragment_boundary_does_not_cut_reaching_definitions() {
+        let mut l = Layout::new(vec![
+            insn(0x10, 4, "MOV"),
+            insn(0x14, 4, "MOV"),
+            insn(0x18, 4, "JMP"),
+        ])
+        .defines(0x10, Mreg::BX);
+        // Raw unwind brackets are range evidence only.  Without an inferred
+        // entry and block owner, 0x14 must not become an artificial cut.
+        l.db.rel_push("known_function_range", (0x14_u64, 0x1c_u64));
+        let mut df = l.dataflow();
+        let at = df.index_of[&0x18];
+        assert_eq!(df.reaching_defs(at, Mreg::BX), vec![df.index_of[&0x10]]);
+    }
+
+    #[test]
+    fn shared_block_has_no_arbitrary_dominance_entry() {
+        let insns = vec![insn(0x20, 4, "MOV")];
+        let mut db = DecompileDB::default();
+        db.rel_push("func_entry", ("left", 0x10_u64));
+        db.rel_push("func_entry", ("right", 0x18_u64));
+        db.rel_push("block_in_function", (0x20_u64, 0x10_u64));
+        db.rel_push("block_in_function", (0x20_u64, 0x18_u64));
+        db.rel_push("code_in_block", (0x20_u64, 0x20_u64));
+        assert_eq!(entry_of_each(&db, &insns), vec![None]);
     }
 
     // The same boundary must not swallow flow inside one function.
@@ -2600,7 +2616,12 @@ mod tests {
                 .iter()
                 .filter(|insn| insn.address >= start && insn.address < end)
             {
-                db.rel_push("instr_in_function", (insn.address, start));
+                if start == 0x3000 {
+                    db.rel_push("block_in_function", (start, start));
+                    db.rel_push("code_in_block", (insn.address, start));
+                } else {
+                    db.rel_push("instr_in_function", (insn.address, start));
+                }
             }
         }
 

@@ -1,9 +1,9 @@
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::c_pass::types::{
-    AssignOp, BinaryOp, CBlockItem, CExpr, CStmt, CType, ExprTransform, FloatLiteral,
-    FloatLiteralSuffix, FuncDef, FuncParam, IntLiteral, IntLiteralBase, IntLiteralSuffix, IntSize,
-    Label, Signedness, SourceLoc, StmtTransform, StorageClass, StringLiteral, TypeQualifiers,
-    UnaryOp, VarDecl,
+    AssignOp, BinaryOp, CBlockItem, CExpr, CStmt, CType, Designator, ExprTransform, FloatLiteral,
+    FloatLiteralSuffix, ForInit, FuncDef, FuncParam, InitItem, Initializer, IntLiteral,
+    IntLiteralBase, IntLiteralSuffix, IntSize, Label, Signedness, SourceLoc, StmtTransform,
+    StorageClass, StringLiteral, TypeQualifiers, UnaryOp, VarDecl,
 };
 use crate::decompile::passes::c_pass::TranslationUnit;
 use crate::decompile::passes::clight_select::query::{
@@ -20,6 +20,225 @@ use std::sync::Arc;
 // GCC hot/cold splitting emits `<base>_cold` companions with trivial abort/unreachable bodies; drop only when name ends in `_cold` AND body matches that trivial pattern (empty body is kept, not silently deleted).
 fn has_cold_suffix(name: &str) -> bool {
     name.len() > 5 && name.ends_with("_cold")
+}
+
+#[cfg(test)]
+mod alignment_safe_access_tests {
+    use super::{
+        aggregate_member_base_type, convert_clight_type, lower_byte_buffer_expr,
+        lower_byte_buffer_stmt, memcpy_load_expr, memcpy_store_expr, normalize_call_arity_expr,
+        scalar_deref_alignment_proven, should_lower_scalar_deref, unsigned_integer_clight_type,
+    };
+    use crate::decompile::passes::c_pass::print::{PrintConfig, Printer};
+    use crate::decompile::passes::c_pass::types::{
+        AssignOp, CExpr, CStmt, CType, FloatSize, Initializer, UnaryOp,
+    };
+    use crate::x86::types::{ClightAttr, ClightExpr, ClightIntSize, ClightSignedness, ClightType};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn attr() -> ClightAttr {
+        ClightAttr::default()
+    }
+
+    fn unknown_address() -> ClightExpr {
+        ClightExpr::Etempvar(
+            1,
+            ClightType::Tpointer(
+                Arc::new(ClightType::Tint(
+                    ClightIntSize::I8,
+                    ClightSignedness::Unsigned,
+                    attr(),
+                )),
+                attr(),
+            ),
+        )
+    }
+
+    #[test]
+    fn unknown_scalar_alignment_lowers_to_one_exact_memcpy_load() {
+        let access_ty = ClightType::Tlong(ClightSignedness::Signed, attr());
+        assert!(should_lower_scalar_deref(&unknown_address(), &access_ty));
+
+        let c_ty = CType::long();
+        let address = CExpr::Call(Box::new(CExpr::Var("next_address".into())), vec![]);
+        let CExpr::Unary(UnaryOp::Deref, cast) = memcpy_load_expr(c_ty.clone(), address.clone())
+        else {
+            panic!("safe load must read the aligned compound-literal destination")
+        };
+        let CExpr::Cast(_, copy) = cast.as_ref() else {
+            panic!("safe load must cast the memcpy result to its exact type")
+        };
+        let CExpr::Call(function, args) = copy.as_ref() else {
+            panic!("safe load must contain one memcpy call")
+        };
+        assert_eq!(function.as_ref(), &CExpr::Var("__builtin_memcpy".into()));
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[2], CExpr::SizeofType(c_ty));
+        let CExpr::Cast(_, source) = &args[1] else {
+            panic!("source address must be converted to a byte-copy pointer")
+        };
+        assert_eq!(source.as_ref(), &address);
+    }
+
+    #[test]
+    fn safe_store_evaluates_address_and_value_once() {
+        let ty = CType::Float(FloatSize::Double);
+        let address = CExpr::Call(Box::new(CExpr::Var("next_address".into())), vec![]);
+        let value = CExpr::Call(Box::new(CExpr::Var("next_value".into())), vec![]);
+        let CExpr::Call(function, args) =
+            memcpy_store_expr(ty.clone(), address.clone(), value.clone())
+        else {
+            panic!("safe store must be one memcpy call")
+        };
+        assert_eq!(function.as_ref(), &CExpr::Var("__builtin_memcpy".into()));
+        let CExpr::Cast(_, destination) = &args[0] else {
+            panic!("destination must be converted once")
+        };
+        assert_eq!(destination.as_ref(), &address);
+        let CExpr::Unary(UnaryOp::AddrOf, source) = &args[1] else {
+            panic!("source value must be addressable")
+        };
+        let CExpr::CompoundLit(source_ty, initializers) = source.as_ref() else {
+            panic!("source must retain its exact scalar type")
+        };
+        assert_eq!(source_ty, &ty);
+        let [Initializer::Expr(CExpr::Cast(_, stored))] = initializers.as_slice() else {
+            panic!("source compound literal must evaluate one stored value")
+        };
+        assert_eq!(stored.as_ref(), &value);
+    }
+
+    #[test]
+    fn exact_byte_and_volatile_accesses_do_not_use_the_fallback() {
+        let long_ty = ClightType::Tlong(ClightSignedness::Signed, attr());
+        let exact = ClightExpr::Eaddrof(
+            Box::new(ClightExpr::Evar(9, long_ty.clone())),
+            ClightType::Tpointer(Arc::new(long_ty.clone()), attr()),
+        );
+        assert!(scalar_deref_alignment_proven(&exact, &long_ty));
+        assert!(!should_lower_scalar_deref(&exact, &long_ty));
+
+        let byte_ty = ClightType::Tint(ClightIntSize::I8, ClightSignedness::Unsigned, attr());
+        assert!(!should_lower_scalar_deref(&unknown_address(), &byte_ty));
+
+        let volatile_long = ClightType::Tlong(
+            ClightSignedness::Signed,
+            ClightAttr {
+                attr_volatile: true,
+                attr_alignas: None,
+            },
+        );
+        assert!(!should_lower_scalar_deref(
+            &unknown_address(),
+            &volatile_long,
+        ));
+        let converted = convert_clight_type(&volatile_long, crate::abi::DataModel::Lp64);
+        let mut printer = Printer::new(PrintConfig::default());
+        printer.print_type_with_name(&converted, "value");
+        assert!(printer.into_string().contains("volatile"));
+
+        let volatile_struct = ClightType::Tstruct(
+            7,
+            ClightAttr {
+                attr_volatile: true,
+                attr_alignas: None,
+            },
+        );
+        let aggregate = convert_clight_type(&volatile_struct, crate::abi::DataModel::Lp64);
+        assert_eq!(
+            aggregate_member_base_type(&aggregate),
+            Some(aggregate.clone())
+        );
+        let mut aggregate_printer = Printer::new(PrintConfig::default());
+        aggregate_printer.print_type_with_name(&CType::ptr(aggregate), "pointer");
+        assert!(aggregate_printer.into_string().contains("volatile"));
+    }
+
+    #[test]
+    fn machine_left_shift_carriers_keep_exact_unsigned_types() {
+        for ty in [
+            ClightType::Tint(ClightIntSize::I16, ClightSignedness::Signed, attr()),
+            ClightType::Tlong(ClightSignedness::Signed, attr()),
+            ClightType::Tint128(ClightSignedness::Signed, attr()),
+        ] {
+            let unsigned = unsigned_integer_clight_type(&ty).expect("integer carrier");
+            assert!(matches!(
+                unsigned,
+                ClightType::Tint(_, ClightSignedness::Unsigned, _)
+                    | ClightType::Tlong(ClightSignedness::Unsigned, _)
+                    | ClightType::Tint128(ClightSignedness::Unsigned, _)
+            ));
+        }
+    }
+
+    #[test]
+    fn cleanup_reaches_calls_nested_in_memcpy_compound_literals() {
+        let expression = CExpr::CompoundLit(
+            CType::long(),
+            vec![Initializer::Expr(CExpr::call(
+                CExpr::var("producer"),
+                vec![CExpr::int(1), CExpr::int(2)],
+            ))],
+        );
+        let normalized =
+            normalize_call_arity_expr(&expression, &HashMap::from([("producer".into(), 1)]));
+        let CExpr::CompoundLit(_, initializers) = normalized else {
+            panic!("compound literal shape changed")
+        };
+        let [Initializer::Expr(CExpr::Call(_, args))] = initializers.as_slice() else {
+            panic!("nested producer call disappeared")
+        };
+        assert_eq!(args, &[CExpr::int(1)]);
+    }
+
+    #[test]
+    fn late_byte_buffer_lowering_preserves_load_store_and_address_contexts() {
+        let int_ty = CType::int();
+        let byte = CExpr::Index(Box::new(CExpr::var("buffer")), Box::new(CExpr::int(4)));
+        let address = CExpr::Unary(UnaryOp::AddrOf, Box::new(byte));
+        let lvalue = CExpr::Unary(
+            UnaryOp::Deref,
+            Box::new(CExpr::Cast(
+                CType::ptr(int_ty.clone()),
+                Box::new(address.clone()),
+            )),
+        );
+        let types = HashMap::from([(
+            "buffer".to_string(),
+            CType::Array(Box::new(CType::char_unsigned()), Some(12)),
+        )]);
+
+        let load = lower_byte_buffer_expr(&lvalue, &types);
+        assert!(matches!(
+            load,
+            CExpr::Unary(UnaryOp::Deref, ref cast)
+                if matches!(cast.as_ref(), CExpr::Cast(_, copy)
+                    if matches!(copy.as_ref(), CExpr::Call(function, _)
+                        if function.as_ref() == &CExpr::var("__builtin_memcpy")))
+        ));
+
+        let formed_address = lower_byte_buffer_expr(
+            &CExpr::Unary(UnaryOp::AddrOf, Box::new(lvalue.clone())),
+            &types,
+        );
+        assert!(matches!(formed_address, CExpr::Cast(_, _)));
+        assert!(!matches!(formed_address, CExpr::Call(..)));
+
+        let store = lower_byte_buffer_stmt(
+            &CStmt::Expr(CExpr::Assign(
+                AssignOp::Assign,
+                Box::new(lvalue),
+                Box::new(CExpr::var("value")),
+            )),
+            &types,
+        );
+        assert!(matches!(
+            store,
+            CStmt::Expr(CExpr::Call(function, _))
+                if function.as_ref() == &CExpr::var("__builtin_memcpy")
+        ));
+    }
 }
 
 fn is_trivial_cold_body(body: &CStmt) -> bool {
@@ -58,11 +277,25 @@ fn is_trivial_cold_call(stmt: &CStmt) -> bool {
 
 /// Clight type -> CType.  CompCert's `Tlong` is the 64-BIT integer type, not the
 /// C type `long`, so it takes the model's spelling for 64 bits.
+fn apply_clight_volatile(base: CType, attr: &crate::x86::types::ClightAttr) -> CType {
+    if attr.attr_volatile {
+        CType::Qualified(
+            Box::new(base),
+            TypeQualifiers {
+                is_volatile: true,
+                ..TypeQualifiers::none()
+            },
+        )
+    } else {
+        base
+    }
+}
+
 fn convert_clight_type(ty: &crate::x86::types::ClightType, model: crate::abi::DataModel) -> CType {
     use crate::x86::types::*;
     match ty {
         crate::x86::types::ClightType::Tvoid => CType::Void,
-        crate::x86::types::ClightType::Tint(size, sign, _attr) => {
+        crate::x86::types::ClightType::Tint(size, sign, attr) => {
             let c_size = match size {
                 ClightIntSize::I8 => crate::decompile::passes::c_pass::types::IntSize::Char,
                 ClightIntSize::I16 => crate::decompile::passes::c_pass::types::IntSize::Short,
@@ -78,9 +311,9 @@ fn convert_clight_type(ty: &crate::x86::types::ClightType, model: crate::abi::Da
                     crate::decompile::passes::c_pass::types::Signedness::Unsigned
                 }
             };
-            CType::Int(c_size, c_sign)
+            apply_clight_volatile(CType::Int(c_size, c_sign), attr)
         }
-        crate::x86::types::ClightType::Tlong(sign, _attr) => {
+        crate::x86::types::ClightType::Tlong(sign, attr) => {
             let c_sign = match sign {
                 ClightSignedness::Signed => {
                     crate::decompile::passes::c_pass::types::Signedness::Signed
@@ -89,9 +322,9 @@ fn convert_clight_type(ty: &crate::x86::types::ClightType, model: crate::abi::Da
                     crate::decompile::passes::c_pass::types::Signedness::Unsigned
                 }
             };
-            CType::int64(model, c_sign)
+            apply_clight_volatile(CType::int64(model, c_sign), attr)
         }
-        crate::x86::types::ClightType::Tint128(sign, _attr) => {
+        crate::x86::types::ClightType::Tint128(sign, attr) => {
             let c_sign = match sign {
                 ClightSignedness::Signed => {
                     crate::decompile::passes::c_pass::types::Signedness::Signed
@@ -100,17 +333,20 @@ fn convert_clight_type(ty: &crate::x86::types::ClightType, model: crate::abi::Da
                     crate::decompile::passes::c_pass::types::Signedness::Unsigned
                 }
             };
-            CType::Int(
-                crate::decompile::passes::c_pass::types::IntSize::Int128,
-                c_sign,
+            apply_clight_volatile(
+                CType::Int(
+                    crate::decompile::passes::c_pass::types::IntSize::Int128,
+                    c_sign,
+                ),
+                attr,
             )
         }
-        crate::x86::types::ClightType::Tfloat(size, _attr) => {
+        crate::x86::types::ClightType::Tfloat(size, attr) => {
             let c_size = match size {
                 ClightFloatSize::F32 => crate::decompile::passes::c_pass::types::FloatSize::Float,
                 ClightFloatSize::F64 => crate::decompile::passes::c_pass::types::FloatSize::Double,
             };
-            CType::Float(c_size)
+            apply_clight_volatile(CType::Float(c_size), attr)
         }
         crate::x86::types::ClightType::Tpointer(inner, attr) => {
             let qualifiers = TypeQualifiers {
@@ -119,9 +355,12 @@ fn convert_clight_type(ty: &crate::x86::types::ClightType, model: crate::abi::Da
             };
             CType::Pointer(Box::new(convert_clight_type(inner, model)), qualifiers)
         }
-        crate::x86::types::ClightType::Tarray(inner, size, _attr) => CType::Array(
-            Box::new(convert_clight_type(inner, model)),
-            Some(*size as usize),
+        crate::x86::types::ClightType::Tarray(inner, size, attr) => apply_clight_volatile(
+            CType::Array(
+                Box::new(convert_clight_type(inner, model)),
+                Some(*size as usize),
+            ),
+            attr,
         ),
         crate::x86::types::ClightType::Tfunction(params, ret, cc) => {
             let c_params: Vec<CType> = params
@@ -136,10 +375,12 @@ fn convert_clight_type(ty: &crate::x86::types::ClightType, model: crate::abi::Da
                 cc.unproto,
             )
         }
-        crate::x86::types::ClightType::Tstruct(id, _attr) => {
-            CType::Struct(format!("struct_{:x}", id))
+        crate::x86::types::ClightType::Tstruct(id, attr) => {
+            apply_clight_volatile(CType::Struct(format!("struct_{:x}", id)), attr)
         }
-        crate::x86::types::ClightType::Tunion(id, _attr) => CType::Union(format!("union_{}", id)),
+        crate::x86::types::ClightType::Tunion(id, attr) => {
+            apply_clight_volatile(CType::Union(format!("union_{}", id)), attr)
+        }
     }
 }
 
@@ -163,6 +404,18 @@ fn clight_expr_to_ctype(expr: &clight::ClightExpr, model: crate::abi::DataModel)
         | clight::ClightExpr::Econdition(_, _, _, ty) => ty,
     };
     convert_clight_type(clight_ty, model)
+}
+
+fn aggregate_member_base_type(ty: &CType) -> Option<CType> {
+    match ty {
+        CType::Struct(_) | CType::Union(_) => Some(ty.clone()),
+        CType::Qualified(inner, _)
+            if matches!(inner.as_ref(), CType::Struct(_) | CType::Union(_)) =>
+        {
+            Some(ty.clone())
+        }
+        _ => None,
+    }
 }
 
 // Well-known variadic libc/coreutils functions whose recovered prototypes carry only the fixed leading params, so calls passing the variadic tail need the prototype declared variadic.
@@ -675,7 +928,19 @@ fn rewrite_global_interior_initializer(
             items
                 .iter()
                 .map(|item| InitItem {
-                    designator: item.designator.clone(),
+                    designator: item.designator.as_ref().map(|designator| {
+                        transform_designator_exprs(designator, &|expr| {
+                            crate::decompile::passes::c_pass::helpers::map_expr(
+                                expr,
+                                &|candidate| {
+                                    let CExpr::Var(name) = candidate else {
+                                        return None;
+                                    };
+                                    members.get(name).cloned()
+                                },
+                            )
+                        })
+                    }),
                     init: rewrite_global_interior_initializer(&item.init, members),
                 })
                 .collect(),
@@ -716,6 +981,23 @@ fn order_globals_for_aggregate_initializers<'a>(
                     collect_expr_vars(arg, out);
                 }
             }
+            CExpr::CompoundLit(_, initializers) => {
+                for init in initializers {
+                    collect_init_vars(init, out);
+                }
+            }
+            CExpr::Generic(selector, arms) => {
+                collect_expr_vars(selector, out);
+                for (_, arm) in arms {
+                    collect_expr_vars(arm, out);
+                }
+            }
+            CExpr::StmtExpr(stmts, tail) => {
+                for stmt in stmts {
+                    collect_stmt_vars(stmt, out);
+                }
+                collect_expr_vars(tail, out);
+            }
             _ => {}
         }
     }
@@ -725,10 +1007,86 @@ fn order_globals_for_aggregate_initializers<'a>(
             Initializer::Expr(expr) => collect_expr_vars(expr, out),
             Initializer::List(items) => {
                 for item in items {
+                    if let Some(designator) = &item.designator {
+                        match designator {
+                            Designator::Field(_) => {}
+                            Designator::Index(expr) => collect_expr_vars(expr, out),
+                            Designator::Range(first, last) => {
+                                collect_expr_vars(first, out);
+                                collect_expr_vars(last, out);
+                            }
+                        }
+                    }
                     collect_init_vars(&item.init, out);
                 }
             }
             Initializer::String(_) => {}
+        }
+    }
+
+    fn collect_stmt_vars(stmt: &CStmt, out: &mut HashSet<String>) {
+        match stmt {
+            CStmt::Expr(expr) | CStmt::Return(Some(expr)) => collect_expr_vars(expr, out),
+            CStmt::Block(items) => {
+                for item in items {
+                    match item {
+                        CBlockItem::Stmt(stmt) => collect_stmt_vars(stmt, out),
+                        CBlockItem::Decl(decls) => {
+                            for decl in decls {
+                                if let Some(init) = &decl.init {
+                                    collect_init_vars(init, out);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            CStmt::If(cond, then_stmt, else_stmt) => {
+                collect_expr_vars(cond, out);
+                collect_stmt_vars(then_stmt, out);
+                if let Some(else_stmt) = else_stmt {
+                    collect_stmt_vars(else_stmt, out);
+                }
+            }
+            CStmt::Switch(expr, body) | CStmt::While(expr, body) | CStmt::DoWhile(body, expr) => {
+                collect_expr_vars(expr, out);
+                collect_stmt_vars(body, out);
+            }
+            CStmt::For(init, cond, update, body) => {
+                if let Some(init) = init {
+                    match init {
+                        ForInit::Expr(expr) => collect_expr_vars(expr, out),
+                        ForInit::Decl(decls) => {
+                            for decl in decls {
+                                if let Some(init) = &decl.init {
+                                    collect_init_vars(init, out);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(cond) = cond {
+                    collect_expr_vars(cond, out);
+                }
+                if let Some(update) = update {
+                    collect_expr_vars(update, out);
+                }
+                collect_stmt_vars(body, out);
+            }
+            CStmt::Labeled(_, body) => collect_stmt_vars(body, out),
+            CStmt::Decl(decls) => {
+                for decl in decls {
+                    if let Some(init) = &decl.init {
+                        collect_init_vars(init, out);
+                    }
+                }
+            }
+            CStmt::Sequence(stmts) => {
+                for stmt in stmts {
+                    collect_stmt_vars(stmt, out);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -893,6 +1251,24 @@ fn rewrite_stack_buffer_end_aliases(
     })
 }
 
+fn stack_buffer_alias_byte_expr(base: &str, offset: usize) -> CExpr {
+    CExpr::Index(
+        Box::new(CExpr::Var(base.to_string())),
+        Box::new(CExpr::int(offset as i64)),
+    )
+}
+
+fn stack_buffer_alias_value_expr(base: &str, offset: usize, value_ty: &CType) -> CExpr {
+    let byte = stack_buffer_alias_byte_expr(base, offset);
+    CExpr::Unary(
+        UnaryOp::Deref,
+        Box::new(CExpr::Cast(
+            CType::ptr(value_ty.clone()),
+            Box::new(CExpr::Unary(UnaryOp::AddrOf, Box::new(byte))),
+        )),
+    )
+}
+
 fn rewrite_stack_buffer_aliases(
     body: &CStmt,
     aliases: &HashMap<RTLReg, (RTLReg, usize)>,
@@ -914,13 +1290,6 @@ fn rewrite_stack_buffer_aliases(
         })
         .collect();
 
-    fn byte_lvalue(base: &str, offset: usize) -> CExpr {
-        CExpr::Index(
-            Box::new(CExpr::Var(base.to_string())),
-            Box::new(CExpr::int(offset as i64)),
-        )
-    }
-
     // This walk is deliberately context-aware. The generic bottom-up mapper
     // replaced an array alias `buffer` with `buffer[0]` before seeing an
     // enclosing pointer cast, turning `(T *)buffer` into `(T *)buffer[0]` and
@@ -936,7 +1305,7 @@ fn rewrite_stack_buffer_aliases(
             let Some((base, offset, value_ty)) = alias_names.get(name) else {
                 return expr.clone();
             };
-            let byte = byte_lvalue(base, *offset);
+            let byte = stack_buffer_alias_byte_expr(base, *offset);
             if pointer_cast_operand && matches!(value_ty, Some(CType::Array(..))) {
                 return CExpr::Unary(UnaryOp::AddrOf, Box::new(byte));
             }
@@ -949,13 +1318,7 @@ fn rewrite_stack_buffer_aliases(
             ) {
                 return byte;
             }
-            return CExpr::Unary(
-                UnaryOp::Deref,
-                Box::new(CExpr::Cast(
-                    CType::ptr(value_ty.clone()),
-                    Box::new(CExpr::Unary(UnaryOp::AddrOf, Box::new(byte))),
-                )),
-            );
+            return stack_buffer_alias_value_expr(base, *offset, value_ty);
         }
 
         match expr {
@@ -1007,7 +1370,60 @@ fn rewrite_stack_buffer_aliases(
                 alias_names,
                 pointer_cast_operand,
             ))),
+            CExpr::CompoundLit(ty, initializers) => CExpr::CompoundLit(
+                ty.clone(),
+                initializers
+                    .iter()
+                    .map(|init| rewrite_initializer(init, alias_names))
+                    .collect(),
+            ),
+            CExpr::Generic(selector, arms) => CExpr::Generic(
+                Box::new(rewrite_expr(selector, alias_names, false)),
+                arms.iter()
+                    .map(|(ty, arm)| {
+                        (
+                            ty.clone(),
+                            rewrite_expr(arm, alias_names, pointer_cast_operand),
+                        )
+                    })
+                    .collect(),
+            ),
+            CExpr::StmtExpr(stmts, tail) => CExpr::StmtExpr(
+                stmts
+                    .iter()
+                    .map(|stmt| {
+                        crate::decompile::passes::c_pass::helpers::map_stmt_exprs_total(
+                            stmt,
+                            &|nested| rewrite_expr(nested, alias_names, false),
+                        )
+                    })
+                    .collect(),
+                Box::new(rewrite_expr(tail, alias_names, pointer_cast_operand)),
+            ),
             _ => expr.clone(),
+        }
+    }
+
+    fn rewrite_initializer(
+        init: &Initializer,
+        alias_names: &HashMap<String, (String, usize, Option<CType>)>,
+    ) -> Initializer {
+        match init {
+            Initializer::Expr(expr) => Initializer::Expr(rewrite_expr(expr, alias_names, false)),
+            Initializer::List(items) => Initializer::List(
+                items
+                    .iter()
+                    .map(|item| InitItem {
+                        designator: item.designator.as_ref().map(|designator| {
+                            transform_designator_exprs(designator, &|expr| {
+                                rewrite_expr(expr, alias_names, false)
+                            })
+                        }),
+                        init: rewrite_initializer(&item.init, alias_names),
+                    })
+                    .collect(),
+            ),
+            Initializer::String(literal) => Initializer::String(literal.clone()),
         }
     }
 
@@ -2169,9 +2585,9 @@ pub fn build_translation_unit_from_stmt_map_with_types(
 
     let local_def_policy = header_collision_policy(selected_functions);
     let func_renames = &local_def_policy.renames;
+    let mut escaped_stack_arrays = derive_escaped_stack_array_layouts(db);
     let stack_buffer_aliases = derive_stack_buffer_aliases(db);
     let stack_buffer_end_aliases = derive_stack_buffer_end_aliases(db);
-    let mut escaped_stack_arrays = derive_escaped_stack_array_layouts(db);
     let escaped_stack_buffers = derive_escaped_stack_buffer_layouts(db, &escaped_stack_arrays);
     remove_buffer_owned_array_layouts(&mut escaped_stack_arrays, &escaped_stack_buffers);
 
@@ -2576,6 +2992,13 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         if let Some(aliases) = stack_buffer_end_aliases.get(&func.address) {
             body = rewrite_stack_buffer_end_aliases(&body, aliases);
         }
+
+        // Ownership recovery above can replace scalar locals with byte-array
+        // coordinates after the initial Clight conversion.  Recheck those
+        // newly introduced lvalues now that final local declarations are
+        // known, lowering only scalar accesses rooted in recovered char[]
+        // storage through exact-width byte copies.
+        body = lower_byte_buffer_stmt(&body, &local_var_types);
 
         body = strip_trivial_casts(&body, &local_var_types);
         body = forward_return_value(&body);
@@ -5095,7 +5518,10 @@ fn rebase_byte_add_through_char(
 fn ctype_from_memchunk(chunk: &MemoryChunk) -> CType {
     use crate::decompile::passes::c_pass::types::{FloatSize, IntSize, Signedness};
     match chunk {
-        MemoryChunk::MBool => CType::Bool,
+        // CompCert MBool is a one-byte memory chunk.  CType::Bool currently
+        // prints as C `int`, so using it here would widen recovered storage to
+        // four bytes and invalidate alignment/extent reasoning.
+        MemoryChunk::MBool => CType::char_unsigned(),
         MemoryChunk::MInt8Signed => CType::Int(IntSize::Char, Signedness::Signed),
         MemoryChunk::MInt8Unsigned => CType::Int(IntSize::Char, Signedness::Unsigned),
         MemoryChunk::MInt16Signed => CType::Int(IntSize::Short, Signedness::Signed),
@@ -5104,6 +5530,62 @@ fn ctype_from_memchunk(chunk: &MemoryChunk) -> CType {
         MemoryChunk::MFloat32 => CType::Float(FloatSize::Float),
         MemoryChunk::MFloat64 => CType::Float(FloatSize::Double),
         _ => CType::long(),
+    }
+}
+
+fn transform_initializer_exprs(
+    init: &Initializer,
+    transform: &impl Fn(&CExpr) -> CExpr,
+) -> Initializer {
+    match init {
+        Initializer::Expr(expr) => Initializer::Expr(transform(expr)),
+        Initializer::List(items) => Initializer::List(
+            items
+                .iter()
+                .map(|item| InitItem {
+                    designator: item
+                        .designator
+                        .as_ref()
+                        .map(|designator| transform_designator_exprs(designator, transform)),
+                    init: transform_initializer_exprs(&item.init, transform),
+                })
+                .collect(),
+        ),
+        Initializer::String(literal) => Initializer::String(literal.clone()),
+    }
+}
+
+fn transform_designator_exprs(
+    designator: &Designator,
+    transform: &impl Fn(&CExpr) -> CExpr,
+) -> Designator {
+    match designator {
+        Designator::Field(field) => Designator::Field(field.clone()),
+        Designator::Index(expr) => Designator::Index(transform(expr)),
+        Designator::Range(first, last) => Designator::Range(transform(first), transform(last)),
+    }
+}
+
+fn transform_decl_initializers(
+    decls: &[VarDecl],
+    transform: &impl Fn(&CExpr) -> CExpr,
+) -> Vec<VarDecl> {
+    decls
+        .iter()
+        .map(|decl| VarDecl {
+            init: decl
+                .init
+                .as_ref()
+                .map(|init| transform_initializer_exprs(init, transform)),
+            ..decl.clone()
+        })
+        .collect()
+}
+
+fn transform_for_initializer(init: &ForInit, transform: &impl Fn(&CExpr) -> CExpr) -> ForInit {
+    match init {
+        ForInit::Expr(expr) => ForInit::Expr(transform(expr)),
+        ForInit::Decl(decls) => ForInit::Decl(transform_decl_initializers(decls, transform)),
     }
 }
 
@@ -5268,6 +5750,21 @@ fn repair_arith_expr(e: &CExpr, types: &HashMap<String, CType>) -> CExpr {
         ),
         CExpr::SizeofExpr(inner) => CExpr::SizeofExpr(Box::new(repair_arith_expr(inner, types))),
         CExpr::Paren(inner) => CExpr::Paren(Box::new(repair_arith_expr(inner, types))),
+        CExpr::CompoundLit(ty, initializers) => CExpr::CompoundLit(
+            ty.clone(),
+            initializers
+                .iter()
+                .map(|init| {
+                    transform_initializer_exprs(init, &|expr| repair_arith_expr(expr, types))
+                })
+                .collect(),
+        ),
+        CExpr::Generic(selector, arms) => CExpr::Generic(
+            Box::new(repair_arith_expr(selector, types)),
+            arms.iter()
+                .map(|(ty, arm)| (ty.clone(), repair_arith_expr(arm, types)))
+                .collect(),
+        ),
         CExpr::StmtExpr(stmts, inner) => CExpr::StmtExpr(
             stmts.iter().map(|s| repair_arith_stmt(s, types)).collect(),
             Box::new(repair_arith_expr(inner, types)),
@@ -5285,7 +5782,11 @@ fn repair_arith_stmt(stmt: &CStmt, types: &HashMap<String, CType>) -> CStmt {
                 .iter()
                 .map(|item| match item {
                     CBlockItem::Stmt(s) => CBlockItem::Stmt(repair_arith_stmt(s, types)),
-                    other => other.clone(),
+                    CBlockItem::Decl(decls) => {
+                        CBlockItem::Decl(transform_decl_initializers(decls, &|expr| {
+                            repair_arith_expr(expr, types)
+                        }))
+                    }
                 })
                 .collect(),
         ),
@@ -5305,7 +5806,9 @@ fn repair_arith_stmt(stmt: &CStmt, types: &HashMap<String, CType>) -> CStmt {
             repair_arith_expr(cond, types),
         ),
         CStmt::For(init, cond, update, body) => CStmt::For(
-            init.clone(),
+            init.as_ref().map(|init| {
+                transform_for_initializer(init, &|expr| repair_arith_expr(expr, types))
+            }),
             cond.as_ref().map(|c| repair_arith_expr(c, types)),
             update.as_ref().map(|u| repair_arith_expr(u, types)),
             Box::new(repair_arith_stmt(body, types)),
@@ -5327,6 +5830,9 @@ fn repair_arith_stmt(stmt: &CStmt, types: &HashMap<String, CType>) -> CStmt {
         CStmt::Sequence(stmts) => {
             CStmt::Sequence(stmts.iter().map(|s| repair_arith_stmt(s, types)).collect())
         }
+        CStmt::Decl(decls) => CStmt::Decl(transform_decl_initializers(decls, &|expr| {
+            repair_arith_expr(expr, types)
+        })),
         other => other.clone(),
     }
 }
@@ -5384,6 +5890,23 @@ fn normalize_call_arity_expr(e: &CExpr, counts: &HashMap<String, usize>) -> CExp
         ),
         CExpr::SizeofExpr(i) => CExpr::SizeofExpr(Box::new(normalize_call_arity_expr(i, counts))),
         CExpr::Paren(i) => CExpr::Paren(Box::new(normalize_call_arity_expr(i, counts))),
+        CExpr::CompoundLit(ty, initializers) => CExpr::CompoundLit(
+            ty.clone(),
+            initializers
+                .iter()
+                .map(|init| {
+                    transform_initializer_exprs(init, &|expr| {
+                        normalize_call_arity_expr(expr, counts)
+                    })
+                })
+                .collect(),
+        ),
+        CExpr::Generic(selector, arms) => CExpr::Generic(
+            Box::new(normalize_call_arity_expr(selector, counts)),
+            arms.iter()
+                .map(|(ty, arm)| (ty.clone(), normalize_call_arity_expr(arm, counts)))
+                .collect(),
+        ),
         CExpr::StmtExpr(stmts, i) => CExpr::StmtExpr(
             stmts
                 .iter()
@@ -5403,7 +5926,11 @@ fn normalize_call_arity_stmt(stmt: &CStmt, counts: &HashMap<String, usize>) -> C
                 .iter()
                 .map(|item| match item {
                     CBlockItem::Stmt(s) => CBlockItem::Stmt(normalize_call_arity_stmt(s, counts)),
-                    other => other.clone(),
+                    CBlockItem::Decl(decls) => {
+                        CBlockItem::Decl(transform_decl_initializers(decls, &|expr| {
+                            normalize_call_arity_expr(expr, counts)
+                        }))
+                    }
                 })
                 .collect(),
         ),
@@ -5422,7 +5949,9 @@ fn normalize_call_arity_stmt(stmt: &CStmt, counts: &HashMap<String, usize>) -> C
             normalize_call_arity_expr(c, counts),
         ),
         CStmt::For(init, c, u, b) => CStmt::For(
-            init.clone(),
+            init.as_ref().map(|init| {
+                transform_for_initializer(init, &|expr| normalize_call_arity_expr(expr, counts))
+            }),
             c.as_ref().map(|x| normalize_call_arity_expr(x, counts)),
             u.as_ref().map(|x| normalize_call_arity_expr(x, counts)),
             Box::new(normalize_call_arity_stmt(b, counts)),
@@ -5442,6 +5971,9 @@ fn normalize_call_arity_stmt(stmt: &CStmt, counts: &HashMap<String, usize>) -> C
                 .map(|s| normalize_call_arity_stmt(s, counts))
                 .collect(),
         ),
+        CStmt::Decl(decls) => CStmt::Decl(transform_decl_initializers(decls, &|expr| {
+            normalize_call_arity_expr(expr, counts)
+        })),
         other => other.clone(),
     }
 }
@@ -5461,6 +5993,7 @@ fn ctype_scalar_class(t: &CType) -> ScalarClass {
         CType::Pointer(..) | CType::Array(..) => ScalarClass::Ptr,
         CType::Int(..) | CType::Bool | CType::Enum(..) => ScalarClass::Int,
         CType::Float(..) => ScalarClass::Float,
+        CType::Qualified(inner, _) => ctype_scalar_class(inner),
         _ => ScalarClass::Other,
     }
 }
@@ -5502,6 +6035,21 @@ fn cexpr_scalar_class(
                 .unwrap_or(ScalarClass::Other),
             _ => ScalarClass::Other,
         },
+        CExpr::CompoundLit(ty, _) => ctype_scalar_class(ty),
+        CExpr::StmtExpr(_, tail) => cexpr_scalar_class(tail, types, callee_ret),
+        CExpr::Generic(_, arms) => {
+            let mut classes = arms
+                .iter()
+                .map(|(_, arm)| cexpr_scalar_class(arm, types, callee_ret));
+            let Some(first) = classes.next() else {
+                return ScalarClass::Other;
+            };
+            if classes.all(|class| class == first) {
+                first
+            } else {
+                ScalarClass::Other
+            }
+        }
         _ => ScalarClass::Other,
     }
 }
@@ -5537,10 +6085,9 @@ fn lvalue_ctype(e: &CExpr, types: &HashMap<String, CType>) -> Option<CType> {
     match e {
         CExpr::Var(n) => types.get(n).cloned(),
         CExpr::Paren(inner) => lvalue_ctype(inner, types),
-        CExpr::Unary(UnaryOp::Deref, inner) => match lvalue_ctype(inner, types) {
-            Some(CType::Pointer(t, _)) => Some(*t),
-            _ => None,
-        },
+        CExpr::Unary(UnaryOp::Deref, inner) => {
+            lvalue_ctype(inner, types).and_then(|pointer| pointer.pointee().cloned())
+        }
         _ => None,
     }
 }
@@ -5629,6 +6176,33 @@ fn insert_casts_expr(
             callee_params,
             callee_ret,
         ))),
+        CExpr::CompoundLit(ty, initializers) => CExpr::CompoundLit(
+            ty.clone(),
+            initializers
+                .iter()
+                .map(|init| {
+                    transform_initializer_exprs(init, &|expr| {
+                        insert_casts_expr(expr, types, callee_params, callee_ret)
+                    })
+                })
+                .collect(),
+        ),
+        CExpr::Generic(selector, arms) => CExpr::Generic(
+            Box::new(insert_casts_expr(
+                selector,
+                types,
+                callee_params,
+                callee_ret,
+            )),
+            arms.iter()
+                .map(|(ty, arm)| {
+                    (
+                        ty.clone(),
+                        insert_casts_expr(arm, types, callee_params, callee_ret),
+                    )
+                })
+                .collect(),
+        ),
         CExpr::StmtExpr(stmts, i) => CExpr::StmtExpr(
             stmts
                 .iter()
@@ -5660,7 +6234,11 @@ fn insert_casts_stmt(
                         callee_ret,
                         ret_type,
                     )),
-                    other => other.clone(),
+                    CBlockItem::Decl(decls) => {
+                        CBlockItem::Decl(transform_decl_initializers(decls, &|expr| {
+                            insert_casts_expr(expr, types, callee_params, callee_ret)
+                        }))
+                    }
                 })
                 .collect(),
         ),
@@ -5704,7 +6282,11 @@ fn insert_casts_stmt(
             insert_casts_expr(c, types, callee_params, callee_ret),
         ),
         CStmt::For(init, c, u, b) => CStmt::For(
-            init.clone(),
+            init.as_ref().map(|init| {
+                transform_for_initializer(init, &|expr| {
+                    insert_casts_expr(expr, types, callee_params, callee_ret)
+                })
+            }),
             c.as_ref()
                 .map(|x| insert_casts_expr(x, types, callee_params, callee_ret)),
             u.as_ref()
@@ -5751,6 +6333,9 @@ fn insert_casts_stmt(
             };
             CStmt::Return(Some(ne))
         }
+        CStmt::Decl(decls) => CStmt::Decl(transform_decl_initializers(decls, &|expr| {
+            insert_casts_expr(expr, types, callee_params, callee_ret)
+        })),
         other => other.clone(),
     }
 }
@@ -5810,6 +6395,456 @@ fn convert_integer_operand(expr: &clight::ClightExpr, ctx: &mut ConversionContex
             | clight::ClightType::Tint128(..)),
         ) => CExpr::Cast(convert_clight_type(ty, ctx.data_model), Box::new(converted)),
         _ => converted,
+    }
+}
+
+fn clight_access_is_volatile(ty: &clight::ClightType) -> bool {
+    match ty {
+        clight::ClightType::Tint(_, _, attr)
+        | clight::ClightType::Tlong(_, attr)
+        | clight::ClightType::Tint128(_, attr)
+        | clight::ClightType::Tfloat(_, attr)
+        | clight::ClightType::Tpointer(_, attr)
+        | clight::ClightType::Tarray(_, _, attr)
+        | clight::ClightType::Tstruct(_, attr)
+        | clight::ClightType::Tunion(_, attr) => attr.attr_volatile,
+        clight::ClightType::Tvoid | clight::ClightType::Tfunction(..) => false,
+    }
+}
+
+// Character lvalues are alignment-1 and may alias every C object.  Other
+// scalar machine accesses require either exact typed-owner evidence or an
+// alignment/effective-type-neutral byte copy at the C boundary.
+fn scalar_access_needs_alignment(ty: &clight::ClightType) -> bool {
+    match ty {
+        clight::ClightType::Tint(clight::ClightIntSize::I8, _, _) => false,
+        clight::ClightType::Tint(..)
+        | clight::ClightType::Tlong(..)
+        | clight::ClightType::Tint128(..)
+        | clight::ClightType::Tfloat(..)
+        | clight::ClightType::Tpointer(..) => true,
+        _ => false,
+    }
+}
+
+fn peel_clight_pointer_casts(expr: &clight::ClightExpr) -> &clight::ClightExpr {
+    match expr {
+        clight::ClightExpr::Ecast(inner, _) => peel_clight_pointer_casts(inner),
+        _ => expr,
+    }
+}
+
+// Only the address of a scalar Clight object with the same exact type proves
+// natural alignment.  Inferred pointers, integer addresses, byte arithmetic,
+// and recovered fields are deliberately not treated as proofs.
+fn scalar_deref_alignment_proven(
+    address: &clight::ClightExpr,
+    access_ty: &clight::ClightType,
+) -> bool {
+    let clight::ClightExpr::Eaddrof(object, _) = peel_clight_pointer_casts(address) else {
+        return false;
+    };
+    match object.as_ref() {
+        clight::ClightExpr::Evar(_, object_ty) | clight::ClightExpr::Etempvar(_, object_ty) => {
+            object_ty == access_ty
+        }
+        _ => false,
+    }
+}
+
+fn should_lower_scalar_deref(address: &clight::ClightExpr, access_ty: &clight::ClightType) -> bool {
+    scalar_access_needs_alignment(access_ty)
+        && !clight_access_is_volatile(access_ty)
+        && !scalar_deref_alignment_proven(address, access_ty)
+}
+
+fn should_lower_scalar_field(
+    address: &clight::ClightExpr,
+    aggregate_ty: &clight::ClightType,
+    field_ty: &clight::ClightType,
+) -> bool {
+    scalar_access_needs_alignment(field_ty)
+        && !clight_access_is_volatile(aggregate_ty)
+        && !clight_access_is_volatile(field_ty)
+        && !scalar_deref_alignment_proven(address, aggregate_ty)
+}
+
+fn byte_offset_expr(base: CExpr, offset: i64) -> CExpr {
+    let byte_base = CExpr::Cast(CType::ptr(CType::char_unsigned()), Box::new(base));
+    if offset == 0 {
+        byte_base
+    } else {
+        CExpr::Binary(
+            if offset > 0 {
+                BinaryOp::Add
+            } else {
+                BinaryOp::Sub
+            },
+            Box::new(byte_base),
+            Box::new(CExpr::int(offset.unsigned_abs() as i64)),
+        )
+    }
+}
+
+fn memcpy_load_expr(access_ty: CType, address: CExpr) -> CExpr {
+    let object = CExpr::CompoundLit(access_ty.clone(), vec![Initializer::Expr(CExpr::int(0))]);
+    let destination = CExpr::Unary(UnaryOp::AddrOf, Box::new(object));
+    let source = CExpr::Cast(CType::ptr(CType::Void), Box::new(address));
+    let copy = CExpr::Call(
+        Box::new(CExpr::Var("__builtin_memcpy".to_string())),
+        vec![destination, source, CExpr::SizeofType(access_ty.clone())],
+    );
+    CExpr::Unary(
+        UnaryOp::Deref,
+        Box::new(CExpr::Cast(CType::ptr(access_ty), Box::new(copy))),
+    )
+}
+
+fn memcpy_store_expr(access_ty: CType, address: CExpr, value: CExpr) -> CExpr {
+    let destination = CExpr::Cast(CType::ptr(CType::Void), Box::new(address));
+    let source_object = CExpr::CompoundLit(
+        access_ty.clone(),
+        vec![Initializer::Expr(CExpr::Cast(
+            access_ty.clone(),
+            Box::new(value),
+        ))],
+    );
+    let source = CExpr::Unary(UnaryOp::AddrOf, Box::new(source_object));
+    CExpr::Call(
+        Box::new(CExpr::Var("__builtin_memcpy".to_string())),
+        vec![destination, source, CExpr::SizeofType(access_ty)],
+    )
+}
+
+fn ctype_is_byte(ty: &CType) -> bool {
+    matches!(
+        ty,
+        CType::Int(IntSize::Char, Signedness::Signed | Signedness::Unsigned)
+    )
+}
+
+fn ctype_needs_byte_copy(ty: &CType) -> bool {
+    match ty {
+        CType::Int(IntSize::Char, _) | CType::Bool => false,
+        CType::Int(..) | CType::Float(..) => true,
+        CType::Pointer(_, qualifiers) => !qualifiers.is_volatile,
+        CType::Qualified(inner, qualifiers) => {
+            !qualifiers.is_volatile && ctype_needs_byte_copy(inner)
+        }
+        _ => false,
+    }
+}
+
+fn expression_is_rooted_in_byte_buffer(expr: &CExpr, types: &HashMap<String, CType>) -> bool {
+    match expr {
+        CExpr::Var(name) => matches!(
+            types.get(name),
+            Some(CType::Array(element, _)) if ctype_is_byte(element)
+        ),
+        CExpr::Unary(_, inner)
+        | CExpr::Cast(_, inner)
+        | CExpr::Paren(inner)
+        | CExpr::SizeofExpr(inner)
+        | CExpr::Member(inner, _)
+        | CExpr::MemberPtr(inner, _) => expression_is_rooted_in_byte_buffer(inner, types),
+        CExpr::Binary(_, left, right) | CExpr::Index(left, right) => {
+            expression_is_rooted_in_byte_buffer(left, types)
+                || expression_is_rooted_in_byte_buffer(right, types)
+        }
+        CExpr::Ternary(cond, yes, no) => {
+            expression_is_rooted_in_byte_buffer(cond, types)
+                || expression_is_rooted_in_byte_buffer(yes, types)
+                || expression_is_rooted_in_byte_buffer(no, types)
+        }
+        _ => false,
+    }
+}
+
+// Return the exact scalar access type and byte address for a dereference
+// synthesized over recovered character-array storage.
+fn byte_buffer_scalar_access(
+    expr: &CExpr,
+    types: &HashMap<String, CType>,
+) -> Option<(CType, CExpr)> {
+    if let CExpr::Paren(inner) = expr {
+        return byte_buffer_scalar_access(inner, types);
+    }
+    let CExpr::Unary(UnaryOp::Deref, pointer) = expr else {
+        return None;
+    };
+    let CExpr::Cast(CType::Pointer(access_ty, _), address) = pointer.as_ref() else {
+        return None;
+    };
+    if !ctype_needs_byte_copy(access_ty) || !expression_is_rooted_in_byte_buffer(address, types) {
+        return None;
+    }
+    Some(((**access_ty).clone(), (**address).clone()))
+}
+
+fn compound_assign_binary_op(op: AssignOp) -> Option<BinaryOp> {
+    match op {
+        AssignOp::Assign => None,
+        AssignOp::AddAssign => Some(BinaryOp::Add),
+        AssignOp::SubAssign => Some(BinaryOp::Sub),
+        AssignOp::MulAssign => Some(BinaryOp::Mul),
+        AssignOp::DivAssign => Some(BinaryOp::Div),
+        AssignOp::ModAssign => Some(BinaryOp::Mod),
+        AssignOp::AndAssign => Some(BinaryOp::BitAnd),
+        AssignOp::OrAssign => Some(BinaryOp::BitOr),
+        AssignOp::XorAssign => Some(BinaryOp::BitXor),
+        AssignOp::ShlAssign => Some(BinaryOp::Shl),
+        AssignOp::ShrAssign => Some(BinaryOp::Shr),
+    }
+}
+
+fn lower_byte_buffer_expr(expr: &CExpr, types: &HashMap<String, CType>) -> CExpr {
+    if let Some((access_ty, address)) = byte_buffer_scalar_access(expr, types) {
+        return memcpy_load_expr(access_ty, lower_byte_buffer_expr(&address, types));
+    }
+    match expr {
+        // Address and unevaluated contexts must never trigger the value-load
+        // fallback.  `&*(T *)addr` is simply that typed pointer.
+        CExpr::Unary(UnaryOp::AddrOf, inner) => {
+            if let Some((access_ty, address)) = byte_buffer_scalar_access(inner, types) {
+                return CExpr::Cast(
+                    CType::ptr(access_ty),
+                    Box::new(lower_byte_buffer_expr(&address, types)),
+                );
+            }
+            CExpr::Unary(
+                UnaryOp::AddrOf,
+                Box::new(lower_byte_buffer_expr(inner, types)),
+            )
+        }
+        CExpr::SizeofExpr(_) => expr.clone(),
+        CExpr::Assign(AssignOp::Assign, lhs, rhs) => {
+            if let Some((access_ty, address)) = byte_buffer_scalar_access(lhs, types) {
+                let store = memcpy_store_expr(
+                    access_ty.clone(),
+                    lower_byte_buffer_expr(&address, types),
+                    lower_byte_buffer_expr(rhs, types),
+                );
+                // Assignment is itself an expression.  Load back through the
+                // returned destination pointer so address and RHS are each
+                // evaluated once without an unaligned typed dereference.
+                return memcpy_load_expr(access_ty, store);
+            }
+            CExpr::Assign(
+                AssignOp::Assign,
+                Box::new(lower_byte_buffer_expr(lhs, types)),
+                Box::new(lower_byte_buffer_expr(rhs, types)),
+            )
+        }
+        CExpr::Assign(op, lhs, rhs) => {
+            if let (Some(binary_op), Some((access_ty, address))) = (
+                compound_assign_binary_op(*op),
+                byte_buffer_scalar_access(lhs, types),
+            ) {
+                // Recovered byte-buffer coordinates are pure address
+                // expressions.  If a future producer supplies a side effect,
+                // retain the original lvalue rather than evaluating it twice.
+                if address.has_side_effects() {
+                    return expr.clone();
+                }
+                let lowered_address = lower_byte_buffer_expr(&address, types);
+                let old_value = memcpy_load_expr(access_ty.clone(), lowered_address.clone());
+                let new_value = CExpr::Binary(
+                    binary_op,
+                    Box::new(old_value),
+                    Box::new(lower_byte_buffer_expr(rhs, types)),
+                );
+                let store = memcpy_store_expr(access_ty.clone(), lowered_address, new_value);
+                return memcpy_load_expr(access_ty, store);
+            }
+            CExpr::Assign(
+                *op,
+                Box::new(lower_byte_buffer_expr(lhs, types)),
+                Box::new(lower_byte_buffer_expr(rhs, types)),
+            )
+        }
+        CExpr::Unary(
+            op @ (UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::PostInc | UnaryOp::PostDec),
+            inner,
+        ) if byte_buffer_scalar_access(inner, types).is_some() => {
+            // A correct post-inc/dec lowering needs an explicit single-use
+            // old-value temporary.  Keep the original lvalue until that
+            // representation exists; converting only its read would mutate a
+            // temporary and change behavior.
+            CExpr::Unary(*op, inner.clone())
+        }
+        CExpr::Unary(op, inner) => {
+            CExpr::Unary(*op, Box::new(lower_byte_buffer_expr(inner, types)))
+        }
+        CExpr::Binary(op, left, right) => CExpr::Binary(
+            *op,
+            Box::new(lower_byte_buffer_expr(left, types)),
+            Box::new(lower_byte_buffer_expr(right, types)),
+        ),
+        CExpr::Ternary(cond, yes, no) => CExpr::Ternary(
+            Box::new(lower_byte_buffer_expr(cond, types)),
+            Box::new(lower_byte_buffer_expr(yes, types)),
+            Box::new(lower_byte_buffer_expr(no, types)),
+        ),
+        CExpr::Call(callee, args) => CExpr::Call(
+            Box::new(lower_byte_buffer_expr(callee, types)),
+            args.iter()
+                .map(|arg| lower_byte_buffer_expr(arg, types))
+                .collect(),
+        ),
+        CExpr::Cast(ty, inner) => {
+            CExpr::Cast(ty.clone(), Box::new(lower_byte_buffer_expr(inner, types)))
+        }
+        CExpr::Member(inner, field) => CExpr::Member(
+            Box::new(lower_byte_buffer_expr(inner, types)),
+            field.clone(),
+        ),
+        CExpr::MemberPtr(inner, field) => CExpr::MemberPtr(
+            Box::new(lower_byte_buffer_expr(inner, types)),
+            field.clone(),
+        ),
+        CExpr::Index(base, index) => CExpr::Index(
+            Box::new(lower_byte_buffer_expr(base, types)),
+            Box::new(lower_byte_buffer_expr(index, types)),
+        ),
+        CExpr::Paren(inner) => CExpr::Paren(Box::new(lower_byte_buffer_expr(inner, types))),
+        CExpr::CompoundLit(ty, initializers) => CExpr::CompoundLit(
+            ty.clone(),
+            initializers
+                .iter()
+                .map(|init| {
+                    transform_initializer_exprs(init, &|nested| {
+                        lower_byte_buffer_expr(nested, types)
+                    })
+                })
+                .collect(),
+        ),
+        // The controlling expression of _Generic is unevaluated.  Transform
+        // every association conservatively; only the selected one will run.
+        CExpr::Generic(selector, arms) => CExpr::Generic(
+            selector.clone(),
+            arms.iter()
+                .map(|(ty, arm)| (ty.clone(), lower_byte_buffer_expr(arm, types)))
+                .collect(),
+        ),
+        CExpr::StmtExpr(stmts, tail) => CExpr::StmtExpr(
+            stmts
+                .iter()
+                .map(|stmt| lower_byte_buffer_stmt(stmt, types))
+                .collect(),
+            Box::new(lower_byte_buffer_expr(tail, types)),
+        ),
+        _ => expr.clone(),
+    }
+}
+
+fn lower_byte_buffer_initializer(
+    init: &Initializer,
+    types: &HashMap<String, CType>,
+) -> Initializer {
+    transform_initializer_exprs(init, &|expr| lower_byte_buffer_expr(expr, types))
+}
+
+fn lower_byte_buffer_decls(decls: &[VarDecl], types: &HashMap<String, CType>) -> Vec<VarDecl> {
+    decls
+        .iter()
+        .map(|decl| VarDecl {
+            init: decl
+                .init
+                .as_ref()
+                .map(|init| lower_byte_buffer_initializer(init, types)),
+            ..decl.clone()
+        })
+        .collect()
+}
+
+fn lower_byte_buffer_stmt(stmt: &CStmt, types: &HashMap<String, CType>) -> CStmt {
+    match stmt {
+        CStmt::Expr(CExpr::Assign(AssignOp::Assign, lhs, rhs)) => {
+            if let Some((access_ty, address)) = byte_buffer_scalar_access(lhs, types) {
+                return CStmt::Expr(memcpy_store_expr(
+                    access_ty,
+                    lower_byte_buffer_expr(&address, types),
+                    lower_byte_buffer_expr(rhs, types),
+                ));
+            }
+            CStmt::Expr(lower_byte_buffer_expr(
+                &CExpr::Assign(AssignOp::Assign, lhs.clone(), rhs.clone()),
+                types,
+            ))
+        }
+        CStmt::Expr(expr) => CStmt::Expr(lower_byte_buffer_expr(expr, types)),
+        CStmt::Block(items) => CStmt::Block(
+            items
+                .iter()
+                .map(|item| match item {
+                    CBlockItem::Stmt(stmt) => CBlockItem::Stmt(lower_byte_buffer_stmt(stmt, types)),
+                    CBlockItem::Decl(decls) => {
+                        CBlockItem::Decl(lower_byte_buffer_decls(decls, types))
+                    }
+                })
+                .collect(),
+        ),
+        CStmt::If(cond, yes, no) => CStmt::If(
+            lower_byte_buffer_expr(cond, types),
+            Box::new(lower_byte_buffer_stmt(yes, types)),
+            no.as_ref()
+                .map(|stmt| Box::new(lower_byte_buffer_stmt(stmt, types))),
+        ),
+        CStmt::Switch(expr, body) => CStmt::Switch(
+            lower_byte_buffer_expr(expr, types),
+            Box::new(lower_byte_buffer_stmt(body, types)),
+        ),
+        CStmt::While(cond, body) => CStmt::While(
+            lower_byte_buffer_expr(cond, types),
+            Box::new(lower_byte_buffer_stmt(body, types)),
+        ),
+        CStmt::DoWhile(body, cond) => CStmt::DoWhile(
+            Box::new(lower_byte_buffer_stmt(body, types)),
+            lower_byte_buffer_expr(cond, types),
+        ),
+        CStmt::For(init, cond, update, body) => CStmt::For(
+            init.as_ref().map(|init| match init {
+                ForInit::Expr(expr) => ForInit::Expr(lower_byte_buffer_expr(expr, types)),
+                ForInit::Decl(decls) => ForInit::Decl(lower_byte_buffer_decls(decls, types)),
+            }),
+            cond.as_ref()
+                .map(|expr| lower_byte_buffer_expr(expr, types)),
+            update
+                .as_ref()
+                .map(|expr| lower_byte_buffer_expr(expr, types)),
+            Box::new(lower_byte_buffer_stmt(body, types)),
+        ),
+        CStmt::Return(Some(expr)) => CStmt::Return(Some(lower_byte_buffer_expr(expr, types))),
+        CStmt::Labeled(label, body) => {
+            CStmt::Labeled(label.clone(), Box::new(lower_byte_buffer_stmt(body, types)))
+        }
+        CStmt::Decl(decls) => CStmt::Decl(lower_byte_buffer_decls(decls, types)),
+        CStmt::Sequence(stmts) => CStmt::Sequence(
+            stmts
+                .iter()
+                .map(|stmt| lower_byte_buffer_stmt(stmt, types))
+                .collect(),
+        ),
+        _ => stmt.clone(),
+    }
+}
+
+fn unsigned_integer_clight_type(ty: &clight::ClightType) -> Option<clight::ClightType> {
+    match ty {
+        clight::ClightType::Tint(size, _, attr) => Some(clight::ClightType::Tint(
+            *size,
+            clight::ClightSignedness::Unsigned,
+            attr.clone(),
+        )),
+        clight::ClightType::Tlong(_, attr) => Some(clight::ClightType::Tlong(
+            clight::ClightSignedness::Unsigned,
+            attr.clone(),
+        )),
+        clight::ClightType::Tint128(_, attr) => Some(clight::ClightType::Tint128(
+            clight::ClightSignedness::Unsigned,
+            attr.clone(),
+        )),
+        _ => None,
     }
 }
 
@@ -5887,6 +6922,12 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
         }
         clight::ClightExpr::Etempvar(id, _ty) => CExpr::Var(ctx.temp_name(*id)),
         clight::ClightExpr::Ederef(inner, ty) => {
+            if should_lower_scalar_deref(inner, ty) {
+                return memcpy_load_expr(
+                    convert_clight_type(ty, ctx.data_model),
+                    convert_expr(inner, ctx),
+                );
+            }
             // Materialize the node's ACCESS type as *(T *)base: always for a bare variable, whose decl may lawfully diverge, and for a composite base unless its annotation already points to the access type.
             let access_castable = matches!(
                 ty,
@@ -5914,6 +6955,29 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
             CExpr::Unary(UnaryOp::Deref, Box::new(convert_expr(inner, ctx)))
         }
         clight::ClightExpr::Eaddrof(inner, ty) => {
+            // Address formation is an lvalue context.  In particular, `&*p`
+            // must not perform the memcpy value-load used for an ordinary
+            // dereference, nor may `&p->field` return the address of that
+            // load's temporary compound literal.  Preserve the original
+            // machine byte address and materialize only the selected pointer
+            // spelling.
+            if let clight::ClightExpr::Ederef(address, _) = inner.as_ref() {
+                return CExpr::Cast(
+                    convert_clight_type(ty, ctx.data_model),
+                    Box::new(convert_expr(address, ctx)),
+                );
+            }
+            if let clight::ClightExpr::Efield(base, field_id, _) = inner.as_ref() {
+                if let clight::ClightExpr::Ederef(address, _) = base.as_ref() {
+                    return CExpr::Cast(
+                        convert_clight_type(ty, ctx.data_model),
+                        Box::new(byte_offset_expr(
+                            convert_expr(address, ctx),
+                            *field_id as i64,
+                        )),
+                    );
+                }
+            }
             match inner.as_ref() {
                 clight::ClightExpr::EvarSymbol(name, _) => {
                     if let Some(content) = ctx.string_label_to_content.get(name) {
@@ -6023,6 +7087,26 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
                     }
                 }
             }
+            // x86 left shifts are fixed-width bitvector operations.  C signed
+            // left shift is undefined on overflow or a negative operand, and
+            // target-specific shift-count behavior belongs in the earlier
+            // machine/IR lowering.  Here we only select the corresponding
+            // unsigned carrier, preventing C signed-shift UB without inventing
+            // an architecture-independent count mask.
+            if matches!(op, clight::ClightBinaryOp::Oshl) {
+                if let Some(unsigned_ty) = unsigned_integer_clight_type(_ty) {
+                    let unsigned_cty = convert_clight_type(&unsigned_ty, ctx.data_model);
+                    let result_cty = convert_clight_type(_ty, ctx.data_model);
+                    let unsigned_lhs =
+                        CExpr::Cast(unsigned_cty, Box::new(convert_integer_operand(lhs, ctx)));
+                    let shifted = CExpr::Binary(
+                        BinaryOp::Shl,
+                        Box::new(unsigned_lhs),
+                        Box::new(convert_integer_operand(rhs, ctx)),
+                    );
+                    return CExpr::Cast(result_cty, Box::new(CExpr::Paren(Box::new(shifted))));
+                }
+            }
             let is_comparison = matches!(
                 op,
                 clight::ClightBinaryOp::Oeq
@@ -6050,6 +7134,14 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
             Box::new(convert_expr(inner, ctx)),
         ),
         clight::ClightExpr::Efield(inner, field_id, field_ty) => {
+            if let clight::ClightExpr::Ederef(address, aggregate_ty) = inner.as_ref() {
+                if should_lower_scalar_field(address, aggregate_ty, field_ty) {
+                    return memcpy_load_expr(
+                        convert_clight_type(field_ty, ctx.data_model),
+                        byte_offset_expr(convert_expr(address, ctx), *field_id as i64),
+                    );
+                }
+            }
             let inner_expr = convert_expr(inner, ctx);
             let field_name = crate::decompile::passes::csh_pass::field_ident_to_name(*field_id);
             let inner_ct = clight_expr_to_ctype(inner, ctx.data_model);
@@ -6057,34 +7149,26 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
             match &inner_expr {
                 CExpr::Unary(UnaryOp::Deref, ptr_expr) => {
                     // The field access is well-typed in clight (base derefs to a struct/union), but the emitted C declaration of the base pointer can disagree (type recovery may type it as int*/void*); cast the base to the struct pointer so `->` type-checks.
-                    match inner_ct {
-                        ct @ (CType::Struct(_) | CType::Union(_)) => {
-                            let sptr = CType::Pointer(Box::new(ct), TypeQualifiers::none());
-                            CExpr::MemberPtr(
-                                Box::new(CExpr::Cast(sptr, ptr_expr.clone())),
-                                field_name,
-                            )
-                        }
+                    if let Some(aggregate_ty) = aggregate_member_base_type(&inner_ct) {
+                        let sptr = CType::Pointer(Box::new(aggregate_ty), TypeQualifiers::none());
+                        CExpr::MemberPtr(Box::new(CExpr::Cast(sptr, ptr_expr.clone())), field_name)
+                    } else {
                         // The base derefs to a non-aggregate, so lower ->ofs_N to a typed byte-offset deref *(FieldTy *)((char *)base + N); the field ident encodes N and FieldTy is always a concrete scalar.
-                        _ => {
-                            let offset = *field_id as i64;
-                            let field_ctype = convert_clight_type(field_ty, ctx.data_model);
-                            let char_ptr = CType::Pointer(
-                                Box::new(CType::char_signed()),
-                                TypeQualifiers::none(),
-                            );
-                            let byte_addr = CExpr::Binary(
-                                BinaryOp::Add,
-                                Box::new(CExpr::Cast(char_ptr, ptr_expr.clone())),
-                                Box::new(CExpr::int(offset)),
-                            );
-                            let field_ptr =
-                                CType::Pointer(Box::new(field_ctype), TypeQualifiers::none());
-                            CExpr::Unary(
-                                UnaryOp::Deref,
-                                Box::new(CExpr::Cast(field_ptr, Box::new(byte_addr))),
-                            )
-                        }
+                        let offset = *field_id as i64;
+                        let field_ctype = convert_clight_type(field_ty, ctx.data_model);
+                        let char_ptr =
+                            CType::Pointer(Box::new(CType::char_signed()), TypeQualifiers::none());
+                        let byte_addr = CExpr::Binary(
+                            BinaryOp::Add,
+                            Box::new(CExpr::Cast(char_ptr, ptr_expr.clone())),
+                            Box::new(CExpr::int(offset)),
+                        );
+                        let field_ptr =
+                            CType::Pointer(Box::new(field_ctype), TypeQualifiers::none());
+                        CExpr::Unary(
+                            UnaryOp::Deref,
+                            Box::new(CExpr::Cast(field_ptr, Box::new(byte_addr))),
+                        )
                     }
                 }
                 _ => CExpr::Member(Box::new(inner_expr), field_name),
@@ -6391,6 +7475,26 @@ pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> C
         clight::ClightStmt::Sskip => CStmt::Empty,
 
         clight::ClightStmt::Sassign(lhs, rhs) => {
+            if let clight::ClightExpr::Efield(inner, field_id, field_ty) = lhs {
+                if let clight::ClightExpr::Ederef(address, aggregate_ty) = inner.as_ref() {
+                    if should_lower_scalar_field(address, aggregate_ty, field_ty) {
+                        return CStmt::Expr(memcpy_store_expr(
+                            convert_clight_type(field_ty, ctx.data_model),
+                            byte_offset_expr(convert_expr(address, ctx), *field_id as i64),
+                            convert_expr(rhs, ctx),
+                        ));
+                    }
+                }
+            }
+            if let clight::ClightExpr::Ederef(address, access_ty) = lhs {
+                if should_lower_scalar_deref(address, access_ty) {
+                    return CStmt::Expr(memcpy_store_expr(
+                        convert_clight_type(access_ty, ctx.data_model),
+                        convert_expr(address, ctx),
+                        convert_expr(rhs, ctx),
+                    ));
+                }
+            }
             let lhs_expr = convert_expr(lhs, ctx);
             let rhs_expr = convert_expr(rhs, ctx);
             CStmt::Expr(CExpr::Assign(

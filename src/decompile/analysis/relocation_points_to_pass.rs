@@ -1352,10 +1352,15 @@ fn validate_relocation_layouts(
         if interior_targets.contains(&target_ident) {
             continue;
         }
-        if let Some(extents) = extents_by_owner.get(&target_ident) {
-            if extents.len() != 1 || extents.first().copied() != Some(target_extent) {
-                continue;
-            }
+        // Section bytes prove only that the observed prefix is initialized;
+        // they do not prove where this object ends.  Publishing a declaration
+        // therefore requires one authoritative physical extent which agrees
+        // exactly with the logical access extent.
+        let Some(extents) = extents_by_owner.get(&target_ident) else {
+            continue;
+        };
+        if extents.len() != 1 || extents.first().copied() != Some(target_extent) {
+            continue;
         }
         if !initialized_ranges_cover(&initialized, target_start, target_extent) {
             continue;
@@ -1606,6 +1611,7 @@ mod tests {
             "retained_initialized_data_range",
             (TARGET - 4, Arc::new(vec![0_u8; 16])),
         );
+        db.rel_push("global_storage_extent", (TARGET as usize, 8_usize));
         for (func, entry) in [
             (WRITER, WRITER_ENTRY),
             (READER, READER_ENTRY),
@@ -1871,6 +1877,22 @@ mod tests {
         assert!(!db
             .rel_iter::<(u64,)>("must_be_ptr")
             .any(|(value,)| *value == CONSUMER_PARAM));
+    }
+
+    #[test]
+    fn initialized_section_prefix_without_object_extent_is_not_an_array() {
+        let mut db = fixture();
+        db.rel_set(
+            "global_storage_extent",
+            ascent::boxcar::Vec::<(usize, usize)>::new(),
+        );
+
+        run_recovery(&mut db);
+
+        assert!(recovered(&db).is_empty());
+        assert!(!db
+            .rel_iter::<(usize,)>("global_var_ref")
+            .any(|(ident,)| *ident == TARGET as usize));
     }
 
     #[test]

@@ -58,7 +58,9 @@ __attribute__((noinline)) int frame_user(int n) {
 __attribute__((noinline)) int bigconst(int x) { return x + 0x12345678; }
 typedef int (*unary_fn)(int);
 __attribute__((noinline)) int add_one(int x) { return x + 1; }
-__attribute__((noinline)) int apply_tail(unary_fn fn, int x) { return fn(x); }
+__attribute__((naked, noinline)) int apply_tail(unary_fn fn, int x) {
+    __asm__("mov r12, r0\n\tmov r0, r1\n\tbx r12");
+}
 void _start(void) { (void)frame_user(3); (void)bigconst(1); (void)apply_tail(add_one, 4); }
 "#;
 

@@ -329,9 +329,19 @@ impl IRPass for FrameCoordinatePass {
             if invalid_functions.contains(&func) {
                 continue;
             }
-            let depth = frame_origins
-                .get(&func)
-                .map_or(0, |origin| origin.saturating_sub(offset).max(0));
+            let depth = if let Some(origin) = frame_origins.get(&func) {
+                // A call-derived origin is the settled body baseline.  Points
+                // above it are pre-allocation/post-epilogue coordinates, not a
+                // zero-depth spelling of body storage.  Omitting them keeps two
+                // physically distinct RSP-relative bytes from sharing one exact
+                // frame coordinate.
+                if offset > *origin {
+                    continue;
+                }
+                origin.saturating_sub(offset)
+            } else {
+                0
+            };
             settled.push((func, node, depth));
         }
         settled.sort_unstable();
@@ -653,5 +663,53 @@ mod tests {
         assert!(!db
             .rel_iter::<(u64, u64, i64)>("settled_sp_entry_offset")
             .any(|(func, node, _)| *func == caller && *node == after_call));
+    }
+
+    #[test]
+    fn preallocation_points_do_not_borrow_call_body_baseline() {
+        let func = 0xa000_u64;
+        let before_alloc = 0xa008_u64;
+        let alloc = 0xa010_u64;
+        let after_alloc = 0xa018_u64;
+        let call = 0xa020_u64;
+        let after_call = 0xa028_u64;
+        let mut db = DecompileDB::default();
+        db.rel_push("abi_pointer_size", (8_i64,));
+
+        for node in [func, before_alloc, alloc, after_alloc, call, after_call] {
+            db.rel_push("instr_in_function", (node, func));
+            db.rel_push("code_in_block", (node, node));
+            db.rel_push("settled_block_dom_set", (func, node, Set::singleton(node)));
+        }
+        for (src, dst) in [
+            (func, before_alloc),
+            (before_alloc, alloc),
+            (alloc, after_alloc),
+            (after_alloc, call),
+            (call, after_call),
+        ] {
+            db.rel_push("ddisasm_cfg_edge", (src, dst, "fallthrough"));
+        }
+        db.rel_push("stack_delta", (alloc, -32_i64));
+        db.rel_push("psub", (alloc, "alloc_rsp", "alloc_size"));
+        db.rel_push("op_register", ("alloc_rsp", "RSP"));
+        db.rel_push(
+            "instruction",
+            (
+                call, 5_usize, "", "CALL", "callee", "", "", "", 0_usize, 0_usize,
+            ),
+        );
+
+        FrameCoordinatePass.run(&mut db);
+
+        let shifts: std::collections::BTreeSet<_> = db
+            .rel_iter::<(u64, u64, i64)>("settled_sp_frame_shift")
+            .copied()
+            .collect();
+        assert!(!shifts.iter().any(|(_, node, _)| *node == before_alloc));
+        assert!(!shifts.iter().any(|(_, node, _)| *node == alloc));
+        assert!(shifts.contains(&(func, after_alloc, 0)));
+        assert!(shifts.contains(&(func, call, 0)));
+        assert!(shifts.contains(&(func, after_call, 0)));
     }
 }

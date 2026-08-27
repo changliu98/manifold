@@ -198,11 +198,27 @@ fn pe_pipeline_emits_export_and_named_import_call() {
                 .lines()
                 .find(|line| line.contains("= first_and_fifth("))
                 .expect("missing call to first_and_fifth");
-            let sparse_args = sparse_call
+            let sparse_tail = sparse_call
                 .split_once("first_and_fifth(")
-                .and_then(|(_, tail)| tail.split_once(')'))
-                .map(|(args, _)| args)
+                .map(|(_, tail)| tail)
                 .expect("malformed first_and_fifth call");
+            let mut nesting = 0_usize;
+            let sparse_end = sparse_tail
+                .char_indices()
+                .find_map(|(index, ch)| match ch {
+                    '(' => {
+                        nesting += 1;
+                        None
+                    }
+                    ')' if nesting == 0 => Some(index),
+                    ')' => {
+                        nesting -= 1;
+                        None
+                    }
+                    _ => None,
+                })
+                .expect("unterminated first_and_fifth call");
+            let sparse_args = &sparse_tail[..sparse_end];
             assert_eq!(
                 sparse_args.split(',').count(),
                 5,
@@ -255,17 +271,30 @@ fn pe_pipeline_emits_export_and_named_import_call() {
                 mixed_args[4].contains("p1"),
                 "Win64 live-in double was not preserved in stack slot 4:\n{text}"
             );
-            for operation in [
-                "var_0 = p0 + p1;",
-                "var_0 = var_0 + p2;",
-                "var_0 = var_0 + p3;",
-                "var_0 = var_0 + p4;",
-            ] {
+            let add_body_start = text
+                .match_indices("add_five(")
+                .find_map(|(start, _)| {
+                    let suffix = &text[start..];
+                    let brace = suffix.find('{')?;
+                    let semicolon = suffix.find(';').unwrap_or(usize::MAX);
+                    (brace < semicolon).then_some(start + brace + 1)
+                })
+                .expect("missing add_five definition");
+            let add_body = &text[add_body_start
+                ..add_body_start
+                    + text[add_body_start..]
+                        .find("\n}")
+                        .expect("unterminated add_five definition")];
+            for parameter in ["p0", "p1", "p2", "p3", "p4"] {
                 assert!(
-                    text.contains(operation),
-                    "Win64 parameter dataflow lost `{operation}` in:\n{text}"
+                    add_body.contains(parameter),
+                    "Win64 parameter dataflow lost `{parameter}` in:\n{add_body}"
                 );
             }
+            assert!(
+                add_body.matches('+').count() >= 4,
+                "Win64 five-parameter reduction lost additions in:\n{add_body}"
+            );
 
             let add_five = db
                 .rel_iter::<(Address, Symbol, Symbol)>("symbols")

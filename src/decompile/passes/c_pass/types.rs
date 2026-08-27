@@ -150,27 +150,44 @@ impl CType {
     }
 
     pub fn is_pointer(&self) -> bool {
-        matches!(self, CType::Pointer(_, _))
+        match self {
+            CType::Pointer(_, _) => true,
+            CType::Qualified(inner, _) => inner.is_pointer(),
+            _ => false,
+        }
     }
 
     #[allow(dead_code)]
     pub fn is_integer(&self) -> bool {
-        matches!(self, CType::Int(_, _) | CType::Bool)
+        match self {
+            CType::Int(_, _) | CType::Bool => true,
+            CType::Qualified(inner, _) => inner.is_integer(),
+            _ => false,
+        }
     }
 
     #[allow(dead_code)]
     pub fn is_float(&self) -> bool {
-        matches!(self, CType::Float(_))
+        match self {
+            CType::Float(_) => true,
+            CType::Qualified(inner, _) => inner.is_float(),
+            _ => false,
+        }
     }
 
     pub fn is_generic_long_ptr(&self) -> bool {
-        matches!(self, CType::Pointer(inner, _) if **inner == CType::Int(IntSize::Long, Signedness::Signed))
+        match self {
+            CType::Pointer(inner, _) => **inner == CType::Int(IntSize::Long, Signedness::Signed),
+            CType::Qualified(inner, _) => inner.is_generic_long_ptr(),
+            _ => false,
+        }
     }
 
     #[allow(dead_code)]
     pub fn pointee(&self) -> Option<&CType> {
         match self {
             CType::Pointer(inner, _) => Some(inner),
+            CType::Qualified(inner, _) => inner.pointee(),
             _ => None,
         }
     }
@@ -503,9 +520,16 @@ impl CExpr {
             CExpr::Member(inner, _) | CExpr::MemberPtr(inner, _) => inner.has_side_effects(),
             CExpr::Index(arr, idx) => arr.has_side_effects() || idx.has_side_effects(),
             CExpr::SizeofType(_) | CExpr::AlignofType(_) => false,
-            CExpr::SizeofExpr(e) => e.has_side_effects(),
-            CExpr::CompoundLit(_, _) => false,
-            CExpr::Generic(e, _) => e.has_side_effects(),
+            // `sizeof(expr)` and the controlling expression of `_Generic` are
+            // unevaluated C contexts.  A compound literal evaluates its
+            // initializer, while exactly one generic association evaluates;
+            // checking every arm is the conservative choice without a type
+            // selector here.
+            CExpr::SizeofExpr(_) => false,
+            CExpr::CompoundLit(_, initializers) => {
+                initializers.iter().any(Initializer::has_side_effects)
+            }
+            CExpr::Generic(_, arms) => arms.iter().any(|(_, arm)| arm.has_side_effects()),
             CExpr::Paren(inner) => inner.has_side_effects(),
             CExpr::StmtExpr(_, _) => true,
         }
@@ -520,6 +544,39 @@ pub enum Initializer {
     List(Vec<InitItem>),
     #[allow(dead_code)]
     String(StringLiteral),
+}
+
+impl Initializer {
+    pub fn has_side_effects(&self) -> bool {
+        match self {
+            Initializer::Expr(expr) => expr.has_side_effects(),
+            Initializer::List(items) => items.iter().any(|item| item.init.has_side_effects()),
+            Initializer::String(_) => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod side_effect_tests {
+    use super::*;
+
+    #[test]
+    fn compound_literal_and_generic_effects_follow_evaluated_subexpressions() {
+        let call = CExpr::call(CExpr::var("produce"), vec![]);
+        let compound = CExpr::CompoundLit(CType::long(), vec![Initializer::Expr(call.clone())]);
+        assert!(compound.has_side_effects());
+
+        let generic = CExpr::Generic(
+            Box::new(call.clone()),
+            vec![(None, CExpr::int(0)), (Some(CType::long()), call.clone())],
+        );
+        assert!(generic.has_side_effects());
+        assert!(!CExpr::Generic(Box::new(call), vec![(None, CExpr::int(0))]).has_side_effects());
+        assert!(
+            !CExpr::SizeofExpr(Box::new(CExpr::call(CExpr::var("unevaluated"), vec![],)))
+                .has_side_effects()
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

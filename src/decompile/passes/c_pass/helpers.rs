@@ -1,6 +1,6 @@
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::c_pass::types::{
-    CBlockItem, CExpr, CStmt, CType, ForInit, InitItem, Initializer, Label, VarDecl,
+    CBlockItem, CExpr, CStmt, CType, Designator, ForInit, InitItem, Initializer, Label, VarDecl,
 };
 use crate::decompile::passes::clight_select::candtype::CandType;
 use crate::x86::types::*;
@@ -35,6 +35,23 @@ pub fn map_expr(e: &CExpr, f: &impl Fn(&CExpr) -> Option<CExpr>) -> CExpr {
         CExpr::Cast(ty, expr) => CExpr::Cast(ty.clone(), Box::new(map_expr(expr, f))),
         CExpr::SizeofExpr(expr) => CExpr::SizeofExpr(Box::new(map_expr(expr, f))),
         CExpr::Paren(expr) => CExpr::Paren(Box::new(map_expr(expr, f))),
+        CExpr::CompoundLit(ty, initializers) => CExpr::CompoundLit(
+            ty.clone(),
+            initializers
+                .iter()
+                .map(|init| map_initializer(init, f))
+                .collect(),
+        ),
+        CExpr::Generic(selector, arms) => CExpr::Generic(
+            Box::new(map_expr(selector, f)),
+            arms.iter()
+                .map(|(ty, arm)| (ty.clone(), map_expr(arm, f)))
+                .collect(),
+        ),
+        CExpr::StmtExpr(stmts, tail) => CExpr::StmtExpr(
+            stmts.iter().map(|stmt| map_stmt_exprs(stmt, f)).collect(),
+            Box::new(map_expr(tail, f)),
+        ),
         _ => e.clone(),
     };
 
@@ -48,12 +65,23 @@ fn map_initializer(init: &Initializer, f: &impl Fn(&CExpr) -> Option<CExpr>) -> 
             items
                 .iter()
                 .map(|item| InitItem {
-                    designator: item.designator.clone(),
+                    designator: item
+                        .designator
+                        .as_ref()
+                        .map(|designator| map_designator(designator, f)),
                     init: map_initializer(&item.init, f),
                 })
                 .collect(),
         ),
         Initializer::String(lit) => Initializer::String(lit.clone()),
+    }
+}
+
+fn map_designator(designator: &Designator, f: &impl Fn(&CExpr) -> Option<CExpr>) -> Designator {
+    match designator {
+        Designator::Field(field) => Designator::Field(field.clone()),
+        Designator::Index(expr) => Designator::Index(map_expr(expr, f)),
+        Designator::Range(first, last) => Designator::Range(map_expr(first, f), map_expr(last, f)),
     }
 }
 
@@ -77,7 +105,16 @@ pub fn map_stmt_exprs(s: &CStmt, f: &impl Fn(&CExpr) -> Option<CExpr>) -> CStmt 
         CStmt::For(init, cond, update, body) => {
             let new_init = match init {
                 Some(ForInit::Expr(e)) => Some(ForInit::Expr(map_expr(e, f))),
-                _ => init.clone(),
+                Some(ForInit::Decl(decls)) => Some(ForInit::Decl(
+                    decls
+                        .iter()
+                        .map(|decl| VarDecl {
+                            init: decl.init.as_ref().map(|init| map_initializer(init, f)),
+                            ..decl.clone()
+                        })
+                        .collect(),
+                )),
+                None => None,
             };
             let new_cond = cond.as_ref().map(|e| map_expr(e, f));
             let new_update = update.as_ref().map(|e| map_expr(e, f));
@@ -109,9 +146,22 @@ pub fn map_stmt_exprs(s: &CStmt, f: &impl Fn(&CExpr) -> Option<CExpr>) -> CStmt 
         CStmt::Sequence(stmts) => {
             CStmt::Sequence(stmts.iter().map(|s| map_stmt_exprs(s, f)).collect())
         }
-        CStmt::Labeled(label, inner) => {
-            CStmt::Labeled(label.clone(), Box::new(map_stmt_exprs(inner, f)))
-        }
+        CStmt::Labeled(label, inner) => CStmt::Labeled(
+            match label {
+                Label::Case(expr) => Label::Case(map_expr(expr, f)),
+                _ => label.clone(),
+            },
+            Box::new(map_stmt_exprs(inner, f)),
+        ),
+        CStmt::Decl(decls) => CStmt::Decl(
+            decls
+                .iter()
+                .map(|decl| VarDecl {
+                    init: decl.init.as_ref().map(|init| map_initializer(init, f)),
+                    ..decl.clone()
+                })
+                .collect(),
+        ),
         _ => s.clone(),
     }
 }
@@ -137,7 +187,19 @@ pub fn map_stmt_exprs_total(s: &CStmt, f: &impl Fn(&CExpr) -> CExpr) -> CStmt {
         CStmt::For(init, cond, update, body) => {
             let new_init = match init {
                 Some(ForInit::Expr(e)) => Some(ForInit::Expr(f(e))),
-                _ => init.clone(),
+                Some(ForInit::Decl(decls)) => Some(ForInit::Decl(
+                    decls
+                        .iter()
+                        .map(|decl| VarDecl {
+                            init: decl
+                                .init
+                                .as_ref()
+                                .map(|init| map_initializer_total(init, f)),
+                            ..decl.clone()
+                        })
+                        .collect(),
+                )),
+                None => None,
             };
             let new_cond = cond.as_ref().map(|e| f(e));
             let new_update = update.as_ref().map(|e| f(e));
@@ -169,9 +231,25 @@ pub fn map_stmt_exprs_total(s: &CStmt, f: &impl Fn(&CExpr) -> CExpr) -> CStmt {
         CStmt::Sequence(stmts) => {
             CStmt::Sequence(stmts.iter().map(|s| map_stmt_exprs_total(s, f)).collect())
         }
-        CStmt::Labeled(label, inner) => {
-            CStmt::Labeled(label.clone(), Box::new(map_stmt_exprs_total(inner, f)))
-        }
+        CStmt::Labeled(label, inner) => CStmt::Labeled(
+            match label {
+                Label::Case(expr) => Label::Case(f(expr)),
+                _ => label.clone(),
+            },
+            Box::new(map_stmt_exprs_total(inner, f)),
+        ),
+        CStmt::Decl(decls) => CStmt::Decl(
+            decls
+                .iter()
+                .map(|decl| VarDecl {
+                    init: decl
+                        .init
+                        .as_ref()
+                        .map(|init| map_initializer_total(init, f)),
+                    ..decl.clone()
+                })
+                .collect(),
+        ),
         _ => s.clone(),
     }
 }
@@ -183,12 +261,23 @@ fn map_initializer_total(init: &Initializer, f: &impl Fn(&CExpr) -> CExpr) -> In
             items
                 .iter()
                 .map(|item| InitItem {
-                    designator: item.designator.clone(),
+                    designator: item
+                        .designator
+                        .as_ref()
+                        .map(|designator| map_designator_total(designator, f)),
                     init: map_initializer_total(&item.init, f),
                 })
                 .collect(),
         ),
         Initializer::String(lit) => Initializer::String(lit.clone()),
+    }
+}
+
+fn map_designator_total(designator: &Designator, f: &impl Fn(&CExpr) -> CExpr) -> Designator {
+    match designator {
+        Designator::Field(field) => Designator::Field(field.clone()),
+        Designator::Index(expr) => Designator::Index(f(expr)),
+        Designator::Range(first, last) => Designator::Range(f(first), f(last)),
     }
 }
 
@@ -1036,5 +1125,53 @@ mod terminal_tests {
         );
 
         assert!(is_terminal_cstmt(&stmt));
+    }
+
+    #[test]
+    fn expression_mapper_reaches_compound_initializers_designators_and_stmt_exprs() {
+        let expression = CExpr::CompoundLit(
+            CType::long(),
+            vec![Initializer::List(vec![InitItem {
+                designator: Some(Designator::Index(CExpr::var("old"))),
+                init: Initializer::Expr(CExpr::StmtExpr(
+                    vec![
+                        CStmt::Expr(CExpr::call(CExpr::var("consume"), vec![CExpr::var("old")])),
+                        CStmt::Decl(vec![VarDecl::new("nested", CType::long())
+                            .with_init(Initializer::Expr(CExpr::var("old")))]),
+                    ],
+                    Box::new(CExpr::var("old")),
+                )),
+            }])],
+        );
+        let rewritten = map_expr(&expression, &|candidate| match candidate {
+            CExpr::Var(name) if name == "old" => Some(CExpr::var("new")),
+            _ => None,
+        });
+
+        let CExpr::CompoundLit(_, initializers) = rewritten else {
+            panic!("compound literal shape changed")
+        };
+        let [Initializer::List(items)] = initializers.as_slice() else {
+            panic!("initializer list disappeared")
+        };
+        assert!(matches!(
+            items[0].designator,
+            Some(Designator::Index(CExpr::Var(ref name))) if name == "new"
+        ));
+        let Initializer::Expr(CExpr::StmtExpr(stmts, tail)) = &items[0].init else {
+            panic!("statement expression disappeared")
+        };
+        assert!(matches!(tail.as_ref(), CExpr::Var(name) if name == "new"));
+        assert!(matches!(
+            &stmts[0],
+            CStmt::Expr(CExpr::Call(_, args))
+                if matches!(&args[0], CExpr::Var(name) if name == "new")
+        ));
+        assert!(matches!(
+            &stmts[1],
+            CStmt::Decl(decls)
+                if matches!(&decls[0].init,
+                    Some(Initializer::Expr(CExpr::Var(name))) if name == "new")
+        ));
     }
 }
