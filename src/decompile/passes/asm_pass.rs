@@ -484,11 +484,11 @@ fn refine_chunk_with_size(mc: MemoryChunk, size: usize) -> MemoryChunk {
 }
 
 // Integer read/modify/write instructions encode the physical memory width on
-// the memory operand.  The architectural destination register determines the
-// operation family (32-bit versus 64-bit in CompCert's IR), but it must never
-// widen the load/store itself: CL/AX memory arithmetic is still a one/two-byte
-// access.  Reject decoder widths outside the x86 integer scalar set rather
-// than silently treating an unknown width as four bytes.
+// the memory operand.  That decoded width determines both the load/store chunk
+// and whether CompCert's integer operation uses its 32- or 64-bit family; a
+// register alias or immediate encoding must never widen a CL/AX-sized access.
+// Reject decoder widths outside the x86 integer scalar set rather than
+// silently treating an unknown width as four bytes.
 fn integer_memory_chunk(size: usize) -> Option<MemoryChunk> {
     match size {
         1 => Some(MemoryChunk::MInt8Unsigned),
@@ -8606,91 +8606,73 @@ ascent_par! {
         let op = if *dst_is_64 { Operation::Osubl } else { Operation::Osub },
         if let Some(chunk) = integer_memory_chunk(*memory_size);
 
-    // ADD/SUB with memory destination, register source: read-modify-write at [mem].
+    // Register-source memory RMW.  The decoded memory width is authoritative:
+    // all subregister spellings map to their full machine register, so testing
+    // only `reg_is_64` widens byte/word writes to four bytes.  SP is an ordinary
+    // base here; keeping it in this shared family prevents operation-specific
+    // holes such as a stack-relative SUB/AND/OR/XOR silently disappearing.
     arith_store_reg(*address, op, chunk, Mreg::x86(base_str), *disp, Mreg::x86(src_str)) <--
         padd(address, dst, src),
         op_register(src, src_str),
-        reg_is_64(src_str, src_is_64),
-        op_indirect(dst, _, base_str, idx, _, disp, _),
+        op_indirect(dst, _, base_str, idx, _, disp, memory_size),
         if *idx == "NONE" || idx.is_empty(),
         if *base_str != "NONE" && !base_str.is_empty(),
-        !reg_sp(base_str),
         !reg_ip(base_str),
-        let op = if *src_is_64 { Operation::Oaddl } else { Operation::Oadd },
-        let chunk = if *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+        let op = if *memory_size == 8 { Operation::Oaddl } else { Operation::Oadd },
+        if let Some(chunk) = integer_memory_chunk(*memory_size);
 
     arith_store_reg(*address, op, chunk, Mreg::x86(base_str), *disp, Mreg::x86(src_str)) <--
         psub(address, dst, src),
         op_register(src, src_str),
-        reg_is_64(src_str, src_is_64),
-        op_indirect(dst, _, base_str, idx, _, disp, _),
+        op_indirect(dst, _, base_str, idx, _, disp, memory_size),
         if *idx == "NONE" || idx.is_empty(),
         if *base_str != "NONE" && !base_str.is_empty(),
-        !reg_sp(base_str),
         !reg_ip(base_str),
-        let op = if *src_is_64 { Operation::Osubl } else { Operation::Osub },
-        let chunk = if *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
-
-    arith_store_reg(*address, op, chunk, Mreg::SP, *disp, Mreg::x86(src_str)) <--
-        padd(address, dst, src),
-        op_register(src, src_str),
-        reg_is_64(src_str, src_is_64),
-        op_indirect(dst, _, base_str, idx, _, disp, _),
-        if *idx == "NONE" || idx.is_empty(),
-        reg_sp(base_str),
-        let op = if *src_is_64 { Operation::Oaddl } else { Operation::Oadd },
-        let chunk = if *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+        let op = if *memory_size == 8 { Operation::Osubl } else { Operation::Osub },
+        if let Some(chunk) = integer_memory_chunk(*memory_size);
 
     // AND/OR/XOR with memory destination: previously emitted arith_load_op (wrong direction), clobbering the source register and silently dropping the memory store (3.8c direction bug).
     arith_store_reg(*address, op, chunk, Mreg::x86(base_str), *disp, Mreg::x86(src_str)) <--
         pand(address, dst, src),
         op_register(src, src_str),
-        reg_is_64(src_str, src_is_64),
-        op_indirect(dst, _, base_str, idx, _, disp, _),
+        op_indirect(dst, _, base_str, idx, _, disp, memory_size),
         if *idx == "NONE" || idx.is_empty(),
         if *base_str != "NONE" && !base_str.is_empty(),
-        !reg_sp(base_str),
         !reg_ip(base_str),
-        let op = if *src_is_64 { Operation::Oandl } else { Operation::Oand },
-        let chunk = if *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+        let op = if *memory_size == 8 { Operation::Oandl } else { Operation::Oand },
+        if let Some(chunk) = integer_memory_chunk(*memory_size);
 
     arith_store_reg(*address, op, chunk, Mreg::x86(base_str), *disp, Mreg::x86(src_str)) <--
         por(address, dst, src),
         op_register(src, src_str),
-        reg_is_64(src_str, src_is_64),
-        op_indirect(dst, _, base_str, idx, _, disp, _),
+        op_indirect(dst, _, base_str, idx, _, disp, memory_size),
         if *idx == "NONE" || idx.is_empty(),
         if *base_str != "NONE" && !base_str.is_empty(),
-        !reg_sp(base_str),
         !reg_ip(base_str),
-        let op = if *src_is_64 { Operation::Oorl } else { Operation::Oor },
-        let chunk = if *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+        let op = if *memory_size == 8 { Operation::Oorl } else { Operation::Oor },
+        if let Some(chunk) = integer_memory_chunk(*memory_size);
 
     arith_store_reg(*address, op, chunk, Mreg::x86(base_str), *disp, Mreg::x86(src_str)) <--
         pxor(address, dst, src),
         op_register(src, src_str),
-        reg_is_64(src_str, src_is_64),
-        op_indirect(dst, _, base_str, idx, _, disp, _),
+        op_indirect(dst, _, base_str, idx, _, disp, memory_size),
         if *idx == "NONE" || idx.is_empty(),
         if *base_str != "NONE" && !base_str.is_empty(),
-        !reg_sp(base_str),
         !reg_ip(base_str),
-        let op = if *src_is_64 { Operation::Oxorl } else { Operation::Oxor },
-        let chunk = if *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+        let op = if *memory_size == 8 { Operation::Oxorl } else { Operation::Oxor },
+        if let Some(chunk) = integer_memory_chunk(*memory_size);
 
     // Atomic XADD: the store side is the load-op-store recovered as add %reg,(%mem); capstone's operand order is (reg, mem), so bind op_register on field4 and op_indirect on field5 directly.
     arith_store_reg(*addr, op, chunk, Mreg::x86(base_str), *disp, Mreg::x86(reg_str)) <--
         instruction(addr, _, _, mnem, reg_op, mem_op, _, _, _, _),
         if *mnem == "LOCK XADD" || *mnem == "XADD",
         op_register(reg_op, reg_str),
-        reg_is_64(reg_str, reg_is_64),
-        op_indirect(mem_op, _, base_str, idx, _, disp, _),
+        op_indirect(mem_op, _, base_str, idx, _, disp, memory_size),
         if *idx == "NONE" || idx.is_empty(),
         if *base_str != "NONE" && !base_str.is_empty(),
-        !reg_sp(base_str),
         !reg_ip(base_str),
-        let op = if *reg_is_64 { Operation::Oaddl } else { Operation::Oadd },
-        let chunk = if *reg_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+        let op = if *memory_size == 8 { Operation::Oaddl } else { Operation::Oadd },
+        if let Some(chunk) = integer_memory_chunk(*memory_size);
 
     // Atomic XCHG: the store half is a plain register-to-memory store routed through pmov so transl_store builds the addrmode; operand order is (reg, mem) like XADD.
     pmov(addr, mem_op, reg_op) <--
@@ -8949,9 +8931,8 @@ ascent_par! {
         if *idx == "NONE" || idx.is_empty(),
         if *base_str != "NONE" && !base_str.is_empty(),
         !reg_ip(base_str),
-        let is_32 = *sz <= 4,
-        let op = if is_32 { Operation::Oaddimm(imm_int) } else { Operation::Oaddlimm(imm_int) },
-        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+        let op = if *sz == 8 { Operation::Oaddlimm(imm_int) } else { Operation::Oaddimm(imm_int) },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_imm(*address, op, chunk, Mreg::x86(base_str), *disp) <--
         psub(address, dst, src),
@@ -8961,9 +8942,8 @@ ascent_par! {
         if *idx == "NONE" || idx.is_empty(),
         if *base_str != "NONE" && !base_str.is_empty(),
         !reg_ip(base_str),
-        let is_32 = *sz <= 4,
-        let op = if is_32 { Operation::Oaddimm(-imm_int) } else { Operation::Oaddlimm(-imm_int) },
-        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+        let op = if *sz == 8 { Operation::Oaddlimm(-imm_int) } else { Operation::Oaddimm(-imm_int) },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     // AND/OR/XOR immediate to memory: previously no rule matched (reg-dest Oandimm requires op_register on dst) so the instruction vanished (3.8c family).
     arith_store_imm(*address, op, chunk, Mreg::x86(base_str), *disp) <--
@@ -8974,9 +8954,8 @@ ascent_par! {
         if *idx == "NONE" || idx.is_empty(),
         if *base_str != "NONE" && !base_str.is_empty(),
         !reg_ip(base_str),
-        let is_32 = *sz <= 4,
-        let op = if is_32 { Operation::Oandimm(imm_int) } else { Operation::Oandlimm(imm_int) },
-        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+        let op = if *sz == 8 { Operation::Oandlimm(imm_int) } else { Operation::Oandimm(imm_int) },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_imm(*address, op, chunk, Mreg::x86(base_str), *disp) <--
         por(address, dst, src),
@@ -8986,9 +8965,8 @@ ascent_par! {
         if *idx == "NONE" || idx.is_empty(),
         if *base_str != "NONE" && !base_str.is_empty(),
         !reg_ip(base_str),
-        let is_32 = *sz <= 4,
-        let op = if is_32 { Operation::Oorimm(imm_int) } else { Operation::Oorlimm(imm_int) },
-        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+        let op = if *sz == 8 { Operation::Oorlimm(imm_int) } else { Operation::Oorimm(imm_int) },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_imm(*address, op, chunk, Mreg::x86(base_str), *disp) <--
         pxor(address, dst, src),
@@ -8998,36 +8976,33 @@ ascent_par! {
         if *idx == "NONE" || idx.is_empty(),
         if *base_str != "NONE" && !base_str.is_empty(),
         !reg_ip(base_str),
-        let is_32 = *sz <= 4,
-        let op = if is_32 { Operation::Oxorimm(imm_int) } else { Operation::Oxorlimm(imm_int) },
-        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+        let op = if *sz == 8 { Operation::Oxorlimm(imm_int) } else { Operation::Oxorimm(imm_int) },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     // Absolute addressing arith: add reg, 0x40402c (read-modify-write at global)
     arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::x86(src_str)) <--
         padd(address, dst, src),
         op_register(src, src_str),
-        reg_is_64(src_str, src_is_64),
         op_indirect(dst, _, base_str, idx, _, disp, sz),
         if *idx == "NONE" || idx.is_empty(),
         if *base_str == "NONE" || base_str.is_empty(),
         if *disp > 0,
         abs_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let op = if *src_is_64 { Operation::Oaddl } else { Operation::Oadd },
-        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+        let op = if *sz == 8 { Operation::Oaddl } else { Operation::Oadd },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::x86(src_str)) <--
         psub(address, dst, src),
         op_register(src, src_str),
-        reg_is_64(src_str, src_is_64),
         op_indirect(dst, _, base_str, idx, _, disp, sz),
         if *idx == "NONE" || idx.is_empty(),
         if *base_str == "NONE" || base_str.is_empty(),
         if *disp > 0,
         abs_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let op = if *src_is_64 { Operation::Osubl } else { Operation::Osub },
-        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+        let op = if *sz == 8 { Operation::Osubl } else { Operation::Osub },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     // Absolute addressing arith: addl $imm, 0x40402c (read-modify-write at global)
     arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
@@ -9040,9 +9015,8 @@ ascent_par! {
         if *disp > 0,
         abs_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let is_32 = *sz <= 4,
-        let op = if is_32 { Operation::Oaddimm(imm_int) } else { Operation::Oaddlimm(imm_int) },
-        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+        let op = if *sz == 8 { Operation::Oaddlimm(imm_int) } else { Operation::Oaddimm(imm_int) },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
         psub(address, dst, src),
@@ -9054,34 +9028,31 @@ ascent_par! {
         if *disp > 0,
         abs_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let is_32 = *sz <= 4,
-        let op = if is_32 { Operation::Oaddimm(-imm_int) } else { Operation::Oaddlimm(-imm_int) },
-        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+        let op = if *sz == 8 { Operation::Oaddlimm(-imm_int) } else { Operation::Oaddimm(-imm_int) },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     // RIP-relative memory-dest arithmetic (3.8c): absolute-addressing rules require base="NONE"; the RIP form resolved nothing and the whole RMW vanished; arith_store_abs_* is ident-keyed so applies unchanged.
     arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::x86(src_str)) <--
         padd(address, dst, src),
         op_register(src, src_str),
-        reg_is_64(src_str, src_is_64),
         op_indirect(dst, _, base_str, idx, _, _, sz),
         if *idx == "NONE" || idx.is_empty(),
         reg_ip(*base_str),
         rip_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let op = if *src_is_64 { Operation::Oaddl } else { Operation::Oadd },
-        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+        let op = if *sz == 8 { Operation::Oaddl } else { Operation::Oadd },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::x86(src_str)) <--
         psub(address, dst, src),
         op_register(src, src_str),
-        reg_is_64(src_str, src_is_64),
         op_indirect(dst, _, base_str, idx, _, _, sz),
         if *idx == "NONE" || idx.is_empty(),
         reg_ip(*base_str),
         rip_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let op = if *src_is_64 { Operation::Osubl } else { Operation::Osub },
-        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+        let op = if *sz == 8 { Operation::Osubl } else { Operation::Osub },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
         padd(address, dst, src),
@@ -9092,9 +9063,8 @@ ascent_par! {
         reg_ip(*base_str),
         rip_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let is_32 = *sz <= 4,
-        let op = if is_32 { Operation::Oaddimm(imm_int) } else { Operation::Oaddlimm(imm_int) },
-        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+        let op = if *sz == 8 { Operation::Oaddlimm(imm_int) } else { Operation::Oaddimm(imm_int) },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
         psub(address, dst, src),
@@ -9105,85 +9075,78 @@ ascent_par! {
         reg_ip(*base_str),
         rip_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let is_32 = *sz <= 4,
-        let op = if is_32 { Operation::Oaddimm(-imm_int) } else { Operation::Oaddlimm(-imm_int) },
-        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+        let op = if *sz == 8 { Operation::Oaddlimm(-imm_int) } else { Operation::Oaddimm(-imm_int) },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     // AND/OR/XOR global RMW (RIP-relative and -fno-pie absolute): previously no rule matched and the whole RMW vanished (3.8c); arith_store_abs_* is op-agnostic.
     arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::x86(src_str)) <--
         pand(address, dst, src),
         op_register(src, src_str),
-        reg_is_64(src_str, src_is_64),
         op_indirect(dst, _, base_str, idx, _, disp, sz),
         if *idx == "NONE" || idx.is_empty(),
         if *base_str == "NONE" || base_str.is_empty(),
         if *disp > 0,
         abs_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let op = if *src_is_64 { Operation::Oandl } else { Operation::Oand },
-        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+        let op = if *sz == 8 { Operation::Oandl } else { Operation::Oand },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::x86(src_str)) <--
         por(address, dst, src),
         op_register(src, src_str),
-        reg_is_64(src_str, src_is_64),
         op_indirect(dst, _, base_str, idx, _, disp, sz),
         if *idx == "NONE" || idx.is_empty(),
         if *base_str == "NONE" || base_str.is_empty(),
         if *disp > 0,
         abs_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let op = if *src_is_64 { Operation::Oorl } else { Operation::Oor },
-        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+        let op = if *sz == 8 { Operation::Oorl } else { Operation::Oor },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::x86(src_str)) <--
         pxor(address, dst, src),
         op_register(src, src_str),
-        reg_is_64(src_str, src_is_64),
         op_indirect(dst, _, base_str, idx, _, disp, sz),
         if *idx == "NONE" || idx.is_empty(),
         if *base_str == "NONE" || base_str.is_empty(),
         if *disp > 0,
         abs_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let op = if *src_is_64 { Operation::Oxorl } else { Operation::Oxor },
-        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+        let op = if *sz == 8 { Operation::Oxorl } else { Operation::Oxor },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::x86(src_str)) <--
         pand(address, dst, src),
         op_register(src, src_str),
-        reg_is_64(src_str, src_is_64),
         op_indirect(dst, _, base_str, idx, _, _, sz),
         if *idx == "NONE" || idx.is_empty(),
         reg_ip(*base_str),
         rip_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let op = if *src_is_64 { Operation::Oandl } else { Operation::Oand },
-        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+        let op = if *sz == 8 { Operation::Oandl } else { Operation::Oand },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::x86(src_str)) <--
         por(address, dst, src),
         op_register(src, src_str),
-        reg_is_64(src_str, src_is_64),
         op_indirect(dst, _, base_str, idx, _, _, sz),
         if *idx == "NONE" || idx.is_empty(),
         reg_ip(*base_str),
         rip_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let op = if *src_is_64 { Operation::Oorl } else { Operation::Oor },
-        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+        let op = if *sz == 8 { Operation::Oorl } else { Operation::Oor },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_abs_reg(*address, op, chunk, *ident, *offset, Mreg::x86(src_str)) <--
         pxor(address, dst, src),
         op_register(src, src_str),
-        reg_is_64(src_str, src_is_64),
         op_indirect(dst, _, base_str, idx, _, _, sz),
         if *idx == "NONE" || idx.is_empty(),
         reg_ip(*base_str),
         rip_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let op = if *src_is_64 { Operation::Oxorl } else { Operation::Oxor },
-        let chunk = if *sz > 4 || *src_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+        let op = if *sz == 8 { Operation::Oxorl } else { Operation::Oxor },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
         pand(address, dst, src),
@@ -9195,9 +9158,8 @@ ascent_par! {
         if *disp > 0,
         abs_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let is_32 = *sz <= 4,
-        let op = if is_32 { Operation::Oandimm(imm_int) } else { Operation::Oandlimm(imm_int) },
-        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+        let op = if *sz == 8 { Operation::Oandlimm(imm_int) } else { Operation::Oandimm(imm_int) },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
         por(address, dst, src),
@@ -9209,9 +9171,8 @@ ascent_par! {
         if *disp > 0,
         abs_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let is_32 = *sz <= 4,
-        let op = if is_32 { Operation::Oorimm(imm_int) } else { Operation::Oorlimm(imm_int) },
-        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+        let op = if *sz == 8 { Operation::Oorlimm(imm_int) } else { Operation::Oorimm(imm_int) },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
         pxor(address, dst, src),
@@ -9223,9 +9184,8 @@ ascent_par! {
         if *disp > 0,
         abs_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let is_32 = *sz <= 4,
-        let op = if is_32 { Operation::Oxorimm(imm_int) } else { Operation::Oxorlimm(imm_int) },
-        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+        let op = if *sz == 8 { Operation::Oxorlimm(imm_int) } else { Operation::Oxorimm(imm_int) },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
         pand(address, dst, src),
@@ -9236,9 +9196,8 @@ ascent_par! {
         reg_ip(*base_str),
         rip_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let is_32 = *sz <= 4,
-        let op = if is_32 { Operation::Oandimm(imm_int) } else { Operation::Oandlimm(imm_int) },
-        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+        let op = if *sz == 8 { Operation::Oandlimm(imm_int) } else { Operation::Oandimm(imm_int) },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
         por(address, dst, src),
@@ -9249,9 +9208,8 @@ ascent_par! {
         reg_ip(*base_str),
         rip_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let is_32 = *sz <= 4,
-        let op = if is_32 { Operation::Oorimm(imm_int) } else { Operation::Oorlimm(imm_int) },
-        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+        let op = if *sz == 8 { Operation::Oorlimm(imm_int) } else { Operation::Oorimm(imm_int) },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     arith_store_abs_imm(*address, op, chunk, *ident, *offset) <--
         pxor(address, dst, src),
@@ -9262,9 +9220,8 @@ ascent_par! {
         reg_ip(*base_str),
         rip_target_addr(address, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
-        let is_32 = *sz <= 4,
-        let op = if is_32 { Operation::Oxorimm(imm_int) } else { Operation::Oxorlimm(imm_int) },
-        let chunk = if is_32 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 };
+        let op = if *sz == 8 { Operation::Oxorlimm(imm_int) } else { Operation::Oxorimm(imm_int) },
+        if let Some(chunk) = integer_memory_chunk(*sz);
 
     // abs_target_addr for and/or/xor RMW destinations so they resolve to synthesized idents; mirrors the padd/psub dst-side rows (the src-side rows cover only the memory-source direction).
     abs_target_addr(addr, target) <--
@@ -13051,6 +13008,229 @@ mod structural_dataflow_tests {
                     )
                 }));
             }
+        });
+    }
+
+    #[test]
+    fn integer_memory_destination_rmw_preserves_width_and_stack_base() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let register_cases = [
+                (
+                    0x6200,
+                    1_i64,
+                    "add_byte_mem",
+                    "add_byte_src",
+                    "CL",
+                    1_usize,
+                    Operation::Oadd,
+                    MemoryChunk::MInt8Unsigned,
+                ),
+                (
+                    0x6210,
+                    2,
+                    "sub_word_mem",
+                    "sub_word_src",
+                    "AX",
+                    2,
+                    Operation::Osub,
+                    MemoryChunk::MInt16Unsigned,
+                ),
+                (
+                    0x6220,
+                    3,
+                    "and_byte_mem",
+                    "and_byte_src",
+                    "CL",
+                    1,
+                    Operation::Oand,
+                    MemoryChunk::MInt8Unsigned,
+                ),
+                (
+                    0x6230,
+                    4,
+                    "or_word_mem",
+                    "or_word_src",
+                    "AX",
+                    2,
+                    Operation::Oor,
+                    MemoryChunk::MInt16Unsigned,
+                ),
+                (
+                    0x6240,
+                    5,
+                    "xor_byte_mem",
+                    "xor_byte_src",
+                    "CL",
+                    1,
+                    Operation::Oxor,
+                    MemoryChunk::MInt8Unsigned,
+                ),
+                (
+                    0x6250,
+                    1,
+                    "add_qword_mem",
+                    "add_qword_src",
+                    "RAX",
+                    8,
+                    Operation::Oaddl,
+                    MemoryChunk::MInt64,
+                ),
+            ];
+
+            for (node, kind, memory, source, source_name, width, _, _) in &register_cases {
+                match kind {
+                    1 => prog.padd.push((*node, *memory, *source)),
+                    2 => prog.psub.push((*node, *memory, *source)),
+                    3 => prog.pand.push((*node, *memory, *source)),
+                    4 => prog.por.push((*node, *memory, *source)),
+                    5 => prog.pxor.push((*node, *memory, *source)),
+                    _ => unreachable!(),
+                };
+                prog.op_register.push((*source, *source_name));
+                prog.op_indirect
+                    .push((*memory, "", "RSP", "NONE", 1, 24, *width));
+            }
+
+            let immediate_cases = [
+                (
+                    0x6260,
+                    2_i64,
+                    "sub_word_imm_mem",
+                    "sub_word_imm",
+                    7_i64,
+                    2_usize,
+                    Operation::Oaddimm(-7),
+                    MemoryChunk::MInt16Unsigned,
+                ),
+                (
+                    0x6270,
+                    3,
+                    "and_byte_imm_mem",
+                    "and_byte_imm",
+                    0x7f,
+                    1,
+                    Operation::Oandimm(0x7f),
+                    MemoryChunk::MInt8Unsigned,
+                ),
+                (
+                    0x6280,
+                    4,
+                    "or_qword_imm_mem",
+                    "or_qword_imm",
+                    9,
+                    8,
+                    Operation::Oorlimm(9),
+                    MemoryChunk::MInt64,
+                ),
+            ];
+            for (node, kind, memory, immediate, value, width, _, _) in &immediate_cases {
+                match kind {
+                    2 => prog.psub.push((*node, *memory, *immediate)),
+                    3 => prog.pand.push((*node, *memory, *immediate)),
+                    4 => prog.por.push((*node, *memory, *immediate)),
+                    _ => unreachable!(),
+                };
+                prog.op_immediate.push((*immediate, *value, 1));
+                prog.op_indirect
+                    .push((*memory, "", "RSP", "NONE", 1, 32, *width));
+            }
+
+            let xadd = 0x6290;
+            prog.instruction.push((
+                xadd,
+                4,
+                "",
+                "XADD",
+                "xadd_byte_src",
+                "xadd_byte_mem",
+                "0",
+                "0",
+                0,
+                0,
+            ));
+            prog.op_register.push(("xadd_byte_src", "CL"));
+            prog.op_indirect
+                .push(("xadd_byte_mem", "", "RSP", "NONE", 1, 40, 1));
+
+            let rip = 0x62a0;
+            let rip_target = 0x404031;
+            let rip_ident = 0x404030;
+            prog.pxor.push((rip, "rip_byte_mem", "rip_byte_src"));
+            prog.op_register.push(("rip_byte_src", "CL"));
+            prog.op_indirect
+                .push(("rip_byte_mem", "", "RIP", "NONE", 1, 17, 1));
+            prog.rip_target_addr.push((rip, rip_target));
+            prog.resolved_addr_to_symbol
+                .push((rip_target, rip_ident, 1));
+
+            let absolute = 0x62b0;
+            let absolute_target = 0x405002;
+            let absolute_ident = 0x405000;
+            prog.por
+                .push((absolute, "absolute_word_mem", "absolute_word_imm"));
+            prog.op_immediate.push(("absolute_word_imm", 0x55, 1));
+            prog.op_indirect.push((
+                "absolute_word_mem",
+                "",
+                "NONE",
+                "NONE",
+                1,
+                absolute_target as i64,
+                2,
+            ));
+            prog.abs_target_addr.push((absolute, absolute_target));
+            prog.resolved_addr_to_symbol
+                .push((absolute_target, absolute_ident, 2));
+
+            prog.run();
+
+            for (node, _, _, _, source_name, _, expected_op, expected_chunk) in register_cases {
+                assert!(prog.arith_store_reg.iter().any(|fact| {
+                    fact == &(
+                        node,
+                        expected_op.clone(),
+                        expected_chunk,
+                        Mreg::SP,
+                        24,
+                        Mreg::x86(source_name),
+                    )
+                }));
+            }
+            for (node, _, _, _, _, _, expected_op, expected_chunk) in immediate_cases {
+                assert!(prog.arith_store_imm.iter().any(|fact| {
+                    fact == &(node, expected_op.clone(), expected_chunk, Mreg::SP, 32)
+                }));
+            }
+            assert!(prog.arith_store_reg.iter().any(|fact| {
+                fact == &(
+                    xadd,
+                    Operation::Oadd,
+                    MemoryChunk::MInt8Unsigned,
+                    Mreg::SP,
+                    40,
+                    Mreg::CX,
+                )
+            }));
+            assert!(prog.arith_store_abs_reg.iter().any(|fact| {
+                fact == &(
+                    rip,
+                    Operation::Oxor,
+                    MemoryChunk::MInt8Unsigned,
+                    rip_ident,
+                    1,
+                    Mreg::CX,
+                )
+            }));
+            assert!(prog.arith_store_abs_imm.iter().any(|fact| {
+                fact == &(
+                    absolute,
+                    Operation::Oorimm(0x55),
+                    MemoryChunk::MInt16Unsigned,
+                    absolute_ident,
+                    2,
+                )
+            }));
         });
     }
 

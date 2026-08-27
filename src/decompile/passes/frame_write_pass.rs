@@ -5,15 +5,16 @@ use ascent::ascent_par;
 use ascent::lattice::set::Set;
 
 // A may-reaching frame write at one CFG point.  The interval belongs inside
-// the lattice value, never in its key: keying the recursive state by both node
-// and pointer cell materializes a node x cell product and can become quadratic
-// in large functions.  `Unwritten` and `Unknown` retain the queried interval so
-// an exact later write can replace only the cells that it actually covers.
+// the lattice value, never in its key.  `Write` retains both the physical write
+// interval and the query cell whose reaching state it represents; otherwise a
+// one-byte update would erase a preceding wide initializer for every disjoint
+// subcell query in the same object.  The recursive relation still has exactly
+// one row per (function, CFG point), with the per-query facts joined in its Set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FrameWriteOrigin {
     Unwritten(i64, usize),
     Unknown(Address, i64, usize),
-    Write(Address, i64, usize),
+    Write(Address, i64, usize, i64, usize),
 }
 
 pub(crate) fn frame_intervals_overlap(
@@ -86,22 +87,36 @@ fn x86_gpr_view_width(reg: &str) -> Option<i64> {
     }
 }
 
-pub(crate) fn frame_origin_overlaps(
+/// Whether this state member belongs to one exact tracked query cell.  Query
+/// identity is byte-layout metadata, not a reachability approximation; the
+/// member reached the current point only through the CFG lattice above.
+pub(crate) fn frame_origin_tracks(
     origin: &FrameWriteOrigin,
     cell_ofs: i64,
     cell_width: usize,
 ) -> bool {
-    let (origin_ofs, origin_width) = match origin {
+    let (tracked_ofs, tracked_width) = match origin {
         FrameWriteOrigin::Unwritten(ofs, width)
         | FrameWriteOrigin::Unknown(_, ofs, width)
-        | FrameWriteOrigin::Write(_, ofs, width) => (*ofs, *width),
+        | FrameWriteOrigin::Write(_, _, _, ofs, width) => (*ofs, *width),
     };
-    let Ok(cell_width) = i64::try_from(cell_width) else {
+    tracked_ofs == cell_ofs && tracked_width == cell_width
+}
+
+fn frame_origin_cell_overlaps(
+    origin: &FrameWriteOrigin,
+    write_ofs: i64,
+    write_width: usize,
+) -> bool {
+    let (cell_ofs, cell_width) = match origin {
+        FrameWriteOrigin::Unwritten(ofs, width)
+        | FrameWriteOrigin::Unknown(_, ofs, width)
+        | FrameWriteOrigin::Write(_, _, _, ofs, width) => (*ofs, *width),
+    };
+    let Ok(write_width) = i64::try_from(write_width) else {
         return true;
     };
-    // Invalid intervals are never evidence for a MUST spill. Treat them as
-    // overlapping so they survive to the reload and veto provenance.
-    frame_intervals_overlap(origin_ofs, origin_width, cell_ofs, cell_width).unwrap_or(true)
+    frame_intervals_overlap(cell_ofs, cell_width, write_ofs, write_width).unwrap_or(true)
 }
 
 ascent_par! {
@@ -359,15 +374,27 @@ ascent_par! {
         !frame_stack_write_bytes(func, node, _, _),
         !opaque_frame_stack_write(func, node);
 
-    // A unique exact write kills only origins whose intervals overlap it.
+    // A unique exact write updates only the tracked query cells it overlaps.
+    // Test the member's query interval, not the preceding physical writer's
+    // interval: a wide initializer may reach several disjoint narrow queries.
     frame_write_out(*func, *write, Set::singleton(*origin)) <--
         frame_write_in(func, write, state),
         for origin in state.0.iter(),
         frame_stack_write_bytes(func, write, write_ofs, write_width),
         !opaque_frame_stack_write(func, write),
-        if !frame_origin_overlaps(origin, *write_ofs, *write_width);
+        if !frame_origin_cell_overlaps(origin, *write_ofs, *write_width);
 
-    frame_write_out(*func, *write, Set::singleton(FrameWriteOrigin::Write(*write, *write_ofs, *write_width))) <--
+    frame_write_out(
+        *func,
+        *write,
+        Set::singleton(FrameWriteOrigin::Write(
+            *write,
+            *write_ofs,
+            *write_width,
+            *cell_ofs,
+            *cell_width,
+        )),
+    ) <--
         frame_write_in(func, write, _),
         frame_stack_write_bytes(func, write, write_ofs, write_width),
         !opaque_frame_stack_write(func, write),
@@ -398,6 +425,18 @@ impl IRPass for FrameWritePass {
 
         // Read only settled lattice rows. Publishing an ordinary relation from
         // inside the recursive SCC would retain transient, incomplete states.
+        let mut read_cells: std::collections::BTreeMap<(Address, Address), Vec<(i64, usize)>> =
+            std::collections::BTreeMap::new();
+        for (func, node, ofs, width) in prog.frame_stack_read_bytes.iter() {
+            read_cells
+                .entry((*func, *node))
+                .or_default()
+                .push((*ofs, *width));
+        }
+        for cells in read_cells.values_mut() {
+            cells.sort_unstable();
+            cells.dedup();
+        }
         let reads: std::collections::HashSet<(Address, Address)> = prog
             .frame_stack_read_bytes
             .iter()
@@ -414,6 +453,45 @@ impl IRPass for FrameWritePass {
             })
             .collect();
         settled.sort_by_key(|(func, node, _)| (*func, *node));
+
+        // Project a unique, covering physical writer only after the lattice is
+        // settled.  This keeps aggregation/negation out of RTL's large SCC and
+        // gives later passes an O(number of reads) storage-provenance input,
+        // never a pairwise reachability relation.
+        let mut storage_origins = Vec::new();
+        for (func, read, state) in &settled {
+            let Some(cells) = read_cells.get(&(*func, *read)) else {
+                continue;
+            };
+            for &(read_ofs, read_width) in cells {
+                let mut origins = state
+                    .0
+                    .iter()
+                    .filter(|origin| frame_origin_tracks(origin, read_ofs, read_width));
+                let Some(origin) = origins.next() else {
+                    continue;
+                };
+                if origins.next().is_some() {
+                    continue;
+                }
+                let FrameWriteOrigin::Write(write, write_ofs, write_width, _, _) = origin else {
+                    continue;
+                };
+                if frame_interval_contains(*write_ofs, *write_width, read_ofs, read_width) {
+                    storage_origins.push((
+                        *func,
+                        *read,
+                        read_ofs,
+                        read_width,
+                        *write,
+                        *write_ofs,
+                        *write_width,
+                    ));
+                }
+            }
+        }
+        storage_origins.sort_unstable();
+        storage_origins.dedup();
 
         if db.measure_rule_times {
             let pass_name = "FrameWritePassProgram".to_string();
@@ -435,6 +513,11 @@ impl IRPass for FrameWritePass {
             relation.push(fact);
         }
         db.rel_set("settled_frame_write_state", relation);
+        let relation = ascent::boxcar::Vec::new();
+        for fact in storage_origins {
+            relation.push(fact);
+        }
+        db.rel_set("settled_frame_storage_origin", relation);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
@@ -446,6 +529,7 @@ impl IRPass for FrameWritePass {
             "exact_frame_stack_lea",
             "frame_stack_read_bytes",
             "frame_stack_write_bytes",
+            "settled_frame_storage_origin",
             "settled_frame_write_state",
             "unnormalized_frame_stack_write",
         ]
@@ -454,7 +538,7 @@ impl IRPass for FrameWritePass {
 
 #[cfg(test)]
 mod tests {
-    use super::{frame_interval_contains, frame_origin_overlaps, FrameWriteOrigin, FrameWritePass};
+    use super::{frame_interval_contains, frame_origin_tracks, FrameWriteOrigin, FrameWritePass};
     use crate::decompile::elevator::DecompileDB;
     use crate::decompile::passes::pass::IRPass;
     use ascent::lattice::set::Set;
@@ -479,7 +563,7 @@ mod tests {
         Set(state
             .0
             .into_iter()
-            .filter(|origin| frame_origin_overlaps(origin, slot, width))
+            .filter(|origin| frame_origin_tracks(origin, slot, width))
             .collect())
     }
 
@@ -505,7 +589,7 @@ mod tests {
 
         assert_eq!(
             settled_at_width(&db, func, read, 5, 1).0,
-            std::collections::BTreeSet::from([FrameWriteOrigin::Write(write, 4, 4)])
+            std::collections::BTreeSet::from([FrameWriteOrigin::Write(write, 4, 4, 5, 1)])
         );
         assert!(frame_interval_contains(4, 4, 5, 1));
         assert!(!frame_interval_contains(4, 1, 4, 4));
@@ -539,7 +623,7 @@ mod tests {
         FrameWritePass.run(&mut disjoint_db);
         assert_eq!(
             settled_at(&disjoint_db, func, reload, 0).0,
-            std::collections::BTreeSet::from([FrameWriteOrigin::Write(spill, 0, 8)])
+            std::collections::BTreeSet::from([FrameWriteOrigin::Write(spill, 0, 8, 0, 8)])
         );
 
         for dynamic in [false, true] {
@@ -571,7 +655,7 @@ mod tests {
                 std::collections::BTreeSet::from([if dynamic {
                     FrameWriteOrigin::Unknown(overwrite, 0, 8)
                 } else {
-                    FrameWriteOrigin::Write(overwrite, 1, 1)
+                    FrameWriteOrigin::Write(overwrite, 1, 1, 0, 8)
                 }])
             );
         }
@@ -607,9 +691,58 @@ mod tests {
             settled_at(&db, func, reload, 24).0,
             std::collections::BTreeSet::from([
                 FrameWriteOrigin::Unwritten(24, 8),
-                FrameWriteOrigin::Write(spill, 24, 8),
+                FrameWriteOrigin::Write(spill, 24, 8, 24, 8),
             ])
         );
+    }
+
+    #[test]
+    fn narrow_write_does_not_erase_a_disjoint_subcell_query() {
+        let func = 0x2800_u64;
+        let wide_write = 0x2810_u64;
+        let byte_rmw = 0x2820_u64;
+        let word_read = 0x2830_u64;
+        let mut db = DecompileDB::default();
+        db.rel_push("abi_pointer_size", (8_i64,));
+        for node in [func, wide_write, byte_rmw, word_read] {
+            db.rel_push("instr_in_function", (node, func));
+            db.rel_push("code_in_block", (node, node));
+            db.rel_push("settled_sp_frame_shift", (func, node, 0_i64));
+            db.rel_push("settled_block_dom_set", (func, node, Set::singleton(node)));
+        }
+        for edge in [
+            (func, wide_write),
+            (wide_write, byte_rmw),
+            (byte_rmw, word_read),
+        ] {
+            db.rel_push("ddisasm_cfg_edge", (edge.0, edge.1, "branch"));
+        }
+        db.rel_push(
+            "decoded_stack_write_bytes",
+            (wide_write, "RSP", -8_i64, 8_usize),
+        );
+        db.rel_push(
+            "decoded_stack_read_bytes",
+            (byte_rmw, "RSP", -8_i64, 1_usize),
+        );
+        db.rel_push(
+            "decoded_stack_write_bytes",
+            (byte_rmw, "RSP", -8_i64, 1_usize),
+        );
+        db.rel_push(
+            "decoded_stack_read_bytes",
+            (word_read, "RSP", -6_i64, 2_usize),
+        );
+
+        FrameWritePass.run(&mut db);
+
+        assert_eq!(
+            settled_at_width(&db, func, word_read, -6, 2).0,
+            std::collections::BTreeSet::from([FrameWriteOrigin::Write(wide_write, -8, 8, -6, 2,)])
+        );
+        assert!(db
+            .rel_iter::<(u64, u64, i64, usize, u64, i64, usize)>("settled_frame_storage_origin")
+            .any(|fact| fact == &(func, word_read, -6, 2, wide_write, -8, 8)));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::decompile::passes::asm_pass::transl_addressing_rev;
 use crate::decompile::passes::cminor_pass::*;
 use crate::decompile::passes::csh_pass::*;
 use crate::decompile::passes::frame_write_pass::{
-    frame_interval_contains, frame_origin_overlaps, FrameWriteOrigin,
+    frame_interval_contains, frame_origin_tracks, FrameWriteOrigin,
 };
 use crate::decompile::passes::pass::IRPass;
 use crate::mreg::{Mreg, RegClass};
@@ -817,6 +817,8 @@ ascent_par! {
     relation stack_def_used(Address, Symbol, i64, Address, Symbol, i64);
     relation exact_frame_stack_lea(Address, Address, i64);
     relation frame_stack_read_bytes(Address, Address, i64, usize);
+    relation frame_stack_write_bytes(Address, Address, i64, usize);
+    relation settled_frame_storage_origin(Address, Address, i64, usize, Address, i64, usize);
     relation stack_offset_backedge_rescued_access(Address, Address);
     // Exact nonzero distance from the function's stable frame origin to SP at
     // this instruction, published by asm_pass.  Absence means zero or unknown;
@@ -2846,20 +2848,81 @@ ascent_par! {
 
     synth_only_addr(addr) <-- sbb_self_carry_op(addr, _, _, _, _, _, _);
 
-    // arith_store_reg: memory-dest arithmetic with a register source; an
-    // SP/BP-relative RMW operates IN-PLACE on the structurally identified
-    // stack_var so the update threads to later reads of the same slot.  The
-    // choice of stack base register is an encoding detail once stack_var has
-    // proven the point-local slot identity.
-    #[local] relation arith_store_reg_uses_stack_var(Node);
-    arith_store_reg_uses_stack_var(addr) <--
+    // Memory-destination arithmetic normally updates an exact scalar
+    // `stack_var` in place.  A narrower access into a wider reaching frame
+    // write is different: it observes and mutates the owner's bytes.  Retain
+    // the decoded chunk and normalized frame coordinate as an explicit
+    // load/op/store chain instead of widening the machine access to the
+    // owner's scalar type.  The reaching owner comes only from the settled
+    // point-keyed frame-write lattice; interval comparisons below establish
+    // byte layout, never CFG reachability.
+    #[local] relation direct_frame_storage_owner_raw(Address, Address, i64, usize, Address, i64, usize, RTLReg);
+    direct_frame_storage_owner_raw(
+        *func,
+        *read,
+        *read_ofs,
+        *read_width,
+        *write,
+        *base_ofs,
+        *owner_width,
+        *owner,
+    ) <--
+        settled_frame_storage_origin(func, read, read_ofs, read_width, write, base_ofs, owner_width),
+        stack_var(func, write, base_ofs, owner);
+
+    #[local] relation direct_frame_storage_owner_conflict(Address, Address, i64);
+    direct_frame_storage_owner_conflict(*func, *read, *read_ofs) <--
+        direct_frame_storage_owner_raw(func, read, read_ofs, _, left_write, left_base, left_width, left_owner),
+        direct_frame_storage_owner_raw(func, read, read_ofs, _, right_write, right_base, right_width, right_owner),
+        if (*left_write, *left_base, *left_width, *left_owner)
+            != (*right_write, *right_base, *right_width, *right_owner);
+
+    #[local] relation direct_frame_storage_owner(Address, Address, i64, usize, Address, i64, usize, RTLReg);
+    direct_frame_storage_owner(
+        *func,
+        *read,
+        *read_ofs,
+        *read_width,
+        *write,
+        *base_ofs,
+        *owner_width,
+        *owner,
+    ) <--
+        direct_frame_storage_owner_raw(func, read, read_ofs, read_width, write, base_ofs, owner_width, owner),
+        !direct_frame_storage_owner_conflict(func, read, read_ofs);
+
+    #[local] relation arith_store_reg_frame_subcell(Node, Address, i64, usize, i64, usize, RTLReg);
+    arith_store_reg_frame_subcell(
+        *addr,
+        *func_start,
+        *read_ofs,
+        *read_width,
+        *base_ofs,
+        *owner_width,
+        *owner,
+    ) <--
+        arith_store_reg(addr, _, chunk, base_mreg, _, _),
+        !has_ltl_op(addr),
+        if *base_mreg == Mreg::SP,
+        instr_in_function(addr, func_start),
+        frame_stack_read_bytes(func_start, addr, read_ofs, read_width),
+        frame_stack_write_bytes(func_start, addr, write_ofs, write_width),
+        if (*write_ofs, *write_width) == (*read_ofs, *read_width),
+        if *read_width == crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk),
+        direct_frame_storage_owner(func_start, addr, read_ofs, read_width, _, base_ofs, owner_width, owner),
+        if *read_ofs != *base_ofs || *read_width < *owner_width;
+
+    #[local] relation arith_store_reg_uses_direct_stack_var(Node);
+    arith_store_reg_uses_direct_stack_var(addr) <--
         arith_store_reg(addr, _, _, base_mreg, disp, _),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, _),
-        if matches!(*base_mreg, Mreg::SP | Mreg::BP);
+        if matches!(*base_mreg, Mreg::SP | Mreg::BP),
+        !arith_store_reg_frame_subcell(addr, _, _, _, _, _, _);
 
-    // Stack-slot in-place RMW: the load/op/store triple collapses to a single in-place `slot = slot op src` writing the slot's stack_rtl (matches the Lsetstack model), no explicit memory load/store; the edge stays addr->next (no synthetic chain), see the guarded succ rules.
+    // Exact whole-slot RMW: the load/op/store triple collapses to one update of
+    // the scalar value web.  Subcell accesses are excluded above.
     rtl_inst_candidate(addr, op_inst) <--
         arith_store_reg(addr, op, _chunk, base_mreg, disp, src_mreg),
         !has_ltl_op(addr),
@@ -2867,13 +2930,47 @@ ascent_par! {
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
         if matches!(*base_mreg, Mreg::SP | Mreg::BP),
+        !arith_store_reg_frame_subcell(addr, _, _, _, _, _, _),
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl, *src_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(addr, load_inst) <--
+        arith_store_reg(addr, _, chunk, _, _, _),
+        arith_store_reg_frame_subcell(addr, _, read_ofs, _, _, _, _),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let load_inst = RTLInst::Iload(
+            *chunk,
+            Addressing::Ainstack(*read_ofs),
+            Arc::new(vec![]),
+            temp,
+        );
+
+    rtl_inst_candidate(synth1, op_inst) <--
+        arith_store_reg(addr, op, _, _, _, src_mreg),
+        reg_rtl(addr, *src_mreg, src_rtl),
+        arith_store_reg_frame_subcell(addr, _, _, _, _, _, _),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::x86("RTEMP")),
+        let synth1 = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![temp, *src_rtl]), temp2);
+
+    rtl_inst_candidate(synth2, store_inst) <--
+        arith_store_reg(addr, _, chunk, _, _, _),
+        arith_store_reg_frame_subcell(addr, _, write_ofs, _, _, _, _),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::x86("RTEMP")),
+        let synth2 = *addr | (1u64 << 63),
+        let store_inst = RTLInst::Istore(
+            *chunk,
+            Addressing::Ainstack(*write_ofs),
+            Arc::new(vec![]),
+            temp2,
+        );
 
     rtl_inst_candidate(addr, load_inst) <--
         arith_store_reg(addr, _op, chunk, base_mreg, disp, _src_mreg),
         !has_ltl_op(addr),
         reg_rtl(addr, *base_mreg, base_rtl),
-        !arith_store_reg_uses_stack_var(addr),
+        !arith_store_reg_uses_direct_stack_var(addr),
+        !arith_store_reg_frame_subcell(addr, _, _, _, _, _, _),
         let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp);
 
@@ -2881,7 +2978,8 @@ ascent_par! {
         arith_store_reg(addr, op, _chunk, _base_mreg, _disp, src_mreg),
         !has_ltl_op(addr),
         reg_rtl(addr, *src_mreg, src_rtl),
-        !arith_store_reg_uses_stack_var(addr),
+        !arith_store_reg_uses_direct_stack_var(addr),
+        !arith_store_reg_frame_subcell(addr, _, _, _, _, _, _),
         let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
         let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::x86("RTEMP")),
         let synth1 = *addr | (1u64 << 62),
@@ -2891,7 +2989,8 @@ ascent_par! {
         arith_store_reg(addr, _op, chunk, base_mreg, disp, _src_mreg),
         !has_ltl_op(addr),
         reg_rtl(addr, *base_mreg, base_rtl),
-        !arith_store_reg_uses_stack_var(addr),
+        !arith_store_reg_uses_direct_stack_var(addr),
+        !arith_store_reg_frame_subcell(addr, _, _, _, _, _, _),
         let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::x86("RTEMP")),
         let synth2 = *addr | (1u64 << 63),
         let store_inst = RTLInst::Istore(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp2);
@@ -2900,14 +2999,14 @@ ascent_par! {
     rtl_inst_candidate(synth1, nop) <--
         arith_store_reg(addr, _, _, _, _, _),
         !has_ltl_op(addr),
-        arith_store_reg_uses_stack_var(addr),
+        arith_store_reg_uses_direct_stack_var(addr),
         let synth1 = *addr | (1u64 << 62),
         let nop = RTLInst::Inop;
 
     rtl_inst_candidate(synth2, nop) <--
         arith_store_reg(addr, _, _, _, _, _),
         !has_ltl_op(addr),
-        arith_store_reg_uses_stack_var(addr),
+        arith_store_reg_uses_direct_stack_var(addr),
         let synth2 = *addr | (1u64 << 63),
         let nop = RTLInst::Inop;
 
@@ -2936,17 +3035,35 @@ ascent_par! {
         let synth2 = *addr | (1u64 << 63),
         next(addr, next);
 
-    // arith_store_imm: memory-dest arithmetic with immediate; only fires
-    // without a real ltl op.  SP/BP-relative read-modify-write operates
-    // IN-PLACE on the slot's stack_rtl so the updated value threads to later
-    // reads of the same structurally identified slot (see arith_store_reg).
-    #[local] relation arith_store_imm_uses_stack_var(Node);
-    arith_store_imm_uses_stack_var(addr) <--
+    #[local] relation arith_store_imm_frame_subcell(Node, Address, i64, usize, i64, usize, RTLReg);
+    arith_store_imm_frame_subcell(
+        *addr,
+        *func_start,
+        *read_ofs,
+        *read_width,
+        *base_ofs,
+        *owner_width,
+        *owner,
+    ) <--
+        arith_store_imm(addr, _, chunk, base_mreg, _),
+        !has_ltl_op(addr),
+        if *base_mreg == Mreg::SP,
+        instr_in_function(addr, func_start),
+        frame_stack_read_bytes(func_start, addr, read_ofs, read_width),
+        frame_stack_write_bytes(func_start, addr, write_ofs, write_width),
+        if (*write_ofs, *write_width) == (*read_ofs, *read_width),
+        if *read_width == crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk),
+        direct_frame_storage_owner(func_start, addr, read_ofs, read_width, _, base_ofs, owner_width, owner),
+        if *read_ofs != *base_ofs || *read_width < *owner_width;
+
+    #[local] relation arith_store_imm_uses_direct_stack_var(Node);
+    arith_store_imm_uses_direct_stack_var(addr) <--
         arith_store_imm(addr, _, _, base_mreg, disp),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, _),
-        if matches!(*base_mreg, Mreg::SP | Mreg::BP);
+        if matches!(*base_mreg, Mreg::SP | Mreg::BP),
+        !arith_store_imm_frame_subcell(addr, _, _, _, _, _, _);
 
     // Stack-slot in-place RMW: the load/op/store triple collapses to one in-place op writing the slot's stack_rtl, so the edge stays addr->next with no synthetic chain.
     rtl_inst_candidate(addr, op_inst) <--
@@ -2955,20 +3072,54 @@ ascent_par! {
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
         if matches!(*base_mreg, Mreg::SP | Mreg::BP),
+        !arith_store_imm_frame_subcell(addr, _, _, _, _, _, _),
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(addr, load_inst) <--
+        arith_store_imm(addr, _, chunk, _, _),
+        arith_store_imm_frame_subcell(addr, _, read_ofs, _, _, _, _),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let load_inst = RTLInst::Iload(
+            *chunk,
+            Addressing::Ainstack(*read_ofs),
+            Arc::new(vec![]),
+            temp,
+        );
+
+    rtl_inst_candidate(synth1, op_inst) <--
+        arith_store_imm(addr, op, _, _, _),
+        arith_store_imm_frame_subcell(addr, _, _, _, _, _, _),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::x86("RTEMP")),
+        let synth1 = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![temp]), temp2);
+
+    rtl_inst_candidate(synth2, store_inst) <--
+        arith_store_imm(addr, _, chunk, _, _),
+        arith_store_imm_frame_subcell(addr, _, write_ofs, _, _, _, _),
+        let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::x86("RTEMP")),
+        let synth2 = *addr | (1u64 << 63),
+        let store_inst = RTLInst::Istore(
+            *chunk,
+            Addressing::Ainstack(*write_ofs),
+            Arc::new(vec![]),
+            temp2,
+        );
 
     rtl_inst_candidate(addr, load_inst) <--
         arith_store_imm(addr, _op, chunk, base_mreg, disp),
         !has_ltl_op(addr),
         reg_rtl(addr, *base_mreg, base_rtl),
-        !arith_store_imm_uses_stack_var(addr),
+        !arith_store_imm_uses_direct_stack_var(addr),
+        !arith_store_imm_frame_subcell(addr, _, _, _, _, _, _),
         let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp);
 
     rtl_inst_candidate(synth1, op_inst) <--
         arith_store_imm(addr, op, _chunk, _base_mreg, _disp),
         !has_ltl_op(addr),
-        !arith_store_imm_uses_stack_var(addr),
+        !arith_store_imm_uses_direct_stack_var(addr),
+        !arith_store_imm_frame_subcell(addr, _, _, _, _, _, _),
         let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
         let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::x86("RTEMP")),
         let synth1 = *addr | (1u64 << 62),
@@ -2978,7 +3129,8 @@ ascent_par! {
         arith_store_imm(addr, _op, chunk, base_mreg, disp),
         !has_ltl_op(addr),
         reg_rtl(addr, *base_mreg, base_rtl),
-        !arith_store_imm_uses_stack_var(addr),
+        !arith_store_imm_uses_direct_stack_var(addr),
+        !arith_store_imm_frame_subcell(addr, _, _, _, _, _, _),
         let temp2 = fresh_xtl_reg(*addr | (1u64 << 62), Mreg::x86("RTEMP")),
         let synth2 = *addr | (1u64 << 63),
         let store_inst = RTLInst::Istore(*chunk, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), temp2);
@@ -2987,16 +3139,28 @@ ascent_par! {
     rtl_inst_candidate(synth1, nop) <--
         arith_store_imm(addr, _, _, _, _),
         !has_ltl_op(addr),
-        arith_store_imm_uses_stack_var(addr),
+        arith_store_imm_uses_direct_stack_var(addr),
         let synth1 = *addr | (1u64 << 62),
         let nop = RTLInst::Inop;
 
     rtl_inst_candidate(synth2, nop) <--
         arith_store_imm(addr, _, _, _, _),
         !has_ltl_op(addr),
-        arith_store_imm_uses_stack_var(addr),
+        arith_store_imm_uses_direct_stack_var(addr),
         let synth2 = *addr | (1u64 << 63),
         let nop = RTLInst::Inop;
+
+    // Cminor preserves Ainstack on the synthetic physical stores.  Publish
+    // their proven owner so Csharpminor can form `&owner + byte_delta` instead
+    // of interpreting a normalized frame displacement as an absolute address.
+    relation frame_write_storage_owner(Address, Address, i64, i64, RTLReg);
+    frame_write_storage_owner(*func, synth2, *write_ofs, *base_ofs, *owner) <--
+        arith_store_reg_frame_subcell(addr, func, write_ofs, _, base_ofs, _, owner),
+        let synth2 = *addr | (1u64 << 63);
+
+    frame_write_storage_owner(*func, synth2, *write_ofs, *base_ofs, *owner) <--
+        arith_store_imm_frame_subcell(addr, func, write_ofs, _, base_ofs, _, owner),
+        let synth2 = *addr | (1u64 << 63);
 
     rtl_edge_negated(addr, next) <--
         arith_store_imm(addr, _, _, _, _),
@@ -8419,7 +8583,8 @@ ascent_par! {
         if normalized_ofs == reload_ofs && *decoded_width == cell_width,
         settled_frame_write_state(func, reload, reaching),
         for origin in reaching.0.iter(),
-        if let FrameWriteOrigin::Write(spill, write_ofs, write_width) = origin,
+        if frame_origin_tracks(origin, *reload_ofs, cell_width),
+        if let FrameWriteOrigin::Write(spill, write_ofs, write_width, _, _) = origin,
         if *write_ofs == *reload_ofs && i64::try_from(*write_width).ok() == Some(*pointer_width),
         ltl_inst(spill, ?LTLInst::Lsetstack(src, Slot::Local, spill_ofs, spill_typ)),
         if spill_ofs == reload_ofs && typ_is_pointer_width(spill_typ, *pointer_width),
@@ -8436,7 +8601,7 @@ ascent_par! {
         if normalized_ofs == reload_ofs && *decoded_width == cell_width,
         settled_frame_write_state(func, reload, reaching),
         for origin in reaching.0.iter(),
-        if frame_origin_overlaps(origin, *reload_ofs, cell_width),
+        if frame_origin_tracks(origin, *reload_ofs, cell_width),
         if matches!(origin, FrameWriteOrigin::Unwritten(..) | FrameWriteOrigin::Unknown(..));
 
     stack_addr_reload_state_conflict(*func, *reload, *dst) <--
@@ -8448,8 +8613,8 @@ ascent_par! {
         if normalized_ofs == reload_ofs && *decoded_width == cell_width,
         settled_frame_write_state(func, reload, reaching),
         for origin in reaching.0.iter(),
-        if frame_origin_overlaps(origin, *reload_ofs, cell_width),
-        if let FrameWriteOrigin::Write(spill, _, _) = origin,
+        if frame_origin_tracks(origin, *reload_ofs, cell_width),
+        if let FrameWriteOrigin::Write(spill, _, _, _, _) = origin,
         !stack_addr_reload_edge(func, reload, dst, spill, _);
 
     #[local] lattice reg_stack_addr_origins(Address, Address, Mreg, Set<StackAddrOrigin>);
@@ -9947,51 +10112,6 @@ ascent_par! {
         slot_escaped_region_canonical_raw(func, ofs, _),
         agg local = ascent::aggregators::min(c) in slot_escaped_region_canonical_raw(func, ofs, c);
 
-    // A stack read may begin inside a wider scalar/object rather than at a
-    // stack_var root.  Preserve the physical owner as an explicit handoff to
-    // Csharpminor so Ainstack(n) never degenerates into a dereference of the
-    // integer literal n.  Reachability comes exclusively from the point-keyed
-    // frame-write Set lattice; the interval comparisons below only establish
-    // byte containment inside that structurally reaching write.
-    #[local] relation frame_read_origin(Address, Address, i64, usize, FrameWriteOrigin);
-    frame_read_origin(*func, *read, *read_ofs, *read_width, *origin) <--
-        frame_stack_read_bytes(func, read, read_ofs, read_width),
-        settled_frame_write_state(func, read, state),
-        for origin in state.0.iter(),
-        if frame_origin_overlaps(origin, *read_ofs, *read_width);
-
-    #[local] relation frame_read_reaching_owner_raw(Address, Address, i64, i64, RTLReg);
-    frame_read_reaching_owner_raw(*func, *read, *read_ofs, *owner_ofs, *owner) <--
-        frame_read_origin(func, read, read_ofs, read_width, origin),
-        if let FrameWriteOrigin::Write(write, owner_ofs, owner_width) = origin,
-        if frame_interval_contains(*owner_ofs, *owner_width, *read_ofs, *read_width),
-        stack_var(func, write, owner_ofs, owner);
-
-    // Every overlapping may-origin must be a full covering write with a
-    // canonical local.  An unwritten/unknown join arm, a partial overwrite, or
-    // an unmodeled writer makes the owner ambiguous and suppresses the handoff.
-    #[local] relation frame_read_bad_reaching_state(Address, Address);
-    frame_read_bad_reaching_state(*func, *read) <--
-        frame_read_origin(func, read, _, _, origin),
-        if !matches!(origin, FrameWriteOrigin::Write(..));
-
-    frame_read_bad_reaching_state(*func, *read) <--
-        frame_read_origin(func, read, read_ofs, read_width, origin),
-        if let FrameWriteOrigin::Write(_, owner_ofs, owner_width) = origin,
-        if !frame_interval_contains(*owner_ofs, *owner_width, *read_ofs, *read_width);
-
-    frame_read_bad_reaching_state(*func, *read) <--
-        frame_read_origin(func, read, read_ofs, read_width, origin),
-        if let FrameWriteOrigin::Write(write, owner_ofs, owner_width) = origin,
-        if frame_interval_contains(*owner_ofs, *owner_width, *read_ofs, *read_width),
-        !stack_var(func, write, owner_ofs, _);
-
-    #[local] relation frame_read_reaching_owner_conflict(Address, Address);
-    frame_read_reaching_owner_conflict(*func, *read) <--
-        frame_read_reaching_owner_raw(func, read, _, left_ofs, left),
-        frame_read_reaching_owner_raw(func, read, _, right_ofs, right),
-        if (*left_ofs, *left) != (*right_ofs, *right);
-
     // Calls through a proven escaped object can overwrite a caller initializer
     // without appearing as a direct frame write.  The exact escaped field is
     // therefore stronger ownership evidence than a pre-call reaching write.
@@ -10027,9 +10147,7 @@ ascent_par! {
         !frame_read_escaped_owner_conflict(func, read);
 
     frame_read_storage_owner(*func, *read, *read_ofs, *base_ofs, *owner) <--
-        frame_read_reaching_owner_raw(func, read, read_ofs, base_ofs, owner),
-        !frame_read_bad_reaching_state(func, read),
-        !frame_read_reaching_owner_conflict(func, read),
+        direct_frame_storage_owner(func, read, read_ofs, _, _, base_ofs, _, owner),
         !frame_read_escaped_owner_raw(func, read, _, _, _);
 
     // Retain the exact writer behind a direct subcell owner.  Clight uses this
@@ -10046,13 +10164,32 @@ ascent_par! {
         *write_width,
         *owner,
     ) <--
+        direct_frame_storage_owner(
+            func,
+            read,
+            read_ofs,
+            _,
+            write,
+            base_ofs,
+            write_width,
+            owner,
+        ),
+        !frame_read_escaped_owner_raw(func, read, _, _, _);
+
+    // Exact physical-memory reads need an address expression even when the
+    // access begins at the owner's base.  The latter occurs for byte/word RMWs
+    // of the low subcell of a wider scalar; offset inequality alone misses it.
+    // Escaped owners currently carry field containment rather than a whole
+    // object width, so retain their established interior-offset case too.
+    relation frame_read_storage_access_owner(Address, Address, i64, i64, RTLReg);
+    frame_read_storage_access_owner(*func, *read, *read_ofs, *base_ofs, *owner) <--
+        frame_read_reaching_storage(func, read, read_ofs, _, base_ofs, owner_width, owner),
+        frame_stack_read_bytes(func, read, read_ofs, read_width),
+        if *read_ofs != *base_ofs || *read_width < *owner_width;
+
+    frame_read_storage_access_owner(*func, *read, *read_ofs, *base_ofs, *owner) <--
         frame_read_storage_owner(func, read, read_ofs, base_ofs, owner),
-        !frame_read_escaped_owner_raw(func, read, _, _, _),
-        frame_read_origin(func, read, read_ofs, read_width, origin),
-        if let FrameWriteOrigin::Write(write, write_ofs, write_width) = origin,
-        if write_ofs == base_ofs,
-        if frame_interval_contains(*write_ofs, *write_width, *read_ofs, *read_width),
-        stack_var(func, write, write_ofs, owner);
+        if read_ofs != base_ofs;
 
     stack_var_chunk(*func, ofs, chunk) <--
         ltl_inst(node, ?LTLInst::Lload(chunk, Addressing::Ainstack(ofs), _, _)),
@@ -16437,8 +16574,8 @@ mod tests {
                         func,
                         reload,
                         Set(std::collections::BTreeSet::from([
-                            FrameWriteOrigin::Write(spill, spill_ofs, 8),
-                            FrameWriteOrigin::Write(overwrite, spill_ofs + 1, 1),
+                            FrameWriteOrigin::Write(spill, spill_ofs, 8, spill_ofs, 8),
+                            FrameWriteOrigin::Write(overwrite, spill_ofs + 1, 1, spill_ofs, 8),
                         ])),
                     ));
                 } else {
@@ -16453,7 +16590,7 @@ mod tests {
                     prog.settled_frame_write_state.push((
                         func,
                         reload,
-                        Set::singleton(FrameWriteOrigin::Write(spill, spill_ofs, 4)),
+                        Set::singleton(FrameWriteOrigin::Write(spill, spill_ofs, 4, spill_ofs, 8)),
                     ));
                 }
                 prog.frame_stack_read_bytes
@@ -16585,7 +16722,7 @@ mod tests {
             prog.settled_frame_write_state.push((
                 func,
                 reload,
-                Set::singleton(FrameWriteOrigin::Write(spill, spill_ofs, 8)),
+                Set::singleton(FrameWriteOrigin::Write(spill, spill_ofs, 8, spill_ofs, 8)),
             ));
             prog.arg_setup_candidate.push((reload, Mreg::DI, call));
 
@@ -16660,7 +16797,13 @@ mod tests {
                 prog.settled_frame_write_state.push((
                     func,
                     reload,
-                    Set::singleton(FrameWriteOrigin::Write(spill, spill_ofs, 8)),
+                    Set::singleton(FrameWriteOrigin::Write(
+                        spill,
+                        spill_ofs,
+                        8,
+                        normalized_read,
+                        8,
+                    )),
                 ));
 
                 prog.run();
@@ -16879,7 +17022,7 @@ mod tests {
                 prog.settled_frame_write_state.push((
                     func,
                     reload,
-                    Set::singleton(FrameWriteOrigin::Write(spill, spill_ofs, 8)),
+                    Set::singleton(FrameWriteOrigin::Write(spill, spill_ofs, 8, spill_ofs, 8)),
                 ));
                 seed_pointer_width_copy(&mut prog, copy, "R15", "RDI");
 
@@ -20109,8 +20252,11 @@ mod tests {
             reaching.settled_frame_write_state.push((
                 func,
                 read,
-                Set::singleton(FrameWriteOrigin::Write(write, 4, 4)),
+                Set::singleton(FrameWriteOrigin::Write(write, 4, 4, 5, 1)),
             ));
+            reaching
+                .settled_frame_storage_origin
+                .push((func, read, 5, 1, write, 4, 4));
             reaching.stack_var.push((func, write, 4, owner));
             reaching.run();
             assert!(reaching
@@ -20129,7 +20275,7 @@ mod tests {
                 func,
                 read,
                 Set(BTreeSet::from([
-                    FrameWriteOrigin::Write(write, 4, 4),
+                    FrameWriteOrigin::Write(write, 4, 4, 5, 1),
                     FrameWriteOrigin::Unwritten(5, 1),
                 ])),
             ));
@@ -20173,6 +20319,116 @@ mod tests {
                 .frame_read_storage_owner
                 .iter()
                 .any(|fact| fact == &(func, projected_read, 17, 16, projected_owner)));
+        });
+    }
+
+    #[test]
+    fn narrow_frame_rmw_uses_decoded_chunks_through_the_reaching_storage_owner() {
+        on_large_stack(|| {
+            let func = 0x600;
+            let init = 0x610;
+            let reg_rmw = 0x620;
+            let imm_rmw = 0x630;
+            let owner = 0x9000;
+            let source = 0x9100;
+            let mut prog = RTLPassProgram::default();
+
+            prog.stack_var.push((func, init, -8, owner));
+
+            // The low-byte case has an exact stack_var at the same base.  It
+            // must still remain a byte-addressed access because its decoded
+            // width is narrower than the physical owner.
+            prog.stack_var.push((func, reg_rmw, -8, owner));
+            prog.arith_store_reg.push((
+                reg_rmw,
+                Operation::Oadd,
+                MemoryChunk::MInt8Unsigned,
+                Mreg::SP,
+                -8,
+                Mreg::AX,
+            ));
+            prog.reg_rtl.push((reg_rmw, Mreg::AX, source));
+            prog.frame_stack_read_bytes.push((func, reg_rmw, -8, 1));
+            prog.frame_stack_write_bytes.push((func, reg_rmw, -8, 1));
+            prog.settled_frame_write_state.push((
+                func,
+                reg_rmw,
+                Set::singleton(FrameWriteOrigin::Write(init, -8, 8, -8, 1)),
+            ));
+            prog.settled_frame_storage_origin
+                .push((func, reg_rmw, -8, 1, init, -8, 8));
+
+            // The interior word has no scalar stack_var root of its own.
+            prog.arith_store_imm.push((
+                imm_rmw,
+                Operation::Oaddimm(-3),
+                MemoryChunk::MInt16Unsigned,
+                Mreg::SP,
+                -6,
+            ));
+            prog.frame_stack_read_bytes.push((func, imm_rmw, -6, 2));
+            prog.frame_stack_write_bytes.push((func, imm_rmw, -6, 2));
+            prog.settled_frame_write_state.push((
+                func,
+                imm_rmw,
+                Set::singleton(FrameWriteOrigin::Write(init, -8, 8, -6, 2)),
+            ));
+            prog.settled_frame_storage_origin
+                .push((func, imm_rmw, -6, 2, init, -8, 8));
+
+            for node in [init, reg_rmw, imm_rmw] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.run();
+
+            for (rmw, chunk, ofs, op, args) in [
+                (
+                    reg_rmw,
+                    MemoryChunk::MInt8Unsigned,
+                    -8,
+                    Operation::Oadd,
+                    vec![fresh_xtl_reg(reg_rmw, Mreg::x86("RTEMP")), source],
+                ),
+                (
+                    imm_rmw,
+                    MemoryChunk::MInt16Unsigned,
+                    -6,
+                    Operation::Oaddimm(-3),
+                    vec![fresh_xtl_reg(imm_rmw, Mreg::x86("RTEMP"))],
+                ),
+            ] {
+                let temp = fresh_xtl_reg(rmw, Mreg::x86("RTEMP"));
+                let op_node = rmw | (1u64 << 62);
+                let store_node = rmw | (1u64 << 63);
+                let result = fresh_xtl_reg(op_node, Mreg::x86("RTEMP"));
+
+                assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                    fact == &(
+                        rmw,
+                        RTLInst::Iload(chunk, Addressing::Ainstack(ofs), Arc::new(vec![]), temp),
+                    )
+                }));
+                assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                    fact == &(
+                        op_node,
+                        RTLInst::Iop(op.clone(), Arc::new(args.clone()), result),
+                    )
+                }));
+                assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                    fact == &(
+                        store_node,
+                        RTLInst::Istore(chunk, Addressing::Ainstack(ofs), Arc::new(vec![]), result),
+                    )
+                }));
+                assert!(prog
+                    .frame_write_storage_owner
+                    .iter()
+                    .any(|fact| fact == &(func, store_node, ofs, -8, owner)));
+            }
+
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == reg_rmw && matches!(inst, RTLInst::Iop(_, _, dst) if *dst == owner)
+            }));
         });
     }
 
