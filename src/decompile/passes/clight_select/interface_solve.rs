@@ -15,8 +15,8 @@ use crate::decompile::passes::c_pass::types::{CType, TypeQualifiers};
 use crate::decompile::passes::clight_select::candtype::{CandType, Sign};
 use crate::decompile::passes::clight_select::ctyping::{self, Severity};
 use crate::decompile::passes::clight_select::query::{
-    CalleeSignature, CommittedInterfaces, FunctionData, InterfaceClass, InterfaceVar,
-    InterfaceVarId, InterfaceVars, KnownGlobalTypes,
+    CalleeSignature, CommittedInterfaces, FunctionData, InterfaceAuthority, InterfaceClass,
+    InterfaceVar, InterfaceVarId, InterfaceVars, KnownGlobalTypes,
 };
 use crate::decompile::passes::clight_select::select::{
     callee_ident_from_expr, ProgramSelectionState,
@@ -75,6 +75,16 @@ struct CallEdge {
     arg_regs: Vec<Option<RTLReg>>,
     result: Option<InterfaceClass>,
     result_reg: Option<RTLReg>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ExternPassThrough {
+    caller: Address,
+    callee: Ident,
+    node: Node,
+    caller_position: usize,
+    callee_position: usize,
+    expected: InterfaceClass,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -391,6 +401,56 @@ fn call_edges(
                 right.result_reg,
             ))
     });
+    out
+}
+
+/// Exact external ABI evidence for an internal parameter passed directly to
+/// a known extern.  The Clight edge may contain a cast inserted only because
+/// Stage A selected the wrong declaration; `bare_reg` deliberately looks
+/// through that cast and identifies the underlying parameter object.
+fn extern_pass_throughs(
+    functions: &[FunctionData],
+    edges: &[CallEdge],
+    initial: &CommittedInterfaces,
+) -> Vec<ExternPassThrough> {
+    let by_addr: BTreeMap<Address, &FunctionData> =
+        functions.iter().map(|func| (func.address, func)).collect();
+    let mut out = Vec::new();
+    for edge in edges {
+        let Some(callee) = initial
+            .functions
+            .get(&edge.callee)
+            .filter(|iface| iface.authority == InterfaceAuthority::Extern)
+        else {
+            continue;
+        };
+        let Some(caller) = by_addr.get(&edge.caller) else {
+            continue;
+        };
+        for (callee_position, arg_reg) in edge.arg_regs.iter().enumerate() {
+            let Some(arg_reg) = arg_reg else { continue };
+            let Some(caller_position) = caller
+                .param_regs
+                .iter()
+                .position(|candidate| candidate == arg_reg)
+            else {
+                continue;
+            };
+            let Some(expected) = callee.signature.param_types.get(callee_position) else {
+                continue;
+            };
+            out.push(ExternPassThrough {
+                caller: edge.caller,
+                callee: edge.callee,
+                node: edge.node,
+                caller_position,
+                callee_position,
+                expected: InterfaceClass::from_xtype(expected),
+            });
+        }
+    }
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -1067,6 +1127,7 @@ pub(crate) fn solve_with_global_feedback(
         .collect();
     let ptr64 = functions.first().map(|func| func.ptr64).unwrap_or(true);
     let edges = call_edges(functions, state, name_to_ident);
+    let extern_pass_throughs = extern_pass_throughs(functions, &edges, initial);
     let preferences = stage_a_preferences(vars, functions, state);
     let (declarations, declaration_votes) =
         declaration_vars(functions, state, initial, name_to_ident);
@@ -1206,6 +1267,35 @@ pub(crate) fn solve_with_global_feedback(
                     &declaration.domain,
                     declaration.domain[0],
                     declaration.votes,
+                );
+            }
+
+            // A known external ABI is stronger than the currently selected
+            // caller expression, whose cast and pointer annotation may be a
+            // consequence of the very interface error Stage B is solving.
+            // Keep this soft: a source wrapper may intentionally cast its own
+            // parameter before the call.  Structural weight makes exact ABI
+            // evidence dominate ordinary call-site agreement and the rank-0
+            // prior, while legality remains the higher stratum.
+            for pass_through in &extern_pass_throughs {
+                let id = InterfaceVarId::Param {
+                    function: pass_through.caller as Ident,
+                    position: pass_through.caller_position,
+                };
+                let Some(&index) = var_index.get(&id) else {
+                    continue;
+                };
+                let Some(alternative) = vars.vars[index]
+                    .domain
+                    .iter()
+                    .position(|candidate| candidate.class == pass_through.expected)
+                else {
+                    continue;
+                };
+                opt.assert_soft(
+                    &zvars[index]._eq(Int::from_u64(alternative as u64)),
+                    config::CONFIG.interface.structural_weight,
+                    None,
                 );
             }
 
@@ -1465,6 +1555,17 @@ pub(crate) fn solve_with_global_feedback(
             crate::decompile::passes::clight_select::flow::aval_label(item.claimed),
         ));
     }
+    for pass_through in &extern_pass_throughs {
+        dump.push_str(&format!(
+            "# extern-pass-through caller={:x} node={:x} callee={:x} caller-param={} callee-param={} expected={}\n",
+            pass_through.caller,
+            pass_through.node,
+            pass_through.callee,
+            pass_through.caller_position,
+            pass_through.callee_position,
+            pass_through.expected.label(),
+        ));
+    }
     for edge in &edges {
         dump.push_str(&format!(
             "# edge caller={:x} node={:x} callee={:x} args={} arg_regs={} result={} result_reg={}\n",
@@ -1666,6 +1767,126 @@ mod tests {
         assert!(!outcome
             .declaration_assignments
             .contains_key(&(caller_addr, 11)));
+    }
+
+    #[test]
+    fn known_extern_abi_outweighs_a_wrappers_pointer_prior() {
+        let wrapper_addr = 0x100;
+        let extern_addr = 0x200;
+        let call = 0x110;
+        let param = 0x700;
+        let ptr_ty = ClightType::Tpointer(Arc::new(int_ty()), ClightAttr::default());
+        let ulong_ty = ClightType::Tlong(ClightSignedness::Unsigned, ClightAttr::default());
+
+        let mut wrapper = FunctionData::new(
+            wrapper_addr,
+            "wrapper".into(),
+            vec![param],
+            vec![ParamType::Typed(XType::Xptr)],
+            None,
+            0,
+            call,
+            true,
+        );
+        wrapper.used_regs.insert(param);
+        wrapper
+            .var_type_candidates
+            .insert(param, vec![CandType::PtrInt, CandType::I64(Sign::Unsigned)]);
+        wrapper.node_statements.insert(
+            call,
+            vec![ClightStmt::Scall(
+                None,
+                ClightExpr::EvarSymbol(
+                    "external".into(),
+                    ClightType::Tfunction(
+                        Arc::new(vec![ulong_ty.clone()]),
+                        Arc::new(ClightType::Tvoid),
+                        CallConv::default(),
+                    ),
+                ),
+                vec![ClightExpr::Ecast(
+                    Box::new(ClightExpr::Etempvar(param as Ident, ptr_ty)),
+                    ulong_ty,
+                )],
+            )],
+        );
+
+        let wrapper_signature = CalleeSignature {
+            param_count: 1,
+            return_type: XType::Xvoid,
+            param_types: vec![XType::Xptr],
+            is_varargs: false,
+        };
+        let external_signature = CalleeSignature {
+            param_count: 1,
+            return_type: XType::Xvoid,
+            param_types: vec![XType::Xlongunsigned],
+            is_varargs: false,
+        };
+        wrapper
+            .callee_signatures
+            .insert(extern_addr as Ident, external_signature.clone());
+
+        let mut committed = CommittedInterfaces::default();
+        committed.functions.insert(
+            wrapper_addr as Ident,
+            CommittedFunctionInterface {
+                signature: wrapper_signature,
+                authority: InterfaceAuthority::Reconciled,
+            },
+        );
+        committed.functions.insert(
+            extern_addr as Ident,
+            CommittedFunctionInterface {
+                signature: external_signature,
+                authority: InterfaceAuthority::Extern,
+            },
+        );
+        let vars = InterfaceVars {
+            vars: vec![InterfaceVar {
+                id: InterfaceVarId::Param {
+                    function: wrapper_addr as Ident,
+                    position: 0,
+                },
+                domain: vec![
+                    InterfaceAlternative {
+                        class: InterfaceClass::PtrInt,
+                        xtype: XType::Xptr,
+                    },
+                    InterfaceAlternative {
+                        class: InterfaceClass::Int,
+                        xtype: XType::Xlongunsigned,
+                    },
+                ],
+                hard_rank0: false,
+            }],
+            ..InterfaceVars::default()
+        };
+        let state = ProgramSelectionState {
+            candidate_idx: [((wrapper_addr, call), Some(0))].into_iter().collect(),
+            var_decl_idx: [((wrapper_addr, param), 0)].into_iter().collect(),
+            var_type_override: HashMap::new(),
+        };
+
+        let outcome = solve(
+            &[wrapper],
+            &state,
+            &vars,
+            &committed,
+            &[("external".into(), extern_addr as Ident)]
+                .into_iter()
+                .collect(),
+            crate::abi::DataModel::Lp64,
+        );
+
+        assert_eq!(
+            outcome.assignments[&InterfaceVarId::Param {
+                function: wrapper_addr as Ident,
+                position: 0,
+            }],
+            InterfaceClass::Int
+        );
+        assert!(outcome.instance_dump.contains("# extern-pass-through"));
     }
 
     #[test]

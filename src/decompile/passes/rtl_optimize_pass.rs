@@ -71,7 +71,151 @@ pub(crate) fn observable_stack_storage_regs(db: &DecompileDB) -> HashMap<Address
     {
         regs.entry(func).or_default().insert(owner);
     }
+    let mut indexed_bases: HashMap<Address, Vec<i64>> = HashMap::new();
+    for &(func, base) in db.rel_iter::<(Address, i64)>("indexed_stack_base_offset") {
+        indexed_bases.entry(func).or_default().push(base);
+    }
+    let mut explicit_frame_tops: HashMap<Address, i64> = HashMap::new();
+    for &(func, _, _, size) in
+        db.rel_iter::<(Address, Address, crate::x86::types::Symbol, u64)>("func_stacksz")
+    {
+        let Ok(size) = i64::try_from(size) else {
+            continue;
+        };
+        explicit_frame_tops
+            .entry(func)
+            .and_modify(|current| *current = (*current).max(size))
+            .or_insert(size);
+    }
+    let exact_stack_address_nodes: HashSet<Node> = db
+        .rel_iter::<(Node, RTLReg)>("exact_stack_addr_ptr_result")
+        .map(|(node, _)| *node)
+        .collect();
+    for &(func, node, offset, _) in db.rel_iter::<(Address, Node, i64, RTLReg)>("stack_var") {
+        if !exact_stack_address_nodes.contains(&node) {
+            continue;
+        }
+        indexed_bases.entry(func).or_default().push(offset);
+        // Framed BP addresses are published in the normalized [0, frame_top)
+        // coordinate, while scalar Lsetstack/Lgetstack cells retain their raw
+        // negative BP displacement. Preserve both spellings of the same base.
+        if offset >= 0 {
+            if let Some(raw) = explicit_frame_tops
+                .get(&func)
+                .and_then(|top| offset.checked_sub(*top))
+                .filter(|raw| *raw < 0)
+            {
+                indexed_bases.entry(func).or_default().push(raw);
+            }
+        }
+    }
+    let mut node_owners: HashMap<Node, HashSet<Address>> = HashMap::new();
+    for &(node, func) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        node_owners.entry(node).or_default().insert(func);
+    }
+    let mut structurally_used_offsets: HashMap<Address, HashSet<i64>> = HashMap::new();
+    for &(def, _, def_offset, use_node, _, use_offset) in db.rel_iter::<(
+        Address,
+        crate::x86::types::Symbol,
+        i64,
+        Address,
+        crate::x86::types::Symbol,
+        i64,
+    )>("stack_def_used")
+    {
+        let (Some(def_owners), Some(use_owners)) =
+            (node_owners.get(&def), node_owners.get(&use_node))
+        else {
+            continue;
+        };
+        for func in def_owners.intersection(use_owners) {
+            structurally_used_offsets
+                .entry(*func)
+                .or_default()
+                .extend([def_offset, use_offset]);
+        }
+    }
+    for &(func, _node, offset, local) in db.rel_iter::<(Address, Node, i64, RTLReg)>("stack_var") {
+        let in_indexed_storage = indexed_bases.get(&func).is_some_and(|bases| {
+            bases.iter().any(|base| {
+                if *base < 0 {
+                    offset >= *base && offset < 0
+                } else {
+                    explicit_frame_tops
+                        .get(&func)
+                        .is_some_and(|top| offset >= *base && offset < *top)
+                }
+            })
+        });
+        let has_structural_memory_use = structurally_used_offsets
+            .get(&func)
+            .is_some_and(|offsets| offsets.contains(&offset));
+        if in_indexed_storage || has_structural_memory_use {
+            regs.entry(func).or_default().insert(local);
+        }
+    }
     regs
+}
+
+/// Preserve the selected destination spelling of every exact pointer-width
+/// stack-address definition.  The authority relation is keyed by the raw RTL
+/// definition, while candidate selection can publish its canonical alias as
+/// the instruction destination.  Protecting only stack_var's storage-local id
+/// therefore lets DSE bypass the LEA even though downstream copy elimination
+/// resolves a call argument back to that address value.
+fn protect_exact_stack_address_definitions(
+    exact_nodes: &HashSet<Node>,
+    instructions: &BTreeMap<Node, RTLInst>,
+    protected_regs: &mut HashSet<RTLReg>,
+) {
+    for node in exact_nodes {
+        let Some(RTLInst::Iop(op, args, destination)) = instructions.get(node) else {
+            continue;
+        };
+        if args.is_empty()
+            && matches!(
+                op,
+                Operation::Olea(crate::x86::op::Addressing::Ainstack(_))
+                    | Operation::Oleal(crate::x86::op::Addressing::Ainstack(_))
+            )
+        {
+            protected_regs.insert(*destination);
+        }
+    }
+}
+
+/// Retarget an `Icond`'s false arm to the first semantic node on the decoded
+/// physical fallthrough.  The taken arm is left untouched.  This is needed
+/// when RTL materializes an instruction that Linear did not have: the older
+/// condition can otherwise jump around that new node even though it remains a
+/// live definition in the optimized program.
+fn repair_conditional_fallthrough(
+    inst: &mut RTLInst,
+    successors: &mut Vec<Node>,
+    structural_fallthrough: Node,
+) -> bool {
+    let RTLInst::Icond(_, _, _, Either::Right(current_fallthrough)) = inst else {
+        return false;
+    };
+    if *current_fallthrough == structural_fallthrough {
+        return false;
+    }
+
+    let stale = *current_fallthrough;
+    *current_fallthrough = structural_fallthrough;
+    let mut replaced = false;
+    for successor in successors.iter_mut() {
+        if *successor == stale {
+            *successor = structural_fallthrough;
+            replaced = true;
+        }
+    }
+    if !replaced {
+        successors.push(structural_fallthrough);
+    }
+    successors.sort_unstable();
+    successors.dedup();
+    true
 }
 
 // Resolve a raw instruction address to the first semantic RTL node reached by
@@ -1423,8 +1567,11 @@ impl IRPass for RTLOptimizePass {
             "slot_escaped_canonical",
             "slot_escaped_region_canonical",
             "frame_read_storage_owner",
+            "indexed_stack_base_offset",
+            "exact_stack_addr_ptr_result",
             "stack_var",
             "stack_def_used",
+            "func_stacksz",
         ]
     }
 }
@@ -1442,7 +1589,9 @@ pub(crate) struct FunctionCFG {
     pub(crate) mem_call_addr_uses: HashMap<Node, Vec<RTLReg>>,
     // Jump-table dispatch entries of IN-LOOP tables: collapsing one threads the guard past the switch, so only these are protected from nop_collapse.
     pub(crate) dispatch_entry_nodes: HashSet<Node>,
-    // Canonical SSA regs of address-escaped stack slots: the callee may write through the escaped pointer, a use reg liveness cannot see, so their stores are excluded from DSE.
+    // Definitions whose stack identity is observable outside ordinary RTL
+    // liveness: address-escaped/overlapping storage locals plus the selected
+    // destination spelling of an exact stack-address LEA.
     pub(crate) escaped_slot_regs: HashSet<RTLReg>,
     // Frame-slot SSA regs whose slot has more than one definition reaching a
     // single read.  Their RTL def count is not the slot's definition count, so
@@ -1558,6 +1707,10 @@ impl PassContext {
         }
 
         let mut escaped_slot_regs = observable_stack_storage_regs(db);
+        let exact_stack_address_nodes: HashSet<Node> = db
+            .rel_iter::<(Node, RTLReg)>("exact_stack_addr_ptr_result")
+            .map(|(node, _)| *node)
+            .collect();
 
         // Per function, the frame-slot SSA names whose slot is written by more
         // than one instruction reaching the same read.  StackAnalysis pairs
@@ -1745,11 +1898,12 @@ impl PassContext {
         }
 
         let mut functions = BTreeMap::new();
-        for (&func_addr, insts) in &func_insts {
+        for (&func_addr, original_func_insts) in &func_insts {
             let raw_entry = match func_entries.get(&func_addr) {
                 Some(&e) => e,
                 None => continue,
             };
+            let mut insts = original_func_insts.clone();
             let nodes: BTreeSet<Node> = insts.keys().copied().collect();
 
             let mut raw_succs = func_succs.remove(&func_addr).unwrap_or_default();
@@ -1763,23 +1917,28 @@ impl PassContext {
             //
             // At this point candidate selection is complete, so repair the
             // fallthrough against the actual semantic-node set. This applies
-            // to every straight-line instruction unless RTL has explicitly
-            // routed it into a synthetic expansion. Synthetic nodes have
-            // dedicated tag bits (a namespace classification, not an ordering
-            // proxy), so that exception is exact. The successor itself is
-            // found solely by walking the structural raw-next chain within
-            // this function.
-            for (&src, inst) in insts {
-                if !matches!(
-                    inst,
-                    RTLInst::Inop
-                        | RTLInst::Iop(..)
-                        | RTLInst::Iload(..)
-                        | RTLInst::Istore(..)
-                        | RTLInst::Ibuiltin(..)
-                ) {
-                    continue;
-                }
+            // to every straight-line instruction and to an Icond's false arm,
+            // unless RTL has explicitly routed the node into a synthetic
+            // expansion. Synthetic nodes have dedicated tag bits (a namespace
+            // classification, not an ordering proxy), so that exception is
+            // exact. The successor itself is found solely by walking the
+            // structural raw-next chain within this function.
+            let repairable_nodes: Vec<(Node, bool)> = insts
+                .iter()
+                .filter_map(|(&src, inst)| {
+                    let straight_line = matches!(
+                        inst,
+                        RTLInst::Inop
+                            | RTLInst::Iop(..)
+                            | RTLInst::Iload(..)
+                            | RTLInst::Istore(..)
+                            | RTLInst::Ibuiltin(..)
+                    );
+                    let condition = matches!(inst, RTLInst::Icond(..));
+                    (straight_line || condition).then_some((src, condition))
+                })
+                .collect();
+            for (src, condition) in repairable_nodes {
                 let Some(raw_dsts) = raw_next.get(&src) else {
                     continue;
                 };
@@ -1803,7 +1962,14 @@ impl PassContext {
                     })
                 });
                 if !enters_synthetic_expansion {
-                    raw_succs.insert(src, vec![structural_dst]);
+                    if condition {
+                        if let Some(inst) = insts.get_mut(&src) {
+                            let successors = raw_succs.entry(src).or_default();
+                            repair_conditional_fallthrough(inst, successors, structural_dst);
+                        }
+                    } else {
+                        raw_succs.insert(src, vec![structural_dst]);
+                    }
                 }
             }
 
@@ -1919,6 +2085,14 @@ impl PassContext {
                 .copied()
                 .collect();
 
+            let mut protected_storage_regs =
+                escaped_slot_regs.remove(&func_addr).unwrap_or_default();
+            protect_exact_stack_address_definitions(
+                &exact_stack_address_nodes,
+                &insts,
+                &mut protected_storage_regs,
+            );
+
             let mut func = FunctionCFG {
                 func_addr,
                 entry,
@@ -1929,7 +2103,7 @@ impl PassContext {
                 params: func_params.remove(&func_addr).unwrap_or_default(),
                 mem_call_addr_uses: func_mem_call_uses,
                 dispatch_entry_nodes: HashSet::new(),
-                escaped_slot_regs: escaped_slot_regs.remove(&func_addr).unwrap_or_default(),
+                escaped_slot_regs: protected_storage_regs,
                 multi_def_slot_regs: multi_def_slot_regs.remove(&func_addr).unwrap_or_default(),
                 shared_nodes: function_shared_nodes,
             };
@@ -2972,10 +3146,10 @@ pub(crate) fn find_inline_temps(
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_propagation, find_inline_temps, fold_static_eq_branches,
-        observable_stack_storage_regs, optimize_rtl_candidates, reachable_from,
-        unique_external_cfg_entry, DefUseInfo, FunctionCFG, LivenessInfo, PassContext,
-        RTLOptimizePass,
+        copy_propagation, dead_store_elimination, find_inline_temps, fold_static_eq_branches,
+        observable_stack_storage_regs, optimize_rtl_candidates,
+        protect_exact_stack_address_definitions, reachable_from, unique_external_cfg_entry,
+        DefUseInfo, FunctionCFG, LivenessInfo, PassContext, RTLOptimizePass,
     };
     use crate::decompile::elevator::DecompileDB;
     use crate::decompile::passes::pass::IRPass;
@@ -3037,6 +3211,123 @@ mod tests {
 
         let protected = observable_stack_storage_regs(&db);
         assert_eq!(protected.get(&func), Some(&HashSet::from([owner])));
+    }
+
+    #[test]
+    fn indexed_stack_base_marks_interval_initializers_observable() {
+        let func: u64 = 0x2000;
+        let inside_base: u64 = 0x7100;
+        let inside_tail: u64 = 0x7200;
+        let below_base: u64 = 0x7300;
+        let nonnegative: u64 = 0x7400;
+        let mut db = DecompileDB::default();
+        db.rel_push("indexed_stack_base_offset", (func, -16_i64));
+        for (node, offset, local) in [
+            (0x2010_u64, -16_i64, inside_base),
+            (0x2020_u64, -4_i64, inside_tail),
+            (0x2030_u64, -20_i64, below_base),
+            (0x2040_u64, 0_i64, nonnegative),
+        ] {
+            db.rel_push("stack_var", (func, node, offset, local));
+        }
+        assert_eq!(
+            db.rel_iter::<(u64, i64)>("indexed_stack_base_offset")
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![(func, -16)]
+        );
+        assert_eq!(db.rel_iter::<(u64, u64, i64, u64)>("stack_var").count(), 4);
+
+        let protected = observable_stack_storage_regs(&db);
+        assert_eq!(
+            protected.get(&func),
+            Some(&HashSet::from([inside_base, inside_tail]))
+        );
+    }
+
+    #[test]
+    fn structurally_reloaded_stack_cell_is_observable_storage() {
+        let func: u64 = 0x3000;
+        let def: u64 = 0x3010;
+        let use_node: u64 = 0x3020;
+        let local: u64 = 0x8100;
+        let mut db = DecompileDB::default();
+        db.rel_push("instr_in_function", (def, func));
+        db.rel_push("instr_in_function", (use_node, func));
+        db.rel_push(
+            "stack_def_used",
+            (def, "RBP", -8_i64, use_node, "RBP", -8_i64),
+        );
+        db.rel_push("stack_var", (func, def, -8_i64, local));
+
+        let protected = observable_stack_storage_regs(&db);
+        assert_eq!(protected.get(&func), Some(&HashSet::from([local])));
+    }
+
+    #[test]
+    fn normalized_frame_address_protects_raw_bp_initializer_cells() {
+        let func: u64 = 0x4000;
+        let address_node: u64 = 0x4010;
+        let initializer_node: u64 = 0x4020;
+        let address_reg: u64 = 0x8100;
+        let normalized_local: u64 = 0x8200;
+        let raw_local: u64 = 0x8300;
+        let mut db = DecompileDB::default();
+        db.rel_push("func_stacksz", (func, 0x4100_u64, "framed", 48_u64));
+        db.rel_push("exact_stack_addr_ptr_result", (address_node, address_reg));
+        db.rel_push("stack_var", (func, address_node, 21_i64, normalized_local));
+        db.rel_push("stack_var", (func, initializer_node, -27_i64, raw_local));
+
+        let protected = observable_stack_storage_regs(&db);
+        assert_eq!(
+            protected.get(&func),
+            Some(&HashSet::from([normalized_local, raw_local]))
+        );
+    }
+
+    #[test]
+    fn selected_exact_stack_address_destination_survives_dse() {
+        let address_node = 0x10;
+        let return_node = 0x20;
+        let selected_destination = 0x100;
+        let unrelated_authority_spelling = 0x101;
+        let return_value = 0x200;
+        let address_inst = RTLInst::Iop(
+            Operation::Oleal(Addressing::Ainstack(-208)),
+            Arc::new(vec![]),
+            selected_destination,
+        );
+
+        let make_function = || {
+            synthetic_function(
+                address_node,
+                vec![
+                    (address_node, address_inst.clone()),
+                    (return_node, RTLInst::Ireturn(return_value)),
+                ],
+                &[(address_node, return_node)],
+                &[return_value],
+            )
+        };
+
+        let mut unprotected = make_function();
+        let du = DefUseInfo::build(&unprotected);
+        let liveness = LivenessInfo::build(&unprotected, &du);
+        let (removed, _, _) = dead_store_elimination(&mut unprotected, &du, &liveness);
+        assert_eq!(removed, 1);
+
+        let mut protected = make_function();
+        let exact_nodes = HashSet::from([address_node]);
+        let mut protected_regs = HashSet::from([unrelated_authority_spelling]);
+        protect_exact_stack_address_definitions(&exact_nodes, &protected.inst, &mut protected_regs);
+        assert!(protected_regs.contains(&selected_destination));
+        protected.escaped_slot_regs = protected_regs;
+
+        let du = DefUseInfo::build(&protected);
+        let liveness = LivenessInfo::build(&protected, &du);
+        let (removed, _, _) = dead_store_elimination(&mut protected, &du, &liveness);
+        assert_eq!(removed, 0);
+        assert_eq!(protected.inst.get(&address_node), Some(&address_inst));
     }
 
     #[test]
@@ -3535,6 +3826,78 @@ mod tests {
         let du = DefUseInfo::build(function);
         let liveness = LivenessInfo::build(function, &du);
         assert!(liveness.live_out[&entry].contains(&delimiter));
+    }
+
+    #[test]
+    fn pass_context_interposes_semantic_node_on_conditional_fallthrough() {
+        let func = 0xa000;
+        // Numeric order is deliberately unrelated to execution. The decoded
+        // next chain alone identifies the condition's physical fallthrough.
+        let condition = 0x900;
+        let raw_jcc = 0x100;
+        let materialized = 0x800;
+        let stale_fallthrough = 0x200;
+        let taken = 0x700;
+        let predicate = 1;
+        let address = 2;
+        let mut db = DecompileDB::default();
+
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                condition,
+                RTLInst::Icond(
+                    Condition::Ccomplimm(Comparison::Clt, 0),
+                    Arc::new(vec![predicate]),
+                    Either::Right(taken),
+                    Either::Right(stale_fallthrough),
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                materialized,
+                RTLInst::Iop(
+                    Operation::Oleal(Addressing::Ainstack(-32)),
+                    Arc::new(vec![]),
+                    address,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst_candidate",
+            (stale_fallthrough, RTLInst::Ireturn(address)),
+        );
+        db.rel_push("rtl_inst_candidate", (taken, RTLInst::Ireturn(predicate)));
+        for node in [condition, raw_jcc, materialized, stale_fallthrough, taken] {
+            db.rel_push("instr_in_function", (node, func));
+        }
+        db.rel_push(
+            "emit_function",
+            (func, "conditional_fallthrough", condition),
+        );
+        db.rel_push("emit_function_param_candidate", (func, predicate));
+        db.rel_push("rtl_succ_candidate", (condition, taken));
+        db.rel_push("rtl_succ_candidate", (condition, stale_fallthrough));
+        db.rel_push("rtl_succ_candidate", (materialized, stale_fallthrough));
+        db.rel_push("next", (condition, raw_jcc));
+        db.rel_push("next", (raw_jcc, materialized));
+        db.rel_push("next", (materialized, stale_fallthrough));
+
+        let context = PassContext::load(&db);
+        let function = &context.functions[&func];
+        let successors: BTreeSet<_> = function.succs[&condition].iter().copied().collect();
+        assert_eq!(successors, BTreeSet::from([materialized, taken]));
+        assert!(matches!(
+            function.inst.get(&condition),
+            Some(RTLInst::Icond(
+                _,
+                _,
+                Either::Right(actual_taken),
+                Either::Right(actual_fallthrough)
+            )) if *actual_taken == taken && *actual_fallthrough == materialized
+        ));
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub(crate) fn canonical_variable_clight_type(spelling: &str) -> Option<ClightTyp
             attr.clone(),
         )),
         "long" => Some(ClightType::Tlong(ClightSignedness::Signed, attr.clone())),
+        "unsigned long" => Some(ClightType::Tlong(ClightSignedness::Unsigned, attr.clone())),
         _ => None,
     }
 }
@@ -191,4 +192,18 @@ pub fn header_db() -> &'static HeaderDb {
         }
         db
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_variable_clight_type;
+    use crate::x86::types::{ClightSignedness, ClightType};
+
+    #[test]
+    fn canonical_header_global_preserves_unsigned_long() {
+        assert!(matches!(
+            canonical_variable_clight_type("unsigned long"),
+            Some(ClightType::Tlong(ClightSignedness::Unsigned, _))
+        ));
+    }
 }

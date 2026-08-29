@@ -1267,7 +1267,16 @@ fn build_function_constraints(
             backend.assert_hard(&t.is_func(&tv).not());
             backend.assert_hard(&t.is_void(&tv).not());
             backend.assert_hard(&t.is_union(&tv).not());
-            if func.must_pointer_regs.contains(&reg) {
+            // Stage C receives an interface commitment selected only after
+            // full legality pricing.  Let an explicit non-pointer commitment
+            // supersede Stage A's pointer-only pruning; otherwise the old
+            // heuristic and the new hard pin contradict each other before
+            // any statement candidate is considered, making every corrected
+            // wrapper interface UNSAT.  Pointer pins retain the pruning.
+            let pinned_non_pointer = interface_pins.iter().any(|(pinned_reg, xtype)| {
+                *pinned_reg == reg && !InterfaceClass::from_xtype(xtype).is_pointer()
+            });
+            if func.must_pointer_regs.contains(&reg) && !pinned_non_pointer {
                 backend.assert_hard(&t.is_ptr(&tv));
             }
             // Float-class pruning (RC-1): the is_float axis is otherwise free, so require positive upstream float evidence; excluding the float variant HARD cannot cause UNSAT since nothing forces is_float.
@@ -2780,6 +2789,47 @@ mod tests {
         assert_eq!(stats.fallback_count, 0);
         let chosen = state.var_decl_idx[&(address, reg)];
         assert!(func.var_type_candidates[&reg][chosen].is_float());
+    }
+
+    #[test]
+    fn dirty_scalar_pin_overrides_stage_a_pointer_pruning() {
+        let [address] = synthetic_ids();
+        let reg = 13;
+        let mut func = FunctionData::new(
+            address,
+            "scalar_dirty".into(),
+            vec![reg],
+            vec![ParamType::Pointer],
+            None,
+            0,
+            1,
+            true,
+        );
+        func.var_type_candidates
+            .insert(reg, vec![CandType::PtrVoid, CandType::I64(Sign::Signed)]);
+        func.must_pointer_regs.insert(reg);
+        let stage_a = ProgramSelectionState {
+            candidate_idx: HashMap::new(),
+            var_decl_idx: [((address, reg), 0)].into_iter().collect(),
+            var_type_override: HashMap::new(),
+        };
+        let (state, stats) = resolve_dirty_functions(
+            std::slice::from_mut(&mut func),
+            &HashMap::new(),
+            &stage_a,
+            &[address].into_iter().collect(),
+            &committed_param(address, XType::Xlong),
+            &BTreeMap::new(),
+            false,
+        );
+
+        assert_eq!(stats.resolved_count, 1);
+        assert_eq!(stats.fallback_count, 0);
+        let chosen = state.var_decl_idx[&(address, reg)];
+        assert_eq!(
+            func.var_type_candidates[&reg][chosen],
+            CandType::I64(Sign::Signed)
+        );
     }
 
     #[test]

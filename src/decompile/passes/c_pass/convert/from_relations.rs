@@ -10,7 +10,9 @@ use crate::decompile::passes::clight_select::query::{
     extract_global_struct_decl_layouts, GlobalData,
 };
 use crate::decompile::passes::clight_select::select::SelectedFunction;
+use crate::mreg::Mreg;
 use crate::util::{exec_order_key, semantic_node_address};
+use crate::x86::op::{Addressing, Operation};
 use crate::x86::types as clight;
 use crate::x86::types::*;
 use log::debug;
@@ -607,6 +609,21 @@ struct EscapedStackBufferLayouts {
 
 type StackBufferAliases = HashMap<Address, HashMap<RTLReg, (RTLReg, usize)>>;
 type StackBufferEndAliases = HashMap<Address, HashMap<RTLReg, (RTLReg, usize)>>;
+type ExactStackBufferStores =
+    HashMap<Address, HashMap<(RTLReg, RTLReg), (RTLReg, usize, MemoryChunk)>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RawFrameBufferRegion {
+    start: i64,
+    end: i64,
+    backing: String,
+}
+
+#[derive(Default)]
+struct RawFrameBufferLayouts {
+    base_pointer_names: HashMap<Address, HashSet<String>>,
+    regions: HashMap<Address, Vec<RawFrameBufferRegion>>,
+}
 
 #[derive(Default)]
 struct GlobalAggregateCoalescing {
@@ -1166,6 +1183,95 @@ fn derive_stack_buffer_aliases(db: &DecompileDB) -> StackBufferAliases {
             .or_default()
             .insert((base, offset));
     }
+    let mut node_owners: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for &(node, func) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        node_owners.entry(node).or_default().insert(func);
+    }
+    let mut framed_functions = HashSet::new();
+    for &(setup, src, dst) in
+        db.rel_iter::<(Address, &'static str, &'static str)>("stack_base_move")
+    {
+        if src == "RSP" && dst == "RBP" {
+            if let Some(owners) = node_owners.get(&setup) {
+                if owners.len() == 1 {
+                    framed_functions.extend(owners.iter().copied());
+                }
+            }
+        }
+    }
+    let mut frame_tops: BTreeMap<Address, i64> = BTreeMap::new();
+    for &(func, _, _, size) in
+        db.rel_iter::<(Address, Address, crate::x86::types::Symbol, u64)>("func_stacksz")
+    {
+        let Ok(size) = i64::try_from(size) else {
+            continue;
+        };
+        frame_tops
+            .entry(func)
+            .and_modify(|current| *current = (*current).max(size))
+            .or_insert(size);
+    }
+    let stack_rows: Vec<_> = db
+        .rel_iter::<(Address, Node, i64, RTLReg)>("stack_var")
+        .copied()
+        .collect();
+    let coordinate_variants = |func: Address, offset: i64| {
+        let mut variants = vec![offset];
+        if offset < 0 && framed_functions.contains(&func) {
+            if let Some(normalized) = frame_tops
+                .get(&func)
+                .and_then(|top| offset.checked_add(*top))
+                .filter(|normalized| *normalized >= 0)
+            {
+                variants.push(normalized);
+            }
+        }
+        variants.sort_unstable();
+        variants.dedup();
+        variants
+    };
+    // Independently sized byte buffers also own every exact stack cell inside
+    // their interval.  Publish those aliases here even when no overlapping
+    // range forced the Clight sizer's coalescing path.
+    for (&func, buffers) in &db.stack_struct_buffers {
+        for (&base, &size) in buffers {
+            if size <= 0 {
+                continue;
+            }
+            let base_offsets: BTreeSet<i64> = stack_rows
+                .iter()
+                .filter_map(|(owner, _, offset, local)| {
+                    (*owner == func && *local == base).then_some(*offset)
+                })
+                .flat_map(|offset| coordinate_variants(func, offset))
+                .collect();
+            for &(owner, _, cell_offset, member) in &stack_rows {
+                if owner != func {
+                    continue;
+                }
+                for base_offset in &base_offsets {
+                    let Some(end) = base_offset.checked_add(size) else {
+                        continue;
+                    };
+                    for cell in coordinate_variants(func, cell_offset) {
+                        if cell < *base_offset || cell >= end {
+                            continue;
+                        }
+                        let Some(relative) = cell.checked_sub(*base_offset) else {
+                            continue;
+                        };
+                        let Ok(relative) = usize::try_from(relative) else {
+                            continue;
+                        };
+                        candidates
+                            .entry((func, member))
+                            .or_default()
+                            .insert((base, relative));
+                    }
+                }
+            }
+        }
+    }
     // The chosen backing local is also a semantic stack cell at byte offset
     // zero.  Once its declaration becomes `unsigned char[N]`, a direct scalar
     // read/write of that local must still access the cell rather than decay to
@@ -1216,6 +1322,87 @@ fn derive_stack_buffer_end_aliases(db: &DecompileDB) -> StackBufferEndAliases {
     result
 }
 
+fn stack_local_physical_types(db: &DecompileDB, function: Address) -> HashMap<String, CType> {
+    use crate::decompile::analysis::struct_recovery_pass::chunk_byte_size;
+
+    let mut chunks: BTreeMap<i64, MemoryChunk> = BTreeMap::new();
+    for &(func, offset, chunk) in db.rel_iter::<(Address, i64, MemoryChunk)>("stack_var_chunk") {
+        if func != function || matches!(chunk, MemoryChunk::Unknown) {
+            continue;
+        }
+        chunks
+            .entry(offset)
+            .and_modify(|current| {
+                if (chunk_byte_size(&chunk), chunk) < (chunk_byte_size(current), *current) {
+                    *current = chunk;
+                }
+            })
+            .or_insert(chunk);
+    }
+
+    let exact_store_chunks = crate::decompile::passes::clight_pass::exact_stack_store_chunks(db);
+    let mut local_chunks: BTreeMap<RTLReg, MemoryChunk> = BTreeMap::new();
+    for &(func, node, offset, local) in db.rel_iter::<(Address, Node, i64, RTLReg)>("stack_var") {
+        if func != function {
+            continue;
+        }
+        let Some(chunk) = exact_store_chunks
+            .get(&node)
+            .or_else(|| chunks.get(&offset))
+            .copied()
+        else {
+            continue;
+        };
+        local_chunks
+            .entry(local)
+            .and_modify(|current| {
+                if (chunk_byte_size(&chunk), chunk) < (chunk_byte_size(current), *current) {
+                    *current = chunk;
+                }
+            })
+            .or_insert(chunk);
+    }
+    local_chunks
+        .into_iter()
+        .map(|(local, chunk)| {
+            (
+                crate::decompile::passes::c_pass::helpers::param_name_for_reg(local),
+                ctype_from_memchunk(&chunk),
+            )
+        })
+        .collect()
+}
+
+fn apply_stack_struct_buffer_types(
+    db: &DecompileDB,
+    function: Address,
+    local_var_types: &mut HashMap<String, CType>,
+) {
+    let Some(buffers) = db.stack_struct_buffers.get(&function) else {
+        return;
+    };
+    let mut widest: BTreeMap<String, usize> = BTreeMap::new();
+    for (reg, size) in buffers {
+        let Ok(size) = usize::try_from(*size) else {
+            continue;
+        };
+        if size == 0 {
+            continue;
+        }
+        let name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(*reg);
+        widest
+            .entry(name)
+            .and_modify(|current| *current = (*current).max(size))
+            .or_insert(size);
+    }
+    for (name, size) in widest {
+        local_var_types.insert(
+            name,
+            CType::Array(Box::new(CType::char_unsigned()), Some(size)),
+        );
+    }
+}
+
 fn rewrite_stack_buffer_end_aliases(
     body: &CStmt,
     aliases: &HashMap<RTLReg, (RTLReg, usize)>,
@@ -1253,9 +1440,221 @@ fn rewrite_stack_buffer_end_aliases(
 
 fn stack_buffer_alias_byte_expr(base: &str, offset: usize) -> CExpr {
     CExpr::Index(
-        Box::new(CExpr::Var(base.to_string())),
+        Box::new(CExpr::Cast(
+            CType::ptr(CType::char_unsigned()),
+            Box::new(CExpr::Var(base.to_string())),
+        )),
         Box::new(CExpr::int(offset as i64)),
     )
+}
+
+/// Recover the raw frame-pointer coordinates of byte buffers that already
+/// have one proven C backing object.
+///
+/// `stack_var` normally uses the post-prologue coordinate system, while a few
+/// expressions retained from machine addressing can still be `RBP + disp`.
+/// A conversion between the two is valid only for a conventional framed
+/// function with one observed allocation size.  Conflicting frame sizes,
+/// multiple locations for one backing local, and buffers extending outside
+/// the allocated frame are deliberately rejected.
+fn derive_raw_frame_buffer_layouts(db: &DecompileDB) -> RawFrameBufferLayouts {
+    let mut node_owners: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for &(node, func) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        node_owners.entry(node).or_default().insert(func);
+    }
+
+    let mut framed_functions = HashSet::new();
+    for &(setup, src, dst) in
+        db.rel_iter::<(Address, &'static str, &'static str)>("stack_base_move")
+    {
+        if src != "RSP" || dst != "RBP" {
+            continue;
+        }
+        let Some(owners) = node_owners.get(&setup) else {
+            continue;
+        };
+        if owners.len() == 1 {
+            framed_functions.extend(owners.iter().copied());
+        }
+    }
+
+    let mut size_candidates: BTreeMap<Address, BTreeSet<i64>> = BTreeMap::new();
+    for &(func, _, _, size) in
+        db.rel_iter::<(Address, Address, crate::x86::types::Symbol, u64)>("func_stacksz")
+    {
+        let Ok(size) = i64::try_from(size) else {
+            continue;
+        };
+        if size > 0 {
+            size_candidates.entry(func).or_default().insert(size);
+        }
+    }
+    let frame_sizes: HashMap<Address, i64> = size_candidates
+        .into_iter()
+        .filter_map(|(func, sizes)| {
+            (framed_functions.contains(&func) && sizes.len() == 1)
+                .then(|| (func, *sizes.first().unwrap()))
+        })
+        .collect();
+
+    let mut base_offsets: BTreeMap<(Address, RTLReg), BTreeSet<i64>> = BTreeMap::new();
+    for &(func, _, offset, local) in db.rel_iter::<(Address, Node, i64, RTLReg)>("stack_var") {
+        let Some(&frame_size) = frame_sizes.get(&func) else {
+            continue;
+        };
+        let normalized = if offset < 0 {
+            offset.checked_add(frame_size)
+        } else {
+            Some(offset)
+        };
+        if let Some(normalized) = normalized.filter(|offset| *offset >= 0) {
+            base_offsets
+                .entry((func, local))
+                .or_default()
+                .insert(normalized);
+        }
+    }
+
+    let mut result = RawFrameBufferLayouts::default();
+    for (&func, function_buffers) in &db.stack_struct_buffers {
+        let Some(&frame_size) = frame_sizes.get(&func) else {
+            continue;
+        };
+        for (&backing, &size_i64) in function_buffers {
+            if size_i64 <= 0 || usize::try_from(size_i64).is_err() {
+                continue;
+            }
+            let Some(offsets) = base_offsets.get(&(func, backing)) else {
+                continue;
+            };
+            let valid_offsets: BTreeSet<i64> = offsets
+                .iter()
+                .copied()
+                .filter(|offset| {
+                    offset
+                        .checked_add(size_i64)
+                        .is_some_and(|end| end <= frame_size)
+                })
+                .collect();
+            if valid_offsets.len() != 1 {
+                continue;
+            }
+            let normalized_start = *valid_offsets.first().unwrap();
+            let Some(start) = normalized_start.checked_sub(frame_size) else {
+                continue;
+            };
+            let Some(end) = start.checked_add(size_i64) else {
+                continue;
+            };
+            result
+                .regions
+                .entry(func)
+                .or_default()
+                .push(RawFrameBufferRegion {
+                    start,
+                    end,
+                    backing: crate::decompile::passes::c_pass::helpers::param_name_for_reg(backing),
+                });
+        }
+    }
+
+    for regions in result.regions.values_mut() {
+        regions.sort_by(|left, right| {
+            (left.start, left.end, &left.backing).cmp(&(right.start, right.end, &right.backing))
+        });
+        regions.dedup();
+    }
+
+    for &(node, mreg, rtl) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl") {
+        if mreg != Mreg::BP {
+            continue;
+        }
+        let func = match node_owners.get(&node) {
+            Some(owners) if owners.len() == 1 => *owners.first().unwrap(),
+            // Entry register facts are keyed by the function address itself;
+            // unlike instructions, that synthetic entry does not need an
+            // `instr_in_function` row.  It is the exact value used when a raw
+            // BP operand survives the prologue normalization.
+            _ if frame_sizes.contains_key(&(node as Address)) => node as Address,
+            _ => continue,
+        };
+        if !result.regions.contains_key(&func) {
+            continue;
+        }
+        result
+            .base_pointer_names
+            .entry(func)
+            .or_default()
+            .insert(crate::decompile::passes::c_pass::helpers::param_name_for_reg(rtl));
+    }
+
+    result
+}
+
+fn rewrite_raw_frame_buffer_addresses(
+    body: &CStmt,
+    base_pointer_names: &HashSet<String>,
+    regions: &[RawFrameBufferRegion],
+) -> CStmt {
+    fn unwrapped_var(expr: &CExpr) -> Option<&str> {
+        match expr {
+            CExpr::Var(name) => Some(name),
+            CExpr::Cast(_, inner) | CExpr::Paren(inner) => unwrapped_var(inner),
+            _ => None,
+        }
+    }
+
+    fn exact_i64(expr: &CExpr) -> Option<i64> {
+        let CExpr::IntLit(literal) = expr else {
+            return None;
+        };
+        i64::try_from(literal.value).ok()
+    }
+
+    fn raw_displacement(expr: &CExpr, base_pointer_names: &HashSet<String>) -> Option<i64> {
+        let CExpr::Binary(op, lhs, rhs) = expr else {
+            return None;
+        };
+        match op {
+            BinaryOp::Add => {
+                if unwrapped_var(lhs).is_some_and(|name| base_pointer_names.contains(name)) {
+                    return exact_i64(rhs);
+                }
+                if unwrapped_var(rhs).is_some_and(|name| base_pointer_names.contains(name)) {
+                    return exact_i64(lhs);
+                }
+                None
+            }
+            BinaryOp::Sub
+                if unwrapped_var(lhs).is_some_and(|name| base_pointer_names.contains(name)) =>
+            {
+                exact_i64(rhs)?.checked_neg()
+            }
+            _ => None,
+        }
+    }
+
+    crate::decompile::passes::c_pass::helpers::map_stmt_exprs(body, &|expr| {
+        let displacement = raw_displacement(expr, base_pointer_names)?;
+        let destinations: BTreeSet<(String, usize)> = regions
+            .iter()
+            .filter(|region| displacement >= region.start && displacement < region.end)
+            .filter_map(|region| {
+                displacement
+                    .checked_sub(region.start)
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .map(|offset| (region.backing.clone(), offset))
+            })
+            .collect();
+        if destinations.len() != 1 {
+            return None;
+        }
+        let (backing, offset) = destinations.into_iter().next().unwrap();
+        Some(CExpr::Unary(
+            UnaryOp::AddrOf,
+            Box::new(stack_buffer_alias_byte_expr(&backing, offset)),
+        ))
+    })
 }
 
 fn stack_buffer_alias_value_expr(base: &str, offset: usize, value_ty: &CType) -> CExpr {
@@ -1269,12 +1668,181 @@ fn stack_buffer_alias_value_expr(base: &str, offset: usize, value_ty: &CType) ->
     )
 }
 
-fn rewrite_stack_buffer_aliases(
+/// Preserve a machine store's own width when several SSA accesses share one
+/// byte-backed frame cell.
+///
+/// A canonical stack local can participate in both a qword initializer and
+/// later byte updates.  Choosing one declaration type for that local is
+/// necessarily lossy.  The exact raw MOV relation plus its RTL source value
+/// instead identifies an individual assignment, allowing only that assignment
+/// to use its physical access width.
+fn derive_exact_stack_buffer_stores(
+    db: &DecompileDB,
+    aliases: &StackBufferAliases,
+    escaped_buffers: &EscapedStackBufferLayouts,
+) -> ExactStackBufferStores {
+    let exact_chunks = crate::decompile::passes::clight_pass::exact_stack_store_chunks(db);
+    let mut stack_cells: BTreeMap<(Node, RTLReg), BTreeSet<Address>> = BTreeMap::new();
+    let mut stack_cell_offsets: BTreeMap<(Address, Node, RTLReg), BTreeSet<i64>> = BTreeMap::new();
+    let mut local_offsets: BTreeMap<(Address, RTLReg), BTreeSet<i64>> = BTreeMap::new();
+    for &(func, node, offset, local) in db.rel_iter::<(Address, Node, i64, RTLReg)>("stack_var") {
+        stack_cells.entry((node, local)).or_default().insert(func);
+        stack_cell_offsets
+            .entry((func, node, local))
+            .or_default()
+            .insert(offset);
+        local_offsets
+            .entry((func, local))
+            .or_default()
+            .insert(offset);
+    }
+
+    let mut candidates: BTreeMap<
+        (Address, RTLReg, RTLReg),
+        BTreeSet<(RTLReg, usize, MemoryChunk)>,
+    > = BTreeMap::new();
+    for &(node, ref inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+        let RTLInst::Iop(Operation::Omove, args, destination) = inst else {
+            continue;
+        };
+        if args.len() != 1 {
+            continue;
+        }
+        let Some(&chunk) = exact_chunks.get(&node) else {
+            continue;
+        };
+        let Some(functions) = stack_cells.get(&(node, *destination)) else {
+            continue;
+        };
+        if functions.len() != 1 {
+            continue;
+        }
+        let func = *functions.first().unwrap();
+        let mut coordinates = BTreeSet::new();
+        if let Some(&(base, offset)) = aliases
+            .get(&func)
+            .and_then(|function_aliases| function_aliases.get(destination))
+        {
+            coordinates.insert((base, offset));
+        }
+        if let Some(&(base, offset, _)) = escaped_buffers
+            .members
+            .get(&func)
+            .and_then(|members| members.get(destination))
+        {
+            coordinates.insert((base, offset));
+        }
+        // A direct initializer can be the only observation at one interior
+        // coordinate, so it need not appear in the callee-derived member map.
+        // The exact stack offsets of the store and of each proven backing base
+        // supply that coordinate without guessing a field layout.
+        if let (Some(destination_offsets), Some(function_buffers)) = (
+            stack_cell_offsets.get(&(func, node, *destination)),
+            escaped_buffers.buffers.get(&func),
+        ) {
+            let width =
+                crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(&chunk) as i64;
+            for (&base, &size) in function_buffers {
+                let Some(base_offsets) = local_offsets.get(&(func, base)) else {
+                    continue;
+                };
+                let Ok(size) = i64::try_from(size) else {
+                    continue;
+                };
+                for &destination_offset in destination_offsets {
+                    for &base_offset in base_offsets {
+                        let Some(relative) = destination_offset.checked_sub(base_offset) else {
+                            continue;
+                        };
+                        if relative < 0 || relative.checked_add(width).is_none_or(|end| end > size)
+                        {
+                            continue;
+                        }
+                        if let Ok(relative) = usize::try_from(relative) {
+                            coordinates.insert((base, relative));
+                        }
+                    }
+                }
+            }
+        }
+        if coordinates.len() != 1 {
+            continue;
+        }
+        let (base, offset) = *coordinates.first().unwrap();
+        candidates
+            .entry((func, *destination, args[0]))
+            .or_default()
+            .insert((base, offset, chunk));
+    }
+
+    let mut result = ExactStackBufferStores::default();
+    for ((func, destination, source), choices) in candidates {
+        if choices.len() != 1 {
+            continue;
+        }
+        result
+            .entry(func)
+            .or_default()
+            .insert((destination, source), *choices.first().unwrap());
+    }
+    result
+}
+
+fn rewrite_exact_stack_buffer_stores(
+    body: &CStmt,
+    stores: &HashMap<(RTLReg, RTLReg), (RTLReg, usize, MemoryChunk)>,
+) -> CStmt {
+    fn unwrapped_var(expr: &CExpr) -> Option<&str> {
+        match expr {
+            CExpr::Var(name) => Some(name),
+            CExpr::Cast(_, inner) | CExpr::Paren(inner) => unwrapped_var(inner),
+            _ => None,
+        }
+    }
+
+    let named: HashMap<(String, String), (String, usize, CType)> = stores
+        .iter()
+        .map(|(&(destination, source), &(base, offset, chunk))| {
+            (
+                (
+                    crate::decompile::passes::c_pass::helpers::param_name_for_reg(destination),
+                    crate::decompile::passes::c_pass::helpers::param_name_for_reg(source),
+                ),
+                (
+                    crate::decompile::passes::c_pass::helpers::param_name_for_reg(base),
+                    offset,
+                    ctype_from_memchunk(&chunk),
+                ),
+            )
+        })
+        .collect();
+
+    crate::decompile::passes::c_pass::helpers::map_stmt_exprs(body, &|expr| {
+        let CExpr::Assign(AssignOp::Assign, lhs, rhs) = expr else {
+            return None;
+        };
+        let CExpr::Var(destination) = lhs.as_ref() else {
+            return None;
+        };
+        let source = unwrapped_var(rhs)?;
+        let (base, offset, access_ty) = named.get(&(destination.clone(), source.to_string()))?;
+        Some(CExpr::Assign(
+            AssignOp::Assign,
+            Box::new(stack_buffer_alias_value_expr(base, *offset, access_ty)),
+            rhs.clone(),
+        ))
+    })
+}
+
+fn rewrite_stack_buffer_aliases_with_access_types(
     body: &CStmt,
     aliases: &HashMap<RTLReg, (RTLReg, usize)>,
     value_types: &HashMap<String, CType>,
+    stack_address_regs: &HashSet<RTLReg>,
+    access_types: &HashMap<RTLReg, CType>,
+    backing_regs: &HashSet<RTLReg>,
 ) -> CStmt {
-    let alias_names: HashMap<String, (String, usize, Option<CType>)> = aliases
+    let alias_names: HashMap<String, (String, usize, Option<CType>, bool, bool)> = aliases
         .iter()
         .map(|(member, (base, offset))| {
             let member_name =
@@ -1284,11 +1852,37 @@ fn rewrite_stack_buffer_aliases(
                 (
                     crate::decompile::passes::c_pass::helpers::param_name_for_reg(*base),
                     *offset,
-                    value_types.get(&member_name).cloned(),
+                    access_types
+                        .get(member)
+                        .cloned()
+                        .or_else(|| value_types.get(&member_name).cloned()),
+                    stack_address_regs.contains(member),
+                    backing_regs.contains(member),
                 ),
             )
         })
         .collect();
+
+    fn addrof_var_name(expr: &CExpr) -> Option<&str> {
+        match expr {
+            CExpr::Cast(_, inner) | CExpr::Paren(inner) => addrof_var_name(inner),
+            CExpr::Unary(UnaryOp::AddrOf, inner) => match inner.as_ref() {
+                CExpr::Var(name) => Some(name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn storage_coordinate(
+        name: &str,
+        alias_names: &HashMap<String, (String, usize, Option<CType>, bool, bool)>,
+    ) -> (String, usize) {
+        alias_names
+            .get(name)
+            .map(|(base, offset, _, _, _)| (base.clone(), *offset))
+            .unwrap_or_else(|| (name.to_string(), 0))
+    }
 
     // This walk is deliberately context-aware. The generic bottom-up mapper
     // replaced an array alias `buffer` with `buffer[0]` before seeing an
@@ -1298,15 +1892,20 @@ fn rewrite_stack_buffer_aliases(
     // position. A scalar-to-pointer cast remains a scalar value conversion.
     fn rewrite_expr(
         expr: &CExpr,
-        alias_names: &HashMap<String, (String, usize, Option<CType>)>,
+        alias_names: &HashMap<String, (String, usize, Option<CType>, bool, bool)>,
         pointer_cast_operand: bool,
     ) -> CExpr {
         if let CExpr::Var(name) = expr {
-            let Some((base, offset, value_ty)) = alias_names.get(name) else {
+            let Some((base, offset, value_ty, is_stack_address, is_backing)) =
+                alias_names.get(name)
+            else {
                 return expr.clone();
             };
             let byte = stack_buffer_alias_byte_expr(base, *offset);
-            if pointer_cast_operand && matches!(value_ty, Some(CType::Array(..))) {
+            if *is_stack_address {
+                return CExpr::Unary(UnaryOp::AddrOf, Box::new(byte));
+            }
+            if pointer_cast_operand && (*is_backing || matches!(value_ty, Some(CType::Array(..)))) {
                 return CExpr::Unary(UnaryOp::AddrOf, Box::new(byte));
             }
             let Some(value_ty) = value_ty else {
@@ -1323,6 +1922,16 @@ fn rewrite_stack_buffer_aliases(
 
         match expr {
             CExpr::Unary(op, inner) => {
+                if *op == UnaryOp::AddrOf {
+                    if let CExpr::Var(name) = inner.as_ref() {
+                        if alias_names
+                            .get(name)
+                            .is_some_and(|(_, _, _, is_stack_address, _)| *is_stack_address)
+                        {
+                            return rewrite_expr(inner, alias_names, false);
+                        }
+                    }
+                }
                 CExpr::Unary(*op, Box::new(rewrite_expr(inner, alias_names, false)))
             }
             CExpr::Binary(op, lhs, rhs) => CExpr::Binary(
@@ -1330,11 +1939,25 @@ fn rewrite_stack_buffer_aliases(
                 Box::new(rewrite_expr(lhs, alias_names, false)),
                 Box::new(rewrite_expr(rhs, alias_names, false)),
             ),
-            CExpr::Assign(op, lhs, rhs) => CExpr::Assign(
-                *op,
-                Box::new(rewrite_expr(lhs, alias_names, false)),
-                Box::new(rewrite_expr(rhs, alias_names, false)),
-            ),
+            CExpr::Assign(op, lhs, rhs) => {
+                if let CExpr::Var(lhs_name) = lhs.as_ref() {
+                    if let Some(rhs_name) = addrof_var_name(rhs) {
+                        let participates = alias_names.contains_key(lhs_name)
+                            || alias_names.contains_key(rhs_name);
+                        if participates
+                            && storage_coordinate(lhs_name, alias_names)
+                                == storage_coordinate(rhs_name, alias_names)
+                        {
+                            return CExpr::int(0);
+                        }
+                    }
+                }
+                CExpr::Assign(
+                    *op,
+                    Box::new(rewrite_expr(lhs, alias_names, false)),
+                    Box::new(rewrite_expr(rhs, alias_names, false)),
+                )
+            }
             CExpr::Ternary(cond, then_expr, else_expr) => CExpr::Ternary(
                 Box::new(rewrite_expr(cond, alias_names, false)),
                 Box::new(rewrite_expr(then_expr, alias_names, false)),
@@ -1406,7 +2029,7 @@ fn rewrite_stack_buffer_aliases(
 
     fn rewrite_initializer(
         init: &Initializer,
-        alias_names: &HashMap<String, (String, usize, Option<CType>)>,
+        alias_names: &HashMap<String, (String, usize, Option<CType>, bool, bool)>,
     ) -> Initializer {
         match init {
             Initializer::Expr(expr) => Initializer::Expr(rewrite_expr(expr, alias_names, false)),
@@ -1432,6 +2055,22 @@ fn rewrite_stack_buffer_aliases(
     })
 }
 
+fn rewrite_stack_buffer_aliases(
+    body: &CStmt,
+    aliases: &HashMap<RTLReg, (RTLReg, usize)>,
+    value_types: &HashMap<String, CType>,
+    stack_address_regs: &HashSet<RTLReg>,
+) -> CStmt {
+    rewrite_stack_buffer_aliases_with_access_types(
+        body,
+        aliases,
+        value_types,
+        stack_address_regs,
+        &HashMap::new(),
+        &HashSet::new(),
+    )
+}
+
 /// Turn a callee-observed, uniform stack region into one C array object.
 ///
 /// RTL proves each field through an exact caller argument -> callee parameter
@@ -1443,12 +2082,9 @@ fn derive_escaped_stack_array_layouts(db: &DecompileDB) -> EscapedStackArrayLayo
     use crate::decompile::analysis::struct_recovery_pass::chunk_byte_size;
     use std::collections::BTreeSet;
 
-    let mut slot_locals: HashMap<(Address, i64), RTLReg> = HashMap::new();
+    let mut slot_locals: BTreeMap<(Address, i64), BTreeSet<RTLReg>> = BTreeMap::new();
     for &(func, _node, ofs, local) in db.rel_iter::<(Address, Address, i64, RTLReg)>("stack_var") {
-        slot_locals
-            .entry((func, ofs))
-            .and_modify(|current| *current = (*current).min(local))
-            .or_insert(local);
+        slot_locals.entry((func, ofs)).or_default().insert(local);
     }
 
     let mut regions: BTreeMap<(Address, i64), BTreeMap<i64, BTreeSet<MemoryChunk>>> =
@@ -1472,7 +2108,10 @@ fn derive_escaped_stack_array_layouts(db: &DecompileDB) -> EscapedStackArrayLayo
         if fields.len() < 2 || !fields.contains_key(&0) {
             continue;
         }
-        let Some(&base_local) = slot_locals.get(&(func, base_ofs)) else {
+        let Some(base_local) = slot_locals
+            .get(&(func, base_ofs))
+            .and_then(|locals| locals.first().copied())
+        else {
             continue;
         };
         // A byte backing buffer is a different, more conservative model; do
@@ -1508,19 +2147,24 @@ fn derive_escaped_stack_array_layouts(db: &DecompileDB) -> EscapedStackArrayLayo
             continue;
         }
 
-        let mut members = Vec::with_capacity(offsets.len());
+        // One physical element can have several SSA names across its lifetime
+        // (an initializer/store name and a later LEA/reload name).  Every one
+        // denotes the same array element and must be rewritten, while the
+        // deterministic minimum remains the backing declaration owner.
+        let mut members = Vec::new();
+        let mut complete_members = true;
         for (idx, field_ofs) in offsets.iter().enumerate() {
             let Some(slot_ofs) = base_ofs.checked_add(*field_ofs) else {
-                members.clear();
+                complete_members = false;
                 break;
             };
-            let Some(&local) = slot_locals.get(&(func, slot_ofs)) else {
-                members.clear();
+            let Some(locals) = slot_locals.get(&(func, slot_ofs)) else {
+                complete_members = false;
                 break;
             };
-            members.push((local, idx));
+            members.extend(locals.iter().map(|local| (*local, idx)));
         }
-        if members.len() != offsets.len() {
+        if !complete_members {
             continue;
         }
 
@@ -1608,37 +2252,27 @@ fn derive_escaped_stack_buffer_layouts(
     // unrelated scalar local.
     let regions = crate::decompile::passes::clight_pass::escaped_stack_region_owned_fields(db);
 
-    // Diagnostic hook (env-gated, like GA_DUMP/ESC_DUMP in the clight sizer).
-    let trace = std::env::var("ESC_DUMP").is_ok();
-    if trace {
-        for ((func, base_ofs), fields) in &regions {
-            let extent = extents.get(&(*func, *base_ofs)).copied();
-            let field_view: Vec<(i64, Vec<usize>)> = fields
-                .iter()
-                .map(|(ofs, chunks)| (*ofs, chunks.iter().map(chunk_byte_size).collect()))
-                .collect();
-            eprintln!(
-                "[ESC-REGION] {func:#x} base={base_ofs} extent={extent:?} fields={field_view:?}"
-            );
-        }
-    }
-
-    // Multiple signedness/type observations are compatible only when they name
-    // the same physical width.  The existing Clight casts retain the access
-    // interpretation; this representative type supplies the C lvalue width.
+    // A byte-backed object can be read at several nested widths from the same
+    // offset (packed flags are commonly read as byte and short).  Keep the
+    // widest observation as the representative member so every touched byte is
+    // reserved; the existing Clight casts retain each individual access width
+    // and signedness.  This relaxation is local to final byte-buffer layout --
+    // raw immediate-store synthesis keeps its stricter exact-tiling guard.
     let exact_region_fields =
         |fields: &BTreeMap<i64, BTreeSet<MemoryChunk>>| -> Option<Vec<(i64, MemoryChunk, usize)>> {
             let mut exact = Vec::with_capacity(fields.len());
             for (field_ofs, chunks) in fields {
-                let widths: BTreeSet<usize> = chunks.iter().map(chunk_byte_size).collect();
-                if widths.len() != 1 || widths.contains(&0) {
+                let Some((chunk, width)) = chunks
+                    .iter()
+                    .filter_map(|chunk| {
+                        let width = chunk_byte_size(chunk);
+                        (width > 0).then_some((*chunk, width))
+                    })
+                    .max_by_key(|(chunk, width)| (*width, *chunk))
+                else {
                     return None;
-                }
-                exact.push((
-                    *field_ofs,
-                    *chunks.iter().next().unwrap(),
-                    *widths.iter().next().unwrap(),
-                ));
+                };
+                exact.push((*field_ofs, chunk, width));
             }
             Some(exact)
         };
@@ -1651,21 +2285,14 @@ fn derive_escaped_stack_buffer_layouts(
             continue;
         }
         let fields = &regions[&(func, base_ofs)];
-        let mut reject = |why: &str| {
-            if trace {
-                eprintln!("[ESC-REGION] {func:#x} base={base_ofs} rejected: {why}");
-            }
-        };
         // One field is enough when the frame itself proves the object is larger
         // than that field: an out-parameter the caller never reads back still
         // has to reserve everything the callee writes.
         let extent = extents.get(&(func, base_ofs)).copied();
         if !fields.contains_key(&0) || (fields.len() < 2 && extent.is_none()) {
-            reject("no base field, or a single field with no extent");
             continue;
         }
         let Some(&base_local) = base_locals.get(&(func, base_ofs)) else {
-            reject("no canonical base local");
             continue;
         };
         if array_layouts
@@ -1673,12 +2300,10 @@ fn derive_escaped_stack_buffer_layouts(
             .get(&func)
             .is_some_and(|arrays| arrays.contains_key(&base_local))
         {
-            reject("owned by a uniform array layout");
             continue;
         }
 
         let Some(mut exact_fields) = exact_region_fields(fields) else {
-            reject("one offset carries two widths");
             continue;
         };
 
@@ -1739,11 +2364,6 @@ fn derive_escaped_stack_buffer_layouts(
             if let Some(inner_span_end) = delta.checked_add(inner_end) {
                 span_end = span_end.max(inner_span_end);
             }
-            if trace {
-                eprintln!(
-                    "[ESC-REGION] {func:#x} base={base_ofs} absorbs enclosed base={inner_base} (end {inner_end})"
-                );
-            }
             absorbed_here.push((inner_func, inner_base));
         }
 
@@ -1751,7 +2371,6 @@ fn derive_escaped_stack_buffer_layouts(
             .ok()
             .filter(|size| *size > 0 && *size <= 1 << 20);
         let Some(size) = size else {
-            reject("no positive bounded size");
             continue;
         };
 
@@ -1774,7 +2393,6 @@ fn derive_escaped_stack_buffer_layouts(
             .iter()
             .any(|(local, (_, offset, _))| *offset == 0 && *local == base_local)
         {
-            reject("base local is not its own offset-0 member");
             continue;
         }
 
@@ -1784,14 +2402,10 @@ fn derive_escaped_stack_buffer_layouts(
                 .get(local)
                 .is_some_and(|existing| existing != candidate)
         }) {
-            reject("a member local is already mapped into another buffer");
             continue;
         }
         for (local, candidate) in candidate_members {
             member_map.entry(local).or_insert(candidate);
-        }
-        if trace {
-            eprintln!("[ESC-REGION] {func:#x} base={base_ofs} sized {size} local={base_local:#x}");
         }
         result
             .buffers
@@ -2588,8 +3202,23 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     let mut escaped_stack_arrays = derive_escaped_stack_array_layouts(db);
     let stack_buffer_aliases = derive_stack_buffer_aliases(db);
     let stack_buffer_end_aliases = derive_stack_buffer_end_aliases(db);
+    let stack_address_regs: HashSet<RTLReg> = db
+        .rel_iter::<(Node, RTLInst)>("rtl_inst")
+        .filter_map(|(_, inst)| match inst {
+            RTLInst::Iop(
+                Operation::Olea(Addressing::Ainstack(_))
+                | Operation::Oleal(Addressing::Ainstack(_)),
+                args,
+                destination,
+            ) if args.is_empty() => Some(*destination),
+            _ => None,
+        })
+        .collect();
     let escaped_stack_buffers = derive_escaped_stack_buffer_layouts(db, &escaped_stack_arrays);
     remove_buffer_owned_array_layouts(&mut escaped_stack_arrays, &escaped_stack_buffers);
+    let exact_stack_buffer_stores =
+        derive_exact_stack_buffer_stores(db, &stack_buffer_aliases, &escaped_stack_buffers);
+    let raw_frame_buffers = derive_raw_frame_buffer_layouts(db);
 
     // Loop-structure facts for top-level ordering, keyed by synth-masked header to member addresses, keeping a rotated loop's body contiguous and ahead of its exit instead of address tie-breaking.
     // loop_members must be keyed through the SAME normalization order_nodes_dfs uses (sseq-head resolve then synth-mask), or a header folded into an sseq bundle reads as loop-free and its body orders after its exit.
@@ -2882,6 +3511,9 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             .flat_map(|aliases| aliases.keys())
             .map(|member| crate::decompile::passes::c_pass::helpers::param_name_for_reg(*member))
             .collect();
+        if let Some(stores) = exact_stack_buffer_stores.get(&func.address) {
+            body = rewrite_exact_stack_buffer_stores(&body, stores);
+        }
 
         // Every canonical local in a proven escaped uniform region denotes an
         // element of one C array object.  Rewrite before type inference so
@@ -2926,50 +3558,10 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             }
         }
 
-        // Mixed-width escaped regions use one byte buffer.  Replace each
-        // canonical field local with `*(T *)(buffer + byte_offset)` before
-        // inference so every read, write, and address-taking expression shares
-        // the exact caller storage observed by the callee.
-        if let Some(members) = escaped_stack_buffers.members.get(&func.address) {
-            let member_names: HashMap<String, (String, usize, CType)> = members
-                .iter()
-                .map(|(member, (base, offset, chunk))| {
-                    (
-                        crate::decompile::passes::c_pass::helpers::param_name_for_reg(*member),
-                        (
-                            crate::decompile::passes::c_pass::helpers::param_name_for_reg(*base),
-                            *offset,
-                            ctype_from_memchunk(chunk),
-                        ),
-                    )
-                })
-                .collect();
-            body = crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&body, &|expr| {
-                let CExpr::Var(name) = expr else {
-                    return None;
-                };
-                if stack_buffer_alias_names.contains(name) {
-                    return None;
-                }
-                let (base, offset, field_ty) = member_names.get(name)?;
-                let byte_base = CExpr::Cast(
-                    CType::ptr(CType::char_unsigned()),
-                    Box::new(CExpr::Var(base.clone())),
-                );
-                let byte_addr = CExpr::Binary(
-                    BinaryOp::Add,
-                    Box::new(byte_base),
-                    Box::new(CExpr::int(*offset as i64)),
-                );
-                Some(CExpr::Unary(
-                    UnaryOp::Deref,
-                    Box::new(CExpr::Cast(
-                        CType::ptr(field_ty.clone()),
-                        Box::new(CExpr::Paren(Box::new(byte_addr))),
-                    )),
-                ))
-            });
-        }
+        // Mixed-width escaped regions use one byte buffer.  Install the final
+        // backing types before the context-aware alias walk: a backing name in
+        // pointer position denotes the array address, while a direct field
+        // access retains the member's own exact scalar type.
         if let Some(buffers) = escaped_stack_buffers.buffers.get(&func.address) {
             for (base, size) in buffers {
                 let name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(*base);
@@ -2979,6 +3571,35 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 );
             }
         }
+        if let Some(members) = escaped_stack_buffers.members.get(&func.address) {
+            let aliases: HashMap<RTLReg, (RTLReg, usize)> = members
+                .iter()
+                .map(|(member, (base, offset, _))| (*member, (*base, *offset)))
+                .collect();
+            let access_types: HashMap<RTLReg, CType> = members
+                .iter()
+                .map(|(member, (_, _, chunk))| (*member, ctype_from_memchunk(chunk)))
+                .collect();
+            let backing_regs: HashSet<RTLReg> = escaped_stack_buffers
+                .buffers
+                .get(&func.address)
+                .into_iter()
+                .flat_map(|buffers| buffers.keys().copied())
+                .collect();
+            body = rewrite_stack_buffer_aliases_with_access_types(
+                &body,
+                &aliases,
+                &local_var_types,
+                &stack_address_regs,
+                &access_types,
+                &backing_regs,
+            );
+        }
+        // These backing objects are final declarations, not an inference
+        // guess.  Publish their array types before alias rewriting so a base
+        // used under a pointer cast decays to its storage address rather than
+        // being read as an offset-zero scalar value.
+        apply_stack_struct_buffer_types(db, func.address, &mut local_var_types);
 
         // An indexed stack anchor and an overlapping/adjacent address-taken
         // buffer denote one physical frame object.  Apply this after escaped
@@ -2986,11 +3607,55 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         // must not themselves be reinterpreted as an offset-zero scalar field.
         // An enclosing Eaddrof names `backing[offset]`, while a direct value
         // access retains the selected local's scalar width at that offset.
+        let stack_physical_types = stack_local_physical_types(db, func.address);
+        for (name, physical_type) in &stack_physical_types {
+            if stack_buffer_alias_names.contains(name)
+                && !matches!(local_var_types.get(name), Some(CType::Array(..)))
+            {
+                local_var_types.insert(name.clone(), physical_type.clone());
+            }
+        }
         if let Some(aliases) = function_stack_buffer_aliases {
-            body = rewrite_stack_buffer_aliases(&body, aliases, &local_var_types);
+            // A byte-array declaration describes storage ownership, not the
+            // width of a direct scalar access to that storage.  Preserve the
+            // narrowest observed physical stack access for ordinary reads;
+            // exact wider stores were already rewritten above.  Mark backing
+            // locals explicitly so pointer casts still use array decay rather
+            // than converting the offset-zero scalar value into an address.
+            let access_types: HashMap<RTLReg, CType> = aliases
+                .keys()
+                .filter_map(|member| {
+                    let name =
+                        crate::decompile::passes::c_pass::helpers::param_name_for_reg(*member);
+                    stack_physical_types
+                        .get(&name)
+                        .cloned()
+                        .map(|ty| (*member, ty))
+                })
+                .collect();
+            let backing_regs: HashSet<RTLReg> = db
+                .stack_struct_buffers
+                .get(&func.address)
+                .into_iter()
+                .flat_map(|buffers| buffers.keys().copied())
+                .collect();
+            body = rewrite_stack_buffer_aliases_with_access_types(
+                &body,
+                aliases,
+                &local_var_types,
+                &stack_address_regs,
+                &access_types,
+                &backing_regs,
+            );
         }
         if let Some(aliases) = stack_buffer_end_aliases.get(&func.address) {
             body = rewrite_stack_buffer_end_aliases(&body, aliases);
+        }
+        if let (Some(base_pointer_names), Some(regions)) = (
+            raw_frame_buffers.base_pointer_names.get(&func.address),
+            raw_frame_buffers.regions.get(&func.address),
+        ) {
+            body = rewrite_raw_frame_buffer_addresses(&body, base_pointer_names, regions);
         }
 
         // Ownership recovery above can replace scalar locals with byte-array
@@ -3057,27 +3722,10 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             }
         }
 
-        // Address-taken stack regions sized as a byte buffer are declared unsigned char[N], so raw byte-offset stores stay in-bounds and (long)var / &var stay valid via array decay.
-        // Several regs can resolve to one declared name, and each carries its own
-        // analysis' extent; keep the largest, since the smaller one would put that
-        // analysis' own byte-offset accesses out of bounds -- and picking by map
-        // order would make the declaration depend on hash iteration order.
-        if let Some(buffers) = db.stack_struct_buffers.get(&func.address) {
-            let mut widest: BTreeMap<String, i64> = BTreeMap::new();
-            for (reg, size) in buffers {
-                let var_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(*reg);
-                widest
-                    .entry(var_name)
-                    .and_modify(|current| *current = (*current).max(*size))
-                    .or_insert(*size);
-            }
-            for (var_name, size) in widest {
-                local_var_types.insert(
-                    var_name,
-                    CType::Array(Box::new(CType::char_unsigned()), Some(size as usize)),
-                );
-            }
-        }
+        // Reassert the authoritative backing declarations after usage
+        // inference, which is allowed to refine ordinary locals but not to
+        // turn one physical byte buffer back into a scalar object.
+        apply_stack_struct_buffer_types(db, func.address, &mut local_var_types);
 
         // Runtime-indexed stack arrays declare with the element type so arr + i strides by element width; a stack_struct_buffers byte-buffer entry is more specific and wins.
         if let Some(arrays) = db.stack_array_buffers.get(&func.address) {
@@ -7010,9 +7658,9 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
             // rewrite: otherwise `&int_slot + i` can silently become
             // `&*(long *)&buffer[0] + i`, changing the machine stride from
             // four bytes to eight.  Named image globals retain their dedicated
-            // byte-coordinate lowering, and interior-global aliases already
-            // carry a typed dereference around their owner coordinate, so
-            // neither needs the additional cast.
+            // byte-coordinate lowering at the surrounding binary operator,
+            // and interior-global aliases already carry a typed dereference
+            // around their owner coordinate, so neither needs this cast.
             if matches!(ty, clight::ClightType::Tpointer(..))
                 && matches!(
                     inner.as_ref(),
@@ -7050,6 +7698,34 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
                 };
                 // C has no floating-point form of pointer arithmetic, so a float rhs is proof this Oadd/Osub is ordinary arithmetic however the lhs was annotated. Taking the pointer path there emits `char * - double`, which gcc rejects outright and which cost stripped sort its whole relink; the plain form below is `long - double` and is already correct.
                 let rhs_is_float = matches!(clight_expr_ctype(rhs), clight::ClightType::Tfloat(..));
+                // Addition is commutative, and Cminor offsets are byte units.
+                // Handle `integer + pointer` symmetrically with the established
+                // pointer-base path.  This matters for Oaddrsymbol(_, 0): its
+                // void* annotation is the only byte-stride marker after a
+                // recovered global is widened to an array/aggregate owner.
+                let lhs_is_integral = matches!(
+                    clight_expr_ctype(lhs),
+                    clight::ClightType::Tint(..) | clight::ClightType::Tlong(..)
+                );
+                if matches!(op, clight::ClightBinaryOp::Oadd) && lhs_is_integral {
+                    if let clight::ClightType::Tpointer(pointee, _) = clight_expr_ctype(rhs) {
+                        let is_void = matches!(pointee.as_ref(), clight::ClightType::Tvoid);
+                        let base_cty = if is_void {
+                            CType::ptr(CType::char_signed())
+                        } else {
+                            convert_clight_type(clight_expr_ctype(rhs), ctx.data_model)
+                        };
+                        let base = CExpr::Cast(base_cty.clone(), Box::new(convert_expr(rhs, ctx)));
+                        let offset = convert_expr(lhs, ctx);
+                        let sum = CExpr::Binary(BinaryOp::Add, Box::new(base), Box::new(offset));
+                        let result_cty = convert_clight_type(_ty, ctx.data_model);
+                        return if result_cty == base_cty {
+                            sum
+                        } else {
+                            CExpr::Cast(result_cty, Box::new(CExpr::Paren(Box::new(sum))))
+                        };
+                    }
+                }
                 if let (false, clight::ClightType::Tpointer(p, _)) = (rhs_is_float, vt) {
                     // A void pointee means byte-add, so scale through char *; a composite base realizes its own annotation faithfully except void *, which C cannot scale or deref through.
                     let is_void = matches!(p.as_ref(), clight::ClightType::Tvoid);
@@ -8557,6 +9233,304 @@ mod escaped_stack_array_tests {
     use crate::decompile::passes::c_pass::types::FloatSize;
 
     #[test]
+    fn aliased_stack_lvalue_uses_narrowest_physical_chunk() {
+        let func: Address = 0x5000;
+        let local: RTLReg = 0x8100;
+        let mut db = DecompileDB::default();
+        db.rel_push("stack_var", (func, 0x5010_u64, 7_i64, local));
+        db.rel_push("stack_var_chunk", (func, 7_i64, MemoryChunk::MAny64));
+        db.rel_push("pmov", (0x5010_u64, "byte_cell", "zero"));
+        db.rel_push(
+            "op_indirect",
+            ("byte_cell", "", "RBP", "NONE", 1_i64, -1_i64, 1_usize),
+        );
+
+        let types = stack_local_physical_types(&db, func);
+        assert_eq!(
+            types.get(&crate::decompile::passes::c_pass::helpers::param_name_for_reg(local)),
+            Some(&CType::char_unsigned()),
+        );
+    }
+
+    #[test]
+    fn framed_byte_buffer_owns_raw_negative_stack_cells() {
+        let func: Address = 0x6000;
+        let setup: Node = 0x6010;
+        let base_site: Node = 0x6020;
+        let byte0_site: Node = 0x6030;
+        let byte1_site: Node = 0x6040;
+        let base: RTLReg = 0x8100;
+        let byte0: RTLReg = 0x8200;
+        let byte1: RTLReg = 0x8300;
+        let mut db = DecompileDB::default();
+        db.rel_push("instr_in_function", (setup, func));
+        db.rel_push("stack_base_move", (setup, "RSP", "RBP"));
+        db.rel_push("func_stacksz", (func, 0x6100_u64, "framed", 48_u64));
+        db.rel_push("stack_var", (func, base_site, 29_i64, base));
+        db.rel_push("stack_var", (func, byte0_site, -19_i64, byte0));
+        db.rel_push("stack_var", (func, byte1_site, -18_i64, byte1));
+        db.stack_struct_buffers
+            .entry(func)
+            .or_default()
+            .insert(base, 3);
+
+        let aliases = derive_stack_buffer_aliases(&db);
+        let function_aliases = aliases.get(&func).expect("function aliases");
+        assert_eq!(function_aliases.get(&byte0), Some(&(base, 0)));
+        assert_eq!(function_aliases.get(&byte1), Some(&(base, 1)));
+    }
+
+    #[test]
+    fn framed_buffer_layout_requires_exact_frame_and_bp_provenance() {
+        let func: Address = 0x6200;
+        let setup: Node = 0x6210;
+        let access: Node = 0x6220;
+        let base: RTLReg = 0x8400;
+        let bp: RTLReg = 1;
+        let mut db = DecompileDB::default();
+        db.rel_push("instr_in_function", (setup, func));
+        db.rel_push("instr_in_function", (access, func));
+        db.rel_push("stack_base_move", (setup, "RSP", "RBP"));
+        db.rel_push("func_stacksz", (func, setup, "framed", 48_u64));
+        db.rel_push("stack_var", (func, access, 29_i64, base));
+        db.rel_push("reg_rtl", (func, Mreg::BP, bp));
+        db.stack_struct_buffers
+            .entry(func)
+            .or_default()
+            .insert(base, 3);
+
+        let layouts = derive_raw_frame_buffer_layouts(&db);
+
+        assert_eq!(
+            layouts.base_pointer_names.get(&func),
+            Some(&HashSet::from([
+                crate::decompile::passes::c_pass::helpers::param_name_for_reg(bp),
+            ])),
+        );
+        assert_eq!(
+            layouts.regions.get(&func),
+            Some(&vec![RawFrameBufferRegion {
+                start: -19,
+                end: -16,
+                backing: crate::decompile::passes::c_pass::helpers::param_name_for_reg(base),
+            }]),
+        );
+    }
+
+    #[test]
+    fn raw_bp_interior_address_rewrites_only_inside_one_proven_buffer() {
+        let frame = "frame".to_string();
+        let regions = vec![RawFrameBufferRegion {
+            start: -208,
+            end: -57,
+            backing: "buffer".to_string(),
+        }];
+        let raw_address = CExpr::Binary(
+            BinaryOp::Add,
+            Box::new(CExpr::Cast(
+                CType::ptr(CType::char_signed()),
+                Box::new(CExpr::Var(frame.clone())),
+            )),
+            Box::new(CExpr::int(-200)),
+        );
+        let body = CStmt::Expr(raw_address.clone());
+
+        assert_eq!(
+            rewrite_raw_frame_buffer_addresses(&body, &HashSet::from([frame.clone()]), &regions),
+            CStmt::Expr(CExpr::Unary(
+                UnaryOp::AddrOf,
+                Box::new(stack_buffer_alias_byte_expr("buffer", 8)),
+            )),
+        );
+
+        let outside = CStmt::Expr(CExpr::Binary(
+            BinaryOp::Add,
+            Box::new(CExpr::Var(frame)),
+            Box::new(CExpr::int(-56)),
+        ));
+        assert_eq!(
+            rewrite_raw_frame_buffer_addresses(
+                &outside,
+                &HashSet::from(["frame".to_string()]),
+                &regions,
+            ),
+            outside,
+        );
+        assert_eq!(
+            rewrite_raw_frame_buffer_addresses(
+                &body,
+                &HashSet::from(["other_base".to_string()]),
+                &regions,
+            ),
+            body,
+        );
+    }
+
+    #[test]
+    fn exact_qword_store_keeps_its_width_inside_a_byte_backing_buffer() {
+        let func: Address = 0x6300;
+        let node: Node = 0x6310;
+        let base_node: Node = 0x6308;
+        let backing: RTLReg = 0x8500;
+        let destination: RTLReg = 0x8510;
+        let source: RTLReg = 0x8520;
+        let interior_node: Node = 0x6320;
+        let interior_destination: RTLReg = 0x8530;
+        let interior_source: RTLReg = 0x8540;
+        let mut db = DecompileDB::default();
+        db.rel_push(
+            "rtl_inst",
+            (
+                node,
+                RTLInst::Iop(Operation::Omove, Arc::new(vec![source]), destination),
+            ),
+        );
+        db.rel_push("stack_var", (func, base_node, 48_i64, backing));
+        db.rel_push("stack_var", (func, node, 96_i64, destination));
+        db.rel_push(
+            "mach_inst",
+            (node, MachInst::Msetstack(Mreg::AX, 96, Typ::Tany64)),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                interior_node,
+                RTLInst::Iop(
+                    Operation::Omove,
+                    Arc::new(vec![interior_source]),
+                    interior_destination,
+                ),
+            ),
+        );
+        db.rel_push(
+            "stack_var",
+            (func, interior_node, 52_i64, interior_destination),
+        );
+        db.rel_push(
+            "mach_inst",
+            (
+                interior_node,
+                MachInst::Msetstack(Mreg::X0, 52, Typ::Tany64),
+            ),
+        );
+        db.stack_struct_buffers
+            .entry(func)
+            .or_default()
+            .insert(backing, 96);
+        let aliases = HashMap::from([(func, HashMap::from([(backing, (backing, 0_usize))]))]);
+        let mut escaped_buffers = EscapedStackBufferLayouts::default();
+        escaped_buffers
+            .buffers
+            .entry(func)
+            .or_default()
+            .insert(backing, 96);
+        escaped_buffers
+            .members
+            .entry(func)
+            .or_default()
+            .insert(destination, (backing, 48_usize, MemoryChunk::MInt8Unsigned));
+
+        let stores = derive_exact_stack_buffer_stores(&db, &aliases, &escaped_buffers);
+        assert_eq!(
+            stores
+                .get(&func)
+                .and_then(|items| items.get(&(destination, source))),
+            Some(&(backing, 48, MemoryChunk::MInt64)),
+        );
+        assert_eq!(
+            stores
+                .get(&func)
+                .and_then(|items| { items.get(&(interior_destination, interior_source)) }),
+            Some(&(backing, 4, MemoryChunk::MInt64)),
+        );
+
+        let backing_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(backing);
+        let mut types = HashMap::from([(backing_name.clone(), CType::int())]);
+        apply_stack_struct_buffer_types(&db, func, &mut types);
+        assert_eq!(
+            types.get(&backing_name),
+            Some(&CType::Array(Box::new(CType::char_unsigned()), Some(96),)),
+        );
+
+        let destination_name =
+            crate::decompile::passes::c_pass::helpers::param_name_for_reg(destination);
+        let source_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(source);
+        let body = CStmt::Expr(CExpr::Assign(
+            AssignOp::Assign,
+            Box::new(CExpr::Var(destination_name)),
+            Box::new(CExpr::Var(source_name.clone())),
+        ));
+        assert_eq!(
+            rewrite_exact_stack_buffer_stores(&body, &stores[&func]),
+            CStmt::Expr(CExpr::Assign(
+                AssignOp::Assign,
+                Box::new(stack_buffer_alias_value_expr(
+                    &backing_name,
+                    48,
+                    &CType::long(),
+                )),
+                Box::new(CExpr::Var(source_name)),
+            )),
+        );
+    }
+
+    #[test]
+    fn aliased_register_self_address_does_not_write_backing_bytes() {
+        let base: RTLReg = 0x7000;
+        let member: RTLReg = 0x7100;
+        let base_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(base);
+        let member_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(member);
+        let pointer_ty = CType::ptr(CType::char_unsigned());
+        let body = CStmt::Expr(CExpr::Assign(
+            AssignOp::Assign,
+            Box::new(CExpr::Var(member_name.clone())),
+            Box::new(CExpr::Cast(
+                pointer_ty.clone(),
+                Box::new(CExpr::Unary(
+                    UnaryOp::AddrOf,
+                    Box::new(CExpr::Var(base_name)),
+                )),
+            )),
+        ));
+
+        let rewritten = rewrite_stack_buffer_aliases(
+            &body,
+            &HashMap::from([(member, (base, 0_usize))]),
+            &HashMap::from([(member_name, pointer_ty)]),
+            &HashSet::new(),
+        );
+
+        assert_eq!(rewritten, CStmt::Expr(CExpr::int(0)));
+    }
+
+    #[test]
+    fn stack_address_alias_uses_the_backing_address_not_stored_bytes() {
+        let base: RTLReg = 0x7200;
+        let address: RTLReg = 0x7300;
+        let base_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(base);
+        let address_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(address);
+        let body = CStmt::Expr(CExpr::Unary(
+            UnaryOp::AddrOf,
+            Box::new(CExpr::Var(address_name.clone())),
+        ));
+
+        let rewritten = rewrite_stack_buffer_aliases(
+            &body,
+            &HashMap::from([(address, (base, 8_usize))]),
+            &HashMap::from([(address_name, CType::ptr(CType::char_unsigned()))]),
+            &HashSet::from([address]),
+        );
+
+        assert_eq!(
+            rewritten,
+            CStmt::Expr(CExpr::Unary(
+                UnaryOp::AddrOf,
+                Box::new(stack_buffer_alias_byte_expr(&base_name, 8)),
+            )),
+        );
+    }
+
+    #[test]
     fn stack_buffer_alias_rewrites_address_to_exact_backing_offset() {
         let base: RTLReg = 0x7100;
         let member: RTLReg = 0x7200;
@@ -8571,6 +9545,7 @@ mod escaped_stack_array_tests {
             &body,
             &HashMap::from([(member, (base, 1_usize))]),
             &HashMap::from([(member_name, CType::long())]),
+            &HashSet::new(),
         );
 
         assert_eq!(
@@ -8583,10 +9558,7 @@ mod escaped_stack_array_tests {
                         CType::ptr(CType::long()),
                         Box::new(CExpr::Unary(
                             UnaryOp::AddrOf,
-                            Box::new(CExpr::Index(
-                                Box::new(CExpr::Var(base_name)),
-                                Box::new(CExpr::int(1)),
-                            )),
+                            Box::new(stack_buffer_alias_byte_expr(&base_name, 1)),
                         )),
                     )),
                 )),
@@ -8608,6 +9580,7 @@ mod escaped_stack_array_tests {
             &body,
             &HashMap::from([(base, (base, 0_usize))]),
             &HashMap::from([(base_name, CType::long())]),
+            &HashSet::new(),
         );
 
         let CStmt::Expr(CExpr::Assign(_, lhs, _)) = rewritten else {
@@ -8621,11 +9594,9 @@ mod escaped_stack_array_tests {
                     CType::ptr(CType::long()),
                     Box::new(CExpr::Unary(
                         UnaryOp::AddrOf,
-                        Box::new(CExpr::Index(
-                            Box::new(CExpr::Var(
-                                crate::decompile::passes::c_pass::helpers::param_name_for_reg(base),
-                            )),
-                            Box::new(CExpr::int(0)),
+                        Box::new(stack_buffer_alias_byte_expr(
+                            &crate::decompile::passes::c_pass::helpers::param_name_for_reg(base),
+                            0,
                         )),
                     )),
                 )),
@@ -8650,6 +9621,7 @@ mod escaped_stack_array_tests {
                 base_name.clone(),
                 CType::Array(Box::new(CType::char_unsigned()), Some(24)),
             )]),
+            &HashSet::new(),
         );
 
         assert_eq!(
@@ -8658,13 +9630,33 @@ mod escaped_stack_array_tests {
                 target_ty,
                 Box::new(CExpr::Unary(
                     UnaryOp::AddrOf,
-                    Box::new(CExpr::Index(
-                        Box::new(CExpr::Var(base_name)),
-                        Box::new(CExpr::int(0)),
-                    )),
+                    Box::new(stack_buffer_alias_byte_expr(&base_name, 0)),
                 )),
             )),
             "an array alias in pointer context must decay to its backing address",
+        );
+    }
+
+    #[test]
+    fn byte_array_backing_direct_value_keeps_its_physical_access_width() {
+        let base: RTLReg = 0x7480;
+        let base_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(base);
+        let body = CStmt::Expr(CExpr::Var(base_name.clone()));
+        let array_ty = CType::Array(Box::new(CType::char_unsigned()), Some(8));
+
+        let rewritten = rewrite_stack_buffer_aliases_with_access_types(
+            &body,
+            &HashMap::from([(base, (base, 0_usize))]),
+            &HashMap::from([(base_name.clone(), array_ty)]),
+            &HashSet::new(),
+            &HashMap::from([(base, CType::int())]),
+            &HashSet::from([base]),
+        );
+
+        assert_eq!(
+            rewritten,
+            CStmt::Expr(stack_buffer_alias_value_expr(&base_name, 0, &CType::int())),
+            "the backing array owns eight bytes, but a direct movl reload reads four",
         );
     }
 
@@ -8684,6 +9676,7 @@ mod escaped_stack_array_tests {
             &body,
             &HashMap::from([(member, (base, 8_usize))]),
             &HashMap::from([(member_name, CType::long())]),
+            &HashSet::new(),
         );
 
         assert_eq!(
@@ -8696,16 +9689,65 @@ mod escaped_stack_array_tests {
                         CType::ptr(CType::long()),
                         Box::new(CExpr::Unary(
                             UnaryOp::AddrOf,
-                            Box::new(CExpr::Index(
-                                Box::new(CExpr::Var(base_name)),
-                                Box::new(CExpr::int(8)),
-                            )),
+                            Box::new(stack_buffer_alias_byte_expr(&base_name, 8)),
                         )),
                     )),
                 )),
             )),
             "a true scalar-to-pointer cast must still convert the stored value",
         );
+    }
+
+    #[test]
+    fn named_global_byte_pointer_on_rhs_keeps_byte_stride() {
+        let global = 0x4000_usize;
+        let index = 0x5000_usize;
+        let int_ty = clight::ClightType::Tint(
+            clight::ClightIntSize::I32,
+            clight::ClightSignedness::Signed,
+            clight::ClightAttr::default(),
+        );
+        let void_ptr = clight::ClightType::Tpointer(
+            Arc::new(clight::ClightType::Tvoid),
+            clight::ClightAttr::default(),
+        );
+        let address = clight::ClightExpr::Ebinop(
+            clight::ClightBinaryOp::Oadd,
+            Box::new(clight::ClightExpr::Etempvar(index, int_ty.clone())),
+            Box::new(clight::ClightExpr::Eaddrof(
+                Box::new(clight::ClightExpr::Evar(global, int_ty)),
+                void_ptr.clone(),
+            )),
+            void_ptr,
+        );
+        let mut ctx = ConversionContext::new(
+            HashMap::from([(global, "global_bytes".to_string())]),
+            crate::abi::DataModel::Lp64,
+        );
+        ctx.global_lvalue_aliases.insert(
+            global,
+            CExpr::Index(
+                Box::new(CExpr::Var("global_bytes".to_string())),
+                Box::new(CExpr::int(0)),
+            ),
+        );
+
+        let converted = convert_expr(&address, &mut ctx);
+        let CExpr::Cast(CType::Pointer(result, _), sum) = converted else {
+            panic!("byte-address result must retain its annotated pointer cast")
+        };
+        assert!(matches!(result.as_ref(), CType::Void));
+        let CExpr::Paren(sum) = sum.as_ref() else {
+            panic!("result cast must parenthesize the byte addition")
+        };
+        let CExpr::Binary(BinaryOp::Add, base, _) = sum.as_ref() else {
+            panic!("expected symmetric byte addition")
+        };
+        assert!(matches!(
+            base.as_ref(),
+            CExpr::Cast(CType::Pointer(pointee, _), _)
+                if matches!(pointee.as_ref(), CType::Int(IntSize::Char, _))
+        ));
     }
 
     #[test]
@@ -8741,6 +9783,7 @@ mod escaped_stack_array_tests {
             &body,
             &HashMap::from([(member, (base, 0_usize))]),
             &HashMap::from([(member_name, CType::long())]),
+            &HashSet::new(),
         );
         let final_types = HashMap::from([
             (
@@ -9279,6 +10322,7 @@ mod escaped_stack_array_tests {
         let func: Address = 0x9000;
         let base_ofs: i64 = 32;
         let locals: [RTLReg; 3] = [0x7100, 0x7200, 0x7300];
+        let late_base_address: RTLReg = 0x7400;
 
         for (idx, local) in locals.into_iter().enumerate() {
             let field_ofs = idx as i64 * 8;
@@ -9291,6 +10335,9 @@ mod escaped_stack_array_tests {
                 (func, 0x100 + idx as u64, base_ofs + field_ofs, local),
             );
         }
+        // A later LEA/reload of element zero gets a distinct SSA name but
+        // still denotes the same physical array base.
+        db.rel_push("stack_var", (func, 0x180_u64, base_ofs, late_base_address));
 
         // A sparse region is struct-like and must remain separate locals.
         let sparse_func: Address = 0xa000;
@@ -9319,6 +10366,7 @@ mod escaped_stack_array_tests {
             layouts.members.get(&func),
             Some(&HashMap::from([
                 (locals[0], (locals[0], 0)),
+                (late_base_address, (locals[0], 0)),
                 (locals[1], (locals[0], 1)),
                 (locals[2], (locals[0], 2)),
             ]))
@@ -9433,6 +10481,43 @@ mod escaped_stack_array_tests {
             .members
             .get(&func)
             .is_none_or(|members| !members.contains_key(&enclosed_scalar)));
+    }
+
+    #[test]
+    fn byte_buffer_accepts_nested_access_widths_at_one_offset() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0xb080;
+        let base_ofs = 16_i64;
+        let base: RTLReg = 0x8000;
+        let packed: RTLReg = 0x8010;
+        db.rel_push(
+            "escaped_stack_region_field",
+            (func, base_ofs, 0_i64, MemoryChunk::MAny64),
+        );
+        for chunk in [MemoryChunk::MInt8Unsigned, MemoryChunk::MInt16Unsigned] {
+            db.rel_push("escaped_stack_region_field", (func, base_ofs, 8_i64, chunk));
+        }
+        db.rel_push("slot_escaped_canonical", (func, base_ofs, base));
+        db.rel_push("stack_var", (func, 0xb081_u64, base_ofs, base));
+        db.rel_push("stack_var", (func, 0xb082_u64, base_ofs + 8, packed));
+
+        let arrays = derive_escaped_stack_array_layouts(&db);
+        let buffers = derive_escaped_stack_buffer_layouts(&db, &arrays);
+
+        assert_eq!(
+            buffers
+                .buffers
+                .get(&func)
+                .and_then(|items| items.get(&base)),
+            Some(&10),
+        );
+        assert_eq!(
+            buffers
+                .members
+                .get(&func)
+                .and_then(|items| items.get(&packed)),
+            Some(&(base, 8, MemoryChunk::MInt16Unsigned)),
+        );
     }
 
     #[test]

@@ -897,6 +897,23 @@ fn populate_known_func_param_pointee_size(db: &mut DecompileDB) {
         ("getdelim", 1, LibcObject::Pointer),
         ("__getdelim", 0, LibcObject::Pointer),
         ("__getdelim", 1, LibcObject::Pointer),
+        // libselinux pointer out-parameters.  Each writes one `char *` into
+        // caller storage; without the pointer-sized extent a default 4-byte
+        // local is overwritten on LP64 targets.
+        ("selabel_lookup", 1, LibcObject::Pointer),
+        ("selabel_lookup_raw", 1, LibcObject::Pointer),
+        ("getcon", 0, LibcObject::Pointer),
+        ("getcon_raw", 0, LibcObject::Pointer),
+        ("getfscreatecon", 0, LibcObject::Pointer),
+        ("getfscreatecon_raw", 0, LibcObject::Pointer),
+        ("getfilecon", 1, LibcObject::Pointer),
+        ("getfilecon_raw", 1, LibcObject::Pointer),
+        ("lgetfilecon", 1, LibcObject::Pointer),
+        ("lgetfilecon_raw", 1, LibcObject::Pointer),
+        ("fgetfilecon", 1, LibcObject::Pointer),
+        ("fgetfilecon_raw", 1, LibcObject::Pointer),
+        ("security_compute_create", 3, LibcObject::Pointer),
+        ("security_compute_create_raw", 3, LibcObject::Pointer),
     ];
     for &(name, idx, obj) in entries {
         db.rel_push(

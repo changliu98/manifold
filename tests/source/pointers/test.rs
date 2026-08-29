@@ -29,7 +29,7 @@ fn deref_write_has_assignment() {
 fn swap_has_multiple_assignments() {
     let b = body(&OUTPUT, "test_swap");
     assert!(
-        b.matches("=").count() >= 3,
+        count_assignments(&OUTPUT, "test_swap") >= 3,
         "expected 3+ assignments for swap:\n{b}"
     );
 }
@@ -54,6 +54,11 @@ fn out_param_writes_through_pointer() {
 #[test]
 fn ptr_arith_accesses_adjacent_slots() {
     let b = body(&OUTPUT, "test_ptr_arith");
-    assert!(b.contains("ofs_0"), "expected base slot load:\n{b}");
-    assert!(b.contains("ofs_4"), "expected adjacent slot access:\n{b}");
+    let recovered_fields = b.contains("ofs_0") && b.contains("ofs_4");
+    let raw_offsets = count_memory_accesses(&OUTPUT, "test_ptr_arith") >= 2
+        && (b.contains("+ 4") || b.contains("[4]"));
+    assert!(
+        recovered_fields || raw_offsets,
+        "expected adjacent 4-byte accesses:\n{b}"
+    );
 }

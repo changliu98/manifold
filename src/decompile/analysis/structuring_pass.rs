@@ -268,6 +268,7 @@ impl IRPass for StructuringPass {
                             stmts: stmts.clone(),
                             switch_chain_members: vec![],
                             valid_switches: vec![],
+                            switch_defaults: vec![],
                             ifbody_true: vec![],
                             ifbody_false: vec![],
                             join_points: vec![],
@@ -294,6 +295,7 @@ impl IRPass for StructuringPass {
         let mut result_stmts: Vec<(Node, CsharpminorStmt)> = Vec::new();
         let mut all_switch_members: Vec<(Address, Node, Node, u64, i64, Node)> = Vec::new();
         let mut all_valid_switches: Vec<(Address, Node, u64)> = Vec::new();
+        let mut all_switch_defaults: Vec<(Address, Node, Node)> = Vec::new();
         let mut all_ifbody_true: Vec<(Address, Node, Node)> = Vec::new();
         let mut all_ifbody_false: Vec<(Address, Node, Node)> = Vec::new();
         let mut all_join_points: Vec<(Address, Node, Node)> = Vec::new();
@@ -317,6 +319,9 @@ impl IRPass for StructuringPass {
             }
             for (head, reg) in &structured.valid_switches {
                 all_valid_switches.push((func_addr, *head, *reg));
+            }
+            for (head, target) in &structured.switch_defaults {
+                all_switch_defaults.push((func_addr, *head, *target));
             }
             for (branch, member) in &structured.ifbody_true {
                 all_ifbody_true.push((func_addr, *branch, *member));
@@ -371,6 +376,12 @@ impl IRPass for StructuringPass {
             valid_switch_rel.push(*tuple);
         }
         db.rel_set("valid_switch_chain", valid_switch_rel);
+
+        let switch_default_rel = ascent::boxcar::Vec::<(Address, Node, Node)>::new();
+        for tuple in all_switch_defaults {
+            switch_default_rel.push(tuple);
+        }
+        db.rel_set("switch_chain_default", switch_default_rel);
 
         let emit_switch_rel = ascent::boxcar::Vec::<(Address, Node, u64)>::new();
         for tuple in &all_valid_switches {
@@ -966,11 +977,13 @@ ascent_par! {
     explicit_cfg_target(*target) <--
         jumptable_target(_, target);
 
-    // An untargeted Sjump to sequential next is a nop.
-    trim_node(*node) <--
-        stmt(node, ?CsharpminorStmt::Sjump(target)),
-        seq_next(node, target),
-        !explicit_cfg_target(node);
+    // Keep explicit jumps through structural assembly.  `seq_next` is allowed
+    // to use the semantic Cminor CFG for synthetic expansion stages, whereas
+    // removing a jump requires a proof about the final printed layout.  In
+    // particular, an ordinary Sjump has its target as its sole semantic
+    // successor; treating that fact as physical fallthrough deletes every
+    // untargeted forward jump.  GotoElide runs after all tree rewrites and is
+    // the layer that can safely remove a transfer whose label is truly next.
 
     // Do not erase an if-arm's explicit jump merely because its target is in
     // the same structural arm or is the arm's join.  Collected nodes are not
@@ -1350,6 +1363,25 @@ mod structural_lattice_tests {
     }
 
     #[test]
+    fn untargeted_semantic_successor_does_not_prove_layout_fallthrough() {
+        const JUMP: u64 = 0x10;
+        const TARGET: u64 = 0x80;
+
+        let mut prog = StructuringProgram::default();
+        prog.entry_node.push((JUMP,));
+        prog.stmt.push((JUMP, CsharpminorStmt::Sjump(TARGET)));
+        prog.stmt.push((TARGET, CsharpminorStmt::Snop));
+        // This is exactly what happens when sequential-edge recovery is fed
+        // the authoritative Cminor successor of an explicit jump.  It is a
+        // semantic edge, not evidence that TARGET will be printed next.
+        prog.seq_next.push((JUMP, TARGET));
+
+        prog.run();
+
+        assert!(!prog.trim_node.iter().any(|fact| fact == &(JUMP,)));
+    }
+
+    #[test]
     fn comparison_tree_crossing_a_loop_exit_is_not_partially_lifted() {
         let [second, loop_exit_leaf, head, case_one, case_two, case_three, exit_case, default, third] =
             synthetic_ids();
@@ -1377,6 +1409,93 @@ mod structural_lattice_tests {
         // switch and lose both its case and default edges.  Keep the original
         // CFG until switch/default and loop-exit structure can be represented
         // together.
+        assert!(switches.is_empty());
+    }
+
+    #[test]
+    fn comparison_chain_records_its_unmatched_default_edge() {
+        let [head, second, third, case_one, case_two, case_three, default] = synthetic_ids();
+        const DISC: u64 = 7;
+        let eq = |value, ifso, ifnot| {
+            CsharpminorStmt::Scond(
+                Condition::Ccompimm(Comparison::Ceq, value),
+                vec![CsharpminorExpr::Evar(DISC)],
+                ifso,
+                ifnot,
+            )
+        };
+        let stmts = vec![
+            (head, eq(1, case_one, second)),
+            (second, eq(2, case_two, third)),
+            (third, eq(3, case_three, default)),
+            (case_one, CsharpminorStmt::Snop),
+            (case_two, CsharpminorStmt::Snop),
+            (case_three, CsharpminorStmt::Snop),
+            (default, CsharpminorStmt::Snop),
+        ];
+        let mut preds: HashMap<u64, Vec<u64>> = HashMap::new();
+        for (source, stmt) in &stmts {
+            if let CsharpminorStmt::Scond(_, _, ifso, ifnot) = stmt {
+                preds.entry(*ifso).or_default().push(*source);
+                preds.entry(*ifnot).or_default().push(*source);
+            }
+        }
+
+        let structured = structure(
+            &stmts,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            Some(head),
+            &preds,
+            &HashSet::new(),
+        );
+
+        assert!(structured
+            .switch_defaults
+            .iter()
+            .any(|fact| fact == &(head, default)));
+    }
+
+    #[test]
+    fn parity_partition_is_not_collapsed_to_a_single_switch_case() {
+        let [head, small, parity, nonprime, prime, trial] = synthetic_ids();
+        const DISC: u64 = 7;
+        let stmts = vec![
+            (
+                head,
+                CsharpminorStmt::Scond(
+                    Condition::Ccompimm(Comparison::Cle, 1),
+                    vec![CsharpminorExpr::Evar(DISC)],
+                    nonprime,
+                    small,
+                ),
+            ),
+            (
+                small,
+                CsharpminorStmt::Scond(
+                    Condition::Ccompimm(Comparison::Cle, 3),
+                    vec![CsharpminorExpr::Evar(DISC)],
+                    prime,
+                    parity,
+                ),
+            ),
+            (
+                parity,
+                CsharpminorStmt::Scond(
+                    Condition::Cmaskzero(1),
+                    vec![CsharpminorExpr::Evar(DISC)],
+                    nonprime,
+                    trial,
+                ),
+            ),
+            (nonprime, CsharpminorStmt::Snop),
+            (prime, CsharpminorStmt::Snop),
+            (trial, CsharpminorStmt::Snop),
+        ];
+
+        let switches = detect_comparison_tree_switches(&stmts, &HashMap::new(), &HashSet::new());
+
         assert!(switches.is_empty());
     }
 
@@ -1452,6 +1571,7 @@ pub struct StructuringResult {
     pub stmts: Vec<(Node, CsharpminorStmt)>,
     pub switch_chain_members: Vec<(Node, Node, u64, i64, Node)>,
     pub valid_switches: Vec<(Node, u64)>,
+    pub switch_defaults: Vec<(Node, Node)>,
     pub ifbody_true: Vec<(Node, Node)>,
     pub ifbody_false: Vec<(Node, Node)>,
     pub join_points: Vec<(Node, Node)>,
@@ -1655,6 +1775,7 @@ pub fn structure(
             stmts: vec![],
             switch_chain_members: vec![],
             valid_switches: vec![],
+            switch_defaults: vec![],
             ifbody_true: vec![],
             ifbody_false: vec![],
             join_points: vec![],
@@ -1962,6 +2083,7 @@ pub fn structure(
 
     // CF-6: clight suppresses clean chain members, so rewrite each untainted leaf to Sjump(exit) and reattribute its case rows to the head, making the surviving goto the default routing.
     let mut leaf_rewrites: Vec<(Node, Node)> = Vec::new();
+    let mut switch_defaults: Vec<(Node, Node)> = Vec::new();
     {
         // Local CFG pred map mirrors the edge set clight's chain_member_tainted sees via cminor_succ.
         let seq_map: HashMap<Node, Node> = seq_edges.iter().copied().collect();
@@ -2091,6 +2213,27 @@ pub fn structure(
                     );
                 }
                 continue;
+            }
+            // The unmatched edge of the final comparison is the semantic
+            // default.  Recover it independently of leaf suppression: a leaf
+            // can also be reached from a case body and therefore must remain
+            // live, while the switch still needs an explicit default goto.
+            let mut default_targets = std::collections::BTreeSet::new();
+            for &(member, case_target) in &rows {
+                let Some(CsharpminorStmt::Scond(_, _, ifso, ifnot)) = stmt_map.get(&member) else {
+                    continue;
+                };
+                let unmatched = match (*ifso == case_target, *ifnot == case_target) {
+                    (true, false) => Some(*ifnot),
+                    (false, true) => Some(*ifso),
+                    _ => None,
+                };
+                if let Some(target) = unmatched.filter(|target| !chain.contains(target)) {
+                    default_targets.insert(target);
+                }
+            }
+            if default_targets.len() == 1 {
+                switch_defaults.push((head, *default_targets.iter().next().unwrap()));
             }
             for (m, exit) in head_leaves {
                 if tainted.contains(&m) {
@@ -2224,6 +2367,7 @@ pub fn structure(
         stmts: result_stmts,
         switch_chain_members,
         valid_switches,
+        switch_defaults,
         ifbody_true: out_ifbody_true,
         ifbody_false: out_ifbody_false,
         join_points: out_join_points,
@@ -3090,6 +3234,36 @@ fn detect_comparison_tree_switches(
                 // candidate that reaches one is therefore incomplete, not a
                 // smaller valid switch: retain the original comparison tree.
                 if visited.iter().any(|n| cond_break_nodes.contains(n)) {
+                    continue;
+                }
+
+                // A mask predicate partitions many values; it is not an
+                // equality case unless the complete incoming domain lies in
+                // one mask period.  This walker cannot prove that across
+                // arbitrary CFG joins.  Lifting the mask would otherwise turn
+                // "all even values" into only `case 0` and delete the parity
+                // branch, so preserve the original comparison tree.
+                let has_discriminant_mask = visited.iter().any(|visited_node| {
+                    let Some(CsharpminorStmt::Scond(cond, args, _, _)) = stmt_map.get(visited_node)
+                    else {
+                        return false;
+                    };
+                    if !matches!(cond, Condition::Cmaskzero(_) | Condition::Cmasknotzero(_)) {
+                        return false;
+                    }
+                    let Some(mask_reg) = args.first().and_then(|arg| match arg {
+                        CsharpminorExpr::Evar(reg) => Some(*reg),
+                        CsharpminorExpr::Ebinop(_, lhs, _) => match lhs.as_ref() {
+                            CsharpminorExpr::Evar(reg) => Some(*reg),
+                            _ => None,
+                        },
+                        _ => None,
+                    }) else {
+                        return false;
+                    };
+                    resolve_reg(mask_reg).0 == root_reg
+                });
+                if has_discriminant_mask {
                     continue;
                 }
 

@@ -5974,6 +5974,29 @@ ascent_par! {
 
 
     // SETcc fuses with the nearest preceding flag-setting compare, tolerating scheduled non-flag-clobbering instructions; the walk stops at any flag setter so a stale compare is never bound.
+    #[local] relation setcc_flag_origin(Address);
+    setcc_flag_origin(addr) <-- pcmp(addr, _, _);
+    setcc_flag_origin(addr) <-- ptest(addr, _, _);
+    setcc_flag_origin(addr) <-- psub(addr, _, _);
+
+    // Same-block structural walk from a flag producer to every subsequent
+    // instruction that can still observe those flags.  Fixed two-instruction
+    // windows missed ordinary scheduling such as TEST; MOV; MOV; CMOV; SETcc.
+    // The recursion stops before crossing a flag-setting instruction, and the
+    // block guard prevents a guessed cross-merge origin.
+    #[local] relation setcc_flag_walk(Address, Address);
+    setcc_flag_walk(origin, *successor) <--
+        setcc_flag_origin(origin),
+        next(origin, successor),
+        code_in_block(origin, block),
+        code_in_block(successor, block);
+    setcc_flag_walk(origin, *successor) <--
+        setcc_flag_walk(origin, current),
+        flags_flow_transparent(current),
+        next(current, successor),
+        code_in_block(origin, block),
+        code_in_block(successor, block);
+
     #[local] relation cmp_setcc_link(Address, Address);
     cmp_setcc_link(addr0, addr1) <--
         pcmp(addr0, _, _),
@@ -6000,6 +6023,10 @@ ascent_par! {
         if !is_flag_setting(mnem2),
         next(addr2, addr3),
         psetcc(addr3, _, _);
+    cmp_setcc_link(addr0, addr_set) <--
+        pcmp(addr0, _, _),
+        setcc_flag_walk(addr0, addr_set),
+        psetcc(addr_set, _, _);
 
     #[local] relation test_setcc_link(Address, Address);
     test_setcc_link(addr0, addr1) <--
@@ -6027,6 +6054,10 @@ ascent_par! {
         if !is_flag_setting(mnem2),
         next(addr2, addr3),
         psetcc(addr3, _, _);
+    test_setcc_link(addr0, addr_set) <--
+        ptest(addr0, _, _),
+        setcc_flag_walk(addr0, addr_set),
+        psetcc(addr_set, _, _);
 
     #[local] relation sub_setcc_link(Address, Address);
     sub_setcc_link(addr0, addr1) <--
@@ -6044,6 +6075,10 @@ ascent_par! {
         if !is_flag_setting(mnem1),
         next(addr1, addr2),
         psetcc(addr2, _, _);
+    sub_setcc_link(addr0, addr_set) <--
+        psub(addr0, _, _),
+        setcc_flag_walk(addr0, addr_set),
+        psetcc(addr_set, _, _);
 
     setcc_compare_site(addr_set, addr0) <-- cmp_setcc_link(addr0, addr_set);
     setcc_compare_site(addr_set, addr0) <-- test_setcc_link(addr0, addr_set);
@@ -6874,8 +6909,7 @@ ascent_par! {
         if Ireg::from(src_str) != *quot_ireg;
     imul2_dividend(*func, *imul_addr, *quot_ireg, *quot_ireg) <--
         imul2_magic(func, imul_addr, quot_ireg, _, _),
-        owned_straightline_step(func, prev_addr, imul_addr),
-        !magic_prev_mov_into_dst(func, imul_addr, prev_addr);
+        !magic_prev_mov_into_dst(func, imul_addr, _);
 
     // Helper: the instruction before the IMUL is a reg-to-reg `mov IMUL_DST, SRC`.
     #[local] relation magic_prev_mov_into_dst(Address, Address, Address);
@@ -7725,6 +7759,65 @@ ascent_par! {
         pjcc(addr2, TestCond::CondNe, lbl),
         direct_jump(addr2, tgt);
 
+    // Ordered float equality with a success-value MOV between JP and JE:
+    // ucomis*; jp false; mov $1,result; je success. MOV preserves flags, so
+    // the JE still consumes the compare and exactly means ordered equality.
+    mach_inst(eq_jcc, MachInst::Mcond(
+        Condition::Ccompfs(Comparison::Ceq),
+        Arc::new(vec![arg1, arg2]),
+        success
+    )),
+    mcond_at_jcc(*eq_jcc),
+    reg_use(*eq_jcc, arg1),
+    reg_use(*eq_jcc, arg2) <--
+        pucomiss(cmp, r1, r2),
+        op_register(r1, r1_name),
+        op_register(r2, r2_name),
+        reg_xmm(r1_name),
+        reg_xmm(r2_name),
+        let arg1 = Mreg::x86(r1_name),
+        let arg2 = Mreg::x86(r2_name),
+        next(cmp, parity_jcc),
+        pjcc(parity_jcc, TestCond::CondP, _),
+        direct_jump(parity_jcc, false_target),
+        next(parity_jcc, set_true),
+        instruction(set_true, _, _, "MOV", one, true_dst, _, _, _, _),
+        op_immediate(one, one_value, _),
+        if *one_value == 1,
+        op_register(true_dst, _),
+        next(set_true, eq_jcc),
+        pjcc(eq_jcc, TestCond::CondE, success),
+        next(eq_jcc, false_fallthrough),
+        if false_fallthrough == false_target;
+
+    mach_inst(eq_jcc, MachInst::Mcond(
+        Condition::Ccompf(Comparison::Ceq),
+        Arc::new(vec![arg1, arg2]),
+        success
+    )),
+    mcond_at_jcc(*eq_jcc),
+    reg_use(*eq_jcc, arg1),
+    reg_use(*eq_jcc, arg2) <--
+        pucomisd(cmp, r1, r2),
+        op_register(r1, r1_name),
+        op_register(r2, r2_name),
+        reg_xmm(r1_name),
+        reg_xmm(r2_name),
+        let arg1 = Mreg::x86(r1_name),
+        let arg2 = Mreg::x86(r2_name),
+        next(cmp, parity_jcc),
+        pjcc(parity_jcc, TestCond::CondP, _),
+        direct_jump(parity_jcc, false_target),
+        next(parity_jcc, set_true),
+        instruction(set_true, _, _, "MOV", one, true_dst, _, _, _, _),
+        op_immediate(one, one_value, _),
+        if *one_value == 1,
+        op_register(true_dst, _),
+        next(set_true, eq_jcc),
+        pjcc(eq_jcc, TestCond::CondE, success),
+        next(eq_jcc, false_fallthrough),
+        if false_fallthrough == false_target;
+
 
     transl_load_inferred(addr, *chunk, addrmode, regs.clone(), dst) <--
         pmov(addr, dst_sym, src),
@@ -8228,6 +8321,7 @@ ascent_par! {
         pneg(address, r),
         !div_consumed(address),
         op_register(r, r_str),
+        !reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res];
@@ -9282,6 +9376,7 @@ ascent_par! {
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, r_str),
+        !reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res];
@@ -9584,6 +9679,7 @@ ascent_par! {
     mach_inst(address, MachInst::Mop(Operation::Onot, Arc::new(args), *res)) <--
         pnot(address, r),
         op_register(r, r_str),
+        !reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res];
@@ -9593,6 +9689,7 @@ ascent_par! {
         op_register(cxreg, cxreg_str),
         reg_cx(cxreg_str),
         op_register(r, r_str),
+        !reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res, Mreg::CX];
@@ -9602,6 +9699,7 @@ ascent_par! {
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, r_str),
+        !reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res];
@@ -9611,6 +9709,7 @@ ascent_par! {
         op_register(cxreg, cxreg_str),
         reg_cx(cxreg_str),
         op_register(r, r_str),
+        !reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res, Mreg::CX];
@@ -9623,6 +9722,7 @@ ascent_par! {
         // A 32-bit shift masks its count to 5 bits, so an immediate >= 32 can only be a 64-bit shift; suppress the 32-bit candidate so the mulhi product keeps full width instead of truncating to 0.
         if imm_int < 32,
         op_register(r, r_str),
+        !reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res];
@@ -9632,6 +9732,7 @@ ascent_par! {
         op_register(cxreg, cxreg_str),
         reg_cx(cxreg_str),
         op_register(r, r_str),
+        !reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res, Mreg::CX];
@@ -9644,6 +9745,7 @@ ascent_par! {
         // As with Oshrimm: a 32-bit logical shift masks its count to 5 bits, so imm >= 32 is a 64-bit shift and the 32-bit candidate is suppressed.
         if imm_int < 32,
         op_register(r, r_str),
+        !reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res];
@@ -9653,6 +9755,7 @@ ascent_par! {
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, r_str),
+        !reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res];
@@ -9902,6 +10005,7 @@ ascent_par! {
         pneg(address, r),
         !div_consumed(address),
         op_register(r, r_str),
+        reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res];
@@ -9938,6 +10042,7 @@ ascent_par! {
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, r_str),
+        reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res];
@@ -10190,6 +10295,7 @@ ascent_par! {
     mach_inst(address, MachInst::Mop(Operation::Onotl, Arc::new(args), *res)) <--
         pnot(address, r),
         op_register(r, r_str),
+        reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res];
@@ -10199,6 +10305,7 @@ ascent_par! {
         op_register(cxreg, cxreg_str),
         reg_cx(cxreg_str),
         op_register(r, r_str),
+        reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res, Mreg::CX];
@@ -10208,6 +10315,7 @@ ascent_par! {
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, r_str),
+        reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res];
@@ -10217,6 +10325,7 @@ ascent_par! {
         op_register(cxreg, cxreg_str),
         reg_cx(cxreg_str),
         op_register(r, r_str),
+        reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res, Mreg::CX];
@@ -10227,6 +10336,7 @@ ascent_par! {
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, r_str),
+        reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res];
@@ -10236,6 +10346,7 @@ ascent_par! {
         op_register(cxreg, cxreg_str),
         reg_cx(cxreg_str),
         op_register(r, r_str),
+        reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res, Mreg::CX];
@@ -10246,6 +10357,7 @@ ascent_par! {
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, r_str),
+        reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res];
@@ -10255,6 +10367,7 @@ ascent_par! {
         op_immediate(n, imm_str, _),
         let imm_int = *imm_str as i64,
         op_register(r, r_str),
+        reg_64(r_str),
         ireg_of(preg_of_r, Ireg::from(r_str)),
         preg_of(res, preg_of_r),
         let args = vec![*res];
@@ -10307,6 +10420,25 @@ ascent_par! {
         preg_of(arg, preg_of_r),
         let args = vec![*arg],
         let addr = Addressing::Aindexed(*disp);
+
+    // A destination-width LEA still reads its base at pointer width.  In a
+    // frameless function RBP is an ordinary callee-saved value, so a 32-bit
+    // `lea disp(%rbp), %edx` is integer arithmetic on that value rather than a
+    // frame address.  This is the 32-bit-result twin of the 64-bit RBP rule.
+    mach_inst(address, MachInst::Mop(Operation::Olea(Addressing::Aindexed(*disp)), Arc::new(args), *res)) <--
+        plea(address, r, am),
+        op_register(r, res_str),
+        !reg_64(res_str),
+        ireg_of(preg_of_res, Ireg::from(res_str)),
+        preg_of(res, preg_of_res),
+        op_indirect(am, _, base_str, index_str, _scale, disp, _),
+        reg_bp(*base_str),
+        if *index_str == "NONE" || index_str.is_empty(),
+        instr_in_function(address, func),
+        !func_has_frame_pointer(func),
+        ireg_of(preg_of_base, Ireg::from(base_str)),
+        preg_of(base_arg, preg_of_base),
+        let args = vec![*base_arg];
 
     mach_inst(address, MachInst::Mop(Operation::Oleal(addr), Arc::new(vec![]), *res)) <--
         plea(address, r, am),
@@ -10875,7 +11007,7 @@ ascent_par! {
 
     // Reg-reg fabs/fabsf: recovered from positive evidence that the loaded constant is the IEEE-754 sign-clear mask plus a structural CFG reaching-def proving the mask register still holds it.
 
-    // A movss/movsd loading a 4-/8-byte sign-clear mask from RIP-relative .rodata into an XMM register; the width distinction keeps a movss from validating a double mask.
+    // A scalar move loading a 4-/8-byte sign-clear mask from RIP-relative .rodata into an XMM register; GCC also uses MOVQ for the 64-bit bit pattern, and the XMM-destination guard distinguishes it from an integer move.
     relation mask_load(Address, Mreg, usize);
     mask_load(load_addr, dst_reg, 4) <--
         instruction(load_addr, _, _, mnem, _, dst, _, _, _, _),
@@ -10887,7 +11019,7 @@ ascent_par! {
         let dst_reg = Mreg::x86(dst_str);
     mask_load(load_addr, dst_reg, 8) <--
         instruction(load_addr, _, _, mnem, _, dst, _, _, _, _),
-        if *mnem == "MOVSD" || *mnem == "VMOVSD",
+        if matches!(*mnem, "MOVSD" | "VMOVSD" | "MOVQ" | "VMOVQ"),
         op_register(dst, dst_str),
         reg_xmm(dst_str),
         rip_target_addr(load_addr, target),
@@ -11242,6 +11374,44 @@ ascent_par! {
         pjcc(addr2, TestCond::CondNe, lbl),
         direct_jump(addr2, tgt);
 
+    // GCC materializes ordered float equality as setnp; movzx; zero; cmovne.
+    // The final value is one exactly when the comparison is ordered and equal.
+    mach_inst(cmov, MachInst::Mop(
+        operation,
+        Arc::new(vec![*arg1, Mreg::FP0]),
+        result
+    )),
+    reg_use(*cmov, *arg1),
+    reg_use(*cmov, Mreg::FP0) <--
+        fcmp_mem_arg(cmp, is_double, arg1),
+        fp0_loaded_at(*cmp),
+        next(cmp, set_ordered),
+        psetcc(set_ordered, TestCond::CondNp, set_dst),
+        op_register(set_dst, set_dst_name),
+        next(set_ordered, extend),
+        instruction(extend, _, _, "MOVZX", extend_src, extend_dst, _, _, _, _),
+        op_register(extend_src, extend_src_name),
+        op_register(extend_dst, extend_dst_name),
+        if Mreg::x86(extend_src_name) == Mreg::x86(set_dst_name),
+        next(extend, zero),
+        instruction(zero, _, _, "MOV", zero_imm, zero_dst, _, _, _, _),
+        op_immediate(zero_imm, zero_value, _),
+        if *zero_value == 0,
+        op_register(zero_dst, zero_dst_name),
+        next(zero, cmov),
+        pcmov(cmov, TestCond::CondNe, cmov_dst, cmov_src),
+        op_register(cmov_dst, cmov_dst_name),
+        op_register(cmov_src, cmov_src_name),
+        if Mreg::x86(cmov_dst_name) == Mreg::x86(extend_dst_name),
+        if Mreg::x86(cmov_src_name) == Mreg::x86(zero_dst_name),
+        let result = Mreg::x86(cmov_dst_name),
+        let condition = if *is_double {
+            Condition::Ccompf(Comparison::Ceq)
+        } else {
+            Condition::Ccompfs(Comparison::Ceq)
+        },
+        let operation = Operation::Ocmp(condition);
+
     // Float compare feeding SETcc (3.8b): had no fcmp->setcc link so neither instruction lifted (function collapsed to `return 0`); mirrors cmp_setcc_link to produce Mop(Ocmp(Ccompf*/Cnotcompf*)) writing the setcc destination.
     #[local] relation fcmp_setcc_link(Address, Address);
     fcmp_setcc_link(addr0, addr1) <--
@@ -11381,10 +11551,35 @@ ascent_par! {
         op_register(res, r_str),
         let bswap_name = bswap_builtin_for_reg(r_str);
 
+    #[local] relation pbsr_forward(Address, Address, Address, Symbol, Symbol, Mreg);
+    pbsr_forward(*addr, *successor, *block, *res, *a1, result_reg) <--
+        pbsr(addr, res, a1),
+        code_in_block(addr, block),
+        op_register(res, result_name),
+        let result_reg = Mreg::x86(*result_name),
+        next(addr, successor),
+        code_in_block(successor, block);
+
+    pbsr_forward(*addr, *successor, *block, *res, *a1, *result_reg) <--
+        pbsr_forward(addr, current, block, res, a1, result_reg),
+        flags_flow_transparent(current),
+        !reg_def(current, *result_reg),
+        !reg_use(current, *result_reg),
+        next(current, successor),
+        code_in_block(successor, block);
+
+    #[local] relation pbsr_xor_mask(Address, Symbol, Symbol, i64);
+    pbsr_xor_mask(*addr, *res, *a1, *imm) <--
+        pbsr_forward(addr, xor_addr, _, res, a1, result_reg),
+        pxor(xor_addr, xor_result, n),
+        op_register(xor_result, xor_result_name),
+        if Mreg::x86(*xor_result_name) == *result_reg,
+        op_immediate(n, imm, _);
+
     expand_builtin_inline(
         addr,
         bswap_name,
-        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1)))]),
+        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1_str)))]),
         BuiltinArg::BA(Mreg::x86(Ireg::from(r_str)))
     ) <--
         pmov(addr, res, a1),
@@ -11398,63 +11593,51 @@ ascent_par! {
     expand_builtin_inline(
         addr,
         "__builtin_clz",
-        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1)))]),
+        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1_str)))]),
         BuiltinArg::BA(Mreg::x86(Ireg::from(r_str)))
     ) <--
-        pbsr(addr, res, a1),
+        pbsr_xor_mask(addr, res, a1, imm_str),
         op_register(res, r_str),
         op_register(a1, a1_str),
-        pxor(addr1, res, n),
-        op_immediate(n, imm_str, _),
-        if *imm_str == 31,
-        next(addr, addr1);
+        if *imm_str == 31;
 
     expand_builtin_inline(
         addr,
         "__builtin_clzl",
-        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1)))]),
+        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1_str)))]),
         BuiltinArg::BA(Mreg::x86(Ireg::from(r_str)))
     ) <--
-        pbsr(addr, res, a1),
+        pbsr_xor_mask(addr, res, a1, imm_str),
         op_register(res, r_str),
         op_register(a1, a1_str),
-        pxor(addr1, res, n),
-        op_immediate(n, imm_str, _),
-        if *imm_str == 31,
-        next(addr, addr1);
+        if *imm_str == 31;
 
     expand_builtin_inline(
         addr,
         "__builtin_clzl",
-        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1)))]),
+        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1_str)))]),
         BuiltinArg::BA(Mreg::x86(Ireg::from(r_str)))
     ) <--
-        pbsr(addr, res, a1),
+        pbsr_xor_mask(addr, res, a1, imm_str),
         op_register(res, r_str),
         op_register(a1, a1_str),
-        pxor(addr1, res, n),
-        op_immediate(n, imm_str, _),
-        if *imm_str == 63,
-        next(addr, addr1);
+        if *imm_str == 63;
 
     expand_builtin_inline(
         addr,
         "__builtin_clzll",
-        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1)))]),
+        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1_str)))]),
         BuiltinArg::BA(Mreg::x86(Ireg::from(r_str)))
     ) <--
-        pbsr(addr, res, a1),
+        pbsr_xor_mask(addr, res, a1, imm_str),
         op_register(res, r_str),
         op_register(a1, a1_str),
-        pxor(addr1, res, n),
-        op_immediate(n, imm_str, _),
-        if *imm_str == 63,
-        next(addr, addr1);
+        if *imm_str == 63;
 
     expand_builtin_inline(
         addr,
         "__builtin_ctz",
-        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1)))]),
+        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1_str)))]),
         BuiltinArg::BA(Mreg::x86(Ireg::from(r_str)))
     ) <--
         pbsf(addr, res, a1),
@@ -11464,7 +11647,7 @@ ascent_par! {
     expand_builtin_inline(
         addr,
         "__builtin_ctzl",
-        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1)))]),
+        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1_str)))]),
         BuiltinArg::BA(Mreg::x86(Ireg::from(r_str)))
     ) <--
         pbsf(addr, res, a1),
@@ -11474,7 +11657,7 @@ ascent_par! {
     expand_builtin_inline(
         addr,
         "__builtin_ctzl",
-        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1)))]),
+        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1_str)))]),
         BuiltinArg::BA(Mreg::x86(Ireg::from(r_str)))
     ) <--
         pbsf(addr, res, a1),
@@ -11484,7 +11667,7 @@ ascent_par! {
     expand_builtin_inline(
         addr,
         "__builtin_ctzll",
-        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1)))]),
+        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1_str)))]),
         BuiltinArg::BA(Mreg::x86(Ireg::from(r_str)))
     ) <--
         pbsf(addr, res, a1),
@@ -11524,7 +11707,7 @@ ascent_par! {
     expand_builtin_inline(
         addr,
         "__builtin_fsqrt",
-        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1)))]),
+        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1_str)))]),
         BuiltinArg::BA(Mreg::x86(Ireg::from(res_str)))
     ) <--
         psqrt(addr, res, a1),
@@ -11534,7 +11717,7 @@ ascent_par! {
     expand_builtin_inline(
         addr,
         "__builtin_sqrt",
-        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1)))]),
+        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1_str)))]),
         BuiltinArg::BA(Mreg::x86(Ireg::from(res_str)))
     ) <--
         psqrt(addr, res, a1),
@@ -11544,7 +11727,7 @@ ascent_par! {
     expand_builtin_inline(
         addr,
         "__builtin_fsqrt",
-        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1)))]),
+        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1_str)))]),
         BuiltinArg::BA(Mreg::x86(Ireg::from(res_str)))
     ) <--
         psqrtsd(addr, res, a1),
@@ -11554,7 +11737,7 @@ ascent_par! {
     expand_builtin_inline(
         addr,
         "__builtin_sqrt",
-        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1)))]),
+        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1_str)))]),
         BuiltinArg::BA(Mreg::x86(Ireg::from(res_str)))
     ) <--
         psqrtsd(addr, res, a1),
@@ -11564,7 +11747,7 @@ ascent_par! {
     expand_builtin_inline(
         addr,
         "__builtin_fsqrt",
-        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1)))]),
+        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1_str)))]),
         BuiltinArg::BA(Mreg::x86(Ireg::from(res_str)))
     ) <--
         psqrtss(addr, res, a1),
@@ -11574,7 +11757,7 @@ ascent_par! {
     expand_builtin_inline(
         addr,
         "__builtin_sqrt",
-        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1)))]),
+        Arc::new(vec![BuiltinArg::BA(Mreg::x86(Ireg::from(a1_str)))]),
         BuiltinArg::BA(Mreg::x86(Ireg::from(res_str)))
     ) <--
         psqrtss(addr, res, a1),
@@ -12153,6 +12336,187 @@ mod structural_dataflow_tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn bsr_clz_idiom_crosses_unrelated_flag_transparent_moves() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let bsr = 0x1000;
+            let middle = 0x1010;
+            let middle2 = 0x1020;
+            let xor = 0x1030;
+            let block = 0x1000;
+            prog.pbsr.push((bsr, "result", "source"));
+            prog.next
+                .extend([(bsr, middle), (middle, middle2), (middle2, xor)]);
+            for node in [bsr, middle, middle2, xor] {
+                prog.code_in_block.push((node, block));
+            }
+            prog.unrefinedinstruction
+                .push((middle, 5, "", "MOV", "constant", "ECX", "", "", 0, 0));
+            prog.unrefinedinstruction
+                .push((middle2, 5, "", "MOV", "one", "EDI", "", "", 0, 0));
+            prog.pxor.push((xor, "xor_result", "mask"));
+            prog.op_immediate.push(("mask", 63, 8));
+            prog.op_register
+                .extend([("result", "RBX"), ("xor_result", "RBX"), ("source", "RBX")]);
+            prog.builtins
+                .extend([("__builtin_clzl",), ("__builtin_clzll",)]);
+
+            prog.run();
+
+            assert!(prog.expand_builtin_inline.iter().any(|(node, name, _, _)| {
+                *node == bsr && matches!(*name, "__builtin_clzl" | "__builtin_clzll")
+            }));
+            assert!(prog
+                .expand_builtin_inline
+                .iter()
+                .any(|(node, name, args, result)| {
+                    *node == bsr
+                        && matches!(*name, "__builtin_clzl" | "__builtin_clzll")
+                        && args.as_slice() == [crate::x86::types::BuiltinArg::BA(Mreg::BX)]
+                        && result == &crate::x86::types::BuiltinArg::BA(Mreg::BX)
+                }));
+            assert!(prog.mach_inst.iter().any(|(node, inst)| {
+                *node == bsr
+                    && matches!(
+                        inst,
+                        MachInst::Mbuiltin(
+                            name,
+                            args,
+                            crate::x86::types::BuiltinArg::BA(result),
+                        ) if matches!(name.as_str(), "__builtin_clzl" | "__builtin_clzll")
+                            && args.as_slice()
+                                == [crate::x86::types::BuiltinArg::BA(Mreg::BX)]
+                            && *result == Mreg::BX
+                    )
+            }));
+        });
+    }
+
+    #[test]
+    fn ordered_float_eq_survives_interposed_true_value_move() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let [cmp, parity, set_true, equal, false_target, success] = synthetic_ids();
+            prog.pucomiss.push((cmp, "lhs", "rhs"));
+            prog.op_register
+                .extend([("lhs", "XMM0"), ("rhs", "XMM1"), ("true_dst", "EAX")]);
+            prog.next.extend([
+                (cmp, parity),
+                (parity, set_true),
+                (set_true, equal),
+                (equal, false_target),
+            ]);
+            prog.pjcc.extend([
+                (parity, TestCond::CondP, "false"),
+                (equal, TestCond::CondE, "success"),
+            ]);
+            prog.direct_jump
+                .extend([(parity, false_target), (equal, success)]);
+            prog.instruction
+                .push((set_true, 5, "", "MOV", "one", "true_dst", "", "", 0, 0));
+            prog.op_immediate.push(("one", 1, 4));
+
+            prog.run();
+
+            assert!(prog.mach_inst.iter().any(|(node, inst)| {
+                *node == equal
+                    && matches!(
+                        inst,
+                        MachInst::Mcond(Condition::Ccompfs(Comparison::Ceq), args, "success")
+                            if args.as_slice() == [Mreg::X0, Mreg::X1]
+                    )
+            }));
+        });
+    }
+
+    #[test]
+    fn movq_loaded_double_sign_mask_recovers_fabs() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let [load, and] = synthetic_ids();
+            let mask = 0x2000;
+            prog.instruction
+                .push((load, 8, "", "MOVQ", "mask_mem", "mask_dst", "", "", 0, 0));
+            prog.op_register.extend([
+                ("mask_dst", "XMM1"),
+                ("and_dst", "XMM1"),
+                ("and_src", "XMM0"),
+            ]);
+            prog.rip_target_addr.push((load, mask));
+            prog.fp_sign_clear_mask.push((mask, 8));
+            prog.next.push((load, and));
+            prog.pandpd.push((and, "and_dst", "and_src"));
+
+            prog.run();
+
+            assert!(prog.mach_inst.iter().any(|(node, inst)| {
+                *node == and
+                    && matches!(
+                        inst,
+                        MachInst::Mop(Operation::Oabsf, args, Mreg::X1)
+                            if args.as_slice() == [Mreg::X0]
+                    )
+            }));
+        });
+    }
+
+    #[test]
+    fn setnp_cmovne_materializes_ordered_float_equality() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let [cmp, set_ordered, extend, zero, cmov] = synthetic_ids();
+            prog.fcmp_mem_arg.push((cmp, false, Mreg::X0));
+            prog.fp0_loaded_at.push((cmp,));
+            prog.next.extend([
+                (cmp, set_ordered),
+                (set_ordered, extend),
+                (extend, zero),
+                (zero, cmov),
+            ]);
+            prog.psetcc.push((set_ordered, TestCond::CondNp, "set_dst"));
+            prog.instruction.push((
+                extend,
+                3,
+                "",
+                "MOVZX",
+                "extend_src",
+                "extend_dst",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.instruction
+                .push((zero, 5, "", "MOV", "zero_imm", "zero_dst", "", "", 0, 0));
+            prog.op_immediate.push(("zero_imm", 0, 4));
+            prog.pcmov
+                .push((cmov, TestCond::CondNe, "cmov_dst", "cmov_src"));
+            prog.op_register.extend([
+                ("set_dst", "AL"),
+                ("extend_src", "AL"),
+                ("extend_dst", "EAX"),
+                ("zero_dst", "EDX"),
+                ("cmov_dst", "EAX"),
+                ("cmov_src", "EDX"),
+            ]);
+
+            prog.run();
+
+            assert!(prog.mach_inst.iter().any(|(node, inst)| {
+                *node == cmov
+                    && matches!(
+                        inst,
+                        MachInst::Mop(
+                            Operation::Ocmp(Condition::Ccompfs(Comparison::Ceq)),
+                            args,
+                            Mreg::AX
+                        ) if args.as_slice() == [Mreg::X0, Mreg::FP0]
+                    )
+            }));
+        });
     }
 
     #[derive(Clone, Copy)]
@@ -12749,6 +13113,78 @@ mod structural_dataflow_tests {
                 assert!(prog.imul2_magic.is_empty());
                 assert!(prog.div_magic_2op.is_empty());
             }
+        });
+    }
+
+    #[test]
+    fn preloaded_unsigned_magic_divide_can_start_a_basic_block() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let func = 0x5100;
+            let magic_load = 0x5110;
+            let branch = 0x5120;
+            let multiply = 0x5130;
+            let shift = 0x5140;
+
+            for node in [func, magic_load, branch, multiply, shift] {
+                prog.instr_in_function.push((node, func));
+            }
+            for node in [func, magic_load, branch] {
+                prog.code_in_block.push((node, func));
+            }
+            for node in [multiply, shift] {
+                prog.code_in_block.push((node, multiply));
+            }
+            prog.next.extend([
+                (func, magic_load),
+                (magic_load, branch),
+                (branch, multiply),
+                (multiply, shift),
+            ]);
+            prog.ddisasm_cfg_edge.push((branch, multiply, "branch"));
+
+            prog.instruction.push((
+                magic_load,
+                5,
+                "",
+                "MOV",
+                "magic_imm",
+                "magic_dst",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.pmov.push((magic_load, "magic_dst", "magic_imm"));
+            prog.op_register.push(("magic_dst", "ESI"));
+            prog.op_immediate
+                .push(("magic_imm", 0xcccc_cccdu32 as i64, 4));
+            prog.reg_def.push((magic_load, Mreg::SI));
+
+            prog.pimul.push((multiply, "mul_dst", "mul_src"));
+            prog.op_register
+                .extend([("mul_dst", "RAX"), ("mul_src", "RSI")]);
+            prog.reg_def.push((multiply, Mreg::AX));
+
+            prog.pshr.push((shift, "shr_dst", "shr_count"));
+            prog.op_register.push(("shr_dst", "RAX"));
+            prog.op_immediate.push(("shr_count", 35, 1));
+            prog.reg_def.push((shift, Mreg::AX));
+
+            prog.run();
+
+            assert!(prog
+                .div_magic_2op
+                .iter()
+                .any(|row| { row == &(multiply, shift, 10, Ireg::RAX, Ireg::RAX) }));
+            assert!(prog.mach_inst.iter().any(|(node, inst)| {
+                *node == multiply
+                    && matches!(
+                        inst,
+                        MachInst::Mop(Operation::Odivuimm(10), args, Mreg::AX)
+                            if args.as_slice() == [Mreg::AX]
+                    )
+            }));
         });
     }
 
@@ -14193,6 +14629,56 @@ mod structural_dataflow_tests {
                 .iter()
                 .any(|fact| fact == &(setcc,)));
             assert!(!prog.mach_inst.iter().any(|(node, _)| *node == setcc));
+        });
+    }
+
+    #[test]
+    fn register_setcc_crosses_three_flag_transparent_instructions() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let [test, first_move, second_move, cmov, setcc, block] = synthetic_ids();
+
+            prog.ptest.push((test, "tested_edi", "tested_edi_again"));
+            prog.op_register
+                .extend([("tested_edi", "EDI"), ("tested_edi_again", "EDI")]);
+            for (node, mnemonic) in [(first_move, "MOV"), (second_move, "MOV"), (cmov, "CMOVG")] {
+                let row = (node, 3, "", mnemonic, "", "", "", "", 0, 0);
+                prog.instruction.push(row);
+                prog.unrefinedinstruction.push(row);
+            }
+            prog.psetcc.push((setcc, TestCond::CondG, "boolean_cl"));
+            prog.op_register.push(("boolean_cl", "CL"));
+            prog.next.extend([
+                (test, first_move),
+                (first_move, second_move),
+                (second_move, cmov),
+                (cmov, setcc),
+            ]);
+            for node in [test, first_move, second_move, cmov, setcc] {
+                prog.code_in_block.push((node, block));
+            }
+
+            prog.run();
+
+            assert!(prog
+                .test_setcc_link
+                .iter()
+                .any(|fact| fact == &(test, setcc)));
+            assert!(prog
+                .setcc_compare_site
+                .iter()
+                .any(|fact| fact == &(setcc, test)));
+            assert!(prog.mach_inst.iter().any(|(node, inst)| {
+                *node == setcc
+                    && matches!(
+                        inst,
+                        MachInst::Mop(
+                            Operation::Ocmp(Condition::Ccompimm(Comparison::Cgt, 0)),
+                            args,
+                            Mreg::CX,
+                        ) if args.as_slice() == [Mreg::DI]
+                    )
+            }));
         });
     }
 
@@ -15700,6 +16186,137 @@ mod structural_dataflow_tests {
                     }),
                     "general LEA at {addr:#x} also admitted the opposite result width",
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn frameless_bp_base_supports_a_32_bit_lea_result() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let func = 0x1000;
+            let lea = 0x1100;
+            prog.plea.push((lea, "lea_dst", "lea_mem"));
+            prog.op_register.push(("lea_dst", "EDX"));
+            prog.op_indirect
+                .push(("lea_mem", "", "RBP", "NONE", 1, -1, 8));
+            prog.instr_in_function.push((lea, func));
+
+            prog.run();
+
+            assert!(prog.mach_inst.iter().any(|fact| {
+                fact == &(
+                    lea,
+                    MachInst::Mop(
+                        Operation::Olea(Addressing::Aindexed(-1)),
+                        Arc::new(vec![Mreg::BP]),
+                        Mreg::DX,
+                    ),
+                )
+            }));
+        });
+    }
+
+    #[test]
+    fn variable_shift_width_follows_the_encoded_destination_register() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let [wide, narrow] = synthetic_ids();
+            prog.pshr.extend([
+                (wide, "wide_dst", "wide_count"),
+                (narrow, "narrow_dst", "narrow_count"),
+            ]);
+            prog.op_register.extend([
+                ("wide_dst", "RAX"),
+                ("wide_count", "CL"),
+                ("narrow_dst", "EAX"),
+                ("narrow_count", "CL"),
+            ]);
+
+            prog.run();
+
+            assert!(prog.mach_inst.iter().any(|(node, inst)| {
+                *node == wide && matches!(inst, MachInst::Mop(Operation::Oshrlu, _, Mreg::AX))
+            }));
+            assert!(!prog.mach_inst.iter().any(|(node, inst)| {
+                *node == wide && matches!(inst, MachInst::Mop(Operation::Oshru, _, _))
+            }));
+            assert!(prog.mach_inst.iter().any(|(node, inst)| {
+                *node == narrow && matches!(inst, MachInst::Mop(Operation::Oshru, _, Mreg::AX))
+            }));
+            assert!(!prog.mach_inst.iter().any(|(node, inst)| {
+                *node == narrow && matches!(inst, MachInst::Mop(Operation::Oshrlu, _, _))
+            }));
+        });
+    }
+
+    #[test]
+    fn unary_rotate_and_immediate_multiply_follow_encoded_width() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let [neg_wide, neg_narrow, not_wide, not_narrow, mul_wide, mul_narrow, ror_wide, ror_narrow] =
+                synthetic_ids();
+            prog.pneg
+                .extend([(neg_wide, "neg_w"), (neg_narrow, "neg_n")]);
+            prog.pnot
+                .extend([(not_wide, "not_w"), (not_narrow, "not_n")]);
+            prog.pimul.extend([
+                (mul_wide, "mul_w", "mul_w_imm"),
+                (mul_narrow, "mul_n", "mul_n_imm"),
+            ]);
+            prog.pror.extend([
+                (ror_wide, "ror_w", "ror_w_imm"),
+                (ror_narrow, "ror_n", "ror_n_imm"),
+            ]);
+            prog.op_register.extend([
+                ("neg_w", "RAX"),
+                ("neg_n", "EAX"),
+                ("not_w", "RBX"),
+                ("not_n", "EBX"),
+                ("mul_w", "RCX"),
+                ("mul_n", "ECX"),
+                ("ror_w", "RDX"),
+                ("ror_n", "EDX"),
+            ]);
+            prog.op_immediate.extend([
+                ("mul_w_imm", 3, 1),
+                ("mul_n_imm", 3, 1),
+                ("ror_w_imm", 5, 1),
+                ("ror_n_imm", 5, 1),
+            ]);
+
+            prog.run();
+
+            let expected = [
+                (neg_wide, Operation::Onegl),
+                (neg_narrow, Operation::Oneg),
+                (not_wide, Operation::Onotl),
+                (not_narrow, Operation::Onot),
+                (mul_wide, Operation::Omullimm(3)),
+                (mul_narrow, Operation::Omulimm(3)),
+                (ror_wide, Operation::Ororlimm(5)),
+                (ror_narrow, Operation::Ororimm(5)),
+            ];
+            for (node, expected_op) in expected {
+                assert!(prog.mach_inst.iter().any(|(candidate_node, inst)| {
+                    *candidate_node == node
+                        && matches!(inst, MachInst::Mop(op, _, _) if op == &expected_op)
+                }));
+            }
+            for (node, forbidden) in [
+                (neg_wide, Operation::Oneg),
+                (neg_narrow, Operation::Onegl),
+                (not_wide, Operation::Onot),
+                (not_narrow, Operation::Onotl),
+                (mul_wide, Operation::Omulimm(3)),
+                (mul_narrow, Operation::Omullimm(3)),
+                (ror_wide, Operation::Ororimm(5)),
+                (ror_narrow, Operation::Ororlimm(5)),
+            ] {
+                assert!(!prog.mach_inst.iter().any(|(candidate_node, inst)| {
+                    *candidate_node == node
+                        && matches!(inst, MachInst::Mop(op, _, _) if op == &forbidden)
+                }));
             }
         });
     }

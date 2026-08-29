@@ -83,6 +83,7 @@ ascent_par! {
     relation loop_head(Address, Node);
     relation primary_exit_node(Address, Node, Node);
     relation switch_chain_member(Address, Node, Node, RTLReg, i64, Node);
+    relation switch_chain_default(Address, Node, Node);
     relation ternary_false_assignment(Address, Node, RTLReg, CsharpminorExpr, Node);
     relation ternary_true_assignment(Address, Node, RTLReg, CsharpminorExpr, Node);
     relation valid_loop(Address, Node);
@@ -813,14 +814,18 @@ ascent_par! {
         all_var_types_global(all_var_types),
         let var_types = filter_and_build_multi_var_type_map(all_var_types, &[ *reg ]),
         let discr = ClightExpr::Etempvar(ident_from_reg(*reg), var_types.get(reg).map(|types| select_type_from_candidates(types, None)).unwrap_or_else(default_int_type)),
-        let table = {
-             let mut entries = Vec::new();
-             for (val, target) in &cases {
-                 let goto_stmt = ClightStmt::Sgoto(ident_from_node(*target));
-                 entries.push((Some(*val as Z), goto_stmt));
-             }
-             entries
-        },
+        switch_chain_default(func, head, default_target),
+        let table = build_goto_switch_cases(&cases, Some(*default_target)),
+        let stmt = ClightStmt::Sswitch(discr.clone(), table);
+
+    clight_stmt(head, stmt) <--
+        valid_switch_chain(func, head, reg),
+        !switch_chain_default(func, head, _),
+        agg cases = collect_switch_cases(val, target) in switch_chain_member(func, head, _, reg, val, target),
+        all_var_types_global(all_var_types),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &[ *reg ]),
+        let discr = ClightExpr::Etempvar(ident_from_reg(*reg), var_types.get(reg).map(|types| select_type_from_candidates(types, None)).unwrap_or_else(default_int_type)),
+        let table = build_goto_switch_cases(&cases, None),
         let stmt = ClightStmt::Sswitch(discr, table);
 
     clight_stmt(branch, stmt) <--
@@ -976,6 +981,8 @@ ascent_par! {
     // selected case body instead of leaving a dangling empty label.
     emit_goto_target(*func, *target) <--
         switch_chain_member(func, _, _, _, _, target);
+    emit_goto_target(*func, *target) <--
+        switch_chain_default(func, _, target);
 
     has_csharp_stmt(node) <-- csharp_stmt(node, _);
 
@@ -1332,6 +1339,38 @@ mod tests {
     }
 
     #[test]
+    fn stack_owner_does_not_assign_its_address_into_its_own_bytes() {
+        let owner = 0x7100;
+        let owner_type = ClightType::Tstruct(owner, default_attr());
+        assert_eq!(
+            stack_owner_address_assignment(owner, owner, owner_type.clone()),
+            ClightStmt::Sskip,
+        );
+        assert!(matches!(
+            stack_owner_address_assignment(owner + 1, owner, owner_type),
+            ClightStmt::Sset(destination, ClightExpr::Eaddrof(_, _)) if destination == owner + 1
+        ));
+    }
+
+    #[test]
+    fn register_self_address_materialization_becomes_a_skip() {
+        let owner = 0x7200;
+        let owner_type = default_int_type();
+        let address = ClightExpr::Ecast(
+            Box::new(ClightExpr::Eaddrof(
+                Box::new(ClightExpr::Evar(owner, owner_type.clone())),
+                pointer_to(owner_type),
+            )),
+            default_void_ptr_type(),
+        );
+
+        assert_eq!(
+            check_clight_stmt(&ClightStmt::Sset(owner, address)),
+            Some(ClightStmt::Sskip),
+        );
+    }
+
+    #[test]
     fn machine_integer_arithmetic_is_emitted_with_defined_wrapping_semantics() {
         let long_add = build_binop_expr(
             &CminorBinop::Oaddl,
@@ -1449,6 +1488,21 @@ mod tests {
         }
         assert_eq!(clight_expr_type(&pointer_add), pointer_ty);
         assert!(!contains_unsigned_integer_cast(&pointer_add));
+
+        // An integer index can be conservatively typed as a pointer too. The
+        // legal-C pointer+pointer repair must use pointer-width integers, not
+        // the uint32 wrapping implementation used for genuine Oadd values.
+        let ambiguous_pointer_add = build_binop_expr(
+            &CminorBinop::Oadd,
+            ClightExpr::Etempvar(9, pointer_ty.clone()),
+            ClightExpr::Etempvar(10, pointer_ty),
+            8,
+        );
+        assert!(!contains_unsigned_integer_cast(&ambiguous_pointer_add));
+        assert!(matches!(
+            ambiguous_pointer_add,
+            ClightExpr::Ebinop(ClightBinaryOp::Oadd, _, _, ClightType::Tlong(_, _),)
+        ));
     }
 
     #[test]
@@ -1864,6 +1918,138 @@ mod tests {
         assert!(db
             .rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_alias")
             .any(|alias| alias == &(func, buffer_local, prefix_local, 1)));
+    }
+
+    #[test]
+    fn framed_negative_indexed_range_joins_normalized_opaque_buffer() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x2200;
+        let setup: Node = 0x2204;
+        let lea: Node = 0x2210;
+        let load: Node = 0x2220;
+        let buffer_site: Node = 0x2230;
+        let address: RTLReg = 0x7100;
+        let index: RTLReg = 0x7200;
+        let loaded: RTLReg = 0x7300;
+        let indexed_local: RTLReg = 0x8100;
+        let buffer_local: RTLReg = 0x8200;
+
+        db.rel_push("func_stacksz", (func, func, "framed_indexed", 48_u64));
+        db.rel_push("stack_base_move", (setup, "RSP", "RBP"));
+        for node in [setup, lea, load] {
+            db.rel_push("instr_in_function", (node, func));
+        }
+        db.rel_push(
+            "rtl_inst",
+            (
+                lea,
+                RTLInst::Iop(
+                    Operation::Oleal(Addressing::Ainstack(-31)),
+                    Arc::new(Vec::new()),
+                    address,
+                ),
+            ),
+        );
+        db.rel_push("canonical_exact_stack_addr_ptr_result", (lea, address));
+        db.rel_push(
+            "rtl_inst",
+            (
+                load,
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed2(0),
+                    Arc::new(vec![address, index]),
+                    loaded,
+                ),
+            ),
+        );
+        db.rel_push("stack_var", (func, lea, -31_i64, indexed_local));
+        db.rel_push("stack_var", (func, buffer_site, 17_i64, buffer_local));
+        db.stack_struct_buffers
+            .entry(func)
+            .or_default()
+            .insert(buffer_local, 31);
+
+        size_indexed_stack_arrays(&mut db);
+
+        assert_eq!(
+            db.stack_struct_buffers
+                .get(&func)
+                .and_then(|buffers| buffers.get(&buffer_local)),
+            Some(&31),
+        );
+        assert!(!db
+            .stack_array_buffers
+            .get(&func)
+            .is_some_and(|arrays| arrays.contains_key(&indexed_local)));
+        assert!(db
+            .rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_alias")
+            .any(|alias| alias == &(func, indexed_local, buffer_local, 0)));
+    }
+
+    #[test]
+    fn framed_red_zone_depth_bounds_negative_indexed_array() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x2300;
+        let setup: Node = 0x2304;
+        let lea: Node = 0x2310;
+        let load: Node = 0x2320;
+        let deepest_site: Node = 0x2330;
+        let interior_site: Node = 0x2340;
+        let address: RTLReg = 0x7100;
+        let index: RTLReg = 0x7200;
+        let loaded: RTLReg = 0x7300;
+        let array_local: RTLReg = 0x8100;
+        let deepest_local: RTLReg = 0x8200;
+        let interior_local: RTLReg = 0x8300;
+
+        db.rel_push("func_stacksz", (func, func, "red_zone", 56_u64));
+        db.rel_push("stack_base_move", (setup, "RSP", "RBP"));
+        for node in [setup, lea, load, deepest_site, interior_site] {
+            db.rel_push("instr_in_function", (node, func));
+        }
+        db.rel_push(
+            "rtl_inst",
+            (
+                lea,
+                RTLInst::Iop(
+                    Operation::Oleal(Addressing::Ainstack(-144)),
+                    Arc::new(Vec::new()),
+                    address,
+                ),
+            ),
+        );
+        db.rel_push("canonical_exact_stack_addr_ptr_result", (lea, address));
+        db.rel_push(
+            "rtl_inst",
+            (
+                load,
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed2scaled(4, 0),
+                    Arc::new(vec![address, index]),
+                    loaded,
+                ),
+            ),
+        );
+        db.rel_push("stack_var", (func, lea, -144_i64, array_local));
+        // A direct f[0] access is compatible with the indexed int elements and
+        // must not turn the whole array back into a scalar.
+        db.rel_push("stack_var_chunk", (func, -144_i64, MemoryChunk::MInt32));
+        db.rel_push("stack_var", (func, deepest_site, -176_i64, deepest_local));
+        db.rel_push("stack_var", (func, interior_site, -140_i64, interior_local));
+
+        size_indexed_stack_arrays(&mut db);
+
+        assert_eq!(
+            db.stack_array_buffers
+                .get(&func)
+                .and_then(|arrays| arrays.get(&array_local)),
+            Some(&(MemoryChunk::MInt32, 36)),
+        );
+        assert!(db
+            .rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_alias")
+            .any(|alias| alias == &(func, interior_local, array_local, 4)));
     }
 
     #[test]
@@ -3011,6 +3197,39 @@ mod tests {
     }
 
     #[test]
+    fn comparison_switch_emits_and_registers_default_goto() {
+        let mut prog = ClightPassProgram::default();
+        let func = 0x1000;
+        let head = 0x1100;
+        let member = 0x1110;
+        let case_target = 0x1200;
+        let default_target = 0x1300;
+        let reg = 7;
+        prog.valid_switch_chain.push((func, head, reg));
+        prog.switch_chain_member
+            .push((func, head, member, reg, 3, case_target));
+        prog.switch_chain_default.push((func, head, default_target));
+
+        prog.run();
+
+        assert!(prog.clight_stmt.iter().any(|(node, stmt)| {
+            *node == head
+                && matches!(
+                    stmt,
+                    ClightStmt::Sswitch(_, entries)
+                        if entries.iter().any(|(label, body)| {
+                            label.is_none()
+                                && body == &ClightStmt::Sgoto(ident_from_node(default_target))
+                        })
+                )
+        }));
+        assert!(prog
+            .emit_goto_target
+            .iter()
+            .any(|fact| fact == &(func, default_target)));
+    }
+
+    #[test]
     fn targeted_nop_materializes_its_unique_cfg_successor() {
         let mut prog = ClightPassProgram::default();
         let func = 0x1000;
@@ -3154,6 +3373,24 @@ mod tests {
             Some((local as Ident, 0))
         );
     }
+
+    #[test]
+    fn negative_pointer_displacement_is_not_rewritten_as_a_positive_field() {
+        let base = 0x7100;
+        let char_ptr = pointer_to(ClightType::Tint(
+            ClightIntSize::I8,
+            ClightSignedness::Unsigned,
+            default_attr(),
+        ));
+        let before = ClightExpr::Ebinop(
+            ClightBinaryOp::Oadd,
+            Box::new(ClightExpr::Etempvar(base, char_ptr.clone())),
+            Box::new(ClightExpr::EconstLong(-1, default_long_type())),
+            char_ptr,
+        );
+
+        assert_eq!(extract_deref_field_pattern(&before, 8), None);
+    }
 }
 
 pub struct ClightFieldPass;
@@ -3201,6 +3438,7 @@ impl IRPass for ClightFieldPass {
             "pmov",
             "op_indirect",
             "func_stacksz",
+            "stack_base_move",
         ]
     }
 
@@ -3254,6 +3492,23 @@ pub fn collect_switch_cases<'a>(
     pairs.sort();
     pairs.dedup_by_key(|(val, _)| *val);
     std::iter::once(pairs)
+}
+
+pub(crate) fn build_goto_switch_cases(
+    cases: &[(i64, Node)],
+    default_target: Option<Node>,
+) -> ClightLabeledStatements {
+    let mut entries = Vec::with_capacity(cases.len() + usize::from(default_target.is_some()));
+    for (value, target) in cases {
+        entries.push((
+            Some(*value as Z),
+            ClightStmt::Sgoto(ident_from_node(*target)),
+        ));
+    }
+    if let Some(target) = default_target {
+        entries.push((None, ClightStmt::Sgoto(ident_from_node(target))));
+    }
+    entries
 }
 
 pub(crate) fn refine_indirect_call_signature(
@@ -4614,6 +4869,11 @@ pub fn build_binop_expr(
 ) -> ClightExpr {
     let lhs_ty = clight_expr_type(&lhs_expr);
     let rhs_ty = clight_expr_type(&rhs_expr);
+    // Remember pointer classes before legal-C repair turns an ambiguous
+    // pointer+pointer operation into integer arithmetic. Such repaired
+    // addresses must stay pointer-width and never enter the uint32 wrapping
+    // path below.
+    let had_pointer_operand = is_pointer_type(&lhs_ty) || is_pointer_type(&rhs_ty);
 
     // CLIGHT-3: lower high-mul faithfully as the high half of a wider product with correct signedness, rather than aliasing it to a wrong-valued plain multiply.
     match op {
@@ -4809,7 +5069,8 @@ pub fn build_binop_expr(
     };
     let (lhs_scaled, rhs_scaled, unsigned_result_ty) = match op {
         CminorBinop::Oadd | CminorBinop::Osub | CminorBinop::Omul
-            if is_integral_type(&clight_expr_type(&lhs_scaled))
+            if !had_pointer_operand
+                && is_integral_type(&clight_expr_type(&lhs_scaled))
                 && is_integral_type(&clight_expr_type(&rhs_scaled)) =>
         {
             let (lhs, rhs, result_ty) =
@@ -4817,7 +5078,8 @@ pub fn build_binop_expr(
             (lhs, rhs, Some(result_ty))
         }
         CminorBinop::Oaddl | CminorBinop::Osubl | CminorBinop::Omull
-            if is_integral_type(&clight_expr_type(&lhs_scaled))
+            if !had_pointer_operand
+                && is_integral_type(&clight_expr_type(&lhs_scaled))
                 && is_integral_type(&clight_expr_type(&rhs_scaled)) =>
         {
             let (lhs, rhs, result_ty) =
@@ -5607,6 +5869,9 @@ pub(crate) fn check_clight_stmt(stmt: &ClightStmt) -> Option<ClightStmt> {
         ClightStmt::Sset(id, expr) => {
             // Repair int<->ptr binop mismatches rather than dropping the assignment.
             let expr = repair_bad_binop(expr);
+            if clight_addrof_target(&expr) == Some(*id) {
+                return Some(ClightStmt::Sskip);
+            }
             let expr_ty = clight_expr_type(&expr);
 
             if !is_function_pointer_type(&expr_ty) && !is_function_type(&expr_ty) {
@@ -5689,6 +5954,17 @@ pub(crate) fn check_clight_stmt(stmt: &ClightStmt) -> Option<ClightStmt> {
             Some(ClightStmt::Sswitch(expr, cases.clone()))
         }
         _ => Some(stmt.clone()),
+    }
+}
+
+fn clight_addrof_target(expr: &ClightExpr) -> Option<Ident> {
+    match expr {
+        ClightExpr::Ecast(inner, _) => clight_addrof_target(inner),
+        ClightExpr::Eaddrof(inner, _) => match inner.as_ref() {
+            ClightExpr::Evar(ident, _) | ClightExpr::Etempvar(ident, _) => Some(*ident),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -6263,9 +6539,16 @@ fn extract_deref_field_pattern(inner: &ClightExpr, ptr_size: i64) -> Option<(Ide
                 extract_base_ident_clight(lhs),
                 extract_const_offset_clight(rhs),
             ) {
-                // `(T*)base + n` advances n*sizeof(T) bytes in C; scale the literal by the base pointer's pointee size to recover the true byte field offset (char*/non-ptr -> 1).
+                // `(T*)base + n` advances n*sizeof(T) bytes in C; scale the
+                // literal by the base pointer's pointee size.  A negative
+                // displacement is a before-pointer access, never a positive
+                // struct field.
                 let scale = clight_base_ptr_elem_size(lhs, ptr_size);
-                return Some((base_ident, (offset * scale).abs()));
+                let byte_offset = offset * scale;
+                if byte_offset >= 0 {
+                    return Some((base_ident, byte_offset));
+                }
+                return None;
             }
             // (base + idx*scale) + const_offset: scale the displacement by the base pointee size to recover the byte offset, and decline negatives rather than abs() them into a wrong forward field.
             if let Some(offset) = extract_const_offset_clight(rhs) {
@@ -7422,14 +7705,7 @@ fn size_opaque_escaped_frame_buffers(db: &mut DecompileDB) {
         .copied()
         .collect();
 
-    // Diagnostic hook (env-gated, like GA_DUMP) for escaped-storage sizing work.
-    let trace = std::env::var("ESC_DUMP").is_ok();
     for (func, ofs, local) in escaped {
-        let mut reject = |why: &str| {
-            if trace {
-                eprintln!("[ESC] {func:#x} ofs={ofs} local={local:#x} rejected: {why}");
-            }
-        };
         // An Ainstack offset counts upward from the stack pointer, so the frame
         // occupies [0, stacksize) and anything at or above the top belongs to
         // the caller: an incoming stack argument, not storage to widen here.
@@ -7438,18 +7714,15 @@ fn size_opaque_escaped_frame_buffers(db: &mut DecompileDB) {
             .copied()
             .and_then(|size| i64::try_from(size).ok())
         else {
-            reject("no recovered frame size to bound the region");
             continue;
         };
         if ofs < 0 || ofs >= frame_top {
-            reject("offset lies outside this function's own frame");
             continue;
         }
         if directly_accessed
             .get(&func)
             .is_some_and(|offsets| offsets.contains(&ofs))
         {
-            reject("direct scalar access gives real width evidence");
             continue;
         }
         if stack_locals.get(&func).is_some_and(|locals| {
@@ -7457,11 +7730,9 @@ fn size_opaque_escaped_frame_buffers(db: &mut DecompileDB) {
                 .iter()
                 .any(|(inner_ofs, inner_local)| *inner_ofs == ofs && *inner_local != local)
         }) {
-            reject("two canonical locals claim this offset");
             continue;
         }
         if value_regs.contains(&local) {
-            reject("local carries a value, so it is a variable and not storage");
             continue;
         }
         let own_fields = region_fields.get(&(func, ofs));
@@ -7477,12 +7748,8 @@ fn size_opaque_escaped_frame_buffers(db: &mut DecompileDB) {
         let gap = limit - ofs;
         let floor = region_extent.get(&(func, ofs)).copied().unwrap_or(0);
         let Some(size) = Some(gap.max(floor)).filter(|size| *size > 0) else {
-            reject("no positive extent below the next modeled offset");
             continue;
         };
-        if trace {
-            eprintln!("[ESC] {func:#x} ofs={ofs} local={local:#x} sized {size} (limit {limit})");
-        }
         db.stack_struct_buffers
             .entry(func)
             .or_default()
@@ -7588,11 +7855,53 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
             .and_modify(|current| *current = (*current).max(size))
             .or_insert(size);
     }
+    let mut framed_functions = HashSet::new();
+    for (setup, src, dst) in db.rel_iter::<(Address, &'static str, &'static str)>("stack_base_move")
+    {
+        if *src != "RSP" || *dst != "RBP" {
+            continue;
+        }
+        let Some(funcs) = node_funcs.get(setup) else {
+            continue;
+        };
+        if funcs.len() == 1 {
+            framed_functions.extend(funcs.iter().copied());
+        }
+    }
+    // A SysV leaf may place locals in the red zone below its explicit RSP
+    // subtraction. In a frame-pointer function the deepest exact stack_var
+    // coordinate is therefore stronger storage-bound evidence than
+    // func_stacksz alone. Normalize negative indexed ranges against the
+    // largest of those two machine-derived depths; positive caller-frame
+    // coordinates never contribute.
+    for func in &framed_functions {
+        let Some(lowest) = boundaries
+            .get(func)
+            .and_then(|offsets| offsets.iter().next())
+            .copied()
+        else {
+            continue;
+        };
+        let Some(depth) = lowest.checked_neg().filter(|depth| *depth > 0) else {
+            continue;
+        };
+        frame_tops
+            .entry(*func)
+            .and_modify(|current| *current = (*current).max(depth))
+            .or_insert(depth);
+    }
 
     let directly_accessed: HashSet<(Address, i64)> = db
         .rel_iter::<(Address, i64, MemoryChunk)>("stack_var_chunk")
         .map(|(func, ofs, _)| (*func, *ofs))
         .collect();
+    let mut direct_access_chunks: BTreeMap<(Address, i64), BTreeSet<MemoryChunk>> = BTreeMap::new();
+    for (func, ofs, chunk) in db.rel_iter::<(Address, i64, MemoryChunk)>("stack_var_chunk") {
+        direct_access_chunks
+            .entry((*func, *ofs))
+            .or_default()
+            .insert(*chunk);
+    }
 
     // (func, local) -> (frame start, exclusive end, element chunk, count).
     // A base reg used as args[0] of an indexed access is an array base.  The
@@ -7619,7 +7928,15 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         let Some(&(func, base_ofs)) = origins.next() else {
             continue;
         };
-        if origins.next().is_some() || directly_accessed.contains(&(func, base_ofs)) {
+        let indexed_width = memchunk_byte_size(chunk).max(1);
+        let direct_base_is_compatible_element = direct_access_chunks
+            .get(&(func, base_ofs))
+            .is_none_or(|chunks| {
+                chunks
+                    .iter()
+                    .all(|direct| memchunk_byte_size(direct).max(1) == indexed_width)
+            });
+        if origins.next().is_some() || !direct_base_is_compatible_element {
             continue;
         }
         let Some(locals) = slot_locals.get(&(func, base_ofs)) else {
@@ -7660,17 +7977,95 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         if byte_size <= 0 || byte_size > 1 << 20 {
             continue;
         }
+        // A framed function's negative Ainstack coordinate is BP-relative;
+        // storage buffers use the post-allocation [0, frame_size) coordinate.
+        // Translate the whole half-open range before overlap checks.  The
+        // unique frame size and structural RSP->RBP setup are both mandatory.
+        let (range_start, range_end) = if base_ofs < 0 && framed_functions.contains(&func) {
+            let Some(frame_top) = frame_tops.get(&func).copied() else {
+                continue;
+            };
+            let (Some(start), Some(end)) = (
+                base_ofs.checked_add(frame_top),
+                limit.checked_add(frame_top),
+            ) else {
+                continue;
+            };
+            if start < 0 || end > frame_top || start >= end {
+                continue;
+            }
+            (start, end)
+        } else {
+            (base_ofs, limit)
+        };
         let elem = memchunk_byte_size(chunk).max(1);
         let count = ((byte_size as usize) + elem - 1) / elem;
         // Keep the SMALLEST element width seen (most conservative stride) and the largest count for it.
         let e = sized
             .entry((func, local))
-            .or_insert((base_ofs, limit, *chunk, count));
+            .or_insert((range_start, range_end, *chunk, count));
         if elem < memchunk_byte_size(&e.2).max(1) {
-            *e = (base_ofs, limit, *chunk, count);
+            *e = (range_start, range_end, *chunk, count);
         } else if *chunk == e.2 && count > e.3 {
             e.3 = count;
         }
+    }
+
+    // Initial scalar stores into an indexed array are represented by the
+    // point-local stack names at interior offsets.  Record their exact byte
+    // coordinates now; after the final array choice is known, the C backend
+    // rewrites those names into typed lvalues inside the one backing array.
+    let mut typed_array_alias_candidates: BTreeMap<(Address, RTLReg), Vec<(RTLReg, usize)>> =
+        BTreeMap::new();
+    for (&(func, base_local), (_, _, chunk, count)) in &sized {
+        let Some(base_offsets) = local_offsets.get(&(func, base_local)) else {
+            continue;
+        };
+        let mut base_offsets = base_offsets.iter();
+        let Some(&base_ofs) = base_offsets.next() else {
+            continue;
+        };
+        if base_offsets.next().is_some() {
+            continue;
+        }
+        let elem = memchunk_byte_size(chunk).max(1);
+        let Some(byte_extent) = count.checked_mul(elem) else {
+            continue;
+        };
+        let Ok(byte_extent_i64) = i64::try_from(byte_extent) else {
+            continue;
+        };
+        let Some(end) = base_ofs.checked_add(byte_extent_i64) else {
+            continue;
+        };
+        let mut members = Vec::new();
+        for (&(slot_func, slot_ofs), locals) in &slot_locals {
+            if slot_func != func || slot_ofs < base_ofs || slot_ofs >= end {
+                continue;
+            }
+            let Some(delta) = slot_ofs.checked_sub(base_ofs) else {
+                continue;
+            };
+            let Ok(delta) = usize::try_from(delta) else {
+                continue;
+            };
+            if delta % elem != 0 {
+                continue;
+            }
+            for &member in locals {
+                if member == base_local
+                    || local_offsets
+                        .get(&(func, member))
+                        .is_none_or(|offsets| offsets.len() != 1)
+                {
+                    continue;
+                }
+                members.push((member, delta));
+            }
+        }
+        members.sort_unstable();
+        members.dedup();
+        typed_array_alias_candidates.insert((func, base_local), members);
     }
 
     // The RTL loop proof supplies an exact byte-coordinate interval. Group by
@@ -7983,7 +8378,6 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
             range.local,
         )
     });
-
     fn find_root(parents: &mut [usize], mut node: usize) -> usize {
         while parents[node] != node {
             let parent = parents[node];
@@ -8134,13 +8528,6 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
             };
             aliases.push((func, local, backing.local, offset));
         }
-        if std::env::var("ESC_DUMP").is_ok() {
-            eprintln!(
-                "[STACK-ALIAS] {func:#x} [{start}, {end}) -> local={:#x} aliases={}",
-                backing.local,
-                members.len().saturating_sub(1)
-            );
-        }
     }
 
     db.stack_struct_buffers
@@ -8194,6 +8581,11 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
                 }
             })
             .or_insert((chunk, count));
+        if let Some(aliases) = typed_array_alias_candidates.get(&(func, local)) {
+            for &(member, byte_offset) in aliases {
+                db.rel_push("stack_buffer_alias", (func, member, local, byte_offset));
+            }
+        }
     }
 }
 
@@ -8206,6 +8598,23 @@ fn memchunk_byte_size(c: &MemoryChunk) -> usize {
         MemoryChunk::MInt64 | MemoryChunk::MFloat64 | MemoryChunk::MAny64 => 8,
         _ => 1,
     }
+}
+
+fn stack_owner_address_assignment(
+    destination: Ident,
+    owner: Ident,
+    owner_type: ClightType,
+) -> ClightStmt {
+    if destination == owner {
+        return ClightStmt::Sskip;
+    }
+    ClightStmt::Sset(
+        destination,
+        ClightExpr::Eaddrof(
+            Box::new(ClightExpr::Evar(owner, owner_type.clone())),
+            pointer_to(owner_type),
+        ),
+    )
 }
 
 /// Result of struct construction synthesis.
@@ -8243,7 +8652,7 @@ fn unsigned_chunk_for_byte_width(size: usize) -> Option<MemoryChunk> {
 /// `mach_imm_stack_init` and a constant register's RTL type are value classes;
 /// neither can distinguish byte/word/dword stack stores, while the physical
 /// memory operand size can.
-fn exact_stack_store_chunks(db: &DecompileDB) -> HashMap<Address, MemoryChunk> {
+pub(crate) fn exact_stack_store_chunks(db: &DecompileDB) -> HashMap<Address, MemoryChunk> {
     use std::collections::{BTreeMap, BTreeSet};
 
     let mut operand_sizes: HashMap<Symbol, BTreeSet<usize>> = HashMap::new();
@@ -8255,22 +8664,50 @@ fn exact_stack_store_chunks(db: &DecompileDB) -> HashMap<Address, MemoryChunk> {
         }
     }
 
-    let mut addr_chunks: BTreeMap<Address, BTreeSet<MemoryChunk>> = BTreeMap::new();
+    let mut addr_widths: BTreeMap<Address, BTreeSet<usize>> = BTreeMap::new();
     for (addr, dst, _) in db.rel_iter::<(Address, Symbol, Symbol)>("pmov") {
         let Some(sizes) = operand_sizes.get(dst) else {
             continue;
         };
         for size in sizes {
-            if let Some(chunk) = unsigned_chunk_for_byte_width(*size) {
-                addr_chunks.entry(*addr).or_default().insert(chunk);
+            if unsigned_chunk_for_byte_width(*size).is_some() {
+                addr_widths.entry(*addr).or_default().insert(*size);
             }
         }
     }
 
-    addr_chunks
+    // Operand strings are an early disassembly join and can be unavailable
+    // after a stack store has been normalized.  Final Mach IR is the stronger
+    // source: Msetstack carries the CompCert access class, while an Ainstack
+    // Mstore retains the exact sub-register MemoryChunk.  Compare widths, not
+    // signed chunks, because two signedness views of one physical store still
+    // prove one byte count.
+    for (addr, inst) in db.rel_iter::<(Address, MachInst)>("mach_inst") {
+        let width = match inst {
+            MachInst::Msetstack(_, _, typ) => match typ {
+                Typ::Tlong | Typ::Tfloat | Typ::Tany64 => Some(8),
+                Typ::Tint | Typ::Tsingle | Typ::Tany32 => Some(4),
+                Typ::Unknown => None,
+            },
+            MachInst::Mstore(chunk, Addressing::Ainstack(_), _, _) => {
+                let width =
+                    crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk);
+                unsigned_chunk_for_byte_width(width).map(|_| width)
+            }
+            _ => None,
+        };
+        if let Some(width) = width {
+            addr_widths.entry(*addr).or_default().insert(width);
+        }
+    }
+
+    addr_widths
         .into_iter()
-        .filter_map(|(addr, chunks)| {
-            (chunks.len() == 1).then(|| (addr, *chunks.iter().next().unwrap()))
+        .filter_map(|(addr, widths)| {
+            (widths.len() == 1)
+                .then(|| unsigned_chunk_for_byte_width(*widths.first().unwrap()))
+                .flatten()
+                .map(|chunk| (addr, chunk))
         })
         .collect()
 }
@@ -9068,11 +9505,8 @@ fn synthesize_struct_construction(
             }
 
             // Rewrite the Oaddrstack Sset: var = -16 -> var = &struct_local
-            let addrof_expr = ClightExpr::Eaddrof(
-                Box::new(ClightExpr::Evar(struct_local_id, struct_ty.clone())),
-                pointer_to(struct_ty),
-            );
-            let rewritten = ClightStmt::Sset(var_id, addrof_expr);
+            let rewritten =
+                stack_owner_address_assignment(var_id, struct_local_id, struct_ty.clone());
             result.rewritten_stmts.insert(*node, rewritten);
         }
 

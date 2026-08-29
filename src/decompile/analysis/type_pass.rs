@@ -96,11 +96,14 @@ fn cond_operand_xtype(cond: &Condition) -> Option<XType> {
         Condition::Ccompu(_) | Condition::Ccompuimm(_, _) => Some(XType::Xintunsigned),
         // Signed 64-bit comparison
         Condition::Ccompl(_) => Some(XType::Xlong),
-        Condition::Ccomplimm(_, 0) => Some(XType::Xany64), // possible NULL check
+        // Only equality against zero can be a pointer/null test.  Relational
+        // comparisons such as `cmpq $0, slot; jle` are signed 64-bit integer
+        // evidence even though the immediate happens to be zero.
+        Condition::Ccomplimm(Comparison::Ceq | Comparison::Cne, 0) => Some(XType::Xany64),
         Condition::Ccomplimm(_, _) => Some(XType::Xlong),
         // Unsigned 64-bit comparison
         Condition::Ccomplu(_) => Some(XType::Xlongunsigned),
-        Condition::Ccompluimm(_, 0) => Some(XType::Xany64), // possible NULL check
+        Condition::Ccompluimm(Comparison::Ceq | Comparison::Cne, 0) => Some(XType::Xany64),
         Condition::Ccompluimm(_, _) => Some(XType::Xlongunsigned),
         // Float comparison
         Condition::Ccompf(_) | Condition::Cnotcompf(_) => Some(XType::Xfloat),
@@ -372,6 +375,10 @@ ascent_par! {
         rtl_inst(_, ?RTLInst::Iop(Operation::Ocmp(cond), args, _)),
         if let Some(xtype) = cond_operand_xtype(cond),
         for arg in args.iter();
+    emit_var_type_candidate(*arg, xtype.clone()) <--
+        rtl_inst(_, ?RTLInst::Icond(cond, args, _, _)),
+        if let Some(xtype) = cond_operand_xtype(cond),
+        for arg in args.iter();
 
     // Apply embedded exact types without requiring a second symbol lookup.
     // Unknown-width placeholders remain non-constraints, matching the older
@@ -493,7 +500,8 @@ ascent_par! {
     value_float_type(*dst, XType::Xsingle) <--
         rtl_inst(_, ?RTLInst::Iload(chunk, _, _, dst)),
         if matches!(chunk, MemoryChunk::MFloat32);
-    // Operands of a floating conditional branch are floats; keyed on rtl_inst so synthetic branches count, since cond_operand_xtype covers only Ocmp and misses a param compared by a branch.
+    // A floating conditional also supplies definitive value-class evidence,
+    // beyond the generic candidate emitted for every Icond above.
     value_float_type(*arg, XType::Xsingle) <--
         rtl_inst(_, ?RTLInst::Icond(cond, args, _, _)),
         if matches!(cond, Condition::Ccompfs(_) | Condition::Cnotcompfs(_)),
@@ -1289,6 +1297,64 @@ mod tests {
             .emit_var_type_candidate
             .iter()
             .any(|row| *row == (constant, XType::Xlong)));
+    }
+
+    #[test]
+    fn direct_conditional_operands_keep_the_encoded_compare_width() {
+        let mut prog = TypePassProgram::default();
+        let signed_relational = 201;
+        let unsigned_relational = 202;
+        let possible_null = 203;
+
+        prog.rtl_inst.extend([
+            (
+                10,
+                RTLInst::Icond(
+                    Condition::Ccomplimm(Comparison::Cle, 0),
+                    Arc::new(vec![signed_relational]),
+                    Either::Right(20),
+                    Either::Right(30),
+                ),
+            ),
+            (
+                11,
+                RTLInst::Icond(
+                    Condition::Ccompluimm(Comparison::Cgt, 0),
+                    Arc::new(vec![unsigned_relational]),
+                    Either::Right(20),
+                    Either::Right(30),
+                ),
+            ),
+            (
+                12,
+                RTLInst::Icond(
+                    Condition::Ccomplimm(Comparison::Ceq, 0),
+                    Arc::new(vec![possible_null]),
+                    Either::Right(20),
+                    Either::Right(30),
+                ),
+            ),
+        ]);
+
+        prog.run();
+
+        for expected in [
+            (signed_relational, XType::Xlong),
+            (unsigned_relational, XType::Xlongunsigned),
+            (possible_null, XType::Xany64),
+        ] {
+            assert!(
+                prog.emit_var_type_candidate
+                    .iter()
+                    .any(|row| *row == expected),
+                "missing direct-condition type {expected:?}: {:?}",
+                prog.emit_var_type_candidate
+            );
+        }
+        assert!(!prog
+            .emit_var_type_candidate
+            .iter()
+            .any(|row| *row == (signed_relational, XType::Xany64)));
     }
 
     #[test]

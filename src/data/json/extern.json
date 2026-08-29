@@ -1,5 +1,12 @@
 {
   "functions": [
+    { "name": "regcomp", "sig_args": ["Xptr", "Xcharptr", "Xint"], "sig_res": "Xint", "ptr_params": [0, 1] },
+    { "name": "regexec", "sig_args": ["Xptr", "Xcharptr", "Xlong", "Xptr", "Xint"], "sig_res": "Xint", "ptr_params": [0, 1, 3] },
+    { "name": "regfree", "sig_args": ["Xptr"], "sig_res": "Xvoid", "ptr_params": [0] },
+    { "name": "log2", "sig_args": ["Xfloat"], "sig_res": "Xfloat" },
+    { "name": "fmax", "sig_args": ["Xfloat", "Xfloat"], "sig_res": "Xfloat" },
+    { "name": "atof", "sig_args": ["Xcharptr"], "sig_res": "Xfloat", "ptr_params": [0] },
+    { "name": "copy_file_range", "sig_args": ["Xint", "Xptr", "Xint", "Xptr", "Xlongunsigned", "Xintunsigned"], "sig_res": "Xlong", "ptr_params": [1, 3] },
     { "name": "dlopen", "sig_args": ["Xcharptr", "Xint"], "sig_res": "Xptr", "ptr_params": [0] },
     { "name": "dlsym", "sig_args": ["Xptr", "Xcharptr"], "sig_res": "Xptr", "ptr_params": [0, 1] },
     { "name": "dlclose", "sig_args": ["Xptr"], "sig_res": "Xint", "ptr_params": [0] },
@@ -2084,6 +2091,78 @@
       ]
     },
     {
+      "name": "getfilecon_raw",
+      "sig_args": ["Xcharptr", "Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [0, 1]
+    },
+    {
+      "name": "lgetfilecon_raw",
+      "sig_args": ["Xcharptr", "Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [0, 1]
+    },
+    {
+      "name": "fgetfilecon",
+      "sig_args": ["Xint", "Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [1]
+    },
+    {
+      "name": "fgetfilecon_raw",
+      "sig_args": ["Xint", "Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [1]
+    },
+    {
+      "name": "getcon",
+      "sig_args": ["Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [0]
+    },
+    {
+      "name": "getcon_raw",
+      "sig_args": ["Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [0]
+    },
+    {
+      "name": "getfscreatecon",
+      "sig_args": ["Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [0]
+    },
+    {
+      "name": "getfscreatecon_raw",
+      "sig_args": ["Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [0]
+    },
+    {
+      "name": "selabel_lookup",
+      "sig_args": ["Xptr", "Xptr", "Xcharptr", "Xint"],
+      "sig_res": "Xint",
+      "ptr_params": [0, 1, 2]
+    },
+    {
+      "name": "selabel_lookup_raw",
+      "sig_args": ["Xptr", "Xptr", "Xcharptr", "Xint"],
+      "sig_res": "Xint",
+      "ptr_params": [0, 1, 2]
+    },
+    {
+      "name": "security_compute_create",
+      "sig_args": ["Xcharptr", "Xcharptr", "Xint", "Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [0, 1, 3]
+    },
+    {
+      "name": "security_compute_create_raw",
+      "sig_args": ["Xcharptr", "Xcharptr", "Xint", "Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [0, 1, 3]
+    },
+    {
       "name": "freecon",
       "sig_args": [
         "Xptr"
@@ -2733,8 +2812,9 @@
     },
     {
       "name": "__vfprintf_chk",
-      "sig_args": ["Xptr", "Xint"],
-      "sig_res": "Xint"
+      "sig_args": ["Xptr", "Xint", "Xcharptr", "Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [0, 2, 3]
     },
     {
       "name": "__snprintf_chk",

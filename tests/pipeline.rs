@@ -139,6 +139,27 @@ fn func_def<'a>(out: &'a TestOutput, name: &str) -> &'a FuncDef {
 }
 
 /// True if any sub-expression in `expr` (recursively) satisfies `pred`.
+fn designator_has(designator: &Designator, pred: &dyn Fn(&CExpr) -> bool) -> bool {
+    match designator {
+        Designator::Field(_) => false,
+        Designator::Index(index) => expr_has(index, pred),
+        Designator::Range(start, end) => expr_has(start, pred) || expr_has(end, pred),
+    }
+}
+
+fn initializer_has(initializer: &Initializer, pred: &dyn Fn(&CExpr) -> bool) -> bool {
+    match initializer {
+        Initializer::Expr(expr) => expr_has(expr, pred),
+        Initializer::List(items) => items.iter().any(|item| {
+            item.designator
+                .as_ref()
+                .is_some_and(|designator| designator_has(designator, pred))
+                || initializer_has(&item.init, pred)
+        }),
+        Initializer::String(_) => false,
+    }
+}
+
 fn expr_has(expr: &CExpr, pred: &dyn Fn(&CExpr) -> bool) -> bool {
     if pred(expr) {
         return true;
@@ -154,7 +175,15 @@ fn expr_has(expr: &CExpr, pred: &dyn Fn(&CExpr) -> bool) -> bool {
         CExpr::Ternary(c, t, e) => expr_has(c, pred) || expr_has(t, pred) || expr_has(e, pred),
         CExpr::Call(f, args) => expr_has(f, pred) || args.iter().any(|a| expr_has(a, pred)),
         CExpr::Member(inner, _) | CExpr::MemberPtr(inner, _) => expr_has(inner, pred),
-        CExpr::StmtExpr(_, inner) => expr_has(inner, pred),
+        CExpr::CompoundLit(_, initializers) => initializers
+            .iter()
+            .any(|initializer| initializer_has(initializer, pred)),
+        CExpr::Generic(selector, arms) => {
+            expr_has(selector, pred) || arms.iter().any(|(_, arm)| expr_has(arm, pred))
+        }
+        CExpr::StmtExpr(stmts, inner) => {
+            stmts.iter().any(|stmt| stmt_has_expr(stmt, pred)) || expr_has(inner, pred)
+        }
         _ => false,
     }
 }
@@ -237,6 +266,22 @@ fn unwrap_casts(e: &CExpr) -> &CExpr {
         CExpr::Cast(_, inner) => unwrap_casts(inner),
         other => other,
     }
+}
+
+fn is_builtin_memcpy(expr: &CExpr) -> bool {
+    matches!(
+        expr,
+        CExpr::Call(callee, args)
+            if args.len() == 3
+                && matches!(unwrap_casts(callee), CExpr::Var(name) if name == "__builtin_memcpy")
+    )
+}
+
+fn is_builtin_memcpy_store(expr: &CExpr) -> bool {
+    let CExpr::Call(_, args) = expr else {
+        return false;
+    };
+    is_builtin_memcpy(expr) && !expr_has(&args[0], &|part| matches!(part, CExpr::CompoundLit(..)))
 }
 
 #[allow(dead_code)]
@@ -366,19 +411,19 @@ fn has_continue_stmt(out: &TestOutput, func: &str) -> bool {
 
 #[allow(dead_code)]
 fn has_deref(out: &TestOutput, func: &str) -> bool {
-    // Accept either `*p` or `p->field`: both indicate pointer deref; decompiler picks based on whether a struct layout is recovered for the pointee.
+    // Accept `*p`, `p->field`, or the exact-width memcpy form used for
+    // potentially unaligned memory. All three represent a pointer dereference.
     let f = func_def(out, func);
     stmt_has_expr(&f.body, &|e| match e {
         CExpr::Unary(UnaryOp::Deref, _) | CExpr::MemberPtr(_, _) => true,
+        call if is_builtin_memcpy(call) => true,
         _ => false,
     })
 }
 
 #[allow(dead_code)]
 fn has_pointer_store(out: &TestOutput, func: &str) -> bool {
-    // Accept both `*p = value` and `p->field = value`.  The pointee may be
-    // represented directly or through a recovered synthetic struct, but the
-    // assignment's left-hand side must perform the dereference.
+    // Accept direct lvalue assignments and the exact-width memcpy store form.
     let f = func_def(out, func);
     stmt_has_expr(&f.body, &|e| match e {
         CExpr::Assign(_, lhs, _) => expr_has(lhs, &|part| {
@@ -387,8 +432,45 @@ fn has_pointer_store(out: &TestOutput, func: &str) -> bool {
                 CExpr::Unary(UnaryOp::Deref, _) | CExpr::MemberPtr(_, _)
             )
         }),
+        call if is_builtin_memcpy_store(call) => true,
         _ => false,
     })
+}
+
+#[allow(dead_code)]
+fn count_memory_accesses(out: &TestOutput, func: &str) -> usize {
+    use std::cell::Cell;
+
+    let f = func_def(out, func);
+    // `expr_has` is a predicate walker, so count with a statement-local
+    // mutable accumulator rather than duplicating every C AST variant here.
+    let accesses = Cell::new(0);
+    stmt_has_expr(&f.body, &|expr| {
+        if matches!(
+            expr,
+            CExpr::Unary(UnaryOp::Deref, _) | CExpr::MemberPtr(_, _)
+        ) || is_builtin_memcpy(expr)
+        {
+            accesses.set(accesses.get() + 1);
+        }
+        false
+    });
+    accesses.get()
+}
+
+#[allow(dead_code)]
+fn count_assignments(out: &TestOutput, func: &str) -> usize {
+    use std::cell::Cell;
+
+    let f = func_def(out, func);
+    let assignments = Cell::new(0);
+    stmt_has_expr(&f.body, &|expr| {
+        if matches!(expr, CExpr::Assign(..)) || is_builtin_memcpy_store(expr) {
+            assignments.set(assignments.get() + 1);
+        }
+        false
+    });
+    assignments.get()
 }
 
 #[allow(dead_code)]
@@ -398,8 +480,7 @@ fn param_count(out: &TestOutput, func: &str) -> usize {
 
 #[allow(dead_code)]
 fn has_assign(out: &TestOutput, func: &str) -> bool {
-    let f = func_def(out, func);
-    stmt_has_expr(&f.body, &|e| matches!(e, CExpr::Assign(..)))
+    count_assignments(out, func) > 0
 }
 
 #[allow(dead_code)]

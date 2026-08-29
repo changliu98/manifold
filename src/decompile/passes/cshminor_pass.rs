@@ -44,6 +44,26 @@ fn collect_dense_node_targets<'a>(
         .into_iter()
 }
 
+fn compute_canonical_stack_slot_locals(
+    rows: impl IntoIterator<Item = (Address, Address, i64, RTLReg)>,
+) -> Vec<(Address, i64, RTLReg)> {
+    let mut grouped =
+        std::collections::BTreeMap::<(Address, i64), std::collections::BTreeSet<RTLReg>>::new();
+    for (func, _node, ofs, local) in rows {
+        grouped.entry((func, ofs)).or_default().insert(local);
+    }
+    grouped
+        .into_iter()
+        .map(|((func, ofs), locals)| {
+            (
+                func,
+                ofs,
+                *locals.iter().next().expect("nonempty stack-local set"),
+            )
+        })
+        .collect()
+}
+
 // Helper: add node n to a Set<Node>, returning new Set
 fn dom_set_with_self(strict: &Set<Node>, n: Node) -> Set<Node> {
     let mut s = strict.0.clone();
@@ -172,6 +192,7 @@ ascent_par! {
     relation next(Address, Address);
     relation idom(Address, Node, Node);
     relation stack_var(Address, Address, i64, RTLReg);
+    relation canonical_stack_slot_local(Address, i64, RTLReg);
     // rtl_pass export: the single escaped canonical local per (func, offset), used to resolve synthetic-only stack loads that have no per-node stack_var.
     relation slot_escaped_canonical(Address, i64, RTLReg);
     // rtl_pass export: a conflict-free physical owner for a frame read that
@@ -579,6 +600,39 @@ ascent_par! {
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Econst(Constant::Oaddrstack(ofs)))),
         instr_in_function(node, func_start),
         stack_var(func_start, node, *ofs, stack_rtl),
+        let var_ident = ident_from_reg(*stack_rtl),
+        let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Eaddrof(var_ident));
+
+    csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Eop(op, args))),
+        if let Operation::Olea(Addressing::Ainstack(ofs)) = op,
+        if args.is_empty(),
+        instr_in_function(node, func_start),
+        !stack_var(func_start, node, *ofs, _),
+        canonical_stack_slot_local(func_start, *ofs, stack_rtl),
+        let var_ident = ident_from_reg(*stack_rtl),
+        let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Eaddrof(var_ident));
+
+    csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Eop(op, args))),
+        if let Operation::Oleal(Addressing::Ainstack(ofs)) = op,
+        if args.is_empty(),
+        instr_in_function(node, func_start),
+        !stack_var(func_start, node, *ofs, _),
+        canonical_stack_slot_local(func_start, *ofs, stack_rtl),
+        let var_ident = ident_from_reg(*stack_rtl),
+        let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Eaddrof(var_ident));
+
+    // A later LEA of the same physical slot can lack a point-local stack_var
+    // even though another modeled access already names the physical storage.
+    // Multiple SSA locals at one byte offset are lifetime variants of that one
+    // frame cell; the finalized pre-pass uses the same deterministic minimum
+    // owner policy as slot_escaped_canonical.
+    csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Econst(Constant::Oaddrstack(ofs)))),
+        instr_in_function(node, func_start),
+        !stack_var(func_start, node, *ofs, _),
+        canonical_stack_slot_local(func_start, *ofs, stack_rtl),
         let var_ident = ident_from_reg(*stack_rtl),
         let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Eaddrof(var_ident));
 
@@ -1323,6 +1377,18 @@ ascent_par! {
 pub struct CshminorPass;
 
 impl CshminorPass {
+    fn prepare_canonical_stack_slot_locals(db: &mut DecompileDB) {
+        let rows = compute_canonical_stack_slot_locals(
+            db.rel_iter::<(Address, Address, i64, RTLReg)>("stack_var")
+                .copied(),
+        );
+        let relation = ascent::boxcar::Vec::new();
+        for row in rows {
+            relation.push(row);
+        }
+        db.rel_set("canonical_stack_slot_local", relation);
+    }
+
     fn prepare_jump_tables(db: &mut DecompileDB) {
         if db
             .rel_iter::<(Node, usize, Node)>("jump_table_target")
@@ -1446,6 +1512,7 @@ impl IRPass for CshminorPass {
 
     fn run(&self, db: &mut DecompileDB) {
         Self::prepare_jump_tables(db);
+        Self::prepare_canonical_stack_slot_locals(db);
 
         run_pass!(db, CshminorPassProgram);
     }
@@ -1457,6 +1524,7 @@ impl IRPass for CshminorPass {
             "jump_table_cmp",
             "jump_table_index_reg",
             "reg_rtl",
+            "stack_var",
         ]
     }
 
@@ -1465,7 +1533,10 @@ impl IRPass for CshminorPass {
 
 #[cfg(test)]
 mod tests {
-    use super::{ident_from_reg, unique_external_cfg_entry, CshminorPassProgram};
+    use super::{
+        compute_canonical_stack_slot_locals, ident_from_reg, unique_external_cfg_entry,
+        CshminorPassProgram,
+    };
     use crate::x86::op::{Addressing, Comparison, Condition, Operation};
     use crate::x86::types::{
         CminorBinop, CminorExpr, CminorStmt, Constant, CsharpminorExpr, CsharpminorStmt,
@@ -1477,6 +1548,72 @@ mod tests {
 
     fn synthetic_ids<const N: usize>() -> [u64; N] {
         std::array::from_fn(|index| index as u64 + 1)
+    }
+
+    #[test]
+    fn later_addrstack_reuses_the_final_canonical_slot_local() {
+        let [func, owner_site, use_site, dst, local, other] = synthetic_ids();
+        let statement = CminorStmt::Sassign(dst, CminorExpr::Econst(Constant::Oaddrstack(12)));
+
+        let mut unique = CshminorPassProgram::default();
+        unique.cminor_stmt.push((use_site, statement.clone()));
+        unique.instr_in_function.push((use_site, func));
+        unique.stack_var.push((func, owner_site, 12, local));
+        let unique_rows = compute_canonical_stack_slot_locals([(func, owner_site, 12, local)]);
+        assert_eq!(unique_rows, vec![(func, 12, local)]);
+        unique.canonical_stack_slot_local.extend(unique_rows);
+        let op_site = use_site + 20;
+        let op_dst = dst + 20;
+        unique.cminor_stmt.push((
+            op_site,
+            CminorStmt::Sassign(
+                op_dst,
+                CminorExpr::Eop(
+                    Operation::Oleal(Addressing::Ainstack(12)),
+                    Arc::new(Vec::new()),
+                ),
+            ),
+        ));
+        unique.instr_in_function.push((op_site, func));
+        unique.run();
+        assert!(unique.csharp_stmt_candidate.iter().any(|fact| {
+            fact == &(
+                use_site,
+                CsharpminorStmt::Sset(dst, CsharpminorExpr::Eaddrof(ident_from_reg(local))),
+            )
+        }));
+        assert!(unique.csharp_stmt_candidate.iter().any(|fact| {
+            fact == &(
+                op_site,
+                CsharpminorStmt::Sset(op_dst, CsharpminorExpr::Eaddrof(ident_from_reg(local))),
+            )
+        }));
+
+        let mut conflicting = CshminorPassProgram::default();
+        conflicting.cminor_stmt.push((use_site, statement));
+        conflicting.instr_in_function.push((use_site, func));
+        conflicting.stack_var.extend([
+            (func, owner_site, 12, local),
+            (func, owner_site + 10, 12, other),
+        ]);
+        let conflict_rows = compute_canonical_stack_slot_locals([
+            (func, owner_site, 12, local),
+            (func, owner_site + 10, 12, other),
+        ]);
+        assert_eq!(conflict_rows, vec![(func, 12, local.min(other))]);
+        conflicting.canonical_stack_slot_local.extend(conflict_rows);
+        conflicting.run();
+        assert!(conflicting
+            .csharp_stmt_candidate
+            .iter()
+            .any(|(node, stmt)| {
+                *node == use_site
+                    && matches!(
+                        stmt,
+                        CsharpminorStmt::Sset(reg, CsharpminorExpr::Eaddrof(owner))
+                            if *reg == dst && *owner == ident_from_reg(local.min(other))
+                    )
+            }));
     }
 
     fn seed_interior_pointer_address(

@@ -47,17 +47,29 @@
         "mempcpy": "void *mempcpy(void *, const void *, unsigned long);"
       }
     },
+    "regex": {
+      "header": "<regex.h>",
+      "names": ["regcomp", "regexec", "regerror", "regfree"]
+    },
     "ctype": {
       "header": "<ctype.h>",
       "names": ["isalpha", "isdigit", "isalnum", "isspace", "isupper", "islower", "toupper", "tolower", "isprint", "ispunct", "isxdigit", "iscntrl", "isgraph", "__ctype_b_loc", "__ctype_tolower_loc", "__ctype_toupper_loc"]
     },
     "math": {
       "header": "<math.h>",
-      "names": ["sin", "sinf", "sinl", "cos", "cosf", "cosl", "tan", "tanf", "tanl", "sqrt", "sqrtf", "sqrtl", "pow", "powf", "powl", "log", "logf", "logl", "log10", "log10f", "log10l", "exp", "expf", "expl", "fabs", "fabsf", "fabsl", "ceil", "ceilf", "ceill", "floor", "floorf", "floorl", "round", "roundf", "roundl", "fmod", "fmodf", "fmodl", "atan2", "atan2f", "atan2l", "asin", "asinf", "asinl", "acos", "acosf", "acosl", "atan", "atanf", "atanl", "sinh", "sinhf", "sinhl", "cosh", "coshf", "coshl", "tanh", "tanhf", "tanhl"]
+      "names": ["sin", "sinf", "sinl", "cos", "cosf", "cosl", "tan", "tanf", "tanl", "sqrt", "sqrtf", "sqrtl", "pow", "powf", "powl", "log", "logf", "logl", "log2", "log2f", "log2l", "log10", "log10f", "log10l", "exp", "expf", "expl", "fabs", "fabsf", "fabsl", "ceil", "ceilf", "ceill", "floor", "floorf", "floorl", "round", "roundf", "roundl", "fmod", "fmodf", "fmodl", "fmax", "fmaxf", "fmaxl", "atan2", "atan2f", "atan2l", "asin", "asinf", "asinl", "acos", "acosf", "acosl", "atan", "atanf", "atanl", "sinh", "sinhf", "sinhl", "cosh", "coshf", "coshl", "tanh", "tanhf", "tanhl"]
     },
     "unistd": {
       "header": "<unistd.h>",
       "names": ["close", "read", "write", "lseek", "access", "unlink", "getpid", "getppid", "getcwd", "chdir", "fchdir", "isatty", "dup", "dup2", "pipe", "fork", "execv", "execve", "execvp", "execl", "execlp", "execle", "fexecve", "ftruncate", "truncate", "link", "symlink", "readlink", "rmdir", "faccessat", "fchownat", "readlinkat", "symlinkat", "unlinkat", "linkat", "chown", "fchown", "lchown", "getuid", "geteuid", "getgid", "getegid", "setuid", "seteuid", "setgid", "setegid", "setpgid", "getpgid", "getpgrp", "setsid", "getsid", "gethostname", "sethostname", "gethostid", "getlogin", "sync", "fsync", "fdatasync", "alarm", "pause", "sleep", "usleep", "ttyname", "ttyname_r", "pathconf", "fpathconf", "sysconf", "confstr", "pread", "pwrite", "getopt", "nice", "chroot", "daemon", "syscall", "lockf", "tcgetpgrp", "tcsetpgrp", "getdtablesize"]
+    },
+    "unistd_gnu": {
+      "header": "<unistd.h>",
+      "feature": "_GNU_SOURCE",
+      "names": ["copy_file_range"],
+      "protos": {
+        "copy_file_range": "long copy_file_range(int, long *, int, long *, unsigned long, unsigned int);"
+      }
     },
     "fcntl": {
       "header": "<fcntl.h>",
@@ -136,6 +148,7 @@
     "optopt": { "kind": "libc_extern", "type": "int" },
     "environ": { "kind": "libc_extern", "type": "char **" },
     "__environ": { "kind": "canonical_type", "type": "char **" },
+    "re_syntax_options": { "kind": "libc_extern", "type": "unsigned long" },
     "errno": { "kind": "reserved_rename" },
     "program_invocation_name": { "kind": "reserved_rename" },
     "program_invocation_short_name": { "kind": "reserved_rename" }

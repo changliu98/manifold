@@ -1,12 +1,5 @@
 #![allow(warnings)]
-mod aarch64;
-mod abi;
-mod arm32;
-mod debug;
-mod decompile;
-mod mreg;
-mod util;
-mod x86;
+use manifold::{debug, decompile};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -164,13 +157,11 @@ fn main() {
     println!("  Pipeline: {}", fmt_elapsed(pipeline_elapsed));
 
     if dump_interface_vars {
-        let canonical = crate::decompile::passes::clight_select::derive_canonical_path(
+        let canonical = decompile::passes::clight_select::derive_canonical_path(
             out_file_path.to_str().unwrap_or("output.light.c"),
         );
-        let interface_path = crate::decompile::passes::clight_select::derive_with_suffix(
-            &canonical,
-            ".interfaces.tsv",
-        );
+        let interface_path =
+            decompile::passes::clight_select::derive_with_suffix(&canonical, ".interfaces.tsv");
         if let Err(error) = std::fs::write(
             &interface_path,
             prog.interface_vars.render_tsv(&prog.committed_interfaces),
@@ -181,10 +172,10 @@ fn main() {
         }
     }
     if dump_interface_instance {
-        let canonical = crate::decompile::passes::clight_select::derive_canonical_path(
+        let canonical = decompile::passes::clight_select::derive_canonical_path(
             out_file_path.to_str().unwrap_or("output.light.c"),
         );
-        let instance_path = crate::decompile::passes::clight_select::derive_with_suffix(
+        let instance_path = decompile::passes::clight_select::derive_with_suffix(
             &canonical,
             ".interface-instance.tsv",
         );
@@ -209,7 +200,7 @@ fn main() {
     }
 
     if dump_ir {
-        let canonical = crate::decompile::passes::clight_select::derive_canonical_path(
+        let canonical = decompile::passes::clight_select::derive_canonical_path(
             out_file_path.to_str().unwrap_or("output.light.c"),
         );
         let base = canonical.trim_end_matches(".light.c");
@@ -217,18 +208,18 @@ fn main() {
             "Dumping IR stages to {}.{{asm,mach,linear,ltl,rtl,cminor,csharpminor,clight}}",
             base
         );
-        if let Err(e) = crate::debug::ir_dump::dump_all_ir(&prog, base) {
+        if let Err(e) = debug::ir_dump::dump_all_ir(&prog, base) {
             eprintln!("Failed to dump IR: {}", e);
         }
     }
 
     if dump_clight_json {
-        let canonical = crate::decompile::passes::clight_select::derive_canonical_path(
+        let canonical = decompile::passes::clight_select::derive_canonical_path(
             out_file_path.to_str().unwrap_or("output.light.c"),
         );
         let json_path =
-            crate::decompile::passes::clight_select::derive_with_suffix(&canonical, ".clight.json");
-        match crate::debug::clight_export::export_clight_json(&mut prog, &json_path) {
+            decompile::passes::clight_select::derive_with_suffix(&canonical, ".clight.json");
+        match debug::clight_export::export_clight_json(&mut prog, &json_path) {
             Ok(()) => println!("Clight IR exported to: {}", json_path),
             Err(e) => eprintln!("Failed to export Clight JSON: {}", e),
         }
@@ -245,11 +236,10 @@ fn main() {
     let out_file_str = out_file_path.to_str().unwrap_or("output.light.c");
 
     if trace_enabled {
-        let canonical =
-            crate::decompile::passes::clight_select::derive_canonical_path(out_file_str);
+        let canonical = decompile::passes::clight_select::derive_canonical_path(out_file_str);
         let lost_out_path =
-            crate::decompile::passes::clight_select::derive_with_suffix(&canonical, ".lost.yaml");
-        if let Err(e) = crate::debug::lost_dump::dump_lost(&prog, &lost_out_path) {
+            decompile::passes::clight_select::derive_with_suffix(&canonical, ".lost.yaml");
+        if let Err(e) = debug::lost_dump::dump_lost(&prog, &lost_out_path) {
             eprintln!("Failed to generate lost statement dump: {}", e);
         } else {
             println!("Lost statement dump written to: {}", lost_out_path);
@@ -257,16 +247,13 @@ fn main() {
     }
 
     if trace_enabled {
-        let canonical =
-            crate::decompile::passes::clight_select::derive_canonical_path(out_file_str);
+        let canonical = decompile::passes::clight_select::derive_canonical_path(out_file_str);
         let debug_out_path =
-            crate::decompile::passes::clight_select::derive_with_suffix(&canonical, ".debug.yaml");
-        let dataflow_out_path = crate::decompile::passes::clight_select::derive_with_suffix(
-            &canonical,
-            ".dataflow.yaml",
-        );
+            decompile::passes::clight_select::derive_with_suffix(&canonical, ".debug.yaml");
+        let dataflow_out_path =
+            decompile::passes::clight_select::derive_with_suffix(&canonical, ".dataflow.yaml");
 
-        if let Err(e) = crate::debug::debug_dump::dump_debug(
+        if let Err(e) = debug::debug_dump::dump_debug(
             &prog,
             input_path.to_str().expect("Invalid input path"),
             &debug_out_path,
@@ -276,7 +263,7 @@ fn main() {
             println!("Debug info written to: {}", debug_out_path);
         }
 
-        if let Err(e) = crate::debug::dataflow_dump::dump_dataflow(
+        if let Err(e) = debug::dataflow_dump::dump_dataflow(
             &prog,
             input_path.to_str().expect("Invalid input path"),
             &dataflow_out_path,
@@ -323,8 +310,8 @@ fn main() {
 }
 
 fn write_outputs(
-    raw_tu: &crate::decompile::passes::c_pass::TranslationUnit,
-    optimized_tu: &crate::decompile::passes::c_pass::TranslationUnit,
+    raw_tu: &decompile::passes::c_pass::TranslationUnit,
+    optimized_tu: &decompile::passes::c_pass::TranslationUnit,
     output_path: &str,
     explicit_output: bool,
     trace_enabled: bool,
@@ -332,11 +319,10 @@ fn write_outputs(
     use std::fs::File;
     use std::io::Write;
 
-    let canonical_path =
-        crate::decompile::passes::clight_select::derive_canonical_path(output_path);
+    let canonical_path = decompile::passes::clight_select::derive_canonical_path(output_path);
 
     if trace_enabled {
-        let light_c_source = crate::decompile::passes::c_pass::print_translation_unit(raw_tu);
+        let light_c_source = decompile::passes::c_pass::print_translation_unit(raw_tu);
         {
             let mut file = File::create(&canonical_path)?;
             file.write_all(light_c_source.as_bytes())?;
@@ -348,9 +334,9 @@ fn write_outputs(
     let optimized_c_path = if explicit_output {
         output_path.to_string()
     } else {
-        crate::decompile::passes::clight_select::derive_optimized_c_path(&canonical_path)
+        decompile::passes::clight_select::derive_optimized_c_path(&canonical_path)
     };
-    let optimized_c_source = crate::decompile::passes::c_pass::print_translation_unit(optimized_tu);
+    let optimized_c_source = decompile::passes::c_pass::print_translation_unit(optimized_tu);
     {
         let mut file = File::create(&optimized_c_path)?;
         file.write_all(optimized_c_source.as_bytes())?;

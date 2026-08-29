@@ -95,7 +95,11 @@ fn phi_mixed_sources_has_multiply() {
 }
 
 #[test]
-fn phi_partially_dead_has_addition() {
-    assert!(has_binop(&OUTPUT, "test_phi_partially_dead", BinaryOp::Add),
-            "expected addition in partially_dead");
+fn phi_partially_dead_keeps_branch_dependent_arithmetic() {
+    let b = body(&OUTPUT, "test_phi_partially_dead");
+    assert!(has_if_stmt(&OUTPUT, "test_phi_partially_dead"),
+            "expected branch-dependent phi values:\n{b}");
+    assert!(has_binop(&OUTPUT, "test_phi_partially_dead", BinaryOp::Add)
+            || has_binop(&OUTPUT, "test_phi_partially_dead", BinaryOp::Sub),
+            "expected addition or equivalent 2-(x>0) arithmetic:\n{b}");
 }

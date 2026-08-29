@@ -346,9 +346,25 @@ fn xtype_from_string(s: &str) -> Option<XType> {
         "Xint8unsigned" => Some(XType::Xint8unsigned),
         "Xint16signed" => Some(XType::Xint16signed),
         "Xint16unsigned" => Some(XType::Xint16unsigned),
+        "Xintunsigned" => Some(XType::Xintunsigned),
+        "Xlongunsigned" => Some(XType::Xlongunsigned),
         "Xany32" => Some(XType::Xany32),
         "Xany64" => Some(XType::Xany64),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod xtype_parser_tests {
+    use super::*;
+
+    #[test]
+    fn external_signature_parser_accepts_all_unsigned_scalar_widths() {
+        assert_eq!(xtype_from_string("Xintunsigned"), Some(XType::Xintunsigned));
+        assert_eq!(
+            xtype_from_string("Xlongunsigned"),
+            Some(XType::Xlongunsigned)
+        );
     }
 }
 

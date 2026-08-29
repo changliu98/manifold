@@ -2852,6 +2852,25 @@ fn resolve_rodata_scalar(
     value.map(|v| (v, writable))
 }
 
+/// Resolve one scalar global while giving an unambiguous scalar-SSE constant
+/// pool load precedence over generic width-only RTL chunks.  The explicit FP
+/// evidence is produced only for allocated read-only data, so it is never a
+/// writable initializer.
+fn resolve_global_scalar(
+    addr: u64,
+    global_chunks: &HashMap<usize, MemoryChunk>,
+    id: usize,
+    data_ranges: &[(u64, u64, Vec<u8>, bool)],
+    symbol_size_map: &HashMap<u64, u64>,
+    rodata_fp_scalars: &HashMap<u64, ScalarConstant>,
+) -> Option<(ScalarConstant, bool)> {
+    rodata_fp_scalars
+        .get(&addr)
+        .cloned()
+        .map(|value| (value, false))
+        .or_else(|| resolve_rodata_scalar(addr, global_chunks, id, data_ranges, symbol_size_map))
+}
+
 pub(crate) type GlobalStructDeclLayouts = HashMap<Ident, (usize, Vec<(i64, Ident, MemoryChunk)>)>;
 
 /// Recover the same deterministic global-struct declaration choice for every
@@ -3001,6 +3020,41 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
             .map(|(id, mut chunks)| {
                 chunks.sort();
                 (id, chunks[0])
+            })
+            .collect()
+    };
+
+    // A scalar-SSE load from a read-only constant pool is stronger type
+    // evidence than the generic RTL load chunk.  The latter may also contain
+    // MAny64 from an address/materialization candidate for the same bytes;
+    // interpreting those IEEE-754 bits as an integer changes the program when
+    // the read-only symbol is folded at C emission.  Accept only one
+    // unambiguous scalar width per address and let conflicting evidence fall
+    // back to the conservative chunk-based path.
+    let rodata_fp_scalars: HashMap<u64, ScalarConstant> = {
+        let mut candidates: HashMap<u64, BTreeSet<(usize, u64)>> = HashMap::new();
+        for (addr, width, bits) in db.rel_iter::<(u64, usize, u64)>("rodata_fp_const") {
+            candidates.entry(*addr).or_default().insert((*width, *bits));
+        }
+        candidates
+            .into_iter()
+            .filter_map(|(addr, values)| {
+                if values.len() != 1 {
+                    return None;
+                }
+                let (width, bits) = *values.first().unwrap();
+                let scalar = match width {
+                    4 => {
+                        let value = f32::from_bits(bits as u32);
+                        value.is_finite().then_some(ScalarConstant::Float32(value))
+                    }
+                    8 => {
+                        let value = f64::from_bits(bits);
+                        value.is_finite().then_some(ScalarConstant::Float64(value))
+                    }
+                    _ => None,
+                }?;
+                Some((addr, scalar))
             })
             .collect()
     };
@@ -3473,17 +3527,22 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
         }
 
         // Try to resolve scalar constants from initialized-data sections before string detection, since float constants (e.g. 3.0f) start with 0x00 and would be misidentified as empty strings. The resolved value also reports whether it came from a writable (.data) or read-only (.rodata) section.
-        let (scalar_value, scalar_writable) = if !is_string
-            && !is_pointer
-            && !is_recovered_aggregate
-        {
-            match resolve_rodata_scalar(addr, &global_chunks, *id, &data_ranges, &symbol_size_map) {
-                Some((v, w)) => (Some(v), w),
-                None => (None, false),
-            }
-        } else {
-            (None, false)
-        };
+        let (scalar_value, scalar_writable) =
+            if !is_string && !is_pointer && !is_recovered_aggregate {
+                match resolve_global_scalar(
+                    addr,
+                    &global_chunks,
+                    *id,
+                    &data_ranges,
+                    &symbol_size_map,
+                    &rodata_fp_scalars,
+                ) {
+                    Some((v, w)) => (Some(v), w),
+                    None => (None, false),
+                }
+            } else {
+                (None, false)
+            };
 
         // Pointer globals must never be classified as string literals: their file bytes are zero pre-relocation, so a leading 0x00 does not mean an empty string.
         if !is_string && scalar_value.is_none() && !is_pointer && !is_recovered_aggregate {
@@ -3589,6 +3648,30 @@ mod rodata_scalar_tests {
     fn any_width_integer_chunks_require_the_complete_load_width() {
         assert!(resolve(MemoryChunk::MAny32, vec![1, 2, 3]).is_none());
         assert!(resolve(MemoryChunk::MAny64, vec![1, 2, 3, 4, 5, 6, 7]).is_none());
+    }
+
+    #[test]
+    fn proven_rodata_double_wins_over_generic_integer_chunk() {
+        let addr = 0x1000;
+        let bits = 0.0001f64.to_bits();
+        let resolved = resolve_global_scalar(
+            addr,
+            &HashMap::from([(addr as usize, MemoryChunk::MAny64)]),
+            addr as usize,
+            &[(
+                addr,
+                addr + std::mem::size_of::<f64>() as u64,
+                bits.to_le_bytes().to_vec(),
+                false,
+            )],
+            &HashMap::new(),
+            &HashMap::from([(addr, ScalarConstant::Float64(f64::from_bits(bits)))]),
+        );
+
+        assert!(matches!(
+            resolved,
+            Some((ScalarConstant::Float64(value), false)) if value == 0.0001
+        ));
     }
 }
 
@@ -4459,7 +4542,8 @@ fn build_fields_with_padding(
     let mut fields = Vec::new();
     let mut current_end: i64 = 0;
 
-    for (_offset, (_idx, offset, field_type, field_name)) in &offset_map {
+    let ordered: Vec<_> = offset_map.values().copied().collect();
+    for (position, (_idx, offset, field_type, field_name)) in ordered.iter().enumerate() {
         if *offset > current_end {
             let pad_size = (*offset - current_end) as usize;
             match pad_size {
@@ -4479,8 +4563,29 @@ fn build_fields_with_padding(
 
         let name =
             crate::decompile::analysis::struct_recovery_pass::field_ident_to_name(*field_name);
-        let ty = fieldtype_to_ctype(field_type, model);
-        let alignment = fieldtype_alignment(field_type, ptr) as i64;
+        let inferred_size = field_type.size(ptr);
+        // A later exact field start is a physical object boundary.  If a
+        // scalar type guess at this offset would overlap it, retain the field
+        // name/value semantics but narrow its storage to the bytes which can
+        // actually precede that boundary.  This is the representable C form
+        // of byte-granular machine accesses such as offsets 0 and 1; allowing
+        // the wider guess to stand would move the second field to offset 4.
+        let available = ordered
+            .get(position + 1)
+            .and_then(|(_, next_offset, _, _)| next_offset.checked_sub(*offset))
+            .and_then(|width| usize::try_from(width).ok())
+            .filter(|width| *width > 0 && *width < inferred_size);
+        let ty = match (field_type, available) {
+            (FieldType::Scalar(_), Some(1)) => CType::char_unsigned(),
+            (FieldType::Scalar(_), Some(2)) => CType::Int(IntSize::Short, Signedness::Unsigned),
+            (FieldType::Scalar(_), Some(4)) => CType::uint(),
+            (FieldType::Scalar(_), Some(8)) => CType::ulong(),
+            _ => fieldtype_to_ctype(field_type, model),
+        };
+        let effective_size = available.unwrap_or(inferred_size);
+        let alignment = available
+            .unwrap_or_else(|| fieldtype_alignment(field_type, ptr))
+            .max(1) as i64;
         let field = StructField::new(name, ty);
         fields.push(if offset.rem_euclid(alignment) == 0 {
             field
@@ -4488,7 +4593,7 @@ fn build_fields_with_padding(
             field.packed()
         });
 
-        current_end = *offset + field_type.size(ptr) as i64;
+        current_end = *offset + effective_size as i64;
     }
 
     fields
@@ -4547,6 +4652,26 @@ mod recovered_struct_layout_tests {
                 Some(2)
             )
         );
+    }
+
+    #[test]
+    fn overlapping_scalar_guess_stops_at_the_next_exact_field() {
+        let tuples = vec![
+            (0, 0, FieldType::Scalar(MemoryChunk::MInt32), 0),
+            (1, 1, FieldType::Scalar(MemoryChunk::MInt8Signed), 1),
+        ];
+        let fields = build_fields_with_padding(&tuples, crate::abi::DataModel::Lp64);
+
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name.as_deref(), Some("ofs_0"));
+        assert_eq!(fields[0].ty, CType::char_unsigned());
+        assert_eq!(fields[1].name.as_deref(), Some("ofs_1"));
+        assert!(!fields.iter().any(|field| {
+            field
+                .name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("_pad_"))
+        }));
     }
 }
 

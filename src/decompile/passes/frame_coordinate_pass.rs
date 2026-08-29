@@ -95,6 +95,18 @@ ascent_par! {
     // directly because the historical stack_delta relation does not cover it.
     #[local] relation frame_exact_stack_delta(Address, i64);
     frame_exact_stack_delta(node, delta) <-- decoded_stack_pointer_delta(node, delta);
+    frame_exact_stack_delta(*node, -*pointer_width) <--
+        ppush(node, _),
+        abi_pointer_size(pointer_width);
+    frame_exact_stack_delta(*node, *pointer_width) <--
+        ppop(node, operand),
+        op_register(operand, register),
+        if Mreg::x86(*register) != Mreg::SP,
+        abi_pointer_size(pointer_width);
+    frame_exact_stack_delta(*node, *pointer_width) <--
+        ppop(node, operand),
+        !op_register(operand, _),
+        abi_pointer_size(pointer_width);
     frame_exact_stack_delta(*node, *delta) <--
         padd(node, dst, _),
         op_register(dst, dst_name),
@@ -162,16 +174,27 @@ ascent_par! {
         frame_call_local_target(node, callee),
         frame_exact_callee_pop(callee, bytes);
 
+    // A nonzero RET immediate is the only x86-64 evidence which overrides the
+    // caller-clean ABI.  A local PLT stub commonly has no ordinary RET body at
+    // all; treating that missing summary as an unknown callee-pop poisons a
+    // loop backedge after the call and erases otherwise exact frame state.
+    #[local] relation frame_call_nonzero_pop_evidence(Address);
+    frame_call_nonzero_pop_evidence(*node) <--
+        frame_call_local_target(node, callee),
+        frame_return_pop_member(callee, _, bytes),
+        if *bytes != 0;
+
     frame_exact_stack_delta(*node, *bytes) <-- frame_call_callee_pop_member(node, bytes);
 
-    // The x86-64 ABIs are caller-clean. A direct RET-imm fact above overrides
-    // that default for unusual hand-written callees. On x86-32, absence of a
-    // callee-pop fact does not distinguish cdecl from an unresolved stdcall,
-    // so the outgoing state remains unknown rather than assuming zero.
+    // The x86-64 ABIs are caller-clean. A direct nonzero RET-imm fact above
+    // overrides that default for unusual hand-written callees. On x86-32,
+    // absence of a callee-pop fact does not distinguish cdecl from an
+    // unresolved stdcall, so the outgoing state remains unknown rather than
+    // assuming zero.
     frame_exact_stack_delta(*node, 0) <--
         instruction(node, _, _, "CALL", _, _, _, _, _, _),
         abi_pointer_size(8),
-        !frame_call_local_target(node, _);
+        !frame_call_nonzero_pop_evidence(node);
 
     // Raw implicit stack mutators provide a fallback even when Capstone omits
     // an implicit SP reg_def. Any form not admitted above invalidates MUST
@@ -529,6 +552,41 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_push_has_one_exact_pointer_sized_stack_delta() {
+        let mut db = DecompileDB::default();
+        let func = 0x4800_u64;
+        let push = 0x4810_u64;
+        let call = 0x4820_u64;
+        let end = 0x4830_u64;
+        db.rel_push("abi_pointer_size", (8_i64,));
+        for node in [func, push, call, end] {
+            db.rel_push("instr_in_function", (node, func));
+            db.rel_push("code_in_block", (node, func));
+        }
+        db.rel_push("settled_block_dom_set", (func, func, Set::singleton(func)));
+        db.rel_push("next", (func, push));
+        db.rel_push("next", (push, call));
+        db.rel_push("next", (call, end));
+        db.rel_push("ppush", (push, "argument"));
+        db.rel_push(
+            "instruction",
+            (
+                call, 1_usize, "", "CALL", "target", "", "", "", 0_usize, 0_usize,
+            ),
+        );
+
+        FrameCoordinatePass.run(&mut db);
+
+        let entries: std::collections::BTreeSet<_> = db
+            .rel_iter::<(u64, u64, i64)>("settled_sp_entry_offset")
+            .copied()
+            .collect();
+        assert!(entries.contains(&(func, push, 0)));
+        assert!(entries.contains(&(func, call, -8)));
+        assert!(entries.contains(&(func, end, -8)));
+    }
+
+    #[test]
     fn pop_rsp_and_leave_invalidate_but_call_preserves_coordinates() {
         let mut db = DecompileDB::default();
         let pop_func = 0x5000_u64;
@@ -663,6 +721,53 @@ mod tests {
         assert!(!db
             .rel_iter::<(u64, u64, i64)>("settled_sp_entry_offset")
             .any(|(func, node, _)| *func == caller && *node == after_call));
+    }
+
+    #[test]
+    fn local_plt_style_call_is_caller_clean_on_x86_64() {
+        let caller = 0xa100_u64;
+        let call = 0xa110_u64;
+        let after_call = 0xa120_u64;
+        let local_stub = 0xb100_u64;
+        let mut db = DecompileDB::default();
+        db.rel_push("abi_pointer_size", (8_i64,));
+
+        for node in [caller, call, after_call] {
+            db.rel_push("instr_in_function", (node, caller));
+            db.rel_push("code_in_block", (node, node));
+            db.rel_push(
+                "settled_block_dom_set",
+                (caller, node, Set::singleton(node)),
+            );
+        }
+        db.rel_push("ddisasm_cfg_edge", (caller, call, "fallthrough"));
+        db.rel_push("ddisasm_cfg_edge", (call, after_call, "fallthrough"));
+        db.rel_push("instr_in_function", (local_stub, local_stub));
+        db.rel_push(
+            "instruction",
+            (
+                call,
+                5_usize,
+                "",
+                "CALL",
+                "local_stub",
+                "",
+                "",
+                "",
+                0_usize,
+                0_usize,
+            ),
+        );
+        db.rel_push("op_immediate", ("local_stub", local_stub as i64, 8_usize));
+
+        FrameCoordinatePass.run(&mut db);
+
+        assert!(db
+            .rel_iter::<(u64, u64, i64)>("settled_sp_entry_offset")
+            .any(|fact| *fact == (caller, after_call, 0)));
+        assert!(db
+            .rel_iter::<(u64, u64, i64)>("settled_sp_frame_shift")
+            .any(|fact| *fact == (caller, after_call, 0)));
     }
 
     #[test]

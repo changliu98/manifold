@@ -6,10 +6,58 @@ use crate::decompile::passes::c_pass::helpers::{
 };
 use crate::decompile::passes::c_pass::types::{CExpr, CStmt, CType, TopLevelDecl, TypeQualifiers};
 use crate::decompile::passes::pass::IRPass;
+use crate::decompile::passes::rtl_pass::StackAddrOrigin;
 use crate::util::exec_order_key;
+use crate::x86::op::{Addressing, Operation};
 use crate::x86::types::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+fn clight_addrof_ident(expr: &ClightExpr) -> Option<Ident> {
+    match expr {
+        ClightExpr::Ecast(inner, _) => clight_addrof_ident(inner),
+        ClightExpr::Eaddrof(inner, _) => match inner.as_ref() {
+            ClightExpr::Evar(ident, _) | ClightExpr::Etempvar(ident, _) => Some(*ident),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn storage_alias_root(mut ident: Ident, aliases: &HashMap<Ident, Ident>) -> Ident {
+    let mut seen = HashSet::new();
+    while seen.insert(ident) {
+        let Some(next) = aliases.get(&ident).copied() else {
+            break;
+        };
+        if next == ident {
+            break;
+        }
+        ident = next;
+    }
+    ident
+}
+
+fn is_self_address_materialization(
+    stmt: &ClightStmt,
+    storage_aliases: &HashMap<Ident, Ident>,
+) -> bool {
+    let ClightStmt::Sset(destination, value) = stmt else {
+        return false;
+    };
+    let Some(owner) = clight_addrof_ident(value) else {
+        return false;
+    };
+    storage_alias_root(*destination, storage_aliases) == storage_alias_root(owner, storage_aliases)
+}
+
+fn uses_storage_alias(stmt: &ClightStmt, storage_aliases: &HashMap<Ident, Ident>) -> bool {
+    let ClightStmt::Sset(destination, value) = stmt else {
+        return false;
+    };
+    storage_aliases.contains_key(destination)
+        || clight_addrof_ident(value).is_some_and(|owner| storage_aliases.contains_key(&owner))
+}
 
 /// Known libc functions that take opaque struct pointer parameters; maps function_name -> Vec<(param_position, typedef_name)>.
 fn known_opaque_struct_params() -> HashMap<&'static str, Vec<(usize, &'static str)>> {
@@ -579,6 +627,97 @@ fn rewrite_recovered_global_expr(
         ))),
         _ => expr.clone(),
     }
+}
+
+fn expr_mentions_byte_array(expr: &CExpr, byte_arrays: &HashSet<String>) -> bool {
+    match expr {
+        CExpr::Var(name) => byte_arrays.contains(name),
+        CExpr::Unary(_, inner)
+        | CExpr::Cast(_, inner)
+        | CExpr::Paren(inner)
+        | CExpr::SizeofExpr(inner) => expr_mentions_byte_array(inner, byte_arrays),
+        CExpr::Index(base, _) => expr_mentions_byte_array(base, byte_arrays),
+        _ => false,
+    }
+}
+
+fn expr_is_proven_integer(expr: &CExpr) -> bool {
+    match expr {
+        CExpr::IntLit(_)
+        | CExpr::CharLit(_)
+        | CExpr::SizeofType(_)
+        | CExpr::SizeofExpr(_)
+        | CExpr::AlignofType(_) => true,
+        CExpr::Cast(CType::Int(..) | CType::Bool | CType::Enum(_), _) => true,
+        CExpr::Paren(inner) => expr_is_proven_integer(inner),
+        CExpr::Unary(
+            crate::decompile::passes::c_pass::types::UnaryOp::Neg
+            | crate::decompile::passes::c_pass::types::UnaryOp::Plus
+            | crate::decompile::passes::c_pass::types::UnaryOp::BitNot,
+            inner,
+        ) => expr_is_proven_integer(inner),
+        _ => false,
+    }
+}
+
+fn repair_byte_array_pointer_arithmetic(expr: &CExpr, byte_arrays: &HashSet<String>) -> CExpr {
+    let CExpr::Binary(op, lhs, rhs) = expr else {
+        return expr.clone();
+    };
+    let lhs_is_byte = expr_mentions_byte_array(lhs, byte_arrays);
+    let rhs_is_byte = expr_mentions_byte_array(rhs, byte_arrays);
+    let char_pointer = CType::ptr(CType::char_unsigned());
+    match (op, lhs_is_byte, rhs_is_byte) {
+        (crate::decompile::passes::c_pass::types::BinaryOp::Add, true, false)
+            if expr_is_proven_integer(rhs) =>
+        {
+            CExpr::Binary(
+                *op,
+                Box::new(CExpr::Cast(char_pointer, lhs.clone())),
+                rhs.clone(),
+            )
+        }
+        (crate::decompile::passes::c_pass::types::BinaryOp::Sub, true, false)
+            if expr_is_proven_integer(rhs) =>
+        {
+            CExpr::Binary(
+                *op,
+                Box::new(CExpr::Cast(char_pointer, lhs.clone())),
+                rhs.clone(),
+            )
+        }
+        (crate::decompile::passes::c_pass::types::BinaryOp::Add, false, true)
+            if expr_is_proven_integer(lhs) =>
+        {
+            CExpr::Binary(
+                *op,
+                lhs.clone(),
+                Box::new(CExpr::Cast(char_pointer, rhs.clone())),
+            )
+        }
+        _ => expr.clone(),
+    }
+}
+
+fn repair_byte_array_bitwise_scalar_reads(expr: &CExpr, byte_arrays: &HashSet<String>) -> CExpr {
+    let CExpr::Binary(op, lhs, rhs) = expr else {
+        return expr.clone();
+    };
+    if !matches!(
+        op,
+        crate::decompile::passes::c_pass::types::BinaryOp::BitAnd
+            | crate::decompile::passes::c_pass::types::BinaryOp::BitOr
+            | crate::decompile::passes::c_pass::types::BinaryOp::BitXor
+    ) {
+        return expr.clone();
+    }
+    let scalar = |operand: &CExpr| match operand {
+        CExpr::Var(name) if byte_arrays.contains(name) => {
+            CExpr::Index(Box::new(CExpr::Var(name.clone())), Box::new(CExpr::int(0)))
+        }
+        _ => operand.clone(),
+    };
+    CExpr::Binary(*op, Box::new(scalar(lhs)), Box::new(scalar(rhs)))
 }
 
 fn rewrite_recovered_global_init(
@@ -2186,6 +2325,56 @@ impl IRPass for ClightEmitPass {
         }
 
         let data_model = db.data_model();
+        let mut pure_stack_address_nodes: HashSet<Node> = db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst")
+            .filter_map(|(node, inst)| match inst {
+                RTLInst::Iop(
+                    Operation::Olea(Addressing::Ainstack(_))
+                    | Operation::Oleal(Addressing::Ainstack(_)),
+                    args,
+                    _,
+                ) if args.is_empty() => Some(*node),
+                _ => None,
+            })
+            .collect();
+        let mut stack_address_origins: HashMap<Node, HashSet<StackAddrOrigin>> = HashMap::new();
+        for (node, _, origin) in
+            db.rel_iter::<(Node, RTLReg, StackAddrOrigin)>("canonical_stack_addr_def_origin")
+        {
+            stack_address_origins
+                .entry(*node)
+                .or_default()
+                .insert(*origin);
+        }
+        pure_stack_address_nodes.extend(stack_address_origins.into_iter().filter_map(
+            |(node, origins)| {
+                (!origins.is_empty()
+                    && origins
+                        .iter()
+                        .all(|origin| matches!(origin, StackAddrOrigin::Slot(..))))
+                .then_some(node)
+            },
+        ));
+        let mut storage_alias_candidates: HashMap<(Address, Ident), HashSet<Ident>> =
+            HashMap::new();
+        for (func, member, base, _) in
+            db.rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_alias")
+        {
+            storage_alias_candidates
+                .entry((*func, *member as Ident))
+                .or_default()
+                .insert(*base as Ident);
+        }
+        let mut storage_aliases: HashMap<Address, HashMap<Ident, Ident>> = HashMap::new();
+        for ((func, member), candidates) in storage_alias_candidates {
+            if candidates.len() == 1 {
+                storage_aliases
+                    .entry(func)
+                    .or_default()
+                    .insert(member, *candidates.iter().next().unwrap());
+            }
+        }
+        let empty_storage_aliases = HashMap::new();
         let mut ctx =
             crate::decompile::passes::c_pass::convert::from_relations::ConversionContext::new(
                 id_to_name.clone(),
@@ -2240,6 +2429,16 @@ impl IRPass for ClightEmitPass {
                 sorted_stmt_nodes.sort_by_key(|node| exec_order_key(*node));
                 for node in sorted_stmt_nodes {
                     let clight_stmt = &func.statements[&node];
+                    let function_storage_aliases = storage_aliases
+                        .get(&func.address)
+                        .unwrap_or(&empty_storage_aliases);
+                    let self_address =
+                        is_self_address_materialization(clight_stmt, function_storage_aliases);
+                    let pure_address = pure_stack_address_nodes.contains(&node);
+                    let mapped_address = uses_storage_alias(clight_stmt, function_storage_aliases);
+                    if self_address && (pure_address || mapped_address) {
+                        continue;
+                    }
                     let cstmt =
                         crate::decompile::passes::c_pass::convert::from_relations::convert_stmt(
                             clight_stmt,
@@ -2375,6 +2574,7 @@ impl IRPass for ClightEmitPass {
         // SR-1 (FIXPLAN 4.5): rewrite function bodies to be consistent with the recovered-global declarations (struct/array VarDecls produced only by from_relations, not convert_xtype). Must run before opaqueness/layout analyses.
         {
             let mut array_globals: HashSet<String> = HashSet::new();
+            let mut byte_array_globals: HashSet<String> = HashSet::new();
             let mut struct_globals: HashMap<String, String> = HashMap::new();
             let first_field_of: HashMap<&String, &String> = struct_defs
                 .iter()
@@ -2387,8 +2587,17 @@ impl IRPass for ClightEmitPass {
             for decl in &tu.decls {
                 if let TopLevelDecl::VarDecl(v) = decl {
                     match &v.ty {
-                        CType::Array(..) => {
+                        CType::Array(element, ..) => {
                             array_globals.insert(v.name.clone());
+                            if matches!(
+                                element.as_ref(),
+                                CType::Int(
+                                    crate::decompile::passes::c_pass::types::IntSize::Char,
+                                    _
+                                )
+                            ) {
+                                byte_array_globals.insert(v.name.clone());
+                            }
                         }
                         CType::Struct(sname) => {
                             if let Some(f) = first_field_of.get(sname) {
@@ -2407,7 +2616,36 @@ impl IRPass for ClightEmitPass {
                 );
                 for decl in &mut tu.decls {
                     if let TopLevelDecl::FuncDef(f) = decl {
+                        let local_byte_arrays: HashSet<String> = f
+                            .local_vars
+                            .iter()
+                            .filter_map(|local| match &local.ty {
+                                CType::Array(element, _)
+                                    if matches!(
+                                        element.as_ref(),
+                                        CType::Int(
+                                            crate::decompile::passes::c_pass::types::IntSize::Char,
+                                            _
+                                        )
+                                    ) =>
+                                {
+                                    Some(local.name.clone())
+                                }
+                                _ => None,
+                            })
+                            .collect();
                         rewrite_recovered_global_stmt(&mut f.body, &array_globals, &struct_globals);
+                        f.body = crate::decompile::passes::c_pass::helpers::map_stmt_exprs(
+                            &f.body,
+                            &|expr| {
+                                let expr =
+                                    repair_byte_array_pointer_arithmetic(expr, &byte_array_globals);
+                                Some(repair_byte_array_bitwise_scalar_reads(
+                                    &expr,
+                                    &local_byte_arrays,
+                                ))
+                            },
+                        );
                         for v in &mut f.local_vars {
                             if let Some(init) = &mut v.init {
                                 rewrite_recovered_global_init(
@@ -2662,11 +2900,157 @@ impl IRPass for ClightEmitPass {
 
 #[cfg(test)]
 mod tests {
-    use super::{rewrite_recovered_global_expr, ClightEmitPass, ClightSelectPass};
-    use crate::decompile::passes::c_pass::types::{CExpr, CType, FloatSize, UnaryOp};
+    use super::{
+        is_self_address_materialization, repair_byte_array_bitwise_scalar_reads,
+        repair_byte_array_pointer_arithmetic, rewrite_recovered_global_expr, uses_storage_alias,
+        ClightEmitPass, ClightSelectPass,
+    };
+    use crate::decompile::passes::c_pass::types::{AssignOp, CExpr, CType, FloatSize, UnaryOp};
     use crate::decompile::passes::clight_pass::ClightPass;
     use crate::decompile::passes::pass::IRPass;
+    use crate::x86::types::{ClightExpr, ClightStmt, ClightType};
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn recovered_byte_array_keeps_byte_stride_in_pointer_addition() {
+        let byte_array = "bytes".to_string();
+        let expr = CExpr::Binary(
+            crate::decompile::passes::c_pass::types::BinaryOp::Add,
+            Box::new(CExpr::int(2)),
+            Box::new(CExpr::Cast(
+                CType::ptr(CType::int()),
+                Box::new(CExpr::Index(
+                    Box::new(CExpr::Var(byte_array.clone())),
+                    Box::new(CExpr::int(0)),
+                )),
+            )),
+        );
+
+        let wrapped = CExpr::Assign(
+            AssignOp::Assign,
+            Box::new(CExpr::Var("cursor".to_string())),
+            Box::new(expr),
+        );
+        let repaired = crate::decompile::passes::c_pass::helpers::map_expr(&wrapped, &|expr| {
+            Some(repair_byte_array_pointer_arithmetic(
+                expr,
+                &HashSet::from([byte_array.clone()]),
+            ))
+        });
+        assert!(matches!(
+            repaired,
+            CExpr::Assign(
+                _,
+                _,
+                rhs
+            ) if matches!(
+                rhs.as_ref(),
+                CExpr::Binary(
+                    crate::decompile::passes::c_pass::types::BinaryOp::Add,
+                    _,
+                    byte_rhs,
+                ) if matches!(
+                    byte_rhs.as_ref(),
+                    CExpr::Cast(CType::Pointer(inner, _), _)
+                        if matches!(inner.as_ref(), CType::Int(crate::decompile::passes::c_pass::types::IntSize::Char, _))
+                )
+            )
+        ));
+
+        let already_byte_scaled = CExpr::Binary(
+            crate::decompile::passes::c_pass::types::BinaryOp::Add,
+            Box::new(CExpr::Cast(
+                CType::ptr(CType::char_signed()),
+                Box::new(CExpr::Var("cursor".to_string())),
+            )),
+            Box::new(CExpr::Cast(
+                CType::long(),
+                Box::new(CExpr::Index(
+                    Box::new(CExpr::Var(byte_array.clone())),
+                    Box::new(CExpr::int(0)),
+                )),
+            )),
+        );
+        assert_eq!(
+            repair_byte_array_pointer_arithmetic(
+                &already_byte_scaled,
+                &HashSet::from([byte_array]),
+            ),
+            already_byte_scaled,
+            "an existing pointer-plus-integer expression must not become pointer-plus-pointer",
+        );
+    }
+
+    #[test]
+    fn byte_buffer_in_bitwise_value_context_reads_its_first_byte() {
+        let buffer = "overflow_flag".to_string();
+        let expr = CExpr::Binary(
+            crate::decompile::passes::c_pass::types::BinaryOp::BitOr,
+            Box::new(CExpr::int(1)),
+            Box::new(CExpr::Var(buffer.clone())),
+        );
+
+        let repaired =
+            repair_byte_array_bitwise_scalar_reads(&expr, &HashSet::from([buffer.clone()]));
+        assert!(matches!(
+            repaired,
+            CExpr::Binary(_, _, rhs)
+                if matches!(
+                    rhs.as_ref(),
+                    CExpr::Index(base, index)
+                        if base.as_ref() == &CExpr::Var(buffer)
+                            && index.as_ref() == &CExpr::int(0)
+                )
+        ));
+    }
+
+    #[test]
+    fn casted_self_address_materialization_is_recognized() {
+        let ident = 0x7100;
+        let self_address = ClightStmt::Sset(
+            ident,
+            ClightExpr::Ecast(
+                Box::new(ClightExpr::Eaddrof(
+                    Box::new(ClightExpr::Evar(ident, ClightType::Tvoid)),
+                    ClightType::Tvoid,
+                )),
+                ClightType::Tvoid,
+            ),
+        );
+        let other_address = ClightStmt::Sset(
+            ident,
+            ClightExpr::Eaddrof(
+                Box::new(ClightExpr::Evar(ident + 1, ClightType::Tvoid)),
+                ClightType::Tvoid,
+            ),
+        );
+
+        assert!(is_self_address_materialization(
+            &self_address,
+            &HashMap::new()
+        ));
+        assert!(!is_self_address_materialization(
+            &other_address,
+            &HashMap::new()
+        ));
+
+        let alias = ident + 2;
+        let aliased_address = ClightStmt::Sset(
+            alias,
+            ClightExpr::Eaddrof(
+                Box::new(ClightExpr::Evar(ident, ClightType::Tvoid)),
+                ClightType::Tvoid,
+            ),
+        );
+        assert!(is_self_address_materialization(
+            &aliased_address,
+            &HashMap::from([(alias, ident)]),
+        ));
+        assert!(uses_storage_alias(
+            &aliased_address,
+            &HashMap::from([(alias, ident)]),
+        ));
+    }
 
     #[test]
     fn explicit_recovered_global_member_is_not_prefixed_by_first_field() {

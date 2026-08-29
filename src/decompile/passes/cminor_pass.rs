@@ -38,12 +38,27 @@ ascent_par! {
     relation func_stacksz(Address, Address, Symbol, u64);
     relation call_return_reg(Node, RTLReg);
     relation stack_var(Address, Address, i64, RTLReg);
+    relation renderable_stack_addr_result(Node, i64, RTLReg);
 
     relation cminor_stmt(Node, CminorStmt);
     relation cminor_fallthrough(Node, Node);
 
     // Track nodes where Olea(Ainstack) was resolved to a stack address constant via stack_var.
     #[local] relation stack_addr_resolved(Node);
+
+    // The RTL frame analysis owns coordinate normalization.  Consume its
+    // definition-keyed handoff before the legacy raw-offset/stack_var path so
+    // a BP-relative local rebased into the common frame coordinate does not
+    // fall back to a literal integer address.
+    cminor_stmt(node, stmt), stack_addr_resolved(node) <--
+        rtl_inst(node, ?RTLInst::Iop(op, args, dst)),
+        if matches!(op, Operation::Olea(Addressing::Ainstack(_)) | Operation::Oleal(Addressing::Ainstack(_))),
+        if args.is_empty(),
+        renderable_stack_addr_result(node, normalized_ofs, dst),
+        let stmt = CminorStmt::Sassign(
+            *dst,
+            CminorExpr::Econst(Constant::Oaddrstack(*normalized_ofs)),
+        );
 
     // Olea(Ainstack(ofs)) with a known stack variable -> Econst(Oaddrstack(ofs))
     cminor_stmt(node, stmt), stack_addr_resolved(node) <--
@@ -206,7 +221,34 @@ impl IRPass for CminorPass {
 #[cfg(test)]
 mod expansion_cfg_tests {
     use super::CminorPassProgram;
-    use crate::x86::types::RTLInst;
+    use crate::x86::op::{Addressing, Operation};
+    use crate::x86::types::{CminorExpr, CminorStmt, Constant, RTLInst};
+    use std::sync::Arc;
+
+    #[test]
+    fn normalized_frame_address_becomes_an_addrstack_constant() {
+        let node = 0x200;
+        let dst = 0x9000;
+        let mut prog = CminorPassProgram::default();
+        prog.rtl_inst.push((
+            node,
+            RTLInst::Iop(
+                Operation::Oleal(Addressing::Ainstack(-80)),
+                Arc::new(Vec::new()),
+                dst,
+            ),
+        ));
+        prog.renderable_stack_addr_result.push((node, 16, dst));
+
+        prog.run();
+
+        assert!(prog.cminor_stmt.iter().any(|fact| {
+            fact == &(
+                node,
+                CminorStmt::Sassign(dst, CminorExpr::Econst(Constant::Oaddrstack(16))),
+            )
+        }));
+    }
 
     #[test]
     fn retargeted_expansion_tail_uses_optimized_successor() {
