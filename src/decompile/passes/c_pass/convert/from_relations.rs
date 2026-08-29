@@ -1788,6 +1788,56 @@ fn derive_exact_stack_buffer_stores(
     result
 }
 
+/// Exact physical byte-buffer coordinate of each selected machine stack
+/// store, keyed by its owning function and instruction node. This is the
+/// node-level view of the same proof used by final C store rewriting, so
+/// consumers cannot disagree about which buffer and byte offset a store owns.
+pub(crate) fn derive_exact_stack_buffer_store_sites(
+    db: &DecompileDB,
+) -> HashMap<(Address, Node), (RTLReg, usize)> {
+    let aliases = derive_stack_buffer_aliases(db);
+    let mut escaped_arrays = derive_escaped_stack_array_layouts(db);
+    let escaped_buffers = derive_escaped_stack_buffer_layouts(db, &escaped_arrays);
+    remove_buffer_owned_array_layouts(&mut escaped_arrays, &escaped_buffers);
+    let stores = derive_exact_stack_buffer_stores(db, &aliases, &escaped_buffers);
+
+    let mut owners: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for &(node, function) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        owners.entry(node).or_default().insert(function);
+    }
+    let mut candidates: BTreeMap<(Address, Node), BTreeSet<(RTLReg, usize)>> = BTreeMap::new();
+    for &(node, ref inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+        let RTLInst::Iop(Operation::Omove, args, destination) = inst else {
+            continue;
+        };
+        if args.len() != 1 {
+            continue;
+        }
+        let Some(node_owners) = owners.get(&node) else {
+            continue;
+        };
+        for function in node_owners {
+            let Some(&(base, offset, _)) = stores
+                .get(function)
+                .and_then(|function_stores| function_stores.get(&(*destination, args[0])))
+            else {
+                continue;
+            };
+            candidates
+                .entry((*function, node))
+                .or_default()
+                .insert((base, offset));
+        }
+    }
+
+    candidates
+        .into_iter()
+        .filter_map(|(site, choices)| {
+            (choices.len() == 1).then(|| (site, *choices.first().unwrap()))
+        })
+        .collect()
+}
+
 fn rewrite_exact_stack_buffer_stores(
     body: &CStmt,
     stores: &HashMap<(RTLReg, RTLReg), (RTLReg, usize, MemoryChunk)>,

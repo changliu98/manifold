@@ -152,6 +152,21 @@ ascent_par! {
 
     relation cminor_stmt(Node, CminorStmt);
     relation trim_jump_table_impl(Node);
+    relation abi_pointer_size(i64);
+
+    // Memory addressing is performed at the target pointer width.  Emitting
+    // both Oadd and Oaddl candidates on LP64 let selection choose a compiling
+    // but truncating `(unsigned int)base + index` expression.  Keep the old
+    // two-width fallback only for isolated relation tests that omit ABI facts.
+    #[local] relation csharp_address_is_64bit(bool);
+    csharp_address_is_64bit(true) <--
+        abi_pointer_size(size),
+        if *size >= 8;
+    csharp_address_is_64bit(false) <--
+        abi_pointer_size(size),
+        if *size < 8;
+    csharp_address_is_64bit(false) <-- !abi_pointer_size(_);
+    csharp_address_is_64bit(true) <-- !abi_pointer_size(_);
 
     #[local] relation active_cminor_stmt(Node, CminorStmt);
     active_cminor_stmt(node, stmt.clone()) <--
@@ -704,21 +719,16 @@ ascent_par! {
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, expr)),
         !stack_addr_resolved(node),
         !symbolic_pointer_assign(node, expr, _),
-        if let Some(converted) = csharp_expr_from_cminor(expr),
-        let stmt = CsharpminorStmt::Sset(*dst, converted);
-
-    csharp_stmt_candidate(node, stmt) <--
-        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, expr)),
-        !stack_addr_resolved(node),
-        !symbolic_pointer_assign(node, expr, _),
-        if let Some(converted) = csharp_expr_from_cminor_sized(expr, true),
+        csharp_address_is_64bit(is_64bit),
+        if let Some(converted) = csharp_expr_from_cminor_sized(expr, *is_64bit),
         let stmt = CsharpminorStmt::Sset(*dst, converted);
 
     csharp_stmt_candidate(node, CsharpminorStmt::Snop) <--
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, expr)),
         !stack_addr_resolved(node),
         !symbolic_pointer_assign(node, expr, _),
-        if csharp_expr_from_cminor(expr).is_none();
+        csharp_address_is_64bit(is_64bit),
+        if csharp_expr_from_cminor_sized(expr, *is_64bit).is_none();
 
     // Synthetic narrow frame stores use the same physical owner as their
     // paired load.  Resolve the normalized frame coordinate before the generic
@@ -749,21 +759,16 @@ ascent_par! {
     csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Sstore(chunk, addr, args, src)),
         !frame_write_has_storage_owner(node),
-        if let Some(addr_expr) = addressing_to_csharp_expr(addr, args.as_slice()),
-        let value_expr = CsharpminorExpr::Evar(*src),
-        let stmt = CsharpminorStmt::Sstore(chunk.clone(), addr_expr, value_expr);
-
-    csharp_stmt_candidate(node, stmt) <--
-        active_cminor_stmt(node, ?CminorStmt::Sstore(chunk, addr, args, src)),
-        !frame_write_has_storage_owner(node),
-        if let Some(addr_expr) = addressing_to_csharp_expr_sized(addr, args.as_slice(), true),
+        csharp_address_is_64bit(is_64bit),
+        if let Some(addr_expr) = addressing_to_csharp_expr_sized(addr, args.as_slice(), *is_64bit),
         let value_expr = CsharpminorExpr::Evar(*src),
         let stmt = CsharpminorStmt::Sstore(chunk.clone(), addr_expr, value_expr);
 
     csharp_stmt_candidate(node, CsharpminorStmt::Snop) <--
         active_cminor_stmt(node, ?CminorStmt::Sstore(chunk, addr, args, src)),
         !frame_write_has_storage_owner(node),
-        if addressing_to_csharp_expr(addr, args.as_slice()).is_none();
+        csharp_address_is_64bit(is_64bit),
+        if addressing_to_csharp_expr_sized(addr, args.as_slice(), *is_64bit).is_none();
 
     // Default Scall conversion (callee is a plain register reference).
     csharp_stmt_candidate(node, stmt) <--
@@ -780,7 +785,8 @@ ascent_par! {
     csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Scall(dst, sig, _, args)),
         call_through_memory_load(node, _temp, chunk, addressing, load_args),
-        if let Some(addr_expr) = addressing_to_csharp_expr_sized(addressing, load_args.as_slice(), true),
+        csharp_address_is_64bit(is_64bit),
+        if let Some(addr_expr) = addressing_to_csharp_expr_sized(addressing, load_args.as_slice(), *is_64bit),
         let converted_func = Either::Left(CsharpminorExpr::Eload(*chunk, Box::new(addr_expr))),
         let call_args = args.iter().map(|r| CsharpminorExpr::Evar(*r)).collect(),
         let stmt = CsharpminorStmt::Scall(dst.clone(), sig.clone(), converted_func, call_args);
@@ -798,7 +804,8 @@ ascent_par! {
     csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Stailcall(sig, _, args)),
         call_through_memory_load(node, _temp, chunk, addressing, load_args),
-        if let Some(addr_expr) = addressing_to_csharp_expr_sized(addressing, load_args.as_slice(), true),
+        csharp_address_is_64bit(is_64bit),
+        if let Some(addr_expr) = addressing_to_csharp_expr_sized(addressing, load_args.as_slice(), *is_64bit),
         let converted_func = Either::Left(CsharpminorExpr::Eload(*chunk, Box::new(addr_expr))),
         let call_args = args.iter().map(|r| CsharpminorExpr::Evar(*r)).collect(),
         let stmt = CsharpminorStmt::Stailcall(sig.clone(), converted_func, call_args);
@@ -1551,6 +1558,98 @@ mod tests {
     }
 
     #[test]
+    fn memory_addresses_use_the_target_pointer_width_exclusively() {
+        let [load, store, base, index, destination, source] = synthetic_ids();
+        let mut lp64 = CshminorPassProgram::default();
+        lp64.abi_pointer_size.push((8,));
+        lp64.cminor_stmt.push((
+            load,
+            CminorStmt::Sassign(
+                destination,
+                CminorExpr::Eload(
+                    MemoryChunk::MInt8Unsigned,
+                    Addressing::Aindexed2(0),
+                    Arc::new(vec![base, index]),
+                ),
+            ),
+        ));
+        lp64.cminor_stmt.push((
+            store,
+            CminorStmt::Sstore(
+                MemoryChunk::MInt8Unsigned,
+                Addressing::Aindexed2(0),
+                Arc::new(vec![base, index]),
+                source,
+            ),
+        ));
+
+        lp64.run();
+
+        let load_candidates: Vec<_> = lp64
+            .csharp_stmt_candidate
+            .iter()
+            .filter(|(node, _)| *node == load)
+            .collect();
+        assert_eq!(load_candidates.len(), 1, "{load_candidates:?}");
+        assert!(matches!(
+            &load_candidates[0].1,
+            CsharpminorStmt::Sset(
+                got_destination,
+                CsharpminorExpr::Eload(_, address),
+            ) if *got_destination == destination
+                && matches!(
+                    address.as_ref(),
+                    CsharpminorExpr::Ebinop(CminorBinop::Oaddl, left, right)
+                        if matches!(left.as_ref(), CsharpminorExpr::Evar(reg) if *reg == base)
+                            && matches!(right.as_ref(), CsharpminorExpr::Evar(reg) if *reg == index)
+                )
+        ));
+
+        let store_candidates: Vec<_> = lp64
+            .csharp_stmt_candidate
+            .iter()
+            .filter(|(node, _)| *node == store)
+            .collect();
+        assert_eq!(store_candidates.len(), 1, "{store_candidates:?}");
+        assert!(matches!(
+            &store_candidates[0].1,
+            CsharpminorStmt::Sstore(_, CsharpminorExpr::Ebinop(CminorBinop::Oaddl, _, _), value)
+                if matches!(value, CsharpminorExpr::Evar(reg) if *reg == source)
+        ));
+
+        let mut ilp32 = CshminorPassProgram::default();
+        ilp32.abi_pointer_size.push((4,));
+        ilp32.cminor_stmt.push((
+            load,
+            CminorStmt::Sassign(
+                destination,
+                CminorExpr::Eload(
+                    MemoryChunk::MInt8Unsigned,
+                    Addressing::Aindexed2(0),
+                    Arc::new(vec![base, index]),
+                ),
+            ),
+        ));
+        ilp32.run();
+        let ilp32_candidates: Vec<_> = ilp32
+            .csharp_stmt_candidate
+            .iter()
+            .filter(|(node, _)| *node == load)
+            .collect();
+        assert_eq!(ilp32_candidates.len(), 1, "{ilp32_candidates:?}");
+        assert!(matches!(
+            &ilp32_candidates[0].1,
+            CsharpminorStmt::Sset(
+                _,
+                CsharpminorExpr::Eload(_, address),
+            ) if matches!(
+                address.as_ref(),
+                CsharpminorExpr::Ebinop(CminorBinop::Oadd, _, _)
+            )
+        ));
+    }
+
+    #[test]
     fn later_addrstack_reuses_the_final_canonical_slot_local() {
         let [func, owner_site, use_site, dst, local, other] = synthetic_ids();
         let statement = CminorStmt::Sassign(dst, CminorExpr::Econst(Constant::Oaddrstack(12)));
@@ -1968,6 +2067,7 @@ mod tests {
     fn memory_tailcall_inlines_the_function_pointer_load() {
         let [node, target, base, arg] = synthetic_ids();
         let mut prog = CshminorPassProgram::default();
+        prog.abi_pointer_size.push((8,));
         prog.cminor_stmt.push((
             node,
             CminorStmt::Stailcall(None, Either::Left(target), Arc::new(vec![arg])),

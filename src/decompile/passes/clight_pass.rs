@@ -440,7 +440,7 @@ ascent_par! {
         let raw_args = clight_exprs_from_csharp_with_multi_types(args.as_slice(), &var_types, *ptr_size),
         let call_args = cast_call_args_to_signature_with_node(raw_args, &sig),
         let call_stmt = ClightStmt::Scall(dst_ident, func_expr, call_args),
-        let ret_expr = ClightExpr::Etempvar(ret_ident, default_int_type()),
+        let ret_expr = ClightExpr::Etempvar(ret_ident, clight_type_from_xtype(&resolved_sig.sig_res)),
         let ret_stmt = ClightStmt::Sreturn(Some(ret_expr)),
         let stmt = ClightStmt::Ssequence(vec![call_stmt, ret_stmt]);
 
@@ -462,7 +462,7 @@ ascent_par! {
         let raw_args = clight_exprs_from_csharp_with_multi_types(args.as_slice(), &var_types, *ptr_size),
         let call_args = cast_call_args_to_signature_with_node(raw_args, &sig),
         let call_stmt = ClightStmt::Scall(dst_ident, func_expr, call_args),
-        let ret_expr = ClightExpr::Etempvar(ret_ident, default_int_type()),
+        let ret_expr = ClightExpr::Etempvar(ret_ident, clight_type_from_xtype(&resolved_sig.sig_res)),
         let ret_stmt = ClightStmt::Sreturn(Some(ret_expr)),
         let stmt = ClightStmt::Ssequence(vec![call_stmt, ret_stmt]);
 
@@ -482,7 +482,7 @@ ascent_par! {
         let raw_args = clight_exprs_from_csharp(args.as_slice(), *ptr_size),
         let call_args = cast_call_args_to_signature_with_node(raw_args, &sig),
         let call_stmt = ClightStmt::Scall(dst_ident, func_expr, call_args),
-        let ret_expr = ClightExpr::Etempvar(ret_ident, default_int_type()),
+        let ret_expr = ClightExpr::Etempvar(ret_ident, clight_type_from_xtype(&resolved_sig.sig_res)),
         let ret_stmt = ClightStmt::Sreturn(Some(ret_expr)),
         let stmt = ClightStmt::Ssequence(vec![call_stmt, ret_stmt]);
 
@@ -554,7 +554,10 @@ ascent_par! {
         let raw_args = clight_exprs_from_csharp_with_multi_types(args.as_slice(), &var_types, *ptr_size),
         let call_args = cast_call_args_to_signature_with_node(raw_args, &sig),
         let call_stmt = ClightStmt::Scall(dst_ident, func_expr, call_args),
-        let ret_stmt = ClightStmt::Sreturn(Some(ClightExpr::Etempvar(ret_ident, default_int_type()))),
+        let ret_stmt = ClightStmt::Sreturn(Some(ClightExpr::Etempvar(
+            ret_ident,
+            clight_type_from_xtype(&resolved_sig.sig_res),
+        ))),
         let stmt = ClightStmt::Ssequence(vec![call_stmt, ret_stmt]);
 
     clight_stmt(node, stmt) <--
@@ -1368,6 +1371,51 @@ mod tests {
             check_clight_stmt(&ClightStmt::Sset(owner, address)),
             Some(ClightStmt::Sskip),
         );
+    }
+
+    #[test]
+    fn tailcall_return_expression_uses_the_resolved_pointer_type() {
+        let func = 0x7300;
+        let node = 0x7310;
+        let ret_reg = 0x8000_0000_0000_7300;
+        let signature = Signature {
+            sig_args: Arc::new(Vec::new()),
+            sig_res: XType::Xptr,
+            sig_cc: CallConv::default(),
+        };
+        let mut prog = ClightPassProgram::default();
+        prog.abi_pointer_size.push((8,));
+        prog.emit_function.push((func, "pointer_wrapper", func));
+        prog.instr_in_function.push((node, func));
+        prog.emit_function_return.push((func, ret_reg));
+        prog.emit_var_type_candidate.push((ret_reg, XType::Xptr));
+        prog.csharp_stmt.push((
+            node,
+            CsharpminorStmt::Stailcall(
+                Some(signature),
+                Either::Right(Either::Right("memcpy")),
+                Vec::new(),
+            ),
+        ));
+
+        prog.run();
+
+        assert!(prog.clight_stmt.iter().any(|(got_node, stmt)| {
+            *got_node == node
+                && matches!(
+                    stmt,
+                    ClightStmt::Ssequence(parts)
+                        if matches!(
+                            parts.as_slice(),
+                            [
+                                ClightStmt::Scall(Some(dst), _, _),
+                                ClightStmt::Sreturn(Some(ClightExpr::Etempvar(ret, ty))),
+                            ] if *dst == ident_from_reg(ret_reg)
+                                && *ret == ident_from_reg(ret_reg)
+                                && matches!(ty, ClightType::Tpointer(_, _))
+                        )
+                )
+        }));
     }
 
     #[test]
@@ -7674,7 +7722,6 @@ fn size_opaque_escaped_frame_buffers(db: &mut DecompileDB) {
             .and_modify(|current| *current = (*current).max(*extent))
             .or_insert(*extent);
     }
-
     // Whole-slot unification lets a slot's canonical local also be the name of a
     // register-resident value, and such a local is a variable, not storage: it
     // is negated, compared and passed by value, none of which an array
@@ -7783,7 +7830,6 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         db.rel_iter::<(Node, RTLReg)>("canonical_exact_stack_addr_ptr_result")
             .copied(),
     );
-
     // node -> function ownership for every real RTL instruction.  Split
     // fragments can transiently publish more than one owner, so consume only
     // singleton ownership instead of choosing by relation iteration order.

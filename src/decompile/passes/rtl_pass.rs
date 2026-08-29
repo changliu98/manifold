@@ -1041,7 +1041,11 @@ ascent_par! {
     // used.  Signature reconciliation binds the resulting semantic builtin to
     // the final last-named parameter after its stricter arity solve.
     relation variadic_next_arg_site(Address, Node, Mreg);
-    #[local] relation variadic_register_save_area_init(Address, i64);
+    // The exact store node is retained for source emission: after the recovered
+    // machine prologue has filled the va_list fields, C must reinitialize the
+    // object with __builtin_va_start so unnamed register arguments come from
+    // the recompiled function's real incoming ABI state.
+    relation variadic_register_save_area_init(Address, i64, Node);
     #[local] relation variadic_overflow_arg_area_init(Address, Node, Mreg, i64);
     #[local] relation variadic_next_arg_prefix_candidate(Address, Node, Mreg, usize);
     relation variadic_fixed_stack_prefix_count(Address, usize);
@@ -4329,9 +4333,24 @@ ascent_par! {
         ltl_inst(cmov_addr, ?LTLInst::Lop(Operation::Osel(_, _), args, _)),
         if args.len() == 2;
 
+    // A memory TEST can feed one or more SETcc instructions before any later
+    // branch consumes the materialized booleans.  Keep the same exact flags
+    // origin exported by asm_pass, and only lower the equality predicates for
+    // which a masked memory value has a direct CompCert condition.
+    #[local] relation test_mem_setcc_link(Address, Address, TestCond);
+    test_mem_setcc_link(test_addr, setcc_addr, test_cond) <--
+        setcc_compare_site(setcc_addr, test_addr),
+        ptest(test_addr, mem_sym, mask_sym),
+        op_indirect(mem_sym, _, _, _, _, _, _),
+        op_immediate(mask_sym, _, _),
+        instruction(setcc_addr, _, _, mnem, _, _, _, _, _, _),
+        if let Some(test_cond) = setcc_mnem_testcond(mnem),
+        if matches!(test_cond, TestCond::CondE | TestCond::CondNe);
+
     #[local] relation test_mem_consumer_link(Address, Address);
     test_mem_consumer_link(addr, consumer) <-- test_mem_jcc_link(addr, consumer);
     test_mem_consumer_link(addr, consumer) <-- test_mem_cmov_link(addr, consumer);
+    test_mem_consumer_link(addr, consumer) <-- test_mem_setcc_link(addr, consumer, _);
 
     temp_test_mem_reg(addr, fresh_reg) <--
         test_mem_consumer_link(addr, _),
@@ -4444,6 +4463,23 @@ ascent_par! {
             TestCond::CondE => Condition::Cmaskzero(*mask),
             TestCond::CondNe => Condition::Cmasknotzero(*mask),
             _ => unreachable!("test_mem_jcc_link only admits JE/JNE"),
+        };
+
+    // TEST $mask,[mem] + SETE/SETNE: the TEST node owns the synthesized load
+    // above, while each SETcc owns its distinct boolean result.  This also
+    // keeps the address-producing call/load chain live through RTL DSE.
+    rtl_inst_candidate(*setcc_addr, RTLInst::Iop(Operation::Ocmp(cond), Arc::new(vec![*fresh_reg]), *dst_rtl)) <--
+        test_mem_setcc_link(test_addr, setcc_addr, test_cond),
+        ptest(test_addr, _, mask_sym),
+        op_immediate(mask_sym, mask, _),
+        temp_test_mem_reg(test_addr, fresh_reg),
+        instruction(setcc_addr, _, _, _, dst_sym, _, _, _, _, _),
+        op_register(dst_sym, dst_str),
+        reg_rtl(setcc_addr, Mreg::x86(dst_str), dst_rtl),
+        let cond = match test_cond {
+            TestCond::CondE => Condition::Cmaskzero(*mask),
+            TestCond::CondNe => Condition::Cmasknotzero(*mask),
+            _ => unreachable!("test_mem_setcc_link only admits SETE/SETNE"),
         };
 
     // A plain BP-relative compare is a stack access only when the function
@@ -12508,7 +12544,7 @@ ascent_par! {
     // va_start stores its address one pointer-width after overflow_arg_area.
     // Following both LEA definitions into adjacent Lsetstack fields avoids
     // mistaking an ordinary address of an incoming parameter for va_start.
-    variadic_register_save_area_init(*func_start, *save_slot) <--
+    variadic_register_save_area_init(*func_start, *save_slot, *store_addr) <--
         func_has_variadic_xmm_prologue(func_start),
         !abi_shared_arg_slots(true),
         exact_local_stack_addr_lea_def(func_start, lea_addr, dst_mreg, base, width),
@@ -12529,7 +12565,7 @@ ascent_par! {
     // uncovered block can withhold in large binaries.  Raw SP coordinates are
     // stable here because `exact_stack_addr_lea_def` and `op_indirect` must
     // agree at the same definition point.
-    variadic_register_save_area_init(*func_start, *save_slot) <--
+    variadic_register_save_area_init(*func_start, *save_slot, *store_addr) <--
         func_has_variadic_xmm_prologue(func_start),
         !abi_shared_arg_slots(true),
         exact_stack_addr_lea_def(func_start, lea_addr, dst_mreg, base, width),
@@ -12560,7 +12596,7 @@ ascent_par! {
         ltl_inst(store_addr, ?LTLInst::Lsetstack(store_src, Slot::Local, overflow_slot, _)),
         if store_src == dst_mreg,
         instr_in_function(store_addr, func_start),
-        variadic_register_save_area_init(func_start, save_slot),
+        variadic_register_save_area_init(func_start, save_slot, _),
         if let Some(expected_save_slot) = overflow_slot.checked_add(*pointer_size),
         if *save_slot == expected_save_slot;
 
@@ -13711,6 +13747,20 @@ ascent_par! {
         instr_in_function(addr, func_start),
         ltl_inst(addr, ?LTLInst::Ltailcall(Either::Right(Either::Left(target))));
 
+    relation func_tailcalls_known_extern(Address, Symbol, XType);
+    func_tailcalls_known_extern(func_start, *name, *return_type) <--
+        emit_function(func_start, _, _),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Ltailcall(Either::Right(Either::Right(name)))),
+        !emit_function(_, name, _),
+        known_extern_signature(name, _, return_type, _);
+    func_tailcalls_known_extern(func_start, *name, *return_type) <--
+        emit_function(func_start, _, _),
+        instr_in_function(addr, func_start),
+        ltl_inst(addr, ?LTLInst::Ltailcall(Either::Right(Either::Left(_)))),
+        external_call_site(addr, _, name),
+        known_extern_signature(name, _, return_type, _);
+
     // (A) Body: synthesize a return reg for a tail-call-only function whose target returns a value, so clight_pass lowers it as ret = target(); return ret; recursing up the tail-call chain.
     emit_function_return(func_start, ret_rtl) <--
         func_tailcalls_local(func_start, target),
@@ -13719,12 +13769,45 @@ ascent_par! {
         abi_ret_int_reg(ret_reg),
         let ret_rtl = fresh_xtl_reg(*func_start, *ret_reg);
 
+    emit_function_return(func_start, ret_rtl) <--
+        func_tailcalls_known_extern(func_start, _, return_type),
+        !func_has_lreturn(func_start),
+        if !matches!(return_type, XType::Xvoid | XType::Xfloat | XType::Xsingle),
+        abi_ret_int_reg(ret_reg),
+        let ret_rtl = fresh_xtl_reg(*func_start, *ret_reg);
+
+    emit_var_type_candidate(ret_rtl, *return_type) <--
+        func_tailcalls_known_extern(func_start, _, return_type),
+        !func_has_lreturn(func_start),
+        if !matches!(return_type, XType::Xvoid | XType::Xfloat | XType::Xsingle),
+        abi_ret_int_reg(ret_reg),
+        let ret_rtl = fresh_xtl_reg(*func_start, *ret_reg);
+
+    emit_function_return(func_start, ret_rtl) <--
+        func_tailcalls_known_extern(func_start, _, return_type),
+        !func_has_lreturn(func_start),
+        if matches!(return_type, XType::Xfloat | XType::Xsingle),
+        abi_ret_float_reg(ret_reg),
+        let ret_rtl = fresh_xtl_reg(*func_start, *ret_reg);
+
+    emit_var_type_candidate(ret_rtl, *return_type) <--
+        func_tailcalls_known_extern(func_start, _, return_type),
+        !func_has_lreturn(func_start),
+        if matches!(return_type, XType::Xfloat | XType::Xsingle),
+        abi_ret_float_reg(ret_reg),
+        let ret_rtl = fresh_xtl_reg(*func_start, *ret_reg);
+
     // (B) Decl type: inherit the tail-call target's non-void return type by positive recursion within the candidate relation.
     emit_function_return_type_xtype_candidate(func_start, xtype) <--
         func_tailcalls_local(func_start, target),
         !func_has_lreturn(func_start),
         emit_function_return_type_xtype_candidate(target, xtype),
         if *xtype != XType::Xvoid;
+
+    emit_function_return_type_xtype_candidate(func_start, *return_type) <--
+        func_tailcalls_known_extern(func_start, _, return_type),
+        !func_has_lreturn(func_start),
+        if *return_type != XType::Xvoid;
 
     emit_function_return_type_candidate(func_start, clight_ty) <--
         emit_function_return_type_xtype_candidate(func_start, xtype),
@@ -17055,6 +17138,76 @@ mod tests {
     }
 
     #[test]
+    fn masked_scaled_memory_test_materializes_each_setcc_result() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let test = 0x900;
+            let setne = 0x100;
+            let sete = 0x700;
+            let base_value = 0x1234;
+            let index_value = 0x2345;
+            let nonzero_value = fresh_xtl_reg(setne, Mreg::R14);
+            let zero_value = fresh_xtl_reg(sete, Mreg::DX);
+
+            prog.ptest.push((test, "tested_byte", "printable_mask"));
+            prog.op_indirect
+                .push(("tested_byte", "", "RDX", "RAX", 2, 1, 1));
+            prog.op_immediate.push(("printable_mask", 0x40, 1));
+            prog.reg_xtl.push((test, Mreg::DX, base_value));
+            prog.reg_xtl.push((test, Mreg::AX, index_value));
+
+            for (setcc, mnemonic, destination, mreg, value) in [
+                (setne, "SETNE", "R14B", Mreg::R14, nonzero_value),
+                (sete, "SETE", "DL", Mreg::DX, zero_value),
+            ] {
+                prog.setcc_compare_site.push((setcc, test));
+                prog.instruction
+                    .push((setcc, 3, "", mnemonic, destination, "0", "0", "0", 0, 0));
+                prog.op_register.push((destination, destination));
+                prog.reg_xtl.push((setcc, mreg, value));
+                prog.instr_in_function.push((setcc, func));
+            }
+            prog.instr_in_function.push((test, func));
+
+            prog.run();
+
+            let loaded = fresh_xtl_reg(test, Mreg::x86("RTEMP"));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    test,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt8Unsigned,
+                        Addressing::Aindexed2scaled(2, 1),
+                        Arc::new(vec![base_value, index_value]),
+                        loaded,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    setne,
+                    RTLInst::Iop(
+                        Operation::Ocmp(Condition::Cmasknotzero(0x40)),
+                        Arc::new(vec![loaded]),
+                        nonzero_value,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    sete,
+                    RTLInst::Iop(
+                        Operation::Ocmp(Condition::Cmaskzero(0x40)),
+                        Arc::new(vec![loaded]),
+                        zero_value,
+                    ),
+                )
+            }));
+        });
+    }
+
+    #[test]
     fn load_overwriting_arg_register_reads_incoming_parameter_value() {
         on_large_stack(|| {
             let mut prog = RTLPassProgram::default();
@@ -20346,7 +20499,8 @@ mod tests {
                 overflow_store,
                 LTLInst::Lsetstack(Mreg::AX, Slot::Local, -32, Typ::Tany64),
             ));
-            prog.variadic_register_save_area_init.push((func, -24));
+            prog.variadic_register_save_area_init
+                .push((func, -24, 0x6a4));
             for node in [func, next_arg, overflow_store] {
                 prog.instr_in_function.push((node, func));
             }
@@ -24720,6 +24874,113 @@ mod tests {
                 .call_site
                 .iter()
                 .any(|row| row == &(shadowed, "shadowed")));
+        });
+    }
+
+    #[test]
+    fn tailcall_only_known_extern_preserves_its_return_value() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let pointer_wrapper = 0x7600;
+            let pointer_tailcall = 0x7610;
+            let float_wrapper = 0x7700;
+            let float_tailcall = 0x7710;
+            let void_wrapper = 0x7800;
+            let void_tailcall = 0x7810;
+            let ordinary_wrapper = 0x7900;
+            let ordinary_call = 0x7910;
+
+            prog.abi_ret_int_reg.push((Mreg::AX,));
+            prog.abi_ret_float_reg.push((Mreg::X0,));
+            for (func, name, node, inst) in [
+                (
+                    pointer_wrapper,
+                    "pointer_wrapper",
+                    pointer_tailcall,
+                    LTLInst::Ltailcall(Either::Right(Either::Right("memcpy"))),
+                ),
+                (
+                    float_wrapper,
+                    "float_wrapper",
+                    float_tailcall,
+                    LTLInst::Ltailcall(Either::Right(Either::Right("sqrt"))),
+                ),
+                (
+                    void_wrapper,
+                    "void_wrapper",
+                    void_tailcall,
+                    LTLInst::Ltailcall(Either::Right(Either::Right("free"))),
+                ),
+                (
+                    ordinary_wrapper,
+                    "ordinary_wrapper",
+                    ordinary_call,
+                    LTLInst::Lcall(Either::Right(Either::Right("malloc"))),
+                ),
+            ] {
+                prog.emit_function.push((func, name, func));
+                prog.instr_in_function.push((node, func));
+                prog.ltl_inst.push((node, inst));
+            }
+            prog.known_extern_signature.extend([
+                (
+                    "memcpy",
+                    3,
+                    XType::Xptr,
+                    Arc::new(vec![XType::Xptr, XType::Xptr, XType::Xlong]),
+                ),
+                ("sqrt", 1, XType::Xfloat, Arc::new(vec![XType::Xfloat])),
+                ("free", 1, XType::Xvoid, Arc::new(vec![XType::Xptr])),
+                (
+                    "malloc",
+                    1,
+                    XType::Xptr,
+                    Arc::new(vec![XType::Xlongunsigned]),
+                ),
+            ]);
+
+            prog.run();
+
+            let pointer_ret = fresh_xtl_reg(pointer_wrapper, Mreg::AX);
+            assert!(prog
+                .func_tailcalls_known_extern
+                .iter()
+                .any(|row| { row == &(pointer_wrapper, "memcpy", XType::Xptr) }));
+            assert!(prog
+                .emit_function_return
+                .iter()
+                .any(|row| row == &(pointer_wrapper, pointer_ret)));
+            assert!(prog
+                .emit_var_type_candidate
+                .iter()
+                .any(|row| row == &(pointer_ret, XType::Xptr)));
+            assert!(prog
+                .emit_function_return_type_xtype_candidate
+                .iter()
+                .any(|row| row == &(pointer_wrapper, XType::Xptr)));
+
+            let float_ret = fresh_xtl_reg(float_wrapper, Mreg::X0);
+            assert!(prog
+                .emit_function_return
+                .iter()
+                .any(|row| row == &(float_wrapper, float_ret)));
+            assert!(prog
+                .emit_var_type_candidate
+                .iter()
+                .any(|row| row == &(float_ret, XType::Xfloat)));
+
+            assert!(!prog
+                .emit_function_return
+                .iter()
+                .any(|(func, _)| *func == void_wrapper));
+            assert!(!prog
+                .func_tailcalls_known_extern
+                .iter()
+                .any(|(func, name, _)| *func == ordinary_wrapper && *name == "malloc"));
+            assert!(!prog
+                .emit_function_return
+                .iter()
+                .any(|(func, _)| *func == ordinary_wrapper));
         });
     }
 

@@ -59,6 +59,122 @@ fn uses_storage_alias(stmt: &ClightStmt, storage_aliases: &HashMap<Ident, Ident>
         || clight_addrof_ident(value).is_some_and(|owner| storage_aliases.contains_key(&owner))
 }
 
+/// Append the source-language va_start operation after the recovered SysV
+/// va_list field stores.  The local stays a byte buffer so the remaining
+/// machine-derived accesses retain their exact offsets; casting its address to
+/// __builtin_va_list lets GCC populate the unnamed GP/FP arguments that cannot
+/// be named as ordinary C parameters.
+fn append_source_va_start(stmt: CStmt, va_list_local: Ident, last_named: RTLReg) -> CStmt {
+    let va_list_ptr = CType::Pointer(
+        Box::new(CType::TypedefName("__builtin_va_list".to_string())),
+        TypeQualifiers::none(),
+    );
+    let va_list = CExpr::deref(CExpr::cast(
+        va_list_ptr,
+        CExpr::var(format!("var_{va_list_local}")),
+    ));
+    let start = CStmt::Expr(CExpr::call(
+        CExpr::var("__builtin_va_start"),
+        vec![va_list, CExpr::var(param_name_for_reg(last_named))],
+    ));
+    match stmt {
+        CStmt::Sequence(mut statements) => {
+            statements.push(start);
+            CStmt::Sequence(statements)
+        }
+        other => CStmt::Sequence(vec![other, start]),
+    }
+}
+
+fn unwrapped_assigned_var(expr: &CExpr) -> Option<&str> {
+    match expr {
+        CExpr::Var(name) => Some(name),
+        CExpr::Cast(_, inner) | CExpr::Paren(inner) => unwrapped_assigned_var(inner),
+        _ => None,
+    }
+}
+
+fn count_assignments_to(stmt: &CStmt, destination: &str) -> usize {
+    match stmt {
+        CStmt::Expr(CExpr::Assign(_, lhs, _)) => {
+            usize::from(unwrapped_assigned_var(lhs) == Some(destination))
+        }
+        CStmt::Block(items) => items
+            .iter()
+            .map(|item| match item {
+                crate::decompile::passes::c_pass::types::CBlockItem::Stmt(stmt) => {
+                    count_assignments_to(stmt, destination)
+                }
+                crate::decompile::passes::c_pass::types::CBlockItem::Decl(_) => 0,
+            })
+            .sum(),
+        CStmt::If(_, then_stmt, else_stmt) => {
+            count_assignments_to(then_stmt, destination)
+                + else_stmt
+                    .as_deref()
+                    .map_or(0, |stmt| count_assignments_to(stmt, destination))
+        }
+        CStmt::Switch(_, body)
+        | CStmt::While(_, body)
+        | CStmt::DoWhile(body, _)
+        | CStmt::For(_, _, _, body)
+        | CStmt::Labeled(_, body) => count_assignments_to(body, destination),
+        CStmt::Sequence(statements) => statements
+            .iter()
+            .map(|stmt| count_assignments_to(stmt, destination))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn insert_va_start_after_assignment(
+    stmt: &mut CStmt,
+    destination: &str,
+    va_list_local: Ident,
+    last_named: RTLReg,
+) -> usize {
+    if matches!(
+        stmt,
+        CStmt::Expr(CExpr::Assign(_, lhs, _))
+            if unwrapped_assigned_var(lhs) == Some(destination)
+    ) {
+        let original = std::mem::replace(stmt, CStmt::Empty);
+        *stmt = append_source_va_start(original, va_list_local, last_named);
+        return 1;
+    }
+    match stmt {
+        CStmt::Block(items) => items
+            .iter_mut()
+            .map(|item| match item {
+                crate::decompile::passes::c_pass::types::CBlockItem::Stmt(stmt) => {
+                    insert_va_start_after_assignment(stmt, destination, va_list_local, last_named)
+                }
+                crate::decompile::passes::c_pass::types::CBlockItem::Decl(_) => 0,
+            })
+            .sum(),
+        CStmt::If(_, then_stmt, else_stmt) => {
+            insert_va_start_after_assignment(then_stmt, destination, va_list_local, last_named)
+                + else_stmt.as_deref_mut().map_or(0, |stmt| {
+                    insert_va_start_after_assignment(stmt, destination, va_list_local, last_named)
+                })
+        }
+        CStmt::Switch(_, body)
+        | CStmt::While(_, body)
+        | CStmt::DoWhile(body, _)
+        | CStmt::For(_, _, _, body)
+        | CStmt::Labeled(_, body) => {
+            insert_va_start_after_assignment(body, destination, va_list_local, last_named)
+        }
+        CStmt::Sequence(statements) => statements
+            .iter_mut()
+            .map(|stmt| {
+                insert_va_start_after_assignment(stmt, destination, va_list_local, last_named)
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
 /// Known libc functions that take opaque struct pointer parameters; maps function_name -> Vec<(param_position, typedef_name)>.
 fn known_opaque_struct_params() -> HashMap<&'static str, Vec<(usize, &'static str)>> {
     let mut m: HashMap<&str, Vec<(usize, &str)>> = HashMap::new();
@@ -1694,6 +1810,7 @@ const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
     "stack_buffer_alias",
     "stack_buffer_end_alias",
     "stack_var",
+    "variadic_register_save_area_init",
     // Exact initialized bytes back designated initializers when a synthetic
     // interior global is coalesced into a recovered aggregate owner.
     "retained_initialized_data_range",
@@ -2374,6 +2491,41 @@ impl IRPass for ClightEmitPass {
                     .insert(member, *candidates.iter().next().unwrap());
             }
         }
+        let exact_stack_buffer_store_sites = crate::decompile::passes::c_pass::convert::from_relations::derive_exact_stack_buffer_store_sites(db);
+        // Resolve each proven SysV register-save-area store to the physical
+        // byte-buffer local that owns the containing va_list.  Ambiguous or
+        // scalar-only storage fails closed: source va_start is inserted only
+        // when both the ABI site and one storage owner are exact.
+        let variadic_store_destinations: HashMap<Node, RTLReg> = db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst")
+            .filter_map(|(node, inst)| match inst {
+                RTLInst::Iop(Operation::Omove, args, destination) if args.len() == 1 => {
+                    Some((*node, *destination))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut variadic_va_start_specs: HashMap<Address, HashSet<(RTLReg, Ident)>> =
+            HashMap::new();
+        for (func, _save_slot, store_node) in
+            db.rel_iter::<(Address, i64, Node)>("variadic_register_save_area_init")
+        {
+            let Some((base, relative)) = exact_stack_buffer_store_sites.get(&(*func, *store_node))
+            else {
+                continue;
+            };
+            if *relative == 16 {
+                if let (Ok(base), Some(destination)) = (
+                    Ident::try_from(*base),
+                    variadic_store_destinations.get(store_node),
+                ) {
+                    variadic_va_start_specs
+                        .entry(*func)
+                        .or_default()
+                        .insert((*destination, base));
+                }
+            }
+        }
         let empty_storage_aliases = HashMap::new();
         let mut ctx =
             crate::decompile::passes::c_pass::convert::from_relations::ConversionContext::new(
@@ -2456,6 +2608,36 @@ impl IRPass for ClightEmitPass {
                     );
                     let cstmt = crate::decompile::passes::c_pass::convert::from_relations::narrow_varargs_in_stmt(&cstmt);
                     statements.push((node, cstmt));
+                }
+            }
+
+            if let (Some(specs), Some(&last_named)) = (
+                variadic_va_start_specs.get(&func.address),
+                func.param_regs.last(),
+            ) {
+                let mut specs: Vec<(RTLReg, Ident)> = specs.iter().copied().collect();
+                specs.sort_unstable();
+                for (destination, va_list_local) in specs {
+                    let destination = param_name_for_reg(destination);
+                    let matches: usize = statements
+                        .iter()
+                        .map(|(_, stmt)| count_assignments_to(stmt, &destination))
+                        .sum();
+                    if matches != 1 {
+                        continue;
+                    }
+                    let inserted: usize = statements
+                        .iter_mut()
+                        .map(|(_, stmt)| {
+                            insert_va_start_after_assignment(
+                                stmt,
+                                &destination,
+                                va_list_local,
+                                last_named,
+                            )
+                        })
+                        .sum();
+                    debug_assert_eq!(inserted, 1);
                 }
             }
 
@@ -2901,15 +3083,85 @@ impl IRPass for ClightEmitPass {
 #[cfg(test)]
 mod tests {
     use super::{
+        append_source_va_start, count_assignments_to, insert_va_start_after_assignment,
         is_self_address_materialization, repair_byte_array_bitwise_scalar_reads,
         repair_byte_array_pointer_arithmetic, rewrite_recovered_global_expr, uses_storage_alias,
         ClightEmitPass, ClightSelectPass,
     };
-    use crate::decompile::passes::c_pass::types::{AssignOp, CExpr, CType, FloatSize, UnaryOp};
+    use crate::decompile::passes::c_pass::types::{
+        AssignOp, CExpr, CStmt, CType, FloatSize, UnaryOp,
+    };
     use crate::decompile::passes::clight_pass::ClightPass;
     use crate::decompile::passes::pass::IRPass;
     use crate::x86::types::{ClightExpr, ClightStmt, ClightType};
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn proven_variadic_save_store_appends_source_va_start() {
+        let original = CStmt::Expr(CExpr::assign(CExpr::var("slot"), CExpr::var("save_area")));
+        let va_list_local = 0x1234;
+        let last_named = 0x5678;
+
+        let rewritten = append_source_va_start(original.clone(), va_list_local, last_named);
+
+        assert!(matches!(
+            rewritten,
+            CStmt::Sequence(parts)
+                if parts.len() == 2
+                    && parts[0] == original
+                    && matches!(
+                        &parts[1],
+                        CStmt::Expr(CExpr::Call(callee, args))
+                            if matches!(callee.as_ref(), CExpr::Var(name) if name == "__builtin_va_start")
+                                && matches!(
+                                    args.as_slice(),
+                                    [
+                                        CExpr::Unary(
+                                            UnaryOp::Deref,
+                                            target,
+                                        ),
+                                        CExpr::Var(last),
+                                    ] if matches!(
+                                        target.as_ref(),
+                                        CExpr::Cast(
+                                            CType::Pointer(inner, _),
+                                            local,
+                                        ) if matches!(inner.as_ref(), CType::TypedefName(name) if name == "__builtin_va_list")
+                                            && matches!(local.as_ref(), CExpr::Var(name) if name == "var_4660")
+                                    ) && last == &crate::decompile::passes::c_pass::helpers::param_name_for_reg(last_named)
+                                )
+                    )
+        ));
+    }
+
+    #[test]
+    fn folded_sequence_inserts_va_start_after_the_unique_save_assignment() {
+        let destination = "var_99";
+        let mut body = CStmt::Sequence(vec![
+            CStmt::Expr(CExpr::assign(CExpr::var("other"), CExpr::int(1))),
+            CStmt::Labeled(
+                crate::decompile::passes::c_pass::types::Label::Named("save".to_string()),
+                Box::new(CStmt::Sequence(vec![
+                    CStmt::Expr(CExpr::assign(
+                        CExpr::var(destination),
+                        CExpr::var("register_save_area"),
+                    )),
+                    CStmt::Expr(CExpr::call(CExpr::var("consume"), vec![])),
+                ])),
+            ),
+        ]);
+
+        assert_eq!(count_assignments_to(&body, destination), 1);
+        assert_eq!(
+            insert_va_start_after_assignment(&mut body, destination, 0x1234, 0x5678),
+            1
+        );
+        let printed = crate::decompile::passes::c_pass::print::print_stmt(&body);
+        let save = printed.find("var_99 = register_save_area;").unwrap();
+        let start = printed.find("__builtin_va_start").unwrap();
+        let consume = printed.find("consume()").unwrap();
+        assert!(save < start && start < consume, "{printed}");
+    }
 
     #[test]
     fn recovered_byte_array_keeps_byte_stride_in_pointer_addition() {
@@ -3143,6 +3395,14 @@ mod tests {
         let select = ClightSelectPass;
         assert!(select.inputs().contains(&"clight_function_owners"));
         assert!(select.inputs().contains(&"clight_targeted_nop_owner"));
+    }
+
+    #[test]
+    fn source_va_start_reads_the_proven_register_save_store() {
+        let emit = ClightEmitPass;
+        assert!(emit
+            .extra_reads()
+            .contains(&"variadic_register_save_area_init"));
     }
 
     #[test]
