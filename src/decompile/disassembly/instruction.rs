@@ -47,6 +47,14 @@ fn is_rsp_reg(cs: &Capstone, op_type: &X86OperandType) -> bool {
     })
 }
 
+/// Capstone 5 leaves the per-operand access field empty for some TEST
+/// encodings (notably `test r/m32, r32`).  TEST is architecturally read-only
+/// for every explicit operand, so recover that exact fact without guessing
+/// access roles for any other instruction.
+fn explicit_operand_is_read(mnemonic: &str, capstone_readable: bool) -> bool {
+    capstone_readable || mnemonic == "TEST"
+}
+
 fn explicit_stack_pointer_delta(
     mnemonic: &str,
     first_operand_size: usize,
@@ -315,7 +323,11 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
                             if op.access.map_or(false, |a| a.is_writable()) {
                                 reg_defs.push((addr, mreg));
                             }
-                            if op.access.map_or(false, |a| a.is_readable()) && !is_xor_self {
+                            if explicit_operand_is_read(
+                                mnemonic,
+                                op.access.map_or(false, |a| a.is_readable()),
+                            ) && !is_xor_self
+                            {
                                 reg_uses.push((addr, mreg));
                             }
                         }
@@ -372,7 +384,10 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
                         if let Some(canon_base) = canonical_stack_reg(base) {
                             if mnemonic != "LEA" {
                                 let is_write = op.access.map_or(false, |a| a.is_writable());
-                                let is_read = op.access.map_or(false, |a| a.is_readable());
+                                let is_read = explicit_operand_is_read(
+                                    mnemonic,
+                                    op.access.map_or(false, |a| a.is_readable()),
+                                );
                                 let indexed = index != "NONE" && !index.is_empty();
                                 stack_memory_operands.push((
                                     base,
@@ -777,8 +792,8 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
 #[cfg(test)]
 mod tests {
     use super::{
-        evex_has_opmask, explicit_stack_pointer_delta, implicit_data_memory_write_width,
-        special_memory_write,
+        evex_has_opmask, explicit_operand_is_read, explicit_stack_pointer_delta,
+        implicit_data_memory_write_width, special_memory_write,
     };
     use capstone::prelude::*;
 
@@ -833,5 +848,31 @@ mod tests {
     fn push_delta_uses_architectural_operand_width_not_immediate_encoding_width() {
         assert_eq!(decoded_push_delta(&[0x6a, 0x01]), -8);
         assert_eq!(decoded_push_delta(&[0x66, 0x6a, 0x01]), -2);
+    }
+
+    #[test]
+    fn scaled_memory_test_recovers_reads_when_capstone_omits_access_metadata() {
+        let cs = Capstone::new()
+            .x86()
+            .mode(arch::x86::ArchMode::Mode64)
+            .syntax(arch::x86::ArchSyntax::Intel)
+            .detail(true)
+            .build()
+            .expect("x86-64 Capstone");
+        let insns = cs
+            .disasm_all(&[0x85, 0x34, 0xb8], 0x401135)
+            .expect("TEST instruction");
+        let insn = insns.iter().next().expect("one TEST");
+        assert_eq!(insn.mnemonic(), Some("test"));
+        let detail = cs.insn_detail(insn).expect("TEST detail");
+        let arch = detail.arch_detail();
+        let operands: Vec<_> = arch.x86().expect("x86 detail").operands().collect();
+        assert_eq!(operands.len(), 2);
+        assert!(operands.iter().all(|operand| operand.access.is_none()));
+        assert!(operands.iter().all(|operand| explicit_operand_is_read(
+            "TEST",
+            operand.access.map_or(false, |access| access.is_readable()),
+        )));
+        assert!(!explicit_operand_is_read("MOV", false));
     }
 }

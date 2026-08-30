@@ -1088,6 +1088,7 @@ pub fn is_terminal_cstmt(stmt: &CStmt) -> bool {
 #[cfg(test)]
 mod terminal_tests {
     use super::*;
+    use crate::decompile::passes::c_pass::types::UnaryOp;
 
     #[test]
     fn scalar_fp_constant_wins_over_incidental_string_decode() {
@@ -1112,6 +1113,46 @@ mod terminal_tests {
             strings.get("L_17620").map(String::as_str),
             Some("real string")
         );
+    }
+
+    #[test]
+    fn exact_scalar_rewrite_prevents_later_raw_string_override() {
+        let label = "L_40200c";
+        let string_map = HashMap::from([(label.to_string(), "%".to_string())]);
+        let scalar_map = HashMap::from([(label.to_string(), CExpr::int(37))]);
+
+        let rewritten = inline_rodata_constants_preserving_addrof(&CExpr::var(label), &scalar_map);
+        assert_eq!(rewritten, CExpr::int(37));
+        assert_eq!(inline_string_literals(&rewritten, &string_map), None);
+    }
+
+    #[test]
+    fn scalar_precedence_preserves_mixed_use_address_for_string_rewrite() {
+        let label = "L_40200c";
+        let string_map = HashMap::from([(label.to_string(), "%".to_string())]);
+        let scalar_map = HashMap::from([(label.to_string(), CExpr::int(37))]);
+        let address = CExpr::Unary(UnaryOp::AddrOf, Box::new(CExpr::var(label)));
+
+        let rewritten = inline_rodata_constants_preserving_addrof(&address, &scalar_map);
+        assert_eq!(rewritten, address);
+        assert!(matches!(
+            inline_string_literals(&rewritten, &string_map),
+            Some(CExpr::StringLit(literal)) if literal.value == "%"
+        ));
+    }
+
+    #[test]
+    fn scalar_first_order_keeps_genuine_string_without_scalar_evidence() {
+        let label = "L_40200c";
+        let string_map = HashMap::from([(label.to_string(), "%".to_string())]);
+        let rewritten =
+            inline_rodata_constants_preserving_addrof(&CExpr::var(label), &HashMap::new());
+
+        assert_eq!(rewritten, CExpr::var(label));
+        assert!(matches!(
+            inline_string_literals(&rewritten, &string_map),
+            Some(CExpr::StringLit(literal)) if literal.value == "%"
+        ));
     }
 
     #[test]

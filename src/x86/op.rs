@@ -15,6 +15,23 @@ pub enum OverflowArithmetic {
     Neg,
 }
 
+/// Boolean result materialized by a SETcc that consumes flags from x86 TEST.
+///
+/// TEST's zero/sign flags describe the complete width-truncated bitwise AND,
+/// while its parity flag describes only that result's low byte.  Keeping this
+/// distinction explicit avoids pretending parity is an ordinary comparison or
+/// re-reading an operand register after an intervening SETcc has overwritten
+/// one of its byte lanes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TestResultCondition {
+    Zero,
+    NonZero,
+    Sign,
+    NonSign,
+    EvenParity,
+    OddParity,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Condition {
     Ccomp(Comparison),
@@ -280,6 +297,11 @@ pub enum Operation {
     Ofloatoflong,
     Olongofsingle,
     Osingleoflong,
+    /// Materialize one TEST-derived flag predicate as 0/1.  The two operands
+    /// are the already-loaded memory value and the register value captured at
+    /// the TEST instruction.  `width` is the TEST operand width in bytes and
+    /// `rhs_shift` is eight only for the legacy AH/BH/CH/DH register views.
+    Otestflags(TestResultCondition, usize, usize),
     Ocmp(Condition),
     Osel(Condition, Typ),
 }

@@ -2,7 +2,7 @@ use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
 use crate::{declare_io_from, run_pass};
 
-use crate::x86::op::{Addressing, Comparison, Condition, Operation};
+use crate::x86::op::{Addressing, Comparison, Condition, Operation, TestResultCondition};
 use crate::x86::types::*;
 use ascent::ascent_par;
 use either::Either;
@@ -220,10 +220,41 @@ impl IRPass for CminorPass {
 
 #[cfg(test)]
 mod expansion_cfg_tests {
-    use super::CminorPassProgram;
-    use crate::x86::op::{Addressing, Operation};
-    use crate::x86::types::{CminorExpr, CminorStmt, Constant, RTLInst};
+    use super::{csharp_expr_from_cminor, CminorPassProgram};
+    use crate::x86::op::{Addressing, Comparison, Operation, TestResultCondition};
+    use crate::x86::types::{
+        CminorBinop, CminorExpr, CminorStmt, Constant, CsharpminorExpr, RTLInst,
+    };
     use std::sync::Arc;
+
+    fn eval_test_expr(expr: &CsharpminorExpr, lhs: u64, rhs: u64) -> u64 {
+        match expr {
+            CsharpminorExpr::Evar(1) => lhs,
+            CsharpminorExpr::Evar(2) => rhs,
+            CsharpminorExpr::Econst(Constant::Ointconst(value)) => (*value as u32) as u64,
+            CsharpminorExpr::Econst(Constant::Olongconst(value)) => *value as u64,
+            CsharpminorExpr::Ebinop(op, left, right) => {
+                let left = eval_test_expr(left, lhs, rhs);
+                let right = eval_test_expr(right, lhs, rhs);
+                match op {
+                    CminorBinop::Oand => ((left as u32) & (right as u32)) as u64,
+                    CminorBinop::Oxor => ((left as u32) ^ (right as u32)) as u64,
+                    CminorBinop::Oshru => ((left as u32) >> ((right as u32) & 31)) as u64,
+                    CminorBinop::Oandl => left & right,
+                    CminorBinop::Oxorl => left ^ right,
+                    CminorBinop::Oshrlu => left >> (right & 63),
+                    CminorBinop::Ocmpu(Comparison::Ceq) | CminorBinop::Ocmplu(Comparison::Ceq) => {
+                        u64::from(left == right)
+                    }
+                    CminorBinop::Ocmpu(Comparison::Cne) | CminorBinop::Ocmplu(Comparison::Cne) => {
+                        u64::from(left != right)
+                    }
+                    other => panic!("unexpected TEST lowering operation {other:?}"),
+                }
+            }
+            other => panic!("unexpected TEST lowering expression {other:?}"),
+        }
+    }
 
     #[test]
     fn normalized_frame_address_becomes_an_addrstack_constant() {
@@ -273,6 +304,57 @@ mod expansion_cfg_tests {
             .cminor_fallthrough
             .iter()
             .any(|fact| fact == &(tail, collapsed)));
+    }
+
+    #[test]
+    fn test_flags_lowering_preserves_zero_sign_and_low_byte_parity() {
+        let predicates = [
+            TestResultCondition::Zero,
+            TestResultCondition::NonZero,
+            TestResultCondition::Sign,
+            TestResultCondition::NonSign,
+            TestResultCondition::EvenParity,
+            TestResultCondition::OddParity,
+        ];
+        let cases = [
+            (0_u64, u32::MAX as u64, 25_u8),
+            (0x8000_0000, u32::MAX as u64, 22),
+            (0x0101_0101, u32::MAX as u64, 42),
+            (u32::MAX as u64, 0x7fff_ffff, 26),
+        ];
+
+        for (lhs, rhs, packed) in cases {
+            for (bit, predicate) in predicates.into_iter().enumerate() {
+                let lowered = csharp_expr_from_cminor(&CminorExpr::Eop(
+                    Operation::Otestflags(predicate, 4, 0),
+                    Arc::new(vec![1, 2]),
+                ))
+                .expect("TEST predicate lowers");
+                assert_eq!(
+                    eval_test_expr(&lowered, lhs, rhs),
+                    u64::from((packed >> bit) & 1),
+                    "{predicate:?} for lhs={lhs:#x} rhs={rhs:#x}",
+                );
+            }
+        }
+
+        // PF observes only the low byte: 0x100 has even low-byte parity even
+        // though the full word contains one set bit.
+        let parity = csharp_expr_from_cminor(&CminorExpr::Eop(
+            Operation::Otestflags(TestResultCondition::EvenParity, 4, 0),
+            Arc::new(vec![1, 2]),
+        ))
+        .unwrap();
+        assert_eq!(eval_test_expr(&parity, 0x100, u32::MAX as u64), 1);
+
+        // A legacy high-byte mask view is shifted down before the byte-width
+        // TEST semantics are applied.
+        let high8_sign = csharp_expr_from_cminor(&CminorExpr::Eop(
+            Operation::Otestflags(TestResultCondition::Sign, 1, 8),
+            Arc::new(vec![1, 2]),
+        ))
+        .unwrap();
+        assert_eq!(eval_test_expr(&high8_sign, 0x80, 0x8000), 1);
     }
 }
 
@@ -567,6 +649,127 @@ fn is_long_binop(op: &CminorBinop) -> bool {
             | CminorBinop::Ocmpl(_)
             | CminorBinop::Ocmplu(_)
     )
+}
+
+fn csharp_binop(op: CminorBinop, lhs: CsharpminorExpr, rhs: CsharpminorExpr) -> CsharpminorExpr {
+    CsharpminorExpr::Ebinop(op, Box::new(lhs), Box::new(rhs))
+}
+
+fn test_flags_constant(width: usize, value: i64) -> CsharpminorExpr {
+    let constant = if width == 8 {
+        Constant::Olongconst(value)
+    } else {
+        Constant::Ointconst(value)
+    };
+    CsharpminorExpr::Econst(constant)
+}
+
+/// Lower the exact flags produced by x86 TEST into side-effect-free unsigned
+/// arithmetic.  Parity is the even/odd parity of the low byte only; folding
+/// the whole word would disagree whenever upper bytes contain an odd number
+/// of set bits.
+fn test_flags_expr(
+    predicate: TestResultCondition,
+    width: usize,
+    rhs_shift: usize,
+    lhs: CsharpminorExpr,
+    rhs: CsharpminorExpr,
+) -> Option<CsharpminorExpr> {
+    if !matches!(width, 1 | 2 | 4 | 8)
+        || !matches!(rhs_shift, 0 | 8)
+        || (rhs_shift == 8 && width != 1)
+    {
+        return None;
+    }
+
+    let (and_op, xor_op, shr_op, cmp_eq, cmp_ne) = if width == 8 {
+        (
+            CminorBinop::Oandl,
+            CminorBinop::Oxorl,
+            CminorBinop::Oshrlu,
+            CminorBinop::Ocmplu(Comparison::Ceq),
+            CminorBinop::Ocmplu(Comparison::Cne),
+        )
+    } else {
+        (
+            CminorBinop::Oand,
+            CminorBinop::Oxor,
+            CminorBinop::Oshru,
+            CminorBinop::Ocmpu(Comparison::Ceq),
+            CminorBinop::Ocmpu(Comparison::Cne),
+        )
+    };
+
+    let rhs_lane = if rhs_shift == 0 {
+        rhs
+    } else {
+        csharp_binop(
+            shr_op.clone(),
+            rhs,
+            test_flags_constant(width, rhs_shift as i64),
+        )
+    };
+    let tested = csharp_binop(and_op.clone(), lhs, rhs_lane);
+    let width_mask = match width {
+        1 => 0xff,
+        2 => 0xffff,
+        // -1 is the exact all-ones value after the selected 32/64-bit C cast.
+        4 | 8 => -1,
+        _ => unreachable!("validated TEST width"),
+    };
+    let tested = csharp_binop(
+        and_op.clone(),
+        tested,
+        test_flags_constant(width, width_mask),
+    );
+    let zero = test_flags_constant(width, 0);
+
+    match predicate {
+        TestResultCondition::Zero => Some(csharp_binop(cmp_eq, tested, zero)),
+        TestResultCondition::NonZero => Some(csharp_binop(cmp_ne, tested, zero)),
+        TestResultCondition::Sign | TestResultCondition::NonSign => {
+            let sign = csharp_binop(
+                and_op.clone(),
+                csharp_binop(
+                    shr_op,
+                    tested,
+                    test_flags_constant(width, (width * 8 - 1) as i64),
+                ),
+                test_flags_constant(width, 1),
+            );
+            let cmp = if predicate == TestResultCondition::Sign {
+                cmp_ne
+            } else {
+                cmp_eq
+            };
+            Some(csharp_binop(cmp, sign, zero))
+        }
+        TestResultCondition::EvenParity | TestResultCondition::OddParity => {
+            let byte = csharp_binop(and_op.clone(), tested, test_flags_constant(width, 0xff));
+            let fold4 = csharp_binop(
+                xor_op.clone(),
+                byte.clone(),
+                csharp_binop(shr_op.clone(), byte, test_flags_constant(width, 4)),
+            );
+            let fold2 = csharp_binop(
+                xor_op.clone(),
+                fold4.clone(),
+                csharp_binop(shr_op.clone(), fold4, test_flags_constant(width, 2)),
+            );
+            let fold1 = csharp_binop(
+                xor_op,
+                fold2.clone(),
+                csharp_binop(shr_op, fold2, test_flags_constant(width, 1)),
+            );
+            let odd = csharp_binop(and_op, fold1, test_flags_constant(width, 1));
+            let cmp = if predicate == TestResultCondition::EvenParity {
+                cmp_eq
+            } else {
+                cmp_ne
+            };
+            Some(csharp_binop(cmp, odd, zero))
+        }
+    }
 }
 
 fn csharp_int_const(value: i64) -> CsharpminorExpr {
@@ -910,6 +1113,9 @@ pub(crate) fn csharp_expr_from_cminor_sized(
                         Some(CsharpminorExpr::Ebinop(binop, Box::new(lhs), Box::new(rhs)))
                     } else {
                         match op {
+                            Operation::Otestflags(predicate, width, rhs_shift) => {
+                                test_flags_expr(*predicate, *width, *rhs_shift, lhs, rhs)
+                            }
                             Operation::Olea(addr) => {
                                 addressing_to_csharp_expr_sized(addr, args, false)
                             }

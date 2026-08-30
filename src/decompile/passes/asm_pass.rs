@@ -7,7 +7,9 @@ use crate::{declare_io_from, run_pass};
 use crate::mreg::Mreg;
 use crate::util::multi_synth_address_is_encodable;
 use crate::x86::asm::{Freg, Ireg, Preg, TestCond};
-use crate::x86::op::{Addressing, Comparison, Condition, Operation, OverflowArithmetic};
+use crate::x86::op::{
+    Addressing, Comparison, Condition, Operation, OverflowArithmetic, TestResultCondition,
+};
 use crate::x86::types::*;
 use ascent::aggregators;
 use ascent::ascent_par;
@@ -16,6 +18,7 @@ use ascent::lattice::set::Set;
 use ascent::Dual;
 use either::Either;
 use log::warn;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 fn shift_stack_offsets(offsets: &Set<i64>, delta: i64) -> Set<i64> {
@@ -49,6 +52,22 @@ fn x86_gpr_view_width(reg: &str) -> Option<i64> {
         | "R8B" | "R9B" | "R10B" | "R11B" | "R12B" | "R13B" | "R14B" | "R15B" => Some(1),
         _ => None,
     }
+}
+
+/// Exact TEST-result predicate named by the SETcc mnemonic.  Keep this
+/// separate from TestCond: SETS tests SF itself (not SF xor OF), and parity is
+/// a low-byte property that cannot be represented by the existing Cmask
+/// placeholders.
+pub(crate) fn test_result_condition_for_setcc(mnemonic: &str) -> Option<TestResultCondition> {
+    Some(match mnemonic {
+        "SETE" | "SETZ" => TestResultCondition::Zero,
+        "SETNE" | "SETNZ" => TestResultCondition::NonZero,
+        "SETS" => TestResultCondition::Sign,
+        "SETNS" => TestResultCondition::NonSign,
+        "SETP" | "SETPE" => TestResultCondition::EvenParity,
+        "SETNP" | "SETPO" => TestResultCondition::OddParity,
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -421,7 +440,13 @@ fn chunk_from_mnem(mnem: &str) -> MemoryChunk {
     } else if m.contains("MOVSS") {
         MemoryChunk::MFloat32
     } else if m.contains("MOVSD") {
-        MemoryChunk::MAny64
+        // In every lowering path that consumes this helper, a two-operand
+        // MOVSD/VMOVSD memory form has an explicit XMM operand; the operand-less
+        // string instruction never satisfies pmov + op_register + op_indirect.
+        // Preserve the scalar-double interpretation so an indexed load is a
+        // bit-preserving MFloat64 read, not an integer read followed by a
+        // numeric `(double)long` conversion.
+        MemoryChunk::MFloat64
     }
     // MOVD/VMOVD (not MOVDQA/MOVDQU) is a 32-bit GP<->XMM transfer, sized 32-bit so the float-bits shuffle does not over-read the source's upper half.
     else if m == "MOVD" || m == "VMOVD" {
@@ -495,6 +520,18 @@ fn integer_memory_chunk(size: usize) -> Option<MemoryChunk> {
         2 => Some(MemoryChunk::MInt16Unsigned),
         4 => Some(MemoryChunk::MInt32),
         8 => Some(MemoryChunk::MInt64),
+        _ => None,
+    }
+}
+
+fn imul3_memory_operation(
+    destination: &str,
+    memory_size: usize,
+    immediate: i64,
+) -> Option<(Operation, MemoryChunk)> {
+    match (x86_gpr_view_width(destination), memory_size) {
+        (Some(4), 4) => Some((Operation::Omulimm(immediate), MemoryChunk::MInt32)),
+        (Some(8), 8) => Some((Operation::Omullimm(immediate), MemoryChunk::MInt64)),
         _ => None,
     }
 }
@@ -890,6 +927,22 @@ ascent_par! {
 
     psetcc(addr, TestCond::CondG, dst)<--
         instruction(addr, _, _, "SETG", dst, _, _, _, _, _);
+
+    // All SETcc spellings whose value can be reconstructed exactly from a
+    // TEST result, including SF-only and parity predicates that TestCond's
+    // ordinary comparison vocabulary cannot represent soundly.
+    relation test_result_setcc(Address, TestResultCondition, Symbol);
+    test_result_setcc(addr, predicate, dst) <--
+        instruction(addr, _, _, mnemonic, dst, _, _, _, _, _),
+        if let Some(predicate) = test_result_condition_for_setcc(mnemonic);
+
+    // SETcc reads flags and writes a logical byte regardless of whether its
+    // predicate has a generic CompCert Condition.  This structural classifier
+    // keeps the flag-origin walk and low-byte boolean lattice complete without
+    // assigning SETS/SETNS or parity an invented comparison.
+    #[local] relation setcc_boolean_writer(Address, Symbol);
+    setcc_boolean_writer(addr, dst) <-- psetcc(addr, _, dst);
+    setcc_boolean_writer(addr, dst) <-- test_result_setcc(addr, _, dst);
 
     relation pxor(Address, Symbol, Symbol);
     pxor(addr, dst, src)<--
@@ -1409,6 +1462,14 @@ ascent_par! {
     relation mach_imm_indirect_store(Address, i64, MemoryChunk, Mreg, i64);
     // Memory-source arithmetic: load from [base+disp], then apply op with dst_reg.
     relation arith_load_op(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
+    // Indexed memory-source arithmetic retains the complete addressing mode and
+    // ordered machine-register operands.  RTL materializes the load before the
+    // arithmetic; no rule may substitute either address register for memory.
+    relation arith_indexed_load_op(Address, Operation, MemoryChunk, Addressing, Arc<Vec<Mreg>>, Mreg);
+    // Write-only unary operation over one scalar stack/frame cell.  Both
+    // integer IMUL3 and integer-to-float conversions use the same canonical
+    // stack value rather than treating SP/BP as an ordinary pointer.
+    relation unary_stack_load_op(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
     // Memory-dest arithmetic with register source: load [base+disp], op with src_reg, store back.
     relation arith_store_reg(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
     // Memory-dest arithmetic with immediate source: load [base+disp], op_imm, store back.
@@ -1423,6 +1484,8 @@ ascent_par! {
     relation node_unlowered_side_effect(Address);
     node_unlowered_side_effect(addr) <-- mach_imm_indirect_store(addr, _, _, _, _);
     node_unlowered_side_effect(addr) <-- arith_load_op(addr, _, _, _, _, _);
+    node_unlowered_side_effect(addr) <-- arith_indexed_load_op(addr, _, _, _, _, _);
+    node_unlowered_side_effect(addr) <-- unary_stack_load_op(addr, _, _, _, _, _);
     node_unlowered_side_effect(addr) <-- arith_store_reg(addr, _, _, _, _, _);
     node_unlowered_side_effect(addr) <-- arith_store_imm(addr, _, _, _, _);
     node_unlowered_side_effect(addr) <-- arith_store_abs_reg(addr, _, _, _, _, _);
@@ -4543,7 +4606,7 @@ ascent_par! {
         if !is_flag_setting(mnem);
     flags_flow_transparent(addr) <-- pjcc(addr, _, _);
     flags_flow_transparent(addr) <-- overflow_jcc(addr, _, _);
-    flags_flow_transparent(addr) <-- psetcc(addr, _, _);
+    flags_flow_transparent(addr) <-- setcc_boolean_writer(addr, _);
 
     // Point-keyed may-state: at each instruction, which compare/test origins
     // have already had a jcc consume their flags on some incoming CFG path.
@@ -4647,7 +4710,7 @@ ascent_par! {
     low_byte_boolean_gen_set(*node, Set::default()) <--
         instr_in_function(node, _);
     low_byte_boolean_gen_set(*addr, Set::singleton(Mreg::x86(*dst_name))) <--
-        psetcc(addr, _, dst_symbol),
+        setcc_boolean_writer(addr, dst_symbol),
         op_register(dst_symbol, dst_name),
         if is_reg_8(dst_name),
         if !is_reg_high8(dst_name);
@@ -6032,18 +6095,18 @@ ascent_par! {
     test_setcc_link(addr0, addr1) <--
         ptest(addr0, _, _),
         next(addr0, addr1),
-        psetcc(addr1, _, _);
+        setcc_boolean_writer(addr1, _);
     test_setcc_link(addr0, addr1) <--
         flags_and_jump_pair(addr0, addr1, _),
         ptest(addr0, _, _),
-        psetcc(addr1, _, _);
+        setcc_boolean_writer(addr1, _);
     test_setcc_link(addr0, addr2) <--
         ptest(addr0, _, _),
         next(addr0, addr1),
         instruction(addr1, _, _, mnem1, _, _, _, _, _, _),
         if !is_flag_setting(mnem1),
         next(addr1, addr2),
-        psetcc(addr2, _, _);
+        setcc_boolean_writer(addr2, _);
     test_setcc_link(addr0, addr3) <--
         ptest(addr0, _, _),
         next(addr0, addr1),
@@ -6053,11 +6116,25 @@ ascent_par! {
         instruction(addr2, _, _, mnem2, _, _, _, _, _, _),
         if !is_flag_setting(mnem2),
         next(addr2, addr3),
-        psetcc(addr3, _, _);
+        setcc_boolean_writer(addr3, _);
     test_setcc_link(addr0, addr_set) <--
         ptest(addr0, _, _),
         setcc_flag_walk(addr0, addr_set),
-        psetcc(addr_set, _, _);
+        setcc_boolean_writer(addr_set, _);
+
+    // Only this exact unsupported-at-Mach SETcc shape is delegated to RTL's
+    // TEST load + Otestflags lowering.  Other SETS/SETNS sites must remain in
+    // the unhandled-definition diagnostic rather than being hidden merely
+    // because they are structurally flag-transparent.
+    #[local] relation test_mem_register_setcc_delegated(Address);
+    test_mem_register_setcc_delegated(addr_set) <--
+        test_setcc_link(test_addr, addr_set),
+        test_result_setcc(addr_set, _, _),
+        ptest(test_addr, mem_sym, mask_sym),
+        op_indirect(mem_sym, _, _, _, _, _, width),
+        if matches!(*width, 1 | 2 | 4 | 8),
+        op_register(mask_sym, mask_name),
+        if x86_gpr_view_width(mask_name) == Some(*width as i64);
 
     #[local] relation sub_setcc_link(Address, Address);
     sub_setcc_link(addr0, addr1) <--
@@ -9426,36 +9503,38 @@ ascent_par! {
         let op = if *dst_is_64 { Operation::Omull } else { Operation::Omul },
         if let Some(chunk) = integer_memory_chunk(*memory_size);
 
-    // Legacy fallback for an INDEXED memory source: keep the base-register approximation, since there is no arith_load_op indexed form yet.
-    mach_inst(address, MachInst::Mop(Operation::Omul, Arc::new(args), *res)) <--
-        pimul(address, r, mem),
+    // Indexed IMUL is not a register-register operation.  Retain its exact
+    // address and let RTL expand load -> multiply.  The old fallback replaced
+    // memory with the base register, making the result depend on pointer bits.
+    // For now destination/address-register overlap fails closed; supporting it
+    // requires a separate pre-definition certificate like the frame-indexed
+    // expansion uses.
+    arith_indexed_load_op(*address, op, chunk, addressing, Arc::new(args), dst_mreg) <--
+        pimul(address, dst, mem),
         !div_consumed(address),
-        op_register(r, r_str),
-        ireg_hold_type(r_str.to_string(), typ),
-        if *typ == Typ::Tint,
-        op_indirect(mem, _, base_str, idx, _, disp, _),
-        if *idx != "NONE" && !idx.is_empty(),
-        if !base_str.is_empty() && *base_str != "NONE",
-        ireg_of(preg_of_r, Ireg::from(r_str)),
-        preg_of(res, preg_of_r),
-        ireg_of(preg_of_base, Ireg::from(base_str)),
-        preg_of(base_arg, preg_of_base),
-        let args = vec![*res, *base_arg];
-
-    mach_inst(address, MachInst::Mop(Operation::Omull, Arc::new(args), *res)) <--
-        pimul(address, r, mem),
-        !div_consumed(address),
-        op_register(r, r_str),
-        ireg_hold_type(r_str.to_string(), typ),
-        if *typ == Typ::Tlong || *typ == Typ::Tany64,
-        op_indirect(mem, _, base_str, idx, _, disp, _),
-        if *idx != "NONE" && !idx.is_empty(),
-        if !base_str.is_empty() && *base_str != "NONE",
-        ireg_of(preg_of_r, Ireg::from(r_str)),
-        preg_of(res, preg_of_r),
-        ireg_of(preg_of_base, Ireg::from(base_str)),
-        preg_of(base_arg, preg_of_base),
-        let args = vec![*res, *base_arg];
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(mem, _, base_str, idx_str, scale, disp, memory_size),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        !reg_ip(base_str),
+        arch_bit(bits),
+        let pointer_width = *bits / 8,
+        if x86_gpr_view_width(base_str) == Some(pointer_width),
+        if x86_gpr_view_width(idx_str) == Some(pointer_width),
+        let dst_mreg = Mreg::x86(dst_str),
+        let base_mreg = Mreg::x86(base_str),
+        let index_mreg = Mreg::x86(idx_str),
+        if dst_mreg != base_mreg && dst_mreg != index_mreg,
+        let addrmode = Addrmode {
+            base: Some(Ireg::from(base_str)),
+            index: Some((Ireg::from(idx_str), *scale)),
+            disp: Displacement::from(*disp),
+        },
+        if let Ok((addressing, args)) = transl_addressing_rev(addrmode, None),
+        if matches!(addressing, Addressing::Aindexed2(_) | Addressing::Aindexed2scaled(_, _)),
+        let op = if *dst_is_64 { Operation::Omull } else { Operation::Omul },
+        if let Some(chunk) = integer_memory_chunk(*memory_size);
 
     mach_inst(address, MachInst::Mop(Operation::Omulhs, Arc::new(args), Mreg::DX)) <--
         pmul(address, r2),
@@ -10568,30 +10647,38 @@ ascent_par! {
         let arg = Mreg::x86(arg_str),
         let args = vec![arg];
 
+    // Scalar-double memory move with a real base.  Preserve an optional index
+    // and its exact scale; the old rule discarded both and emitted a competing
+    // base-only candidate beside the correctly addressed generic load.
     mach_inst(addr, MachInst::Mload(MemoryChunk::MFloat64, addressing, Arc::new(args), dst)) <--
         pmovsd(addr, dst_sym, src),
         op_register(dst_sym, dst_str),
         reg_xmm(dst_str),
         let dst = Mreg::x86(dst_str),
-        op_indirect(src, _, r2, _, _scale, disp, _),
+        op_indirect(src, _, r2, idx_str, scale, disp, _),
+        if *r2 != "NONE" && !r2.is_empty(),
         if Mreg::x86(r2) != Mreg::BP && Mreg::x86(r2) != Mreg::SP,
+        let has_index = *idx_str != "NONE" && !idx_str.is_empty(),
         let addrmode = Addrmode{
             base: Some(Ireg::from(r2)),
-            index: None,
+            index: if has_index { Some((Ireg::from(idx_str), *scale)) } else { None },
             disp: Displacement::from(*disp),
         },
         if let Ok((addressing, args)) = transl_addressing_rev(addrmode, None);
 
+    // Store counterpart of the exact scalar-double load above.
     mach_inst(addr, MachInst::Mstore(MemoryChunk::MFloat64, addressing, Arc::new(args), src)) <--
         pmovsd(addr, dst, src_sym),
         op_register(src_sym, src_str),
         reg_xmm(src_str),
         let src = Mreg::x86(src_str),
-        op_indirect(dst, _, r2, _, _scale, disp, _),
+        op_indirect(dst, _, r2, idx_str, scale, disp, _),
+        if *r2 != "NONE" && !r2.is_empty(),
         if Mreg::x86(r2) != Mreg::BP && Mreg::x86(r2) != Mreg::SP,
+        let has_index = *idx_str != "NONE" && !idx_str.is_empty(),
         let addrmode = Addrmode{
             base: Some(Ireg::from(r2)),
-            index: None,
+            index: if has_index { Some((Ireg::from(idx_str), *scale)) } else { None },
             disp: Displacement::from(*disp),
         },
         if let Ok((addressing, args)) = transl_addressing_rev(addrmode, None);
@@ -10844,6 +10931,116 @@ ascent_par! {
 
     relation float_load_op(Address, Operation, MemoryChunk, Addressing, Arc<Vec<Mreg>>, Mreg, bool);
 
+    // Three-operand IMUL with a memory source is unary at the IR level:
+    // `dst = loaded * immediate`.  The destination contributes no input.
+    // Admit only exact dword/qword agreement between the decoded memory width
+    // and architectural destination view.
+    #[local] relation imul3_mem_raw(Address, Operation, MemoryChunk, Symbol, Mreg);
+    imul3_mem_raw(*addr, operation, chunk, *src, Mreg::x86(dst_name)) <--
+        pimul3(addr, dst, src, immediate),
+        op_register(dst, dst_name),
+        op_indirect(src, _, _, _, _, _, memory_size),
+        op_immediate(immediate, value, _),
+        if let Some((operation, chunk)) = imul3_memory_operation(dst_name, *memory_size, *value);
+
+    // A normal register base retains its complete base/index/scale/offset.
+    // Pointer-width spelling is required because Addrmode canonicalizes
+    // address-size-overridden aliases. Destination/address overlap is left
+    // unlowered: the generic unary path has no pre-definition certificate.
+    #[local] relation imul3_regular_memory_base(Address, &'static str);
+    imul3_regular_memory_base(*addr, *base_name) <--
+        imul3_mem_raw(addr, _, _, src, _),
+        op_indirect(src, _, base_name, _, _, _, _),
+        if *base_name != "NONE" && !base_name.is_empty(),
+        if Mreg::x86(*base_name) != Mreg::SP && Mreg::x86(*base_name) != Mreg::BP,
+        !reg_ip(base_name);
+    imul3_regular_memory_base(*addr, *base_name) <--
+        imul3_mem_raw(addr, _, _, src, _),
+        op_indirect(src, _, base_name, _, _, _, _),
+        if Mreg::x86(*base_name) == Mreg::BP,
+        instr_in_function(addr, func),
+        !func_has_frame_pointer(func);
+
+    float_load_op(*addr, operation.clone(), *chunk, addressing, Arc::new(args), *dst, true) <--
+        imul3_mem_raw(addr, operation, chunk, src, dst),
+        op_indirect(src, _, base_name, index_name, scale, displacement, _),
+        imul3_regular_memory_base(addr, base_name),
+        arch_bit(bits),
+        let pointer_width = *bits / 8,
+        if x86_gpr_view_width(base_name) == Some(pointer_width),
+        let has_index = *index_name != "NONE" && !index_name.is_empty(),
+        if !has_index || x86_gpr_view_width(index_name) == Some(pointer_width),
+        let base = Mreg::x86(base_name),
+        let index = Mreg::x86(index_name),
+        if *dst != base && (!has_index || *dst != index),
+        let addrmode = Addrmode {
+            base: Some(Ireg::from(base_name)),
+            index: if has_index { Some((Ireg::from(index_name), *scale)) } else { None },
+            disp: Displacement::from(*displacement),
+        },
+        if let Ok((addressing, args)) = transl_addressing_rev(addrmode, None),
+        if matches!(
+            (&addressing, has_index),
+            (Addressing::Aindexed(_), false)
+                | (Addressing::Aindexed2(_), true)
+                | (Addressing::Aindexed2scaled(_, _), true)
+        );
+
+    // Structural SP and frame-pointer BP bases are not ordinary C pointers.
+    #[local] relation imul3_frame_memory_base(Address, &'static str);
+    imul3_frame_memory_base(*addr, *base_name) <--
+        imul3_mem_raw(addr, _, _, src, _),
+        op_indirect(src, _, base_name, _, _, _, _),
+        if Mreg::x86(*base_name) == Mreg::SP;
+    imul3_frame_memory_base(*addr, *base_name) <--
+        imul3_mem_raw(addr, _, _, src, _),
+        op_indirect(src, _, base_name, _, _, _, _),
+        if Mreg::x86(*base_name) == Mreg::BP,
+        instr_in_function(addr, func),
+        func_has_frame_pointer(func);
+
+    // Scalar stack/frame cell: RTL binds this to stack_var, an incoming stack
+    // parameter, or an exact frame read. No raw SP/BP pointer is fabricated.
+    unary_stack_load_op(*addr, operation.clone(), *chunk, base, *displacement, *dst) <--
+        imul3_mem_raw(addr, operation, chunk, src, dst),
+        op_indirect(src, _, base_name, index_name, _, displacement, _),
+        imul3_frame_memory_base(addr, base_name),
+        if *index_name == "NONE" || index_name.is_empty(),
+        let base = Mreg::x86(base_name),
+        if *dst != base;
+
+    // Indexed structural frame access uses the existing base->load->op
+    // expansion. It alone can recover a dst/index collision from the exact
+    // pre-definition; dst/base remains unsupported and fails closed.
+    float_load_op(*addr, operation.clone(), *chunk, addressing, Arc::new(args), *dst, true) <--
+        imul3_mem_raw(addr, operation, chunk, src, dst),
+        op_indirect(src, _, base_name, index_name, scale, displacement, _),
+        imul3_frame_memory_base(addr, base_name),
+        if *index_name != "NONE" && !index_name.is_empty(),
+        arch_bit(bits),
+        let pointer_width = *bits / 8,
+        if x86_gpr_view_width(base_name) == Some(pointer_width),
+        if x86_gpr_view_width(index_name) == Some(pointer_width),
+        let base = Mreg::x86(base_name),
+        if *dst != base,
+        let addrmode = Addrmode {
+            base: Some(Ireg::from(base_name)),
+            index: Some((Ireg::from(index_name), *scale)),
+            disp: Displacement::from(*displacement),
+        },
+        if let Ok((addressing, args)) = transl_addressing_rev(addrmode, None),
+        if matches!(addressing, Addressing::Aindexed2(_) | Addressing::Aindexed2scaled(_, _));
+
+    // RIP-relative sources are accepted only after exact symbolic resolution.
+    // A no-base absolute or unresolved numeric address produces no row.
+    float_load_op(*addr, operation.clone(), *chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), *dst, true) <--
+        imul3_mem_raw(addr, operation, chunk, src, dst),
+        op_indirect(src, _, base_name, index_name, _, _, _),
+        reg_ip(*base_name),
+        if *index_name == "NONE" || index_name.is_empty(),
+        rip_target_addr(addr, target),
+        resolved_addr_to_symbol(target, ident, offset);
+
     float_load_op(*addr, op.clone(), *chunk, addressing, Arc::new(args), *dst, *is_unary) <--
         float_mem_op_raw(addr, op, chunk, src, dst, is_unary),
         op_indirect(src, _, base_str, idx_str, scale, disp, _),
@@ -10917,9 +11114,8 @@ ascent_par! {
         resolved_addr_to_symbol(target_addr, ident, offset);
 
     // A BP/SP-relative SCALAR stack slot must be read through the slot-variable model, not a raw Iload that would re-materialize it as *(&local + k); an indexed access is a stack array.
-    relation cvtsi2_stack_op(Address, Operation, Mreg, i64, Mreg);
-    cvtsi2_stack_op(*addr, op.clone(), Mreg::x86(base_str), *disp, *dst) <--
-        cvtsi2_mem_raw(addr, op, _chunk, src, dst),
+    unary_stack_load_op(*addr, op.clone(), *chunk, Mreg::x86(base_str), *disp, *dst) <--
+        cvtsi2_mem_raw(addr, op, chunk, src, dst),
         op_indirect(src, _, base_str, idx_str, _, disp, _),
         if Mreg::x86(base_str) == Mreg::BP || Mreg::x86(base_str) == Mreg::SP,
         if *idx_str == "NONE" || idx_str.is_empty();
@@ -11929,7 +12125,8 @@ ascent_par! {
         !mach_inst(addr, _),
         !trim_instruction(addr),
         // SETcc's Ocmp is correctly keyed at the fused CMP's address, so its own address legitimately has a reg_def and no mach_inst; exclude it so the diagnostic only fires for an unlowered mnemonic.
-        !psetcc(addr, _, _);
+        !psetcc(addr, _, _),
+        !test_mem_register_setcc_delegated(addr);
 
 }
 
@@ -12312,13 +12509,16 @@ impl IRPass for AsmPass {
 #[cfg(test)]
 mod structural_dataflow_tests {
     use super::{
-        exact_stack_offset, finalize_simd_dword_event_chains, integer_memory_chunk,
-        recover_unsigned_divisor, refine_direct_load_chunk, AsmPass, AsmPassProgram,
+        chunk_from_mnem, exact_stack_offset, finalize_simd_dword_event_chains,
+        integer_memory_chunk, recover_unsigned_divisor, refine_direct_load_chunk, AsmPass,
+        AsmPassProgram,
     };
     use crate::decompile::passes::pass::IRPass;
     use crate::mreg::Mreg;
     use crate::x86::asm::{Ireg, TestCond};
-    use crate::x86::op::{Addressing, Comparison, Condition, Operation, OverflowArithmetic};
+    use crate::x86::op::{
+        Addressing, Comparison, Condition, Operation, OverflowArithmetic, TestResultCondition,
+    };
     use crate::x86::types::{Address, Addrmode, Displacement, Ident, MachInst, MemoryChunk, Typ};
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -14683,6 +14883,326 @@ mod structural_dataflow_tests {
     }
 
     #[test]
+    fn memory_test_links_zero_sign_and_parity_setcc_consumers_without_crossing_a_clobber() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let test = 0x100;
+            let block = 0x100;
+            let consumers = [
+                (0x103, "SETE", "AL", TestResultCondition::Zero),
+                (0x106, "SETNE", "CL", TestResultCondition::NonZero),
+                (0x109, "SETS", "DL", TestResultCondition::Sign),
+                (0x10c, "SETNS", "SIL", TestResultCondition::NonSign),
+                (0x110, "SETP", "DIL", TestResultCondition::EvenParity),
+                (0x114, "SETNP", "R8B", TestResultCondition::OddParity),
+            ];
+
+            prog.ptest.push((test, "tested_memory", "mask_register"));
+            prog.code_in_block.push((test, block));
+            let mut previous = test;
+            for (setcc, mnemonic, destination, _) in consumers {
+                let row = (setcc, 3, "", mnemonic, destination, "", "", "", 0, 0);
+                prog.instruction.push(row);
+                prog.unrefinedinstruction.push(row);
+                prog.op_register.push((destination, destination));
+                prog.next.push((previous, setcc));
+                prog.code_in_block.push((setcc, block));
+                previous = setcc;
+            }
+
+            prog.run();
+
+            for (setcc, _, destination, predicate) in consumers {
+                assert!(prog
+                    .test_result_setcc
+                    .iter()
+                    .any(|fact| fact == &(setcc, predicate, destination)));
+                assert!(prog
+                    .setcc_compare_site
+                    .iter()
+                    .any(|fact| fact == &(setcc, test)));
+                assert!(prog
+                    .flags_flow_transparent
+                    .iter()
+                    .any(|fact| fact == &(setcc,)));
+            }
+
+            let mut killed = AsmPassProgram::default();
+            let sete = 0x203;
+            let add = 0x206;
+            let setnp = 0x209;
+            let killed_block = 0x200;
+            killed.ptest.push((0x200, "memory", "mask"));
+            for row in [
+                (sete, 3, "", "SETE", "AL", "", "", "", 0, 0),
+                (add, 2, "", "ADD", "CL", "DL", "", "", 0, 0),
+                (setnp, 4, "", "SETNP", "R8B", "", "", "", 0, 0),
+            ] {
+                killed.instruction.push(row);
+                killed.unrefinedinstruction.push(row);
+            }
+            killed
+                .next
+                .extend([(0x200, sete), (sete, add), (add, setnp)]);
+            for node in [0x200, sete, add, setnp] {
+                killed.code_in_block.push((node, killed_block));
+            }
+            killed.run();
+            assert!(!killed
+                .setcc_compare_site
+                .iter()
+                .any(|fact| fact == &(setnp, 0x200)));
+        });
+    }
+
+    #[test]
+    fn indexed_imul_preserves_memory_address_and_never_uses_its_base_as_value() {
+        on_large_stack(|| {
+            let build = |destination: &'static str, index: &'static str| {
+                let mut prog = AsmPassProgram::default();
+                let access = 0x1176;
+                prog.arch_bit.push((64,));
+                prog.pimul
+                    .push((access, "imul_destination", "indexed_memory"));
+                prog.op_register.push(("imul_destination", destination));
+                prog.op_indirect
+                    .push(("indexed_memory", "", "R11", index, 4, -8, 4));
+                prog.run();
+                prog
+            };
+
+            let exact = build("EDX", "R10");
+            assert!(exact.arith_indexed_load_op.iter().any(|fact| {
+                fact == &(
+                    0x1176,
+                    Operation::Omul,
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed2scaled(4, -8),
+                    Arc::new(vec![Mreg::R11, Mreg::R10]),
+                    Mreg::DX,
+                )
+            }));
+            assert!(!exact.mach_inst.iter().any(|(node, inst)| {
+                *node == 0x1176
+                    && matches!(
+                        inst,
+                        MachInst::Mop(Operation::Omul, args, Mreg::DX)
+                            if args.as_slice() == [Mreg::DX, Mreg::R11]
+                    )
+            }));
+
+            // Destination/address overlap needs a pre-definition proof, and an
+            // address-size-overridden index is not a pointer-width address.
+            for rejected in [build("R11D", "R10"), build("EDX", "R10D")] {
+                assert!(rejected.arith_indexed_load_op.is_empty());
+                assert!(!rejected
+                    .mach_inst
+                    .iter()
+                    .any(|(node, inst)| *node == 0x1176 && matches!(inst, MachInst::Mop(..))));
+            }
+        });
+    }
+
+    #[test]
+    fn imul3_memory_sources_preserve_exact_address_and_write_only_operation() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let func = 0x1100;
+            let (simple, indexed, stack_scalar, stack_indexed, global) =
+                (0x1110, 0x1120, 0x1130, 0x1140, 0x1150);
+            prog.arch_bit.push((64,));
+            for node in [simple, indexed, stack_scalar, stack_indexed, global] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            let mut add = |node,
+                           dst_symbol,
+                           dst_name,
+                           mem_symbol,
+                           base,
+                           index,
+                           scale,
+                           displacement,
+                           width,
+                           imm_symbol,
+                           immediate| {
+                prog.pimul3.push((node, dst_symbol, mem_symbol, imm_symbol));
+                prog.op_register.push((dst_symbol, dst_name));
+                prog.op_indirect
+                    .push((mem_symbol, "", base, index, scale, displacement, width));
+                prog.op_immediate.push((imm_symbol, immediate, 1));
+            };
+
+            add(
+                simple,
+                "simple_dst",
+                "EDX",
+                "simple_mem",
+                "R11",
+                "NONE",
+                1,
+                16,
+                4,
+                "simple_imm",
+                3,
+            );
+            add(
+                indexed,
+                "indexed_dst",
+                "RAX",
+                "indexed_mem",
+                "R14",
+                "R15",
+                8,
+                -8,
+                8,
+                "indexed_imm",
+                24,
+            );
+            add(
+                stack_scalar,
+                "stack_dst",
+                "ECX",
+                "stack_mem",
+                "RSP",
+                "NONE",
+                1,
+                -4,
+                4,
+                "stack_imm",
+                7,
+            );
+            add(
+                stack_indexed,
+                "stack_indexed_dst",
+                "EAX",
+                "stack_indexed_mem",
+                "RSP",
+                "RDI",
+                4,
+                -32,
+                4,
+                "stack_indexed_imm",
+                5,
+            );
+            add(
+                global,
+                "global_dst",
+                "EAX",
+                "global_mem",
+                "RIP",
+                "NONE",
+                1,
+                0x1234,
+                4,
+                "global_imm",
+                131,
+            );
+            prog.rip_target_addr.push((global, 0x404020));
+            prog.resolved_addr_to_symbol.push((0x404020, 0x404020, 0));
+
+            prog.run();
+
+            for expected in [
+                (
+                    simple,
+                    Operation::Omulimm(3),
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed(16),
+                    vec![Mreg::R11],
+                    Mreg::DX,
+                ),
+                (
+                    indexed,
+                    Operation::Omullimm(24),
+                    MemoryChunk::MInt64,
+                    Addressing::Aindexed2scaled(8, -8),
+                    vec![Mreg::R14, Mreg::R15],
+                    Mreg::AX,
+                ),
+                (
+                    stack_indexed,
+                    Operation::Omulimm(5),
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed2scaled(4, -32),
+                    vec![Mreg::SP, Mreg::DI],
+                    Mreg::AX,
+                ),
+                (
+                    global,
+                    Operation::Omulimm(131),
+                    MemoryChunk::MInt32,
+                    Addressing::Aglobal(0x404020, 0),
+                    vec![],
+                    Mreg::AX,
+                ),
+            ] {
+                assert!(prog.float_load_op.iter().any(
+                    |(node, operation, chunk, addressing, args, dst, unary)| {
+                        *node == expected.0
+                            && operation == &expected.1
+                            && *chunk == expected.2
+                            && addressing == &expected.3
+                            && args.as_slice() == expected.4.as_slice()
+                            && *dst == expected.5
+                            && *unary
+                    }
+                ));
+            }
+            assert!(prog.unary_stack_load_op.iter().any(
+                |(node, operation, chunk, base, displacement, dst)| {
+                    *node == stack_scalar
+                        && operation == &Operation::Omulimm(7)
+                        && *chunk == MemoryChunk::MInt32
+                        && *base == Mreg::SP
+                        && *displacement == -4
+                        && *dst == Mreg::CX
+                }
+            ));
+            assert!([simple, indexed, stack_scalar, stack_indexed, global]
+                .into_iter()
+                .all(|site| !prog.mach_inst.iter().any(|(node, _)| *node == site)));
+        });
+    }
+
+    #[test]
+    fn imul3_memory_sources_fail_closed_on_width_address_or_resolution_ambiguity() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let func = 0x2100;
+            prog.arch_bit.push((64,));
+            let rejected = [0x2110, 0x2120, 0x2130, 0x2140];
+            for node in rejected {
+                prog.instr_in_function.push((node, func));
+            }
+
+            for (node, dst_symbol, dst_name, mem_symbol, base, index, width) in [
+                (0x2110, "wide_dst", "EAX", "wide_mem", "R11", "NONE", 8),
+                (0x2120, "base_dst", "R11D", "base_mem", "R11", "NONE", 4),
+                (0x2130, "index_dst", "EDI", "index_mem", "R11", "RDI", 4),
+                (0x2140, "rip_dst", "EAX", "rip_mem", "RIP", "NONE", 4),
+            ] {
+                prog.pimul3.push((node, dst_symbol, mem_symbol, "imm"));
+                prog.op_register.push((dst_symbol, dst_name));
+                prog.op_indirect
+                    .push((mem_symbol, "", base, index, 4, 0x20, width));
+            }
+            prog.op_immediate.push(("imm", 9, 1));
+
+            prog.run();
+
+            assert!(rejected.into_iter().all(|site| {
+                !prog.float_load_op.iter().any(|(node, ..)| *node == site)
+                    && !prog
+                        .unary_stack_load_op
+                        .iter()
+                        .any(|(node, ..)| *node == site)
+                    && !prog.mach_inst.iter().any(|(node, _)| *node == site)
+            }));
+        });
+    }
+
+    #[test]
     fn register_tailcall_publishes_target_use_at_semantic_anchor() {
         on_large_stack(|| {
             let mut prog = AsmPassProgram::default();
@@ -15859,6 +16379,132 @@ mod structural_dataflow_tests {
                         ) if args.as_slice() == [Mreg::SP, Mreg::AX]
                     )
             }));
+        });
+    }
+
+    #[test]
+    fn indexed_scaled_scalar_double_moves_preserve_chunk_and_full_address() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let scaled_load = 0x908;
+            let indexed_load = 0x918;
+            let scaled_store = 0x928;
+            let string_movsd = 0x938;
+
+            prog.instruction.push((
+                scaled_load,
+                5,
+                "",
+                "MOVSD",
+                "scaled_load_mem",
+                "scaled_load_dst",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.pmov
+                .push((scaled_load, "scaled_load_dst", "scaled_load_mem"));
+            prog.op_register.push(("scaled_load_dst", "XMM0"));
+            prog.op_indirect
+                .push(("scaled_load_mem", "", "RAX", "RCX", 8, 24, 8));
+
+            prog.instruction.push((
+                indexed_load,
+                5,
+                "",
+                "VMOVSD",
+                "indexed_load_mem",
+                "indexed_load_dst",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.pmov
+                .push((indexed_load, "indexed_load_dst", "indexed_load_mem"));
+            prog.op_register.push(("indexed_load_dst", "XMM2"));
+            prog.op_indirect
+                .push(("indexed_load_mem", "", "R10", "R11", 1, -8, 8));
+
+            prog.instruction.push((
+                scaled_store,
+                5,
+                "",
+                "VMOVSD",
+                "scaled_store_src",
+                "scaled_store_mem",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.pmov
+                .push((scaled_store, "scaled_store_mem", "scaled_store_src"));
+            prog.op_register.push(("scaled_store_src", "XMM1"));
+            prog.op_indirect
+                .push(("scaled_store_mem", "", "RDX", "R8", 4, -16, 8));
+
+            // The operand-less string MOVSD mnemonic is not a scalar-XMM
+            // memory move and must not acquire an MFloat64 candidate merely
+            // from its spelling.
+            prog.instruction
+                .push((string_movsd, 1, "", "MOVSD", "", "", "", "", 0, 0));
+
+            prog.run();
+
+            let scaled_loads: Vec<_> = prog
+                .mach_inst
+                .iter()
+                .filter_map(|(node, inst)| (*node == scaled_load).then_some(inst))
+                .collect();
+            assert_eq!(scaled_loads.len(), 1, "{scaled_loads:#?}");
+            assert!(matches!(
+                scaled_loads[0],
+                MachInst::Mload(
+                    MemoryChunk::MFloat64,
+                    Addressing::Aindexed2scaled(8, 24),
+                    args,
+                    Mreg::X0,
+                ) if args.as_slice() == [Mreg::AX, Mreg::CX]
+            ));
+
+            let indexed_loads: Vec<_> = prog
+                .mach_inst
+                .iter()
+                .filter_map(|(node, inst)| (*node == indexed_load).then_some(inst))
+                .collect();
+            assert_eq!(indexed_loads.len(), 1, "{indexed_loads:#?}");
+            assert!(matches!(
+                indexed_loads[0],
+                MachInst::Mload(
+                    MemoryChunk::MFloat64,
+                    Addressing::Aindexed2(-8),
+                    args,
+                    Mreg::X2,
+                ) if args.as_slice() == [Mreg::R10, Mreg::R11]
+            ));
+
+            let scaled_stores: Vec<_> = prog
+                .mach_inst
+                .iter()
+                .filter_map(|(node, inst)| (*node == scaled_store).then_some(inst))
+                .collect();
+            assert_eq!(scaled_stores.len(), 1, "{scaled_stores:#?}");
+            assert!(matches!(
+                scaled_stores[0],
+                MachInst::Mstore(
+                    MemoryChunk::MFloat64,
+                    Addressing::Aindexed2scaled(4, -16),
+                    args,
+                    Mreg::X1,
+                ) if args.as_slice() == [Mreg::DX, Mreg::R8]
+            ));
+
+            assert!(!prog.mach_inst.iter().any(|(node, _)| *node == string_movsd));
+            assert_eq!(chunk_from_mnem("MOVSD"), MemoryChunk::MFloat64);
+            assert_eq!(chunk_from_mnem("VMOVSD"), MemoryChunk::MFloat64);
+            assert_eq!(chunk_from_mnem("MOVQ"), MemoryChunk::MInt64);
         });
     }
 

@@ -80,9 +80,17 @@ fn op_output_xtype(op: &Operation) -> Option<XType> {
         Onegfs | Oabsfs | Oaddfs | Osubfs | Omulfs | Odivfs | Osingleofint | Osingleoflong
         | Osingleoffloat => Some(XType::Xsingle),
 
-        // Comparison result (boolean)
-        Ocmp(_) => Some(XType::Xbool),
+        // Comparison/flag result (boolean)
+        Ocmp(_) | Otestflags(_, _, _) => Some(XType::Xbool),
 
+        _ => None,
+    }
+}
+
+fn test_flags_operand_xtype(width: usize) -> Option<XType> {
+    match width {
+        1 | 2 | 4 => Some(XType::Xintunsigned),
+        8 => Some(XType::Xlongunsigned),
         _ => None,
     }
 }
@@ -378,6 +386,15 @@ ascent_par! {
     emit_var_type_candidate(*arg, xtype.clone()) <--
         rtl_inst(_, ?RTLInst::Icond(cond, args, _, _)),
         if let Some(xtype) = cond_operand_xtype(cond),
+        for arg in args.iter();
+
+    // Otestflags truncates both operands to the decoded TEST width before its
+    // unsigned bit operations.  Make that width explicit in C typing so a
+    // mask carried in a canonical 64-bit register cannot turn the expression
+    // into pointer arithmetic or a signed right shift.
+    emit_var_type_candidate(*arg, xtype.clone()) <--
+        rtl_inst(_, ?RTLInst::Iop(Operation::Otestflags(_, width, _), args, _)),
+        if let Some(xtype) = test_flags_operand_xtype(*width),
         for arg in args.iter();
 
     // Apply embedded exact types without requiring a second symbol lookup.

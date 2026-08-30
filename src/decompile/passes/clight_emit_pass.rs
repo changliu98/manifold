@@ -2596,16 +2596,23 @@ impl IRPass for ClightEmitPass {
                             clight_stmt,
                             &mut ctx,
                         );
-                    let cstmt =
-                        crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&cstmt, &|e| {
-                            inline_string_literals(e, &string_map)
-                        });
+                    // A finalized exact scalar load is stronger than the
+                    // high-recall string_data byte-shape hint.  Fold proven
+                    // scalars first so an integer such as 37 (bytes
+                    // `25 00 00 00`) cannot subsequently become "%".  The
+                    // scalar rewriter deliberately preserves direct address-of
+                    // operands, so genuine and mixed-use strings still reach
+                    // the string pass below.
                     let cstmt = crate::decompile::passes::c_pass::helpers::map_stmt_exprs_total(
                         &cstmt,
                         &|e| {
                             crate::decompile::passes::c_pass::helpers::inline_rodata_constants_preserving_addrof(e, &rodata_const_map)
                         },
                     );
+                    let cstmt =
+                        crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&cstmt, &|e| {
+                            inline_string_literals(e, &string_map)
+                        });
                     let cstmt = crate::decompile::passes::c_pass::convert::from_relations::narrow_varargs_in_stmt(&cstmt);
                     statements.push((node, cstmt));
                 }

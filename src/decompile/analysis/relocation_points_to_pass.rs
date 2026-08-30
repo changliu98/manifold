@@ -11,7 +11,7 @@ use crate::x86::types::*;
 use ascent::ascent_par;
 use ascent::lattice::set::Set;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Bound::Excluded;
+use std::ops::Bound::{Excluded, Included};
 use std::sync::Arc;
 
 /// Resolve a direct symbolic memory operand to its exact byte coordinate.
@@ -1047,6 +1047,13 @@ ascent_par! {
     relation retained_initialized_data_range(Address, Arc<Vec<u8>>);
     relation rtl_inst(Node, RTLInst);
     relation rtl_value_canonical(RTLReg, RTLReg);
+    // Scheduler-visible raw superset only.  RelocationArrayPass restores the
+    // pre-pass extent inventory before logical-layout validation, validates a
+    // symbol-less byte fragment independently, and replaces both of these
+    // relations before the sub-DB is merged.  In particular, this temporary
+    // row must never certify relocation_target_array as a typed layout.
+    relation relocation_target_storage_fragment(Ident, usize);
+    relation global_storage_extent(Ident, usize);
 
     #[local] relation relocation_target_access(Address, i64, usize);
     relocation_target_access(*target, *offset, width) <--
@@ -1134,6 +1141,12 @@ ascent_par! {
     relation is_global_array(Ident, usize, usize);
     is_global_array(ident, width, count) <--
         relocation_target_array(ident, width, count);
+
+    relocation_target_storage_fragment(ident, extent) <--
+        relocation_target_array(ident, width, count),
+        if let Some(extent) = width.checked_mul(*count);
+    global_storage_extent(ident, extent) <--
+        relocation_target_storage_fragment(ident, extent);
 }
 
 fn initialized_ranges_cover(
@@ -1422,6 +1435,380 @@ fn validate_relocation_layouts(
     validated
 }
 
+fn synthetic_label_address(label: &str) -> Option<Address> {
+    label
+        .strip_prefix("L_")
+        .or_else(|| label.strip_prefix(".L_"))
+        .and_then(|hex| Address::from_str_radix(hex, 16).ok())
+}
+
+fn exact_targets_for_raw_value(
+    func: Address,
+    raw: RTLReg,
+    canonical_by_raw: &BTreeMap<RTLReg, BTreeSet<RTLReg>>,
+    targets_by_value: &BTreeMap<(Address, RTLReg), BTreeSet<Address>>,
+) -> BTreeSet<Address> {
+    let mut targets = BTreeSet::new();
+    if let Some(canonicals) = canonical_by_raw.get(&raw) {
+        for canonical in canonicals {
+            if let Some(exact) = targets_by_value.get(&(func, *canonical)) {
+                targets.extend(exact.iter().copied());
+            }
+        }
+    } else if let Some(exact) = targets_by_value.get(&(func, raw)) {
+        targets.extend(exact.iter().copied());
+    }
+    targets
+}
+
+fn mark_raw_value_targets(
+    func: Address,
+    raw: RTLReg,
+    canonical_by_raw: &BTreeMap<RTLReg, BTreeSet<RTLReg>>,
+    targets_by_value: &BTreeMap<(Address, RTLReg), BTreeSet<Address>>,
+    unsupported: &mut BTreeSet<Address>,
+) {
+    unsupported.extend(exact_targets_for_raw_value(
+        func,
+        raw,
+        canonical_by_raw,
+        targets_by_value,
+    ));
+}
+
+/// Targets with an address use that the fixed-offset array certificate did not
+/// represent.  A dynamic/negative/unknown-width dereference could reach beyond
+/// the proposed fragment, while arithmetic, a builtin, or an external call can
+/// create an alias whose accesses are not in relocation_target_access.  Direct
+/// internal calls and returns remain admissible because the preceding exact
+/// points-to pass transports only closed call interfaces.
+fn unsupported_relocation_target_uses(db: &DecompileDB) -> BTreeSet<Address> {
+    let mut canonical_by_raw: BTreeMap<RTLReg, BTreeSet<RTLReg>> = BTreeMap::new();
+    for (raw, canonical) in db.rel_iter::<(RTLReg, RTLReg)>("rtl_value_canonical") {
+        canonical_by_raw.entry(*raw).or_default().insert(*canonical);
+    }
+
+    let mut targets_by_value: BTreeMap<(Address, RTLReg), BTreeSet<Address>> = BTreeMap::new();
+    for (func, value, target) in
+        db.rel_iter::<(Address, RTLReg, Address)>("relocation_pointer_target")
+    {
+        targets_by_value
+            .entry((*func, *value))
+            .or_default()
+            .insert(*target);
+    }
+
+    let mut owners_by_node: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for (func, node) in db.rel_iter::<(Address, Node)>("relocation_reachable_node") {
+        owners_by_node.entry(*node).or_default().insert(*func);
+    }
+
+    let mut unsupported = BTreeSet::new();
+    for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+        let Some(funcs) = owners_by_node.get(node) else {
+            continue;
+        };
+        match inst {
+            RTLInst::Iload(chunk, addressing, args, _)
+            | RTLInst::Istore(chunk, addressing, args, _) => {
+                let supported = matches!(addressing, Addressing::Aindexed(offset) if *offset >= 0)
+                    && args.len() == 1
+                    && known_chunk_byte_size(chunk).is_some();
+                if supported {
+                    continue;
+                }
+                for func in funcs {
+                    for raw in args.iter() {
+                        mark_raw_value_targets(
+                            *func,
+                            *raw,
+                            &canonical_by_raw,
+                            &targets_by_value,
+                            &mut unsupported,
+                        );
+                    }
+                }
+            }
+            RTLInst::Icall(_, callee, args, _, _) => {
+                let direct_internal =
+                    matches!(callee, either::Either::Right(either::Either::Left(_)));
+                if direct_internal {
+                    continue;
+                }
+                for func in funcs {
+                    if let either::Either::Left(raw_target) = callee {
+                        mark_raw_value_targets(
+                            *func,
+                            *raw_target,
+                            &canonical_by_raw,
+                            &targets_by_value,
+                            &mut unsupported,
+                        );
+                    }
+                    for raw in args.iter() {
+                        mark_raw_value_targets(
+                            *func,
+                            *raw,
+                            &canonical_by_raw,
+                            &targets_by_value,
+                            &mut unsupported,
+                        );
+                    }
+                }
+            }
+            RTLInst::Itailcall(_, callee, args) => {
+                let direct_internal =
+                    matches!(callee, either::Either::Right(either::Either::Left(_)));
+                if direct_internal {
+                    continue;
+                }
+                for func in funcs {
+                    if let either::Either::Left(raw_target) = callee {
+                        mark_raw_value_targets(
+                            *func,
+                            *raw_target,
+                            &canonical_by_raw,
+                            &targets_by_value,
+                            &mut unsupported,
+                        );
+                    }
+                    for raw in args.iter() {
+                        mark_raw_value_targets(
+                            *func,
+                            *raw,
+                            &canonical_by_raw,
+                            &targets_by_value,
+                            &mut unsupported,
+                        );
+                    }
+                }
+            }
+            RTLInst::Iop(operation, args, _)
+                if !matches!(operation, Operation::Omove | Operation::Ocmp(_)) =>
+            {
+                for func in funcs {
+                    for raw in args.iter() {
+                        mark_raw_value_targets(
+                            *func,
+                            *raw,
+                            &canonical_by_raw,
+                            &targets_by_value,
+                            &mut unsupported,
+                        );
+                    }
+                }
+            }
+            RTLInst::Ibuiltin(_, _, _) => {
+                let uses = inst_def_use(inst).1;
+                for func in funcs {
+                    for raw in &uses {
+                        mark_raw_value_targets(
+                            *func,
+                            *raw,
+                            &canonical_by_raw,
+                            &targets_by_value,
+                            &mut unsupported,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    unsupported
+}
+
+/// Choose a byte-backed representation fragment for a data-pointer target that
+/// lost its ELF object symbol.  The target is an exact address root; its end is
+/// the first independent root or initialized section boundary above it.  This
+/// is deliberately not a logical-array proof: the wrapper publishes these rows
+/// only after typed relocation layouts have been validated against the prior
+/// physical inventory.
+fn validate_relocation_storage_fragments(
+    db: &DecompileDB,
+    raw_layouts: &BTreeSet<(Ident, usize, usize)>,
+    prior_layouts: &BTreeSet<(Ident, usize, usize)>,
+    prior_global_refs: &BTreeSet<Ident>,
+    prior_storage_extents: &BTreeSet<(Ident, usize)>,
+) -> BTreeSet<(Ident, usize)> {
+    let pointer_widths: BTreeSet<usize> = db
+        .rel_iter::<(i64,)>("abi_pointer_size")
+        .filter_map(|(width,)| usize::try_from(*width).ok())
+        .filter(|width| *width > 0)
+        .collect();
+    let Some(&pointer_width) = pointer_widths.first().filter(|_| pointer_widths.len() == 1) else {
+        return BTreeSet::new();
+    };
+
+    let initialized: Vec<(Address, Arc<Vec<u8>>)> = db
+        .rel_iter::<(Address, Arc<Vec<u8>>)>("retained_initialized_data_range")
+        .cloned()
+        .collect();
+    let data_sections: BTreeSet<(Address, Address)> = db
+        .rel_iter::<(Address, Address)>("data_section_range")
+        .copied()
+        .collect();
+    let symbol_addresses: BTreeSet<Address> = db
+        .rel_iter::<(Address, Symbol, Symbol)>("symbols")
+        .map(|(address, _, _)| *address)
+        .collect();
+
+    let mut extents_by_owner: BTreeMap<Ident, BTreeSet<usize>> = BTreeMap::new();
+    for (owner, extent) in prior_storage_extents {
+        if *extent > 0 {
+            extents_by_owner.entry(*owner).or_default().insert(*extent);
+        }
+    }
+    for (address, extent, _) in db.rel_iter::<(Address, usize, Symbol)>("symbol_size") {
+        if *extent > 0 {
+            if let Ok(owner) = Ident::try_from(*address) {
+                extents_by_owner.entry(owner).or_default().insert(*extent);
+            }
+        }
+    }
+    let known_intervals: Vec<PhysicalInterval> = extents_by_owner
+        .iter()
+        .flat_map(|(owner, extents)| {
+            let start = Address::try_from(*owner).ok();
+            extents.iter().filter_map(move |extent| {
+                let start = start?;
+                Some(PhysicalInterval {
+                    start,
+                    end: start.checked_add(*extent as u64)?,
+                    owner: *owner,
+                })
+            })
+        })
+        .collect();
+
+    let interior_targets: BTreeSet<Ident> = db
+        .rel_iter::<(Ident, Ident, i64)>("interior_to_base_ident")
+        .map(|(interior, _, _)| *interior)
+        .collect();
+    let unsupported_targets = unsupported_relocation_target_uses(db);
+
+    let mut relocation_slots: Vec<Address> = db
+        .rel_iter::<(Address, Address)>("pointer_in_data")
+        .chain(db.rel_iter::<(Address, Address)>("code_pointer_in_data"))
+        .map(|(slot, _)| *slot)
+        .collect();
+    relocation_slots.sort_unstable();
+    relocation_slots.dedup();
+    let data_pointer_targets: BTreeSet<Address> = db
+        .rel_iter::<(Address, Address)>("pointer_in_data")
+        .map(|(_, target)| *target)
+        .collect();
+
+    let string_ranges: BTreeSet<(Address, Address)> = db
+        .rel_iter::<(String, String, usize)>("string_data")
+        .filter_map(|(label, _, size)| {
+            let start = synthetic_label_address(label)?;
+            let extent = size.checked_add(1)?;
+            Some((start, start.checked_add(u64::try_from(extent).ok()?)?))
+        })
+        .collect();
+
+    let mut raw_by_owner: BTreeMap<Ident, BTreeSet<(usize, usize)>> = BTreeMap::new();
+    for (owner, width, count) in raw_layouts {
+        raw_by_owner
+            .entry(*owner)
+            .or_default()
+            .insert((*width, *count));
+    }
+    let prior_layout_owners: BTreeSet<Ident> =
+        prior_layouts.iter().map(|(owner, _, _)| *owner).collect();
+
+    let mut boundary_roots = symbol_addresses;
+    boundary_roots.extend(
+        prior_global_refs
+            .iter()
+            .filter_map(|ident| Address::try_from(*ident).ok()),
+    );
+    boundary_roots.extend(
+        extents_by_owner
+            .keys()
+            .filter_map(|ident| Address::try_from(*ident).ok()),
+    );
+    boundary_roots.extend(
+        prior_layout_owners
+            .iter()
+            .filter_map(|ident| Address::try_from(*ident).ok()),
+    );
+    boundary_roots.extend(relocation_slots.iter().copied());
+    boundary_roots.extend(data_pointer_targets.iter().copied());
+    boundary_roots.extend(
+        raw_by_owner
+            .keys()
+            .filter_map(|ident| Address::try_from(*ident).ok()),
+    );
+    boundary_roots.extend(string_ranges.iter().map(|(start, _)| *start));
+
+    let mut validated = BTreeSet::new();
+    for (target_ident, layouts) in raw_by_owner {
+        if layouts.len() != 1
+            || prior_layout_owners.contains(&target_ident)
+            || extents_by_owner.contains_key(&target_ident)
+            || interior_targets.contains(&target_ident)
+        {
+            continue;
+        }
+        let (width, count) = *layouts.first().unwrap();
+        let Some(observed_extent) = width.checked_mul(count) else {
+            continue;
+        };
+        let Ok(target) = Address::try_from(target_ident) else {
+            continue;
+        };
+        if observed_extent == 0
+            || !data_pointer_targets.contains(&target)
+            || unsupported_targets.contains(&target)
+            || known_intervals
+                .iter()
+                .any(|interval| interval.start <= target && target < interval.end)
+            || string_ranges
+                .iter()
+                .any(|(start, end)| *start <= target && target < *end)
+        {
+            continue;
+        }
+
+        let initialized_ends: BTreeSet<Address> = initialized
+            .iter()
+            .filter_map(|(start, bytes)| {
+                let end = start.checked_add(u64::try_from(bytes.len()).ok()?)?;
+                (target >= *start && target < end).then_some(end)
+            })
+            .collect();
+        let section_ends: BTreeSet<Address> = data_sections
+            .iter()
+            .filter_map(|(start, end)| (target >= *start && target < *end).then_some(*end))
+            .collect();
+        if initialized_ends.len() != 1 || section_ends.len() != 1 {
+            continue;
+        }
+        let outer_end = (*initialized_ends.first().unwrap()).min(*section_ends.first().unwrap());
+        let fragment_end = boundary_roots
+            .range((Excluded(target), Included(outer_end)))
+            .next()
+            .copied()
+            .unwrap_or(outer_end);
+        let Some(extent_u64) = fragment_end.checked_sub(target) else {
+            continue;
+        };
+        let Ok(extent) = usize::try_from(extent_u64) else {
+            continue;
+        };
+        if extent < observed_extent
+            || !initialized_ranges_cover(&initialized, target, extent)
+            || relocation_slots_overlap(&relocation_slots, target, extent, pointer_width)
+        {
+            continue;
+        }
+        validated.insert((target_ident, extent));
+    }
+    validated
+}
+
 pub struct RelocationPointsToPass;
 
 fn run_relocation_points_to_program(db: &mut DecompileDB) {
@@ -1493,6 +1880,10 @@ impl IRPass for RelocationArrayPass {
             .rel_iter::<(Ident,)>("global_var_ref")
             .map(|(ident,)| *ident)
             .collect();
+        let prior_storage_extents: BTreeSet<(Ident, usize)> = db
+            .rel_iter::<(Ident, usize)>("global_storage_extent")
+            .copied()
+            .collect();
         run_pass!(db, RelocationArrayPassProgram);
         let raw: BTreeSet<(Ident, usize, usize)> = db
             .rel_iter::<(Ident, usize, usize)>("relocation_target_array")
@@ -1507,13 +1898,41 @@ impl IRPass for RelocationArrayPass {
             restored_global_refs.push((*ident,));
         }
         db.rel_set("global_var_ref", restored_global_refs);
+        // The Ascent rule publishes only the observed prefix so the scheduler
+        // knows this pass writes global_storage_extent.  Restore the prior
+        // inventory before either validator runs: a raw prefix must not prove
+        // its own typed layout or become an exact physical owner by accident.
+        let restored_storage_extents = ascent::boxcar::Vec::new();
+        for row in &prior_storage_extents {
+            restored_storage_extents.push(*row);
+        }
+        db.rel_set("global_storage_extent", restored_storage_extents);
         let validated = validate_relocation_layouts(db, &raw, &prior);
+        let validated_fragments = validate_relocation_storage_fragments(
+            db,
+            &raw,
+            &prior,
+            &prior_global_refs,
+            &prior_storage_extents,
+        );
 
         let relocation_relation = ascent::boxcar::Vec::new();
         for row in &validated {
             relocation_relation.push(*row);
         }
         db.rel_set("relocation_target_array", relocation_relation);
+
+        let fragment_relation = ascent::boxcar::Vec::new();
+        for row in &validated_fragments {
+            fragment_relation.push(*row);
+        }
+        db.rel_set("relocation_target_storage_fragment", fragment_relation);
+
+        let storage_extent_relation = ascent::boxcar::Vec::new();
+        for row in prior_storage_extents.union(&validated_fragments) {
+            storage_extent_relation.push(*row);
+        }
+        db.rel_set("global_storage_extent", storage_extent_relation);
 
         let global_array_relation = ascent::boxcar::Vec::new();
         for row in prior.union(&validated) {
@@ -1522,8 +1941,9 @@ impl IRPass for RelocationArrayPass {
         db.rel_set("is_global_array", global_array_relation);
 
         let global_ref_relation = ascent::boxcar::Vec::new();
-        let validated_refs: BTreeSet<Ident> =
+        let mut validated_refs: BTreeSet<Ident> =
             validated.iter().map(|(ident, _, _)| *ident).collect();
+        validated_refs.extend(validated_fragments.iter().map(|(ident, _)| *ident));
         for ident in prior_global_refs.union(&validated_refs) {
             global_ref_relation.push((*ident,));
         }
@@ -1532,6 +1952,9 @@ impl IRPass for RelocationArrayPass {
         if std::env::var("GA_DUMP").is_ok() {
             for row in &validated {
                 eprintln!("[GA] relocation_target_array {:x?}", row);
+            }
+            for row in &validated_fragments {
+                eprintln!("[GA] relocation_target_storage_fragment {:x?}", row);
             }
         }
     }
@@ -1545,6 +1968,9 @@ impl IRPass for RelocationArrayPass {
             "abi_pointer_size",
             "global_var_ref",
             "symbol_size",
+            "data_section_range",
+            "symbols",
+            "string_data",
         ]
     }
 
@@ -1809,6 +2235,28 @@ mod tests {
             .collect()
     }
 
+    fn recovered_fragments(db: &DecompileDB) -> Vec<(usize, usize)> {
+        let mut fragments: Vec<_> = db
+            .rel_iter::<(usize, usize)>("relocation_target_storage_fragment")
+            .copied()
+            .collect();
+        fragments.sort_unstable();
+        fragments
+    }
+
+    fn prepare_symbol_less_target(db: &mut DecompileDB, section_end: u64) {
+        db.rel_set(
+            "global_storage_extent",
+            ascent::boxcar::Vec::<(usize, usize)>::new(),
+        );
+        let start = TARGET - 4;
+        let len = usize::try_from(section_end - start).unwrap();
+        let initialized: ascent::boxcar::Vec<(u64, Arc<Vec<u8>>)> = ascent::boxcar::Vec::new();
+        initialized.push((start, Arc::new(vec![0_u8; len])));
+        db.rel_set("retained_initialized_data_range", initialized);
+        db.rel_push("data_section_range", (start, section_end));
+    }
+
     fn replace_inst(db: &mut DecompileDB, node: u64, replacement: Option<RTLInst>) {
         let mut facts: Vec<(u64, RTLInst)> = db
             .rel_iter::<(u64, RTLInst)>("rtl_inst")
@@ -1868,6 +2316,7 @@ mod tests {
         let mut db = fixture();
         run_recovery(&mut db);
         assert_eq!(recovered(&db), vec![(TARGET as usize, 4, 2)]);
+        assert!(recovered_fragments(&db).is_empty());
         assert!(db
             .rel_iter::<(u64,)>("must_be_ptr")
             .any(|(value,)| *value == RETURNED_PTR));
@@ -1877,6 +2326,127 @@ mod tests {
         assert!(!db
             .rel_iter::<(u64,)>("must_be_ptr")
             .any(|(value,)| *value == CONSUMER_PARAM));
+    }
+
+    #[test]
+    fn symbol_less_relocation_target_owns_initialized_byte_suffix() {
+        let mut db = fixture();
+        prepare_symbol_less_target(&mut db, TARGET + 12);
+
+        run_recovery(&mut db);
+
+        assert!(recovered(&db).is_empty());
+        assert_eq!(recovered_fragments(&db), vec![(TARGET as usize, 12)]);
+        assert!(db
+            .rel_iter::<(usize, usize)>("global_storage_extent")
+            .any(|fact| *fact == (TARGET as usize, 12)));
+        assert!(db
+            .rel_iter::<(usize,)>("global_var_ref")
+            .any(|(ident,)| *ident == TARGET as usize));
+        assert!(!db
+            .rel_iter::<(usize, usize, usize)>("is_global_array")
+            .any(|(ident, _, _)| *ident == TARGET as usize));
+    }
+
+    #[test]
+    fn relocation_fragment_and_storage_extent_are_scheduler_outputs() {
+        let pass = RelocationArrayPass;
+        assert!(pass
+            .outputs()
+            .contains(&"relocation_target_storage_fragment"));
+        assert!(pass.outputs().contains(&"global_storage_extent"));
+    }
+
+    #[test]
+    fn next_independent_root_caps_symbol_less_byte_suffix() {
+        let mut db = fixture();
+        prepare_symbol_less_target(&mut db, TARGET + 12);
+        db.rel_push("global_var_ref", ((TARGET + 8) as usize,));
+
+        run_recovery(&mut db);
+
+        assert_eq!(recovered_fragments(&db), vec![(TARGET as usize, 8)]);
+        assert!(!db
+            .rel_iter::<(usize, usize, usize)>("is_global_array")
+            .any(|(ident, _, _)| *ident == TARGET as usize));
+    }
+
+    #[test]
+    fn root_or_relocation_before_observed_end_vetoes_byte_suffix() {
+        let mut rooted = fixture();
+        prepare_symbol_less_target(&mut rooted, TARGET + 12);
+        rooted.rel_push("global_var_ref", ((TARGET + 4) as usize,));
+        run_recovery(&mut rooted);
+        assert!(recovered_fragments(&rooted).is_empty());
+
+        let mut relocated = fixture();
+        prepare_symbol_less_target(&mut relocated, TARGET + 12);
+        relocated.rel_push("pointer_in_data", (TARGET + 4, TARGET + 0x100));
+        run_recovery(&mut relocated);
+        assert!(recovered_fragments(&relocated).is_empty());
+    }
+
+    #[test]
+    fn containing_sized_owner_vetoes_symbol_less_byte_suffix() {
+        let mut db = fixture();
+        prepare_symbol_less_target(&mut db, TARGET + 12);
+        db.rel_push("symbol_size", (TARGET - 8, 20_usize, "owner"));
+
+        run_recovery(&mut db);
+
+        assert!(recovered_fragments(&db).is_empty());
+    }
+
+    #[test]
+    fn dynamic_relocation_target_access_vetoes_byte_suffix() {
+        let mut db = fixture();
+        prepare_symbol_less_target(&mut db, TARGET + 12);
+        let dynamic_access = 0x4a00_u64;
+        insert_between(&mut db, ACCESS_FOUR, CONSUMER_CALL, dynamic_access);
+        db.rel_push("instr_in_function", (dynamic_access, CALLER));
+        db.rel_push(
+            "rtl_inst",
+            (
+                dynamic_access,
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed2(0),
+                    Arc::new(vec![RETURNED_PTR, 0x9f0]),
+                    0x9f1,
+                ),
+            ),
+        );
+
+        run_recovery(&mut db);
+
+        assert!(recovered_fragments(&db).is_empty());
+    }
+
+    #[test]
+    fn exact_pointer_comparison_does_not_veto_byte_suffix() {
+        let mut db = fixture();
+        prepare_symbol_less_target(&mut db, TARGET + 12);
+        let comparison = 0x4a00_u64;
+        insert_between(&mut db, ACCESS_FOUR, CONSUMER_CALL, comparison);
+        db.rel_push("instr_in_function", (comparison, CALLER));
+        db.rel_push(
+            "rtl_inst",
+            (
+                comparison,
+                RTLInst::Iop(
+                    crate::x86::op::Operation::Ocmp(crate::x86::op::Condition::Ccomplimm(
+                        crate::x86::op::Comparison::Ceq,
+                        TARGET as i64,
+                    )),
+                    Arc::new(vec![RETURNED_PTR]),
+                    0x9f1,
+                ),
+            ),
+        );
+
+        run_recovery(&mut db);
+
+        assert_eq!(recovered_fragments(&db), vec![(TARGET as usize, 12)]);
     }
 
     #[test]

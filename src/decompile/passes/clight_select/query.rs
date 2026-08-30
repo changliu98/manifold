@@ -2752,6 +2752,70 @@ fn is_string_literal(bytes: &[u8]) -> Option<usize> {
     Some(null_pos + 1)
 }
 
+fn integer_scalar_chunk_width(chunk: &MemoryChunk) -> Option<usize> {
+    match chunk {
+        MemoryChunk::MBool | MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned => Some(1),
+        MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => Some(2),
+        MemoryChunk::MInt32 | MemoryChunk::MAny32 => Some(4),
+        MemoryChunk::MInt64 | MemoryChunk::MAny64 => Some(8),
+        _ => None,
+    }
+}
+
+/// Decide whether a recorded `string_data` row is only an ASCII-looking
+/// prefix of an integer constant.
+///
+/// `string_data` is deliberately high recall, so the bytes for the integer 37
+/// (`25 00 00 00`) also look like the one-character string "%".  A finalized
+/// direct integer load is stronger semantic evidence, but only when it reads
+/// beyond the complete NUL-terminated string span and the address is never
+/// materialized.  Equal-width reads stay strings: compilers routinely compare
+/// short literals with one scalar load.  Multiple widths, missing bytes, and
+/// mixed scalar/address use all fail closed.
+fn exact_scalar_load_preempts_recorded_string(
+    load_widths: Option<&BTreeSet<usize>>,
+    address_used: bool,
+    recorded_content: &[u8],
+    initialized_bytes: &[u8],
+) -> bool {
+    if address_used || recorded_content.is_empty() {
+        return false;
+    }
+    let Some(load_widths) = load_widths else {
+        return false;
+    };
+    if load_widths.len() != 1 {
+        return false;
+    }
+    let width = *load_widths.first().unwrap();
+    let payload_len = recorded_content
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(recorded_content.len());
+    if payload_len == 0 {
+        return false;
+    }
+    let string_span = payload_len.saturating_add(1);
+    if width <= string_span || initialized_bytes.len() < width {
+        return false;
+    }
+    initialized_bytes.get(..payload_len) == recorded_content.get(..payload_len)
+        && initialized_bytes.get(payload_len) == Some(&0)
+}
+
+fn collect_builtin_addressed_globals<T>(arg: &BuiltinArg<T>, out: &mut HashSet<Ident>) {
+    match arg {
+        BuiltinArg::BAAddrGlobal(ident, _) => {
+            out.insert(*ident);
+        }
+        BuiltinArg::BASplitLong(left, right) | BuiltinArg::BAAddPtr(left, right) => {
+            collect_builtin_addressed_globals(left, out);
+            collect_builtin_addressed_globals(right, out);
+        }
+        _ => {}
+    }
+}
+
 fn try_read_float32(remaining: &[u8]) -> Option<ScalarConstant> {
     if remaining.len() < 4 {
         return None;
@@ -3024,6 +3088,56 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
             .collect()
     };
 
+    // `string_data` is a byte-shape hint, while a finalized offset-zero Iload
+    // is an executable interpretation of those bytes.  Retain every exact
+    // integer width rather than reusing global_chunks: that relation is
+    // candidate-level and also includes stores, so it cannot prove that the
+    // emitted program actually reads this object as one scalar.  Address
+    // materialization is collected independently and vetoes scalar precedence
+    // below, preserving genuine and mixed-use strings.
+    let mut exact_scalar_load_widths: HashMap<Ident, BTreeSet<usize>> = HashMap::new();
+    let mut global_address_uses: HashSet<Ident> = HashSet::new();
+    for (_node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+        match inst {
+            RTLInst::Iload(chunk, addressing, args, _) if args.is_empty() => {
+                let ident = match addressing {
+                    Addressing::Aglobal(ident, 0) | Addressing::Abased(ident, 0) => Some(*ident),
+                    _ => None,
+                };
+                if let (Some(ident), Some(width)) = (ident, integer_scalar_chunk_width(chunk)) {
+                    exact_scalar_load_widths
+                        .entry(ident)
+                        .or_default()
+                        .insert(width);
+                }
+            }
+            RTLInst::Iop(crate::x86::op::Operation::Oindirectsymbol(ident), _, _)
+            | RTLInst::Iop(crate::x86::op::Operation::Olea(Addressing::Aglobal(ident, _)), _, _)
+            | RTLInst::Iop(crate::x86::op::Operation::Olea(Addressing::Abased(ident, _)), _, _)
+            | RTLInst::Iop(
+                crate::x86::op::Operation::Olea(Addressing::Abasedscaled(_, ident, _)),
+                _,
+                _,
+            )
+            | RTLInst::Iop(crate::x86::op::Operation::Oleal(Addressing::Aglobal(ident, _)), _, _)
+            | RTLInst::Iop(crate::x86::op::Operation::Oleal(Addressing::Abased(ident, _)), _, _)
+            | RTLInst::Iop(
+                crate::x86::op::Operation::Oleal(Addressing::Abasedscaled(_, ident, _)),
+                _,
+                _,
+            ) => {
+                global_address_uses.insert(*ident);
+            }
+            RTLInst::Ibuiltin(_, args, result) => {
+                for arg in args {
+                    collect_builtin_addressed_globals(arg, &mut global_address_uses);
+                }
+                collect_builtin_addressed_globals(result, &mut global_address_uses);
+            }
+            _ => {}
+        }
+    }
+
     // A scalar-SSE load from a read-only constant pool is stronger type
     // evidence than the generic RTL load chunk.  The latter may also contain
     // MAny64 from an address/materialization candidate for the same bytes;
@@ -3136,6 +3250,11 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
         .chain(db.rel_iter::<(Address, Address)>("code_pointer_in_data"))
         .map(|(slot, target)| (*slot, *target))
         .collect();
+    for target in reloc_targets.values() {
+        if let Ok(ident) = Ident::try_from(*target) {
+            global_address_uses.insert(ident);
+        }
+    }
     let reloc_slots: Vec<u64> = reloc_targets.keys().copied().collect();
 
     // Keep every candidate because is_global_array is a set-valued relation.
@@ -3492,8 +3611,56 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
         // is_pointer from relocation ground truth or the access-derived signal.
         let is_pointer = !pointer_init.is_empty() || global_ptr_ids.contains(id);
 
+        // A recorded string row can be a printable low byte followed by the
+        // zero padding of a wider integer constant.  Let a single finalized
+        // scalar-load width override that hint only when the file image agrees,
+        // the load extends past the full string including its terminator, and
+        // no finalized operation or relocation takes this address.  Keeping the
+        // address-use veto separate from is_pointer matters: a real string is
+        // an addressed byte object, not a global whose *contents* are a pointer.
+        let recorded_string_candidate: Option<&[u8]> = string_data_map
+            .get(&name)
+            .map(String::as_bytes)
+            .filter(|candidate| is_valid_ascii_content(candidate))
+            .or_else(|| {
+                let idx = string_addr_map.partition_point(|(start, _)| *start <= addr);
+                if idx == 0 {
+                    return None;
+                }
+                let (start, str_content) = &string_addr_map[idx - 1];
+                let offset = usize::try_from(addr.checked_sub(*start)?).ok()?;
+                let candidate = if offset == 0 {
+                    str_content.as_bytes()
+                } else if offset < str_content.len() {
+                    str_content[offset..].as_bytes()
+                } else {
+                    return None;
+                };
+                is_valid_ascii_content(candidate).then_some(candidate)
+            });
+        let initialized_bytes = data_ranges
+            .iter()
+            .find(|(start, end, _, _)| addr >= *start && addr < *end)
+            .and_then(|(start, _, bytes, _)| {
+                usize::try_from(addr - *start)
+                    .ok()
+                    .and_then(|offset| bytes.get(offset..))
+            });
+        let scalar_preempts_recorded_string = !is_pointer
+            && !is_recovered_aggregate
+            && recorded_string_candidate.is_some_and(|candidate| {
+                initialized_bytes.is_some_and(|bytes| {
+                    exact_scalar_load_preempts_recorded_string(
+                        exact_scalar_load_widths.get(id),
+                        global_address_uses.contains(id),
+                        candidate,
+                        bytes,
+                    )
+                })
+            });
+
         // Pointer globals are never string literals; skip all string detection for them.
-        if !is_pointer && !is_recovered_aggregate {
+        if !is_pointer && !is_recovered_aggregate && !scalar_preempts_recorded_string {
             if let Some(str_content) = string_data_map.get(&name) {
                 if is_valid_ascii_content(str_content.as_bytes()) {
                     is_string = true;
@@ -3673,12 +3840,78 @@ mod rodata_scalar_tests {
             Some((ScalarConstant::Float64(value), false)) if value == 0.0001
         ));
     }
+
+    #[test]
+    fn exact_wider_scalar_load_outweighs_ascii_prefix_string_hint() {
+        let widths = BTreeSet::from([4]);
+        assert!(exact_scalar_load_preempts_recorded_string(
+            Some(&widths),
+            false,
+            b"%",
+            &[37, 0, 0, 0],
+        ));
+    }
+
+    #[test]
+    fn string_sized_scalar_read_keeps_genuine_literal() {
+        let percent_width = BTreeSet::from([2]);
+        assert!(!exact_scalar_load_preempts_recorded_string(
+            Some(&percent_width),
+            false,
+            b"%",
+            &[37, 0],
+        ));
+
+        let word_width = BTreeSet::from([4]);
+        assert!(!exact_scalar_load_preempts_recorded_string(
+            Some(&word_width),
+            false,
+            b"abc",
+            b"abc\0",
+        ));
+    }
+
+    #[test]
+    fn address_or_mixed_width_use_vetoes_scalar_string_override() {
+        let scalar_width = BTreeSet::from([4]);
+        assert!(!exact_scalar_load_preempts_recorded_string(
+            Some(&scalar_width),
+            true,
+            b"%",
+            &[37, 0, 0, 0],
+        ));
+
+        let mixed_widths = BTreeSet::from([1, 4]);
+        assert!(!exact_scalar_load_preempts_recorded_string(
+            Some(&mixed_widths),
+            false,
+            b"%",
+            &[37, 0, 0, 0],
+        ));
+    }
+
+    #[test]
+    fn scalar_string_override_requires_matching_complete_file_bytes() {
+        let widths = BTreeSet::from([4]);
+        assert!(!exact_scalar_load_preempts_recorded_string(
+            Some(&widths),
+            false,
+            b"%",
+            &[36, 0, 0, 0],
+        ));
+        assert!(!exact_scalar_load_preempts_recorded_string(
+            Some(&widths),
+            false,
+            b"%",
+            &[37, 0, 0],
+        ));
+    }
 }
 
 use crate::decompile::passes::c_pass::types::{
     CType, FloatSize, IntSize, Signedness, StructDef, StructField, TypeQualifiers,
 };
-use crate::x86::op::Condition;
+use crate::x86::op::{Addressing, Condition};
 use crate::x86::types::FieldType;
 use std::sync::Arc;
 

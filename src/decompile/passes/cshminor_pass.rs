@@ -102,6 +102,82 @@ fn cond_subst_exprs(args: &[CsharpminorExpr], old: RTLReg, new: RTLReg) -> Vec<C
         .collect()
 }
 
+const ARITH_LOAD_SYNTH_NODE_BIT: u64 = 1u64 << 62;
+
+/// All fixed, post-RTL evidence required to reinterpret one memory-source
+/// arithmetic operand as a physical frame load.  Keeping the full proof in one
+/// value lets the Datalog layer reject any disagreement before changing the
+/// generic Cminor conversion.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct PostRtlArithLoadClaim {
+    function: Address,
+    real_node: Node,
+    operation: Operation,
+    chunk: MemoryChunk,
+    raw_displacement: i64,
+    destination_mreg: Mreg,
+    result: RTLReg,
+    read_offset: i64,
+    read_width: usize,
+    base_offset: i64,
+    owner: RTLReg,
+    extent: i64,
+    address_is_64bit: bool,
+}
+
+/// Replace only the exact owner operand emitted by RTL's memory-source
+/// arithmetic expansion.  The finalized RTL shape is checked in Datalog; this
+/// helper independently checks the Cminor operation/result shape so a later IR
+/// change fails closed instead of rewriting the wrong variable occurrence.
+fn post_rtl_arith_load_stmt(
+    destination: RTLReg,
+    expr: &CminorExpr,
+    claim: &PostRtlArithLoadClaim,
+) -> Option<CsharpminorStmt> {
+    let CminorExpr::Ebinop(binop, lhs, rhs) = expr else {
+        return None;
+    };
+    let expected_binop = binop_from_operation(&claim.operation)?;
+    if *binop != expected_binop
+        || destination != claim.result
+        || *lhs != claim.result
+        || *rhs != claim.owner
+        || claim.result == claim.owner
+    {
+        return None;
+    }
+
+    let delta = claim.read_offset.checked_sub(claim.base_offset)?;
+    if delta < 0 {
+        return None;
+    }
+    let owner_address = CsharpminorExpr::Eaddrof(ident_from_reg(claim.owner));
+    let address = if delta == 0 {
+        owner_address
+    } else if claim.address_is_64bit {
+        CsharpminorExpr::Ebinop(
+            CminorBinop::Oaddl,
+            Box::new(owner_address),
+            Box::new(CsharpminorExpr::Econst(Constant::Olongconst(delta))),
+        )
+    } else {
+        CsharpminorExpr::Ebinop(
+            CminorBinop::Oadd,
+            Box::new(owner_address),
+            Box::new(CsharpminorExpr::Econst(Constant::Ointconst(delta))),
+        )
+    };
+    let loaded = CsharpminorExpr::Eload(claim.chunk, Box::new(address));
+    Some(CsharpminorStmt::Sset(
+        destination,
+        CsharpminorExpr::Ebinop(
+            binop.clone(),
+            Box::new(CsharpminorExpr::Evar(claim.result)),
+            Box::new(loaded),
+        ),
+    ))
+}
+
 /// Split an immediate equality comparison into the register/register
 /// condition and Cminor binary operator that preserve its width/signedness.
 /// Only equality is admitted: ordering unrelated C objects is not a portable
@@ -210,6 +286,10 @@ ascent_par! {
     relation canonical_stack_slot_local(Address, i64, RTLReg);
     // rtl_pass export: the single escaped canonical local per (func, offset), used to resolve synthetic-only stack loads that have no per-node stack_var.
     relation slot_escaped_canonical(Address, i64, RTLReg);
+    // Canonical scalar local for each exact field belonging to a wider escaped
+    // region.  At the region base this is the same backing-owner authority the
+    // final C layout consumes when it constructs one byte buffer.
+    relation slot_escaped_region_canonical(Address, i64, RTLReg);
     // rtl_pass export: a conflict-free physical owner for a frame read that
     // begins inside a wider reaching write or escaped object.
     relation frame_read_storage_owner(Address, Address, i64, i64, RTLReg);
@@ -217,6 +297,16 @@ ascent_par! {
     // rather than collapsing to the owner's scalar SSA value.
     relation frame_read_storage_access_owner(Address, Address, i64, i64, RTLReg);
     relation frame_write_storage_owner(Address, Address, i64, i64, RTLReg);
+    // Fixed post-RTL evidence for memory-source arithmetic whose stack operand
+    // was initially represented by the canonical slot value.  This pass runs
+    // after RTL and its storage/extent analyses have settled, so consuming the
+    // complete relations here cannot feed a candidate-selection cycle back
+    // into RTL.
+    relation arith_load_op(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
+    relation frame_stack_read_bytes(Address, Address, i64, usize);
+    relation escaped_stack_region_extent(Address, i64, i64);
+    relation reg_rtl(Node, Mreg, RTLReg);
+    relation rtl_inst(Node, RTLInst);
     // Noreturn recognition inputs: the always-noreturn symbol set, single-def constants for resolving an error-family status arg, and function_noreturn for user-defined wrappers.
     relation is_known_noreturn_function(Symbol);
     relation single_def_const(RTLReg, Constant);
@@ -685,6 +775,7 @@ ascent_par! {
         if args.is_empty(),
         instr_in_function(node, func_start),
         slot_escaped_canonical(func_start, *ofs, stack_rtl),
+        !frame_read_has_storage_access_owner(node),
         let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Evar(*stack_rtl));
 
     csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
@@ -709,6 +800,79 @@ ascent_par! {
         stack_local_at(func_start, *ofs - 8, stack_rtl),
         let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Evar(*stack_rtl));
 
+    // RTL expands `op reg,[sp+ofs]` into an Inop at the real node and one
+    // synthetic Iop whose second value operand is the canonical stack slot.
+    // If that slot later becomes an escaped byte-array owner, treating the
+    // operand as Evar(owner) changes an integer load into the owner's address.
+    // Recover the machine load here, after every ownership/extent relation has
+    // settled.  Every field which could change the rewrite participates in the
+    // claim; any disagreement vetoes the transformation.
+    #[local] relation post_rtl_arith_load_claim(Node, PostRtlArithLoadClaim);
+    post_rtl_arith_load_claim(synthetic, claim) <--
+        arith_load_op(real, operation, chunk, base_mreg, raw_displacement, destination_mreg),
+        if *base_mreg == Mreg::SP,
+        instr_in_function(real, function),
+        reg_rtl(real, *destination_mreg, result),
+        frame_stack_read_bytes(function, real, read_offset, read_width),
+        if *read_width == crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk),
+        escaped_stack_region_extent(function, base_offset, extent),
+        slot_escaped_region_canonical(function, base_offset, owner),
+        if let Ok(read_width_i64) = i64::try_from(*read_width),
+        if *extent > read_width_i64,
+        if let Some(read_end) = read_offset.checked_add(read_width_i64),
+        if let Some(region_end) = base_offset.checked_add(*extent),
+        if *read_offset >= *base_offset && read_end <= region_end,
+        csharp_address_is_64bit(address_is_64bit),
+        let synthetic = *real | ARITH_LOAD_SYNTH_NODE_BIT,
+        let claim = PostRtlArithLoadClaim {
+            function: *function,
+            real_node: *real,
+            operation: operation.clone(),
+            chunk: *chunk,
+            raw_displacement: *raw_displacement,
+            destination_mreg: *destination_mreg,
+            result: *result,
+            read_offset: *read_offset,
+            read_width: *read_width,
+            base_offset: *base_offset,
+            owner: *owner,
+            extent: *extent,
+            address_is_64bit: *address_is_64bit,
+        };
+
+    #[local] relation post_rtl_arith_load_claim_conflict(Node);
+    post_rtl_arith_load_claim_conflict(*node) <--
+        post_rtl_arith_load_claim(node, left),
+        post_rtl_arith_load_claim(node, right),
+        if left != right;
+
+    #[local] relation post_rtl_arith_load_rewrite_candidate(Node, CsharpminorStmt);
+    post_rtl_arith_load_rewrite_candidate(*node, stmt) <--
+        post_rtl_arith_load_claim(node, claim),
+        !post_rtl_arith_load_claim_conflict(node),
+        rtl_inst(node, ?RTLInst::Iop(seen_operation, args, result)),
+        if seen_operation == &claim.operation,
+        if args.as_slice() == [claim.result, claim.owner] && *result == claim.result,
+        active_cminor_stmt(node, ?CminorStmt::Sassign(destination, expr)),
+        if let Some(stmt) = post_rtl_arith_load_stmt(*destination, expr, claim);
+
+    #[local] relation post_rtl_arith_load_rewrite_conflict(Node);
+    post_rtl_arith_load_rewrite_conflict(*node) <--
+        post_rtl_arith_load_rewrite_candidate(node, left),
+        post_rtl_arith_load_rewrite_candidate(node, right),
+        if left != right;
+
+    #[local] relation post_rtl_arith_load_rewrite(Node, CsharpminorStmt);
+    post_rtl_arith_load_rewrite(*node, stmt.clone()) <--
+        post_rtl_arith_load_rewrite_candidate(node, stmt),
+        !post_rtl_arith_load_rewrite_conflict(node);
+
+    #[local] relation post_rtl_arith_load_rewritten(Node);
+    post_rtl_arith_load_rewritten(node) <-- post_rtl_arith_load_rewrite(node, _);
+
+    csharp_stmt_candidate(*node, stmt.clone()) <--
+        post_rtl_arith_load_rewrite(node, stmt);
+
     csharp_stmt_candidate(node, CsharpminorStmt::Sset(*dst, converted.clone())) <--
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, expr)),
         symbolic_pointer_assign(node, expr, converted);
@@ -719,6 +883,7 @@ ascent_par! {
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, expr)),
         !stack_addr_resolved(node),
         !symbolic_pointer_assign(node, expr, _),
+        !post_rtl_arith_load_rewritten(node),
         csharp_address_is_64bit(is_64bit),
         if let Some(converted) = csharp_expr_from_cminor_sized(expr, *is_64bit),
         let stmt = CsharpminorStmt::Sset(*dst, converted);
@@ -727,6 +892,7 @@ ascent_par! {
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, expr)),
         !stack_addr_resolved(node),
         !symbolic_pointer_assign(node, expr, _),
+        !post_rtl_arith_load_rewritten(node),
         csharp_address_is_64bit(is_64bit),
         if csharp_expr_from_cminor_sized(expr, *is_64bit).is_none();
 
@@ -1544,10 +1710,11 @@ mod tests {
         compute_canonical_stack_slot_locals, ident_from_reg, unique_external_cfg_entry,
         CshminorPassProgram,
     };
+    use crate::mreg::Mreg;
     use crate::x86::op::{Addressing, Comparison, Condition, Operation};
     use crate::x86::types::{
         CminorBinop, CminorExpr, CminorStmt, Constant, CsharpminorExpr, CsharpminorStmt,
-        MemoryChunk,
+        MemoryChunk, RTLInst,
     };
     use either::Either;
     use std::collections::HashSet;
@@ -1555,6 +1722,83 @@ mod tests {
 
     fn synthetic_ids<const N: usize>() -> [u64; N] {
         std::array::from_fn(|index| index as u64 + 1)
+    }
+
+    fn on_large_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024 * 1024)
+            .spawn(test)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn post_rtl_arith_load_fixture(
+        read_offset: i64,
+        read_width: usize,
+        base_offset: i64,
+        extent: i64,
+        owner: u64,
+    ) -> (CshminorPassProgram, u64, u64, u64) {
+        let real = 0x4510;
+        let synthetic = real | super::ARITH_LOAD_SYNTH_NODE_BIT;
+        let result = 0x9100;
+        let mut prog = CshminorPassProgram::default();
+        prog.abi_pointer_size.push((8,));
+        prog.arith_load_op.push((
+            real,
+            Operation::Oadd,
+            MemoryChunk::MInt32,
+            Mreg::SP,
+            read_offset,
+            Mreg::R8,
+        ));
+        prog.reg_rtl.push((real, Mreg::R8, result));
+        prog.frame_stack_read_bytes
+            .push((FUNC, real, read_offset, read_width));
+        prog.escaped_stack_region_extent
+            .push((FUNC, base_offset, extent));
+        prog.slot_escaped_region_canonical
+            .push((FUNC, base_offset, owner));
+        prog.rtl_inst.push((
+            synthetic,
+            RTLInst::Iop(Operation::Oadd, Arc::new(vec![result, owner]), result),
+        ));
+        prog.cminor_stmt.push((
+            synthetic,
+            CminorStmt::Sassign(result, CminorExpr::Ebinop(CminorBinop::Oadd, result, owner)),
+        ));
+        for node in [real, synthetic] {
+            prog.instr_in_function.push((node, FUNC));
+        }
+        (prog, real, synthetic, result)
+    }
+
+    fn assert_generic_arith_owner_candidate(
+        prog: &CshminorPassProgram,
+        synthetic: u64,
+        result: u64,
+        owner: u64,
+    ) {
+        assert!(!prog
+            .post_rtl_arith_load_rewritten
+            .iter()
+            .any(|(node,)| *node == synthetic));
+        let candidates: Vec<_> = prog
+            .csharp_stmt_candidate
+            .iter()
+            .filter_map(|(node, stmt)| (*node == synthetic).then_some(stmt))
+            .collect();
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        assert!(matches!(
+            candidates[0],
+            CsharpminorStmt::Sset(
+                destination,
+                CsharpminorExpr::Ebinop(CminorBinop::Oadd, lhs, rhs),
+            ) if *destination == result
+                && matches!(lhs.as_ref(), CsharpminorExpr::Evar(reg) if *reg == result)
+                && matches!(rhs.as_ref(), CsharpminorExpr::Evar(reg) if *reg == owner)
+        ));
     }
 
     #[test]
@@ -2100,6 +2344,131 @@ mod tests {
     }
 
     #[test]
+    fn post_rtl_arith_load_rewrites_exact_owner_at_zero_and_nonzero_delta() {
+        on_large_stack(|| {
+            for (read_offset, base_offset, expected_delta) in [(4_i64, 4_i64, 0_i64), (8, 4, 4)] {
+                let owner = 0x9000;
+                let (mut prog, _real, synthetic, result) =
+                    post_rtl_arith_load_fixture(read_offset, 4, base_offset, 12, owner);
+                prog.run();
+
+                assert!(prog
+                    .post_rtl_arith_load_rewritten
+                    .iter()
+                    .any(|(node,)| *node == synthetic));
+                let candidates: Vec<_> = prog
+                    .csharp_stmt_candidate
+                    .iter()
+                    .filter_map(|(node, stmt)| (*node == synthetic).then_some(stmt))
+                    .collect();
+                assert_eq!(candidates.len(), 1, "{candidates:?}");
+                assert!(matches!(
+                    candidates[0],
+                    CsharpminorStmt::Sset(
+                        destination,
+                        CsharpminorExpr::Ebinop(
+                            CminorBinop::Oadd,
+                            lhs,
+                            loaded,
+                        ),
+                    ) if *destination == result
+                        && matches!(lhs.as_ref(), CsharpminorExpr::Evar(reg) if *reg == result)
+                        && matches!(
+                            loaded.as_ref(),
+                            CsharpminorExpr::Eload(MemoryChunk::MInt32, address)
+                                if if expected_delta == 0 {
+                                    matches!(
+                                        address.as_ref(),
+                                        CsharpminorExpr::Eaddrof(ident)
+                                            if *ident == ident_from_reg(owner)
+                                    )
+                                } else {
+                                    matches!(
+                                        address.as_ref(),
+                                        CsharpminorExpr::Ebinop(
+                                            CminorBinop::Oaddl,
+                                            base,
+                                            delta,
+                                        ) if matches!(
+                                            base.as_ref(),
+                                            CsharpminorExpr::Eaddrof(ident)
+                                                if *ident == ident_from_reg(owner)
+                                        ) && matches!(
+                                            delta.as_ref(),
+                                            CsharpminorExpr::Econst(Constant::Olongconst(value))
+                                                if *value == expected_delta
+                                        )
+                                    )
+                                }
+                        )
+                ));
+            }
+        });
+    }
+
+    #[test]
+    fn post_rtl_arith_load_rejects_scalar_width_mismatch_and_noncontainment() {
+        on_large_stack(|| {
+            let owner = 0x9000;
+            for (read_offset, read_width, base_offset, extent) in [
+                // A scalar-sized object keeps the established scalar SSA route.
+                (4_i64, 4_usize, 4_i64, 4_i64),
+                // The decoder width must agree exactly with the machine chunk.
+                (4, 8, 4, 12),
+                // A larger extent is insufficient when the read crosses its end.
+                (12, 4, 4, 8),
+            ] {
+                let (mut prog, _real, synthetic, result) = post_rtl_arith_load_fixture(
+                    read_offset,
+                    read_width,
+                    base_offset,
+                    extent,
+                    owner,
+                );
+                prog.run();
+                assert_generic_arith_owner_candidate(&prog, synthetic, result, owner);
+            }
+        });
+    }
+
+    #[test]
+    fn post_rtl_arith_load_rejects_ambiguous_owner_or_operation() {
+        on_large_stack(|| {
+            let owner = 0x9000;
+            let other_owner = 0x9010;
+
+            let (mut owners, _real, synthetic, result) =
+                post_rtl_arith_load_fixture(4, 4, 4, 12, owner);
+            owners
+                .slot_escaped_region_canonical
+                .push((FUNC, 4, other_owner));
+            owners.run();
+            assert!(owners
+                .post_rtl_arith_load_claim_conflict
+                .iter()
+                .any(|(node,)| *node == synthetic));
+            assert_generic_arith_owner_candidate(&owners, synthetic, result, owner);
+
+            let (mut operations, real, synthetic, result) =
+                post_rtl_arith_load_fixture(4, 4, 4, 12, owner);
+            operations.arith_load_op.push((
+                real,
+                Operation::Osub,
+                MemoryChunk::MInt32,
+                Mreg::SP,
+                4,
+                Mreg::R8,
+            ));
+            operations.run();
+            assert!(operations
+                .post_rtl_arith_load_claim_conflict
+                .iter()
+                .any(|(node,)| *node == synthetic));
+            assert_generic_arith_owner_candidate(&operations, synthetic, result, owner);
+        });
+    }
+
+    #[test]
     fn interior_frame_read_uses_its_structural_storage_owner() {
         let [node, dst, owner, stale_exact_local] = synthetic_ids();
         let mut prog = CshminorPassProgram::default();
@@ -2179,6 +2548,7 @@ mod tests {
         // Deliberately provide an exact scalar local too: the structural
         // storage access must win because this is a byte read of its base.
         prog.stack_var.push((FUNC, read, 4, owner));
+        prog.slot_escaped_canonical.push((FUNC, 4, owner));
         prog.frame_read_storage_access_owner
             .push((FUNC, read, 4, 4, owner));
 

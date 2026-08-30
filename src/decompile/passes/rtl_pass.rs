@@ -1,7 +1,7 @@
 use crate::decompile::elevator::DecompileDB;
 use crate::run_pass;
 
-use crate::decompile::passes::asm_pass::transl_addressing_rev;
+use crate::decompile::passes::asm_pass::{is_reg_high8, transl_addressing_rev};
 use crate::decompile::passes::cminor_pass::*;
 use crate::decompile::passes::csh_pass::*;
 use crate::decompile::passes::frame_write_pass::{
@@ -15,7 +15,7 @@ use crate::util::{
 };
 use crate::x86::asm::{Ireg, TestCond};
 use crate::x86::mach::X86Mreg;
-use crate::x86::op::{Addressing, Comparison, Condition, Operation};
+use crate::x86::op::{Addressing, Comparison, Condition, Operation, TestResultCondition};
 use crate::x86::types::*;
 use ascent::ascent_par;
 use ascent::lattice::constant_propagation::ConstPropagation;
@@ -631,20 +631,24 @@ fn offset_addressing(addressing: &Addressing, delta: i64) -> Option<Addressing> 
     }
 }
 
-fn is_indexed_integer_rmw_operation(op: &Operation) -> bool {
-    matches!(
-        op,
-        Operation::Oadd
-            | Operation::Oaddl
-            | Operation::Osub
-            | Operation::Osubl
-            | Operation::Oand
-            | Operation::Oandl
-            | Operation::Oor
-            | Operation::Oorl
-            | Operation::Oxor
-            | Operation::Oxorl
-    )
+fn is_frame_indexed_load_operation(op: &Operation, is_unary: bool) -> bool {
+    if is_unary {
+        matches!(op, Operation::Omulimm(_) | Operation::Omullimm(_))
+    } else {
+        matches!(
+            op,
+            Operation::Oadd
+                | Operation::Oaddl
+                | Operation::Osub
+                | Operation::Osubl
+                | Operation::Oand
+                | Operation::Oandl
+                | Operation::Oor
+                | Operation::Oorl
+                | Operation::Oxor
+                | Operation::Oxorl
+        )
+    }
 }
 
 /// Recover exact initialized stack-object extents from two independent machine
@@ -818,9 +822,11 @@ ascent_par! {
     relation xmm_hi_mem_store(Address, i64, Mreg, i64, Address);
     relation sse_wide_frame_load(Address, Mreg, i64);
     relation arith_load_op(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
+    relation arith_indexed_load_op(Address, Operation, MemoryChunk, Addressing, Arc<Vec<Mreg>>, Mreg);
     relation float_load_op(Address, Operation, MemoryChunk, Addressing, Arc<Vec<Mreg>>, Mreg, bool);
-    // cvtsi2_stack_op: a cvtsi2ss/sd reading a spilled int SCALAR slot, whose unary conversion reads the slot's canonical SSA reg directly, like arith_load_op's BP-slot path.
-    relation cvtsi2_stack_op(Address, Operation, Mreg, i64, Mreg);
+    // Write-only unary operation over a scalar SP/BP cell.  Integer IMUL3 and
+    // integer-to-float conversion share the same canonical stack-value path.
+    relation unary_stack_load_op(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
     // float_arith_stack_op: a binary float arith reading a spilled float SCALAR slot in place, with the slot operand read through its canonical SSA reg rather than a raw frame Iload.
     relation float_arith_stack_op(Address, Operation, Mreg, i64, Mreg);
     relation arith_store_reg(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
@@ -833,6 +839,7 @@ ascent_par! {
     relation sbb_self_carry_op(Address, Address, Condition, bool, Mreg, Mreg, Mreg);
     relation flags_and_jump_pair(Address, Address, &'static str);
     relation setcc_compare_site(Address, Address);
+    relation test_result_setcc(Address, TestResultCondition, Symbol);
     relation next(Address, Address);
     relation op_immediate(Symbol, i64, usize);
     relation op_produces_data(Node, RTLReg);
@@ -1381,14 +1388,14 @@ ascent_par! {
         func_sets_frame_pointer(func_start);
 
     frame_indexed_load_op(addr) <--
-        float_load_op(addr, op, _, addressing, args, _, false),
-        if is_indexed_integer_rmw_operation(op),
+        float_load_op(addr, op, _, addressing, args, _, is_unary),
+        if is_frame_indexed_load_operation(op, *is_unary),
         if args.len() == 2 && args[0] == Mreg::SP,
         if matches!(addressing, Addressing::Aindexed2(_) | Addressing::Aindexed2scaled(_, _));
 
     frame_indexed_load_op(addr) <--
-        float_load_op(addr, op, _, addressing, args, _, false),
-        if is_indexed_integer_rmw_operation(op),
+        float_load_op(addr, op, _, addressing, args, _, is_unary),
+        if is_frame_indexed_load_operation(op, *is_unary),
         if args.len() == 2 && args[0] == Mreg::BP,
         if matches!(addressing, Addressing::Aindexed2(_) | Addressing::Aindexed2scaled(_, _)),
         real_addr_in_func(addr, func_start),
@@ -2159,6 +2166,26 @@ ascent_par! {
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *dst_mreg, arg_id);
 
+    // Indexed memory-source arithmetic has no Mach/LTL operation. Thread only
+    // its ordered address operands here; the RMW input uses the ordinary
+    // two-address shadow and its output uses the raw definition bridge.
+    reg_xtl(*addr, *address_mreg, arg_id) <--
+        arith_indexed_load_op(addr, _, _, _, address_mregs, _),
+        !has_ltl_op(addr),
+        for address_mreg in address_mregs.iter(),
+        reg_def_used(defaddr, *address_mreg, *addr),
+        !load_overwrites_base(defaddr, address_mreg),
+        reg_xtl(defaddr, *address_mreg, arg_id);
+
+    reg_xtl(*addr, *address_mreg, arg_id) <--
+        arith_indexed_load_op(addr, _, _, _, address_mregs, _),
+        !has_ltl_op(addr),
+        for address_mreg in address_mregs.iter(),
+        reg_def_used(defaddr, *address_mreg, *addr),
+        load_overwrites_base(defaddr, address_mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, *address_mreg, arg_id);
+
     reg_xtl(*addr, *base_mreg, arg_id) <--
         arith_store_reg(addr, _, _, base_mreg, _, _),
         !has_ltl_op(addr),
@@ -2438,53 +2465,214 @@ ascent_par! {
         let synthetic_addr = *addr | (1u64 << 62),
         next(addr, next);
 
-    // cvtsi2_stack_op: the slot value is already live in stack_rtl, so the load node carries an Inop and the conversion at the synthetic address consumes stack_rtl instead of a frame Iload.
+    // Preserve indexed IMUL memory as an exact load followed by arithmetic.
+    // Every machine address position and the destination must select one final
+    // RTL value; missing or conflicting mappings leave the instruction
+    // unmaterialized instead of reviving the old base-register approximation.
+    #[local] relation arith_indexed_load_arg_candidate(Node, usize, RTLReg);
+    arith_indexed_load_arg_candidate(*addr, position, *rtl) <--
+        arith_indexed_load_op(addr, _, _, _, machine_args, _),
+        if machine_args.len() == 2,
+        for (position, machine_reg) in machine_args.iter().enumerate(),
+        reg_rtl(addr, *machine_reg, rtl);
+
+    #[local] relation arith_indexed_load_arg_conflict(Node, usize);
+    arith_indexed_load_arg_conflict(addr, position) <--
+        arith_indexed_load_arg_candidate(addr, position, left),
+        arith_indexed_load_arg_candidate(addr, position, right),
+        if left != right;
+
+    #[local] relation arith_indexed_load_arg_exact(Node, usize, RTLReg);
+    arith_indexed_load_arg_exact(addr, position, rtl) <--
+        arith_indexed_load_arg_candidate(addr, position, rtl),
+        !arith_indexed_load_arg_conflict(addr, position);
+
+    // The two-address accumulator is an input from its unique reaching
+    // previous definition, while the x86 destination is a distinct raw
+    // definition whose value is produced at the synthetic operation node.
+    #[local] relation arith_indexed_load_dst_input_candidate(Node, RTLReg);
+    arith_indexed_load_dst_input_candidate(*addr, *input) <--
+        arith_indexed_load_op(addr, _, _, _, _, dst_mreg),
+        reg_def_used(previous, dst_mreg, addr),
+        if *previous != *addr,
+        def_value_rtl(previous, dst_mreg, input);
+
+    #[local] relation arith_indexed_load_dst_input_conflict(Node);
+    arith_indexed_load_dst_input_conflict(addr) <--
+        arith_indexed_load_dst_input_candidate(addr, left),
+        arith_indexed_load_dst_input_candidate(addr, right),
+        if left != right;
+
+    #[local] relation arith_indexed_load_dst_input_exact(Node, RTLReg);
+    arith_indexed_load_dst_input_exact(addr, rtl) <--
+        arith_indexed_load_dst_input_candidate(addr, rtl),
+        !arith_indexed_load_dst_input_conflict(addr);
+
+    #[local] relation arith_indexed_load_dst_output_candidate(Node, RTLReg);
+    arith_indexed_load_dst_output_candidate(*addr, *output) <--
+        arith_indexed_load_op(addr, _, _, _, _, dst_mreg),
+        def_value_rtl(addr, dst_mreg, output);
+
+    #[local] relation arith_indexed_load_dst_output_conflict(Node);
+    arith_indexed_load_dst_output_conflict(addr) <--
+        arith_indexed_load_dst_output_candidate(addr, left),
+        arith_indexed_load_dst_output_candidate(addr, right),
+        if left != right;
+
+    #[local] relation arith_indexed_load_dst_output_exact(Node, RTLReg);
+    arith_indexed_load_dst_output_exact(addr, rtl) <--
+        arith_indexed_load_dst_output_candidate(addr, rtl),
+        !arith_indexed_load_dst_output_conflict(addr);
+
+    #[local] relation arith_indexed_load_materialized(
+        Node, Addressing, Arc<Vec<RTLReg>>, RTLReg, RTLReg
+    );
+    arith_indexed_load_materialized(
+        *addr, addressing.clone(), Arc::new(vec![*base, *index]), *input, *output
+    ) <--
+        arith_indexed_load_op(addr, _, _, addressing, machine_args, dst_mreg),
+        if machine_args.len() == 2,
+        instr_in_function(addr, func),
+        let base_mreg = machine_args[0],
+        let index_mreg = machine_args[1],
+        !unknown_reg_value_reaches_use(func, addr, base_mreg),
+        !unknown_reg_value_reaches_use(func, addr, index_mreg),
+        !unknown_reg_value_reaches_use(func, addr, dst_mreg),
+        arith_indexed_load_arg_exact(addr, 0, base),
+        arith_indexed_load_arg_exact(addr, 1, index),
+        arith_indexed_load_dst_input_exact(addr, input),
+        arith_indexed_load_dst_output_exact(addr, output);
+
+    rtl_inst_candidate(*addr, load), op_produces_data(*addr, temp) <--
+        arith_indexed_load_op(addr, _, chunk, _, _, _),
+        !has_ltl_op(addr),
+        arith_indexed_load_materialized(addr, addressing, args, _, _),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let load = RTLInst::Iload(*chunk, addressing.clone(), args.clone(), temp);
+
+    rtl_inst_candidate(synthetic, op_inst), op_produces_data(synthetic, *output) <--
+        arith_indexed_load_op(addr, operation, _, _, _, _),
+        !has_ltl_op(addr),
+        arith_indexed_load_materialized(addr, _, _, input, output),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let synthetic = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(operation.clone(), Arc::new(vec![*input, temp]), *output);
+
+    rtl_edge_negated(*addr, *next) <--
+        arith_indexed_load_op(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        next(addr, next);
+
+    rtl_succ_candidate(*addr, synthetic), rtl_expansion_edge(*addr, synthetic) <--
+        arith_indexed_load_op(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        let synthetic = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synthetic, *next), rtl_expansion_edge(synthetic, *next),
+    instr_in_function(synthetic, *func) <--
+        arith_indexed_load_op(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func),
+        let synthetic = *addr | (1u64 << 62),
+        next(addr, next);
+
+    // Keep semantic-node discovery dependent only on the ASM certificate.
+    // Depending on reg_rtl-backed materialization feeds rtl_next_semantic back
+    // into its own negated traversal and is not stratifiable.
+    synth_only_addr(addr) <--
+        arith_indexed_load_op(addr, _, _, _, _, _),
+        !has_ltl_op(addr);
+
+    // The slot value is already live in stack_rtl, so the real node is an Inop
+    // and the synthetic unary operation consumes that canonical value. A
+    // scalar SP/BP form without an exact stack_var gets no operation candidate.
     rtl_inst_candidate(addr, nop) <--
-        cvtsi2_stack_op(addr, _op, _base_mreg, disp, _dst_mreg),
+        unary_stack_load_op(addr, _, _, _, disp, _),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, _),
         let nop = RTLInst::Inop;
 
-    // Conversion at synth: dst_xmm = convert(slot); the xmm dst is write-only, so handle both an existing canonical SSA reg and the fresh case.
     rtl_inst_candidate(synthetic_addr, op_inst) <--
-        cvtsi2_stack_op(addr, op, _base_mreg, disp, dst_mreg),
+        unary_stack_load_op(addr, operation, _, _, disp, dst),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
-        reg_rtl(addr, *dst_mreg, dst_rtl),
+        reg_rtl(addr, *dst, dst_rtl),
         let synthetic_addr = *addr | (1u64 << 62),
-        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl]), *dst_rtl);
+        let op_inst = RTLInst::Iop(operation.clone(), Arc::new(vec![*stack_rtl]), *dst_rtl);
 
     rtl_inst_candidate(synthetic_addr, op_inst) <--
-        cvtsi2_stack_op(addr, op, _base_mreg, disp, dst_mreg),
+        unary_stack_load_op(addr, operation, _, _, disp, dst),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
-        !reg_xtl(addr, *dst_mreg, _),
+        !reg_xtl(addr, *dst, _),
         let synthetic_addr = *addr | (1u64 << 62),
-        let dst_rtl = fresh_xtl_reg(*addr, *dst_mreg),
-        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl]), dst_rtl);
+        let dst_rtl = fresh_xtl_reg(*addr, *dst),
+        let op_inst = RTLInst::Iop(operation.clone(), Arc::new(vec![*stack_rtl]), dst_rtl);
+
+    // A red-zone/escaped SP cell may have no scalar stack_var even though the
+    // point-keyed frame analysis proves its exact normalized read. Preserve a
+    // real Ainstack load of precisely the decoded width; no raw SP value or
+    // displacement fallback is admissible.
+    #[local] relation unary_stack_exact_frame_read(Node, i64);
+    unary_stack_exact_frame_read(*addr, *offset) <--
+        unary_stack_load_op(addr, _, chunk, base, raw_disp, _),
+        !has_ltl_op(addr),
+        if *base == Mreg::SP,
+        instr_in_function(addr, func_start),
+        frame_stack_read_bytes(func_start, addr, offset, width),
+        if *width == crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk),
+        !stack_var(func_start, addr, raw_disp, _);
+
+    rtl_inst_candidate(*addr, load) <--
+        unary_stack_load_op(addr, _, chunk, _, _, _),
+        unary_stack_exact_frame_read(addr, offset),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let load = RTLInst::Iload(
+            *chunk,
+            Addressing::Ainstack(*offset),
+            Arc::new(vec![]),
+            temp,
+        );
+
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        unary_stack_load_op(addr, operation, _, _, _, dst),
+        unary_stack_exact_frame_read(addr, _),
+        reg_rtl(addr, *dst, dst_rtl),
+        let source = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(operation.clone(), Arc::new(vec![source]), *dst_rtl);
+
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        unary_stack_load_op(addr, operation, _, _, _, dst),
+        unary_stack_exact_frame_read(addr, _),
+        !reg_xtl(addr, *dst, _),
+        let source = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let dst_rtl = fresh_xtl_reg(*addr, *dst),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(operation.clone(), Arc::new(vec![source]), dst_rtl);
 
     rtl_edge_negated(addr, next) <--
-        cvtsi2_stack_op(addr, _, _, _, _),
+        unary_stack_load_op(addr, _, _, _, _, _),
         !has_ltl_op(addr),
         next(addr, next);
 
     rtl_succ_candidate(addr, synthetic_addr), instr_in_function(addr, func_start) <--
-        cvtsi2_stack_op(addr, _, _, _, _),
+        unary_stack_load_op(addr, _, _, _, _, _),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         let synthetic_addr = *addr | (1u64 << 62);
 
     rtl_succ_candidate(synthetic_addr, next), instr_in_function(synthetic_addr, func_start) <--
-        cvtsi2_stack_op(addr, _, _, _, _),
+        unary_stack_load_op(addr, _, _, _, _, _),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         let synthetic_addr = *addr | (1u64 << 62),
         next(addr, next);
 
-    synth_only_addr(addr) <-- cvtsi2_stack_op(addr, _, _, _, _), !has_ltl_op(addr);
+    synth_only_addr(addr) <-- unary_stack_load_op(addr, _, _, _, _, _), !has_ltl_op(addr);
 
     // float_arith_stack_op: the slot value is live in stack_rtl, so the binary op at the synthetic address consumes it as the second operand; the read+written dst threads its incoming value in via reg_xtl.
     reg_xtl(*addr, *dst_mreg, arg_id) <--
@@ -2585,33 +2773,33 @@ ascent_par! {
     #[local] relation frame_indexed_load_op_offset(Node, i64);
     frame_indexed_load_op_offset(addr, normalized) <--
         frame_indexed_load_op(addr),
-        float_load_op(addr, _, _, addressing, args, _, false),
+        float_load_op(addr, _, _, addressing, args, _, _),
         if args[0] == Mreg::SP,
         if let Addressing::Aindexed2scaled(_, raw) | Addressing::Aindexed2(raw) = addressing,
         sp_window_depth(addr, depth),
         if let Some(normalized) = raw.checked_sub(*depth);
     frame_indexed_load_op_offset(addr, *raw) <--
         frame_indexed_load_op(addr),
-        float_load_op(addr, _, _, addressing, args, _, false),
+        float_load_op(addr, _, _, addressing, args, _, _),
         if args[0] == Mreg::SP,
         if let Addressing::Aindexed2scaled(_, raw) | Addressing::Aindexed2(raw) = addressing,
         !sp_window_depth(addr, _);
     frame_indexed_load_op_offset(addr, *raw) <--
         frame_indexed_load_op(addr),
-        float_load_op(addr, _, _, addressing, args, _, false),
+        float_load_op(addr, _, _, addressing, args, _, _),
         if args[0] == Mreg::BP,
         if let Addressing::Aindexed2scaled(_, raw) | Addressing::Aindexed2(raw) = addressing;
 
     #[local] relation frame_indexed_load_op_index_rtl(Node, RTLReg);
     frame_indexed_load_op_index_rtl(addr, *idx_rtl) <--
         frame_indexed_load_op(addr),
-        float_load_op(addr, _, _, _, args, dst, false),
+        float_load_op(addr, _, _, _, args, dst, _),
         !has_ltl_op(addr),
         if args[1] != *dst,
         reg_rtl(addr, args[1], idx_rtl);
     frame_indexed_load_op_index_rtl(addr, idx_rtl) <--
         frame_indexed_load_op(addr),
-        float_load_op(addr, _, _, _, args, dst, false),
+        float_load_op(addr, _, _, _, args, dst, _),
         !has_ltl_op(addr),
         if args[1] == *dst,
         reg_def_used(def_addr, *dst, *addr),
@@ -2620,7 +2808,7 @@ ascent_par! {
     rtl_inst_candidate(addr, base_inst), op_produces_ptr(addr, base_rtl),
     indexed_synth_stack_base(func, *addr, *frame_ofs, base_rtl) <--
         frame_indexed_load_op(addr),
-        float_load_op(addr, _, _, _, args, _, false),
+        float_load_op(addr, _, _, _, args, _, _),
         !has_ltl_op(addr),
         instr_in_function(addr, func),
         frame_indexed_load_op_offset(addr, frame_ofs),
@@ -2633,7 +2821,7 @@ ascent_par! {
 
     rtl_inst_candidate(load_node, load_inst), op_produces_int(load_node, temp) <--
         frame_indexed_load_op(addr),
-        float_load_op(addr, _, chunk, ?Addressing::Aindexed2scaled(scale, _), args, _, false),
+        float_load_op(addr, _, chunk, ?Addressing::Aindexed2scaled(scale, _), args, _, _),
         !has_ltl_op(addr),
         frame_indexed_load_op_index_rtl(addr, idx_rtl),
         let base_rtl = fresh_xtl_reg(*addr, args[0]) | FRESH_NS_SP_BASE,
@@ -2648,7 +2836,7 @@ ascent_par! {
 
     rtl_inst_candidate(load_node, load_inst), op_produces_int(load_node, temp) <--
         frame_indexed_load_op(addr),
-        float_load_op(addr, _, chunk, ?Addressing::Aindexed2(_), args, _, false),
+        float_load_op(addr, _, chunk, ?Addressing::Aindexed2(_), args, _, _),
         !has_ltl_op(addr),
         frame_indexed_load_op_index_rtl(addr, idx_rtl),
         let base_rtl = fresh_xtl_reg(*addr, args[0]) | FRESH_NS_SP_BASE,
@@ -2673,6 +2861,27 @@ ascent_par! {
             Arc::new(vec![*dst_rtl, temp]),
             *dst_rtl,
         );
+
+    // Unary IMUL3: dst = loaded * immediate. The destination is write-only;
+    // unlike the RMW form it contributes no argument.
+    rtl_inst_candidate(op_node, op_inst), op_produces_int(op_node, *dst_rtl) <--
+        frame_indexed_load_op(addr),
+        float_load_op(addr, op, _, _, _, dst, true),
+        !has_ltl_op(addr),
+        reg_rtl(addr, *dst, dst_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let op_node = *addr | (1u64 << 63),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![temp]), *dst_rtl);
+
+    rtl_inst_candidate(op_node, op_inst), op_produces_int(op_node, dst_rtl) <--
+        frame_indexed_load_op(addr),
+        float_load_op(addr, op, _, _, _, dst, true),
+        !has_ltl_op(addr),
+        !reg_xtl(addr, *dst, _),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let dst_rtl = fresh_xtl_reg(*addr, *dst),
+        let op_node = *addr | (1u64 << 63),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![temp]), dst_rtl);
 
     rtl_edge_negated(addr, dst) <--
         frame_indexed_load_op(addr),
@@ -3523,6 +3732,13 @@ ascent_par! {
         for src in mregs.iter(),
         if src == dst_reg;
 
+    // Two-operand indexed IMUL reads the old destination before its raw x86
+    // definition is produced at the synthetic arithmetic node. Reuse the
+    // established shadow-use namespace so predecessor input and fresh output
+    // can never alias merely because they occupy one machine address.
+    lop_overwrites_input(*addr, *dst_reg) <--
+        arith_indexed_load_op(addr, _, _, _, _, dst_reg);
+
     // One-operand DIV/IDIV reads the old AX dividend and writes a new AX
     // quotient at the same address.  Keep those SSA roles distinct just like
     // other two-address operations with an extended result lifetime.
@@ -4347,10 +4563,51 @@ ascent_par! {
         if let Some(test_cond) = setcc_mnem_testcond(mnem),
         if matches!(test_cond, TestCond::CondE | TestCond::CondNe);
 
+    // TEST reg,[mem] needs a value-bearing predicate rather than Cmask*: the
+    // mask is dynamic, and later SETcc destinations can overwrite the base,
+    // index, or mask register itself.  Capture all operands at TEST and carry
+    // the decoded width (plus AH/BH/CH/DH lane shift) to exact C lowering.
+    #[local] relation test_mem_register_setcc_link(
+        Address,
+        Address,
+        TestResultCondition,
+        usize,
+        Mreg,
+        usize,
+    );
+    test_mem_register_setcc_link(
+        *test_addr,
+        *setcc_addr,
+        *predicate,
+        *width,
+        mask_mreg,
+        mask_shift,
+    ) <--
+        setcc_compare_site(setcc_addr, test_addr),
+        test_result_setcc(setcc_addr, predicate, _),
+        ptest(test_addr, mem_sym, mask_sym),
+        op_indirect(mem_sym, _, _, _, _, _, width),
+        if matches!(*width, 1 | 2 | 4 | 8),
+        op_register(mask_sym, mask_name),
+        if x86_gpr_view_width(mask_name) == Some(*width as i64),
+        let mask_mreg = Mreg::x86(*mask_name),
+        let mask_shift = if is_reg_high8(mask_name) { 8usize } else { 0usize };
+
     #[local] relation test_mem_consumer_link(Address, Address);
     test_mem_consumer_link(addr, consumer) <-- test_mem_jcc_link(addr, consumer);
     test_mem_consumer_link(addr, consumer) <-- test_mem_cmov_link(addr, consumer);
     test_mem_consumer_link(addr, consumer) <-- test_mem_setcc_link(addr, consumer, _);
+    test_mem_consumer_link(addr, consumer) <--
+        test_mem_register_setcc_link(addr, consumer, _, _, _, _);
+
+    #[local] relation temp_test_mem_mask(Address, Mreg, usize);
+    temp_test_mem_mask(addr, *mask, *shift) <--
+        test_mem_register_setcc_link(addr, _, _, _, mask, shift);
+
+    #[local] relation temp_test_mem_mask_rtl(Address, RTLReg, usize);
+    temp_test_mem_mask_rtl(addr, *mask_rtl, *shift) <--
+        temp_test_mem_mask(addr, mask, shift),
+        reg_rtl(addr, mask, mask_rtl);
 
     temp_test_mem_reg(addr, fresh_reg) <--
         test_mem_consumer_link(addr, _),
@@ -4394,6 +4651,7 @@ ascent_par! {
 
     ltl_inst_uses_mreg(addr, mreg) <--
         temp_test_mem_mreg_args(addr, _, mreg);
+    ltl_inst_uses_mreg(addr, mreg) <-- temp_test_mem_mask(addr, mreg, _);
 
     // TEST itself is selected away before LTL, so carry the structurally
     // reaching address-register definition to the synthetic load explicitly.
@@ -4405,6 +4663,22 @@ ascent_par! {
 
     reg_xtl(test_addr, mreg, arg_id) <--
         temp_test_mem_mreg_args(test_addr, _, mreg),
+        reg_def_used(defaddr, mreg, test_addr),
+        load_overwrites_base(defaddr, mreg),
+        is_def(defaddr, arg_id),
+        reg_xtl(defaddr, mreg, arg_id);
+
+    // The dynamic mask is also a TEST-origin use selected away before LTL.
+    // Mirror the address-register handoff so locally defined masks and live-in
+    // argument masks both obtain the origin-time SSA identity.
+    reg_xtl(test_addr, mreg, arg_id) <--
+        temp_test_mem_mask(test_addr, mreg, _),
+        reg_def_used(defaddr, mreg, test_addr),
+        !load_overwrites_base(defaddr, mreg),
+        reg_xtl(defaddr, mreg, arg_id);
+
+    reg_xtl(test_addr, mreg, arg_id) <--
+        temp_test_mem_mask(test_addr, mreg, _),
         reg_def_used(defaddr, mreg, test_addr),
         load_overwrites_base(defaddr, mreg),
         is_def(defaddr, arg_id),
@@ -4481,6 +4755,28 @@ ascent_par! {
             TestCond::CondNe => Condition::Cmasknotzero(*mask),
             _ => unreachable!("test_mem_setcc_link only admits SETE/SETNE"),
         };
+
+    rtl_inst_candidate(
+        *setcc_addr,
+        RTLInst::Iop(
+            Operation::Otestflags(*predicate, *width, *mask_shift),
+            Arc::new(vec![*loaded, *mask_rtl]),
+            *dst_rtl,
+        )
+    ) <--
+        test_mem_register_setcc_link(
+            test_addr,
+            setcc_addr,
+            predicate,
+            width,
+            _,
+            mask_shift,
+        ),
+        temp_test_mem_reg(test_addr, loaded),
+        temp_test_mem_mask_rtl(test_addr, mask_rtl, mask_shift),
+        test_result_setcc(setcc_addr, predicate, dst_sym),
+        op_register(dst_sym, dst_name),
+        reg_rtl(setcc_addr, Mreg::x86(*dst_name), dst_rtl);
 
     // A plain BP-relative compare is a stack access only when the function
     // structurally establishes RBP as its frame pointer.  Optimized frameless
@@ -6309,6 +6605,28 @@ ascent_par! {
     // Lbranch addresses reg_def butno ltl op
     reg_def_site(*addr, *mreg) <--
         arith_load_op(addr, _, _, _, _, _),
+        !has_ltl_op(addr),
+        reg_def(addr, mreg),
+        if *mreg != Mreg::SP,
+        !trim_instruction(addr);
+
+    // Indexed memory-source arithmetic moves the architectural register write
+    // to a synthetic operation, but the raw x86 site remains the definition
+    // authority for reaching-def/alias analysis. This bridge depends only on
+    // ASM/decoder facts; materialization and canonical values are downstream.
+    reg_def_site(*addr, *mreg) <--
+        arith_indexed_load_op(addr, _, _, _, _, mreg),
+        !has_ltl_op(addr),
+        reg_def(addr, mreg),
+        if *mreg != Mreg::SP,
+        !trim_instruction(addr);
+
+    // A scalar SP/BP unary load is represented by an Inop/Iload at the raw
+    // address and its write-only operation at a synthetic successor.  The raw
+    // x86 definition still denotes that final operation result, exactly like
+    // the established arith_load_op/float_load_op bridges below.
+    reg_def_site(*addr, *mreg) <--
+        unary_stack_load_op(addr, _, _, _, _, _),
         !has_ltl_op(addr),
         reg_def(addr, mreg),
         if *mreg != Mreg::SP,
@@ -15671,7 +15989,7 @@ mod tests {
     use crate::decompile::elevator::DecompileDB;
     use crate::mreg::Mreg;
     use crate::x86::asm::TestCond;
-    use crate::x86::op::{Addressing, Comparison, Condition, Operation};
+    use crate::x86::op::{Addressing, Comparison, Condition, Operation, TestResultCondition};
     use crate::x86::types::{
         Address, BuiltinArg, LTLInst, MemoryChunk, Node, RTLInst, RTLReg, Slot, Typ, XType,
     };
@@ -17202,6 +17520,109 @@ mod tests {
                         Arc::new(vec![loaded]),
                         zero_value,
                     ),
+                )
+            }));
+        });
+    }
+
+    #[test]
+    fn register_masked_scaled_memory_test_uses_origin_values_for_all_setcc_results() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x400;
+            let test = 0x900;
+            let base_value = 0x1234;
+            let index_value = 0x2345;
+            let mask_value = 0x3456;
+            let loaded = fresh_xtl_reg(test, Mreg::x86("RTEMP"));
+            let stale_mask = 0x4567;
+            let consumers = [
+                (0x910, "set_zero", "AL", Mreg::AX, TestResultCondition::Zero),
+                (
+                    0x920,
+                    "set_nonzero",
+                    "CL",
+                    Mreg::CX,
+                    TestResultCondition::NonZero,
+                ),
+                (0x930, "set_sign", "DL", Mreg::DX, TestResultCondition::Sign),
+                (
+                    0x940,
+                    "set_nonsign",
+                    "SIL",
+                    Mreg::SI,
+                    TestResultCondition::NonSign,
+                ),
+                (
+                    0x950,
+                    "set_parity",
+                    "DIL",
+                    Mreg::DI,
+                    TestResultCondition::EvenParity,
+                ),
+                (
+                    0x960,
+                    "set_nonparity",
+                    "R8B",
+                    Mreg::R8,
+                    TestResultCondition::OddParity,
+                ),
+            ];
+
+            prog.ptest.push((test, "tested_word", "mask_operand"));
+            prog.op_indirect
+                .push(("tested_word", "", "RAX", "RDI", 4, 0, 4));
+            prog.op_register.push(("mask_operand", "ESI"));
+            prog.reg_xtl.extend([
+                (test, Mreg::AX, base_value),
+                (test, Mreg::DI, index_value),
+                (test, Mreg::SI, mask_value),
+            ]);
+            prog.instr_in_function.push((test, func));
+
+            for (setcc, destination, register_name, mreg, predicate) in consumers {
+                let result = fresh_xtl_reg(setcc, mreg);
+                prog.setcc_compare_site.push((setcc, test));
+                prog.test_result_setcc.push((setcc, predicate, destination));
+                prog.op_register.push((destination, register_name));
+                prog.reg_xtl.push((setcc, mreg, result));
+                prog.instr_in_function.push((setcc, func));
+            }
+            // These are the values visible after SETNS has overwritten SIL.
+            // No later predicate may consume them instead of TEST's mask.
+            prog.reg_xtl.push((0x950, Mreg::SI, stale_mask));
+
+            prog.run();
+
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    test,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt32,
+                        Addressing::Aindexed2scaled(4, 0),
+                        Arc::new(vec![base_value, index_value]),
+                        loaded,
+                    ),
+                )
+            }));
+            for (setcc, _, _, mreg, predicate) in consumers {
+                let result = fresh_xtl_reg(setcc, mreg);
+                assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                    fact == &(
+                        setcc,
+                        RTLInst::Iop(
+                            Operation::Otestflags(predicate, 4, 0),
+                            Arc::new(vec![loaded, mask_value]),
+                            result,
+                        ),
+                    )
+                }));
+            }
+            assert!(!prog.rtl_inst_candidate.iter().any(|(_, inst)| {
+                matches!(
+                    inst,
+                    RTLInst::Iop(Operation::Otestflags(_, _, _), args, _)
+                        if args.contains(&stale_mask)
                 )
             }));
         });
@@ -22612,6 +23033,513 @@ mod tests {
             assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
                 *node == read && matches!(inst, RTLInst::Iload(_, Addressing::Aindexed(24), _, _))
             }));
+        });
+    }
+
+    #[test]
+    fn indexed_imul_materializes_exact_load_before_arithmetic() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let (func, access, next) = (0x1100, 0x1176, 0x1181);
+            let previous = 0x1170;
+            let continuation = 0x1180;
+            let (base, index, input) = (0x1111, 0x2222, 0x3333);
+            let output = fresh_xtl_reg(access, Mreg::DX);
+            let continued = fresh_xtl_reg(continuation, Mreg::DX);
+            prog.arith_indexed_load_op.push((
+                access,
+                Operation::Omul,
+                MemoryChunk::MInt32,
+                Addressing::Aindexed2scaled(4, -8),
+                Arc::new(vec![Mreg::R11, Mreg::R10]),
+                Mreg::DX,
+            ));
+            prog.reg_rtl
+                .extend([(access, Mreg::R11, base), (access, Mreg::R10, index)]);
+            prog.is_def.push((previous, input));
+            prog.reg_xtl.push((previous, Mreg::DX, input));
+            prog.reg_def_used.push((previous, Mreg::DX, access));
+            prog.reg_def.push((access, Mreg::DX));
+            prog.reg_def_used.push((access, Mreg::DX, continuation));
+            prog.reg_xtl.push((continuation, Mreg::DX, continued));
+            prog.next.push((access, next));
+            prog.ltl_inst
+                .push((access, LTLInst::Lbranch(Either::Right(next))));
+            prog.ltl_inst.push((next, LTLInst::Lreturn));
+            prog.instr_in_function.extend([
+                (previous, func),
+                (access, func),
+                (continuation, func),
+                (next, func),
+            ]);
+
+            prog.run();
+
+            let temp = fresh_xtl_reg(access, Mreg::x86("RTEMP"));
+            let operation = access | (1u64 << 62);
+            let shadow = fresh_xtl_reg(access, Mreg::DX) | (1u64 << 62);
+            assert_ne!(input, output);
+            assert!(!prog
+                .alias_edge
+                .iter()
+                .any(|fact| fact == &(input, output) || fact == &(output, input)));
+            assert!(prog
+                .xtl_canonical
+                .iter()
+                .any(|fact| fact == &(shadow, input)));
+            assert!(prog.is_def.iter().any(|fact| fact == &(access, output)));
+            assert!(!prog.is_def.iter().any(|fact| fact == &(access, temp)));
+            assert!(prog
+                .def_value_rtl
+                .iter()
+                .any(|fact| fact == &(access, Mreg::DX, output)));
+            assert!(prog
+                .xtl_canonical
+                .iter()
+                .any(|fact| fact == &(continued, output)));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    access,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt32,
+                        Addressing::Aindexed2scaled(4, -8),
+                        Arc::new(vec![base, index]),
+                        temp,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    operation,
+                    RTLInst::Iop(Operation::Omul, Arc::new(vec![input, temp]), output),
+                )
+            }));
+            assert!(prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(access, operation)));
+            assert!(prog
+                .rtl_succ_candidate
+                .iter()
+                .any(|fact| fact == &(operation, next)));
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == access
+                    && matches!(
+                        inst,
+                        RTLInst::Iop(Operation::Omul, args, _)
+                            if args.as_slice() == [input, base]
+                    )
+            }));
+
+            let mut ambiguous = RTLPassProgram::default();
+            ambiguous.arith_indexed_load_op.push((
+                access,
+                Operation::Omul,
+                MemoryChunk::MInt32,
+                Addressing::Aindexed2scaled(4, -8),
+                Arc::new(vec![Mreg::R11, Mreg::R10]),
+                Mreg::DX,
+            ));
+            ambiguous.reg_rtl.extend([
+                (access, Mreg::R11, base),
+                (access, Mreg::R10, index),
+                (access, Mreg::R10, index + 1),
+            ]);
+            ambiguous.is_def.push((previous, input));
+            ambiguous.reg_xtl.push((previous, Mreg::DX, input));
+            ambiguous.reg_def_used.push((previous, Mreg::DX, access));
+            ambiguous.reg_def.push((access, Mreg::DX));
+            ambiguous.next.push((access, next));
+            ambiguous
+                .ltl_inst
+                .push((access, LTLInst::Lbranch(Either::Right(next))));
+            ambiguous.ltl_inst.push((next, LTLInst::Lreturn));
+            ambiguous
+                .instr_in_function
+                .extend([(access, func), (next, func)]);
+            ambiguous.run();
+            assert!(ambiguous.arith_indexed_load_materialized.is_empty());
+            assert!(!ambiguous.rtl_inst_candidate.iter().any(|(node, inst)| {
+                (*node == access || *node == operation)
+                    && matches!(inst, RTLInst::Iload(..) | RTLInst::Iop(Operation::Omul, ..))
+            }));
+
+            let mut unknown = RTLPassProgram::default();
+            unknown.arith_indexed_load_op.push((
+                access,
+                Operation::Omul,
+                MemoryChunk::MInt32,
+                Addressing::Aindexed2scaled(4, -8),
+                Arc::new(vec![Mreg::R11, Mreg::R10]),
+                Mreg::DX,
+            ));
+            unknown
+                .arith_indexed_load_arg_exact
+                .extend([(access, 0, base), (access, 1, index)]);
+            unknown
+                .arith_indexed_load_dst_input_exact
+                .push((access, input));
+            unknown
+                .arith_indexed_load_dst_output_exact
+                .push((access, output));
+            unknown.instr_in_function.push((access, func));
+            unknown
+                .unknown_reg_value_reaches_use
+                .push((func, access, Mreg::R11));
+            unknown.run();
+            assert!(unknown.arith_indexed_load_materialized.is_empty());
+        });
+    }
+
+    #[test]
+    fn indexed_imul_entry_parameter_flows_to_distinct_raw_output_and_continuation() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let (func, access, continuation, next) = (0x2100, 0x2110, 0x2118, 0x2120);
+            let (base, index) = (0x5101, 0x5102);
+            let parameter = fresh_xtl_reg(func, Mreg::AX);
+            let output = fresh_xtl_reg(access, Mreg::AX);
+            let continued = fresh_xtl_reg(continuation, Mreg::AX);
+            prog.arith_indexed_load_op.push((
+                access,
+                Operation::Omul,
+                MemoryChunk::MInt32,
+                Addressing::Aindexed2scaled(4, -8),
+                Arc::new(vec![Mreg::R11, Mreg::R10]),
+                Mreg::AX,
+            ));
+            prog.reg_rtl
+                .extend([(access, Mreg::R11, base), (access, Mreg::R10, index)]);
+
+            // Established entry-parameter pseudo-definition and its exact
+            // reaching edge to the two-address IMUL input.
+            prog.reg_xtl.push((func, Mreg::AX, parameter));
+            prog.reg_def_used.push((func, Mreg::AX, access));
+
+            // Decoder-owned raw definition and one later machine use.
+            prog.reg_def.push((access, Mreg::AX));
+            prog.reg_def_used.push((access, Mreg::AX, continuation));
+            prog.reg_xtl.push((continuation, Mreg::AX, continued));
+            prog.next.push((access, next));
+            prog.ltl_inst
+                .push((access, LTLInst::Lbranch(Either::Right(next))));
+            prog.ltl_inst.push((next, LTLInst::Lreturn));
+            prog.instr_in_function.extend([
+                (func, func),
+                (access, func),
+                (continuation, func),
+                (next, func),
+            ]);
+
+            prog.run();
+
+            let temp = fresh_xtl_reg(access, Mreg::x86("RTEMP"));
+            let operation = access | (1u64 << 62);
+            assert_ne!(parameter, output);
+            assert!(!prog
+                .alias_edge
+                .iter()
+                .any(|fact| { fact == &(parameter, output) || fact == &(output, parameter) }));
+            assert!(prog
+                .def_value_rtl
+                .iter()
+                .any(|fact| fact == &(func, Mreg::AX, parameter)));
+            assert!(prog
+                .arith_indexed_load_dst_input_exact
+                .iter()
+                .any(|fact| fact == &(access, parameter)));
+            assert!(prog
+                .arith_indexed_load_dst_output_exact
+                .iter()
+                .any(|fact| fact == &(access, output)));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    operation,
+                    RTLInst::Iop(Operation::Omul, Arc::new(vec![parameter, temp]), output),
+                )
+            }));
+            assert!(prog
+                .def_value_rtl
+                .iter()
+                .any(|fact| fact == &(access, Mreg::AX, output)));
+            assert!(prog
+                .xtl_canonical
+                .iter()
+                .any(|fact| fact == &(continued, output)));
+            assert!(!prog.is_def.iter().any(|fact| fact == &(access, temp)));
+
+            // A parameter pseudo-definition and raw output share the same
+            // deterministic id when IMUL is the first instruction. Refuse
+            // that namespace collision rather than coalescing old and new.
+            let mut first = RTLPassProgram::default();
+            first.arith_indexed_load_op.push((
+                func,
+                Operation::Omul,
+                MemoryChunk::MInt32,
+                Addressing::Aindexed2scaled(4, -8),
+                Arc::new(vec![Mreg::R11, Mreg::R10]),
+                Mreg::AX,
+            ));
+            first
+                .reg_rtl
+                .extend([(func, Mreg::R11, base), (func, Mreg::R10, index)]);
+            first.reg_xtl.push((func, Mreg::AX, parameter));
+            first.reg_def_used.push((func, Mreg::AX, func));
+            first.reg_def.push((func, Mreg::AX));
+            first
+                .ltl_inst
+                .push((func, LTLInst::Lbranch(Either::Right(next))));
+            first.instr_in_function.extend([(func, func), (next, func)]);
+            first.run();
+            assert!(first.arith_indexed_load_dst_input_candidate.is_empty());
+            assert!(first.arith_indexed_load_materialized.is_empty());
+        });
+    }
+
+    #[test]
+    fn imul3_indexed_memory_is_one_load_then_one_write_only_immediate_multiply() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let (func, access, next) = (0x1200, 0x1210, 0x1220);
+            let (base, index, destination) = (0x3101, 0x3102, 0x3103);
+            prog.float_load_op.push((
+                access,
+                Operation::Omullimm(24),
+                MemoryChunk::MInt64,
+                Addressing::Aindexed2scaled(8, -8),
+                Arc::new(vec![Mreg::R14, Mreg::R15]),
+                Mreg::AX,
+                true,
+            ));
+            prog.reg_rtl.extend([
+                (access, Mreg::R14, base),
+                (access, Mreg::R15, index),
+                (access, Mreg::AX, destination),
+            ]);
+            prog.next.push((access, next));
+            prog.ltl_inst
+                .push((access, LTLInst::Lbranch(Either::Right(next))));
+            prog.ltl_inst.push((next, LTLInst::Lreturn));
+            prog.instr_in_function
+                .extend([(access, func), (next, func)]);
+
+            prog.run();
+
+            let temp = fresh_xtl_reg(access, Mreg::x86("RTEMP"));
+            let operation = access | (1u64 << 62);
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    access,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt64,
+                        Addressing::Aindexed2scaled(8, -8),
+                        Arc::new(vec![base, index]),
+                        temp,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    operation,
+                    RTLInst::Iop(Operation::Omullimm(24), Arc::new(vec![temp]), destination),
+                )
+            }));
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == operation
+                    && matches!(
+                        inst,
+                        RTLInst::Iop(Operation::Omullimm(24), args, _)
+                            if args.as_slice().contains(&destination)
+                    )
+            }));
+        });
+    }
+
+    #[test]
+    fn imul3_scalar_stack_cell_uses_canonical_value_or_exact_frame_read() {
+        on_large_stack(|| {
+            let (func, local, escaped, next) = (0x1300, 0x1310, 0x1320, 0x1330);
+            let local_value = 0x4101;
+            let local_dst = fresh_xtl_reg(local, Mreg::AX);
+            let escaped_dst = fresh_xtl_reg(escaped, Mreg::DX);
+            let local_continuation = fresh_xtl_reg(next, Mreg::AX);
+            let escaped_use = 0x1328;
+            let escaped_continuation = fresh_xtl_reg(escaped_use, Mreg::DX);
+            let mut prog = RTLPassProgram::default();
+            prog.unary_stack_load_op.push((
+                local,
+                Operation::Omulimm(7),
+                MemoryChunk::MInt32,
+                Mreg::SP,
+                -4,
+                Mreg::AX,
+            ));
+            prog.stack_var.push((func, local, -4, local_value));
+            prog.reg_def.push((local, Mreg::AX));
+            prog.reg_def_used.push((local, Mreg::AX, next));
+            prog.reg_xtl.push((next, Mreg::AX, local_continuation));
+
+            prog.unary_stack_load_op.push((
+                escaped,
+                Operation::Omulimm(9),
+                MemoryChunk::MInt32,
+                Mreg::SP,
+                24,
+                Mreg::DX,
+            ));
+            prog.frame_stack_read_bytes.push((func, escaped, 8, 4));
+            prog.reg_def.push((escaped, Mreg::DX));
+            prog.reg_def_used.push((escaped, Mreg::DX, escaped_use));
+            prog.reg_xtl
+                .push((escaped_use, Mreg::DX, escaped_continuation));
+
+            prog.next.extend([(local, escaped), (escaped, next)]);
+            prog.ltl_inst
+                .push((local, LTLInst::Lbranch(Either::Right(escaped))));
+            prog.ltl_inst
+                .push((escaped, LTLInst::Lbranch(Either::Right(next))));
+            prog.ltl_inst.push((next, LTLInst::Lreturn));
+            prog.instr_in_function.extend([
+                (local, func),
+                (escaped, func),
+                (escaped_use, func),
+                (next, func),
+            ]);
+
+            prog.run();
+
+            let local_op = local | (1u64 << 62);
+            assert!(prog.is_def.iter().any(|fact| fact == &(local, local_dst)));
+            assert!(prog
+                .def_value_rtl
+                .iter()
+                .any(|fact| fact == &(local, Mreg::AX, local_dst)));
+            assert!(prog
+                .xtl_canonical
+                .iter()
+                .any(|fact| fact == &(local_continuation, local_dst)));
+            assert!(prog
+                .rtl_inst_candidate
+                .iter()
+                .any(|fact| fact == &(local, RTLInst::Inop)));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    local_op,
+                    RTLInst::Iop(
+                        Operation::Omulimm(7),
+                        Arc::new(vec![local_value]),
+                        local_dst,
+                    ),
+                )
+            }));
+
+            let escaped_temp = fresh_xtl_reg(escaped, Mreg::x86("RTEMP"));
+            let escaped_op = escaped | (1u64 << 62);
+            assert!(prog
+                .is_def
+                .iter()
+                .any(|fact| fact == &(escaped, escaped_dst)));
+            assert!(!prog
+                .is_def
+                .iter()
+                .any(|fact| fact == &(escaped, escaped_temp)));
+            assert!(prog
+                .def_value_rtl
+                .iter()
+                .any(|fact| fact == &(escaped, Mreg::DX, escaped_dst)));
+            assert!(prog
+                .xtl_canonical
+                .iter()
+                .any(|fact| fact == &(escaped_continuation, escaped_dst)));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    escaped,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt32,
+                        Addressing::Ainstack(8),
+                        Arc::new(vec![]),
+                        escaped_temp,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    escaped_op,
+                    RTLInst::Iop(
+                        Operation::Omulimm(9),
+                        Arc::new(vec![escaped_temp]),
+                        escaped_dst,
+                    ),
+                )
+            }));
+        });
+    }
+
+    #[test]
+    fn imul3_sp_indexed_memory_uses_frame_base_load_and_unary_operation() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let (func, access, next) = (0x1400, 0x1410, 0x1420);
+            let (index, destination) = (0x5101, 0x5102);
+            prog.float_load_op.push((
+                access,
+                Operation::Omulimm(5),
+                MemoryChunk::MInt32,
+                Addressing::Aindexed2scaled(4, -32),
+                Arc::new(vec![Mreg::SP, Mreg::DI]),
+                Mreg::AX,
+                true,
+            ));
+            prog.reg_rtl
+                .extend([(access, Mreg::DI, index), (access, Mreg::AX, destination)]);
+            prog.next.push((access, next));
+            prog.code_in_block.extend([(access, func), (next, func)]);
+            prog.ltl_inst
+                .push((access, LTLInst::Lbranch(Either::Right(next))));
+            prog.ltl_inst.push((next, LTLInst::Lreturn));
+            prog.instr_in_function
+                .extend([(access, func), (next, func)]);
+
+            prog.run();
+
+            let base = fresh_xtl_reg(access, Mreg::SP) | FRESH_NS_SP_BASE;
+            let temp = fresh_xtl_reg(access, Mreg::x86("RTEMP"));
+            let load = access | (1u64 << 62);
+            let operation = access | (1u64 << 63);
+            assert!(prog
+                .frame_indexed_load_op
+                .iter()
+                .any(|row| row == &(access,)));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    access,
+                    RTLInst::Iop(
+                        Operation::Olea(Addressing::Ainstack(-32)),
+                        Arc::new(vec![]),
+                        base,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    load,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt32,
+                        Addressing::Aindexed2scaled(4, 0),
+                        Arc::new(vec![base, index]),
+                        temp,
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    operation,
+                    RTLInst::Iop(Operation::Omulimm(5), Arc::new(vec![temp]), destination),
+                )
+            }));
+            for edge in [(access, load), (load, operation), (operation, next)] {
+                assert!(prog.rtl_succ_candidate.iter().any(|fact| fact == &edge));
+            }
         });
     }
 

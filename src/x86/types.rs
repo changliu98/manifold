@@ -1007,7 +1007,7 @@ pub fn is_single_operation(op: &Operation) -> bool {
 }
 
 pub fn is_boolean_operation(op: &Operation) -> bool {
-    matches!(op, Operation::Ocmp(_))
+    matches!(op, Operation::Ocmp(_) | Operation::Otestflags(_, _, _))
 }
 
 pub fn is_pointer_operation(op: &Operation) -> bool {
