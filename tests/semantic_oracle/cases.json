@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "suite": "manifold-focused-semantic-v1",
+  "cases": [
+    {
+      "name": "overflow_flags",
+      "source": "cases/overflow_flags.c",
+      "description": "Signed-overflow and no-overflow control flow through x86 JO and JNO.",
+      "cflags": ["-O2"],
+      "binary_checks": [
+        {"description": "overflow branch", "regex": "\\bjo\\s"},
+        {"description": "no-overflow branch", "regex": "\\bjno\\s"}
+      ],
+      "runs": [
+        {"name": "safe_positive", "args": [], "expected": {"returncode": 62, "stdout": "", "stderr": ""}},
+        {"name": "positive_overflow", "args": ["x"], "expected": {"returncode": 108, "stdout": "", "stderr": ""}},
+        {"name": "negative_overflow", "args": ["x", "x"], "expected": {"returncode": 108, "stdout": "", "stderr": ""}},
+        {"name": "safe_negative", "args": ["x", "x", "x"], "expected": {"returncode": 62, "stdout": "", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "stack_alias",
+      "source": "cases/stack_alias.c",
+      "description": "Stack addresses passed to a callee with aliased and non-aliased writes.",
+      "cflags": ["-O2"],
+      "runs": [
+        {"name": "left_slot", "args": [], "expected": {"returncode": 247, "stdout": "", "stderr": ""}},
+        {"name": "same_slot", "args": ["x"], "expected": {"returncode": 219, "stdout": "", "stderr": ""}},
+        {"name": "right_slot", "args": ["x", "x"], "expected": {"returncode": 111, "stdout": "", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "global_simd_lane",
+      "source": "cases/global_simd_lane.c",
+      "description": "Vector lane selection combined with byte-granular global offsets.",
+      "cflags": ["-O2"],
+      "binary_checks": [
+        {"description": "SIMD register use", "regex": "\\bxmm[0-9]+\\b"}
+      ],
+      "runs": [
+        {"name": "lane_0", "args": [], "expected": {"returncode": 254, "stdout": "", "stderr": ""}},
+        {"name": "lane_1", "args": ["x"], "expected": {"returncode": 58, "stdout": "", "stderr": ""}},
+        {"name": "lane_2", "args": ["x", "x"], "expected": {"returncode": 101, "stdout": "", "stderr": ""}},
+        {"name": "lane_3", "args": ["x", "x", "x"], "expected": {"returncode": 147, "stdout": "", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "outparam_width",
+      "source": "cases/outparam_width.c",
+      "description": "One-, two-, and eight-byte out-parameter stores surrounded by live bytes.",
+      "cflags": ["-O2"],
+      "runs": [
+        {"name": "salt_1", "args": [], "expected": {"returncode": 130, "stdout": "", "stderr": ""}},
+        {"name": "salt_2", "args": ["x"], "expected": {"returncode": 173, "stdout": "", "stderr": ""}},
+        {"name": "salt_3", "args": ["x", "x"], "expected": {"returncode": 88, "stdout": "", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "global_interior_pointer",
+      "source": "cases/global_interior_pointer.c",
+      "description": "Copied initialized aggregate with a relocated pointer at base plus eight.",
+      "cflags": ["-O2"],
+      "runs": [
+        {"name": "value_1", "args": [], "expected": {"returncode": 78, "stdout": "", "stderr": ""}},
+        {"name": "value_2", "args": ["x"], "expected": {"returncode": 75, "stdout": "", "stderr": ""}},
+        {"name": "value_3", "args": ["x", "x"], "expected": {"returncode": 72, "stdout": "", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "one_past_identity",
+      "source": "cases/one_past_identity.c",
+      "description": "Identity of an array one-past pointer and the adjacent member start.",
+      "cflags": ["-O2"],
+      "runs": [
+        {"name": "one_past", "args": [], "expected": {"returncode": 137, "stdout": "", "stderr": ""}},
+        {"name": "last_element", "args": ["x"], "expected": {"returncode": 36, "stdout": "", "stderr": ""}}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,268 @@
+{
+  "schema_version": 1,
+  "suite": "manifold-semantic-frontier-v1",
+  "cases": [
+    {
+      "name": "mixed_sysv_variadic",
+      "source": "cases/mixed_sysv_variadic.c",
+      "description": "Mixed GP/XMM SysV varargs crossing both register limits, copied with va_copy and consumed through an indirect call.",
+      "cflags": ["-O2"],
+      "binary_checks": [
+        {
+          "description": "highest variadic XMM argument register is live",
+          "regex": "\\bxmm7\\b"
+        },
+        {
+          "description": "last GP argument register is saved by the variadic callee",
+          "regex": "\\bmov\\s+%r9,"
+        },
+        {
+          "description": "overflow floating argument is written to the caller stack",
+          "regex": "\\bmovsd\\s+%xmm[0-9]+,(?:0x[0-9a-f]+)?\\(%rsp\\)"
+        },
+        {
+          "description": "overflow integer argument is pushed or written to the caller stack",
+          "regex": "(?:\\bpush\\s+%r(?:ax|bx|cx|dx|si|di|8|9|10|11)\\b|\\bmov\\s+%r[a-z0-9]+,(?:0x[0-9a-f]+)?\\(%rsp\\))"
+        },
+        {
+          "description": "variadic callee tests the SysV vector-register count",
+          "regex": "\\btest\\s+%al,%al"
+        },
+        {
+          "description": "va_copy states are each passed to the opaque indirect consumer",
+          "regex": "\\bcall\\s+\\*[^\\n]*\\n(?:[^\\n]*\\n){0,8}[^\\n]*\\bcall\\s+\\*"
+        }
+      ],
+      "runs": [
+        {
+          "name": "argc_1",
+          "args": [],
+          "expected": {"returncode": 102, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "argc_2",
+          "args": ["x"],
+          "expected": {"returncode": 215, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "argc_3",
+          "args": ["x", "x"],
+          "expected": {"returncode": 72, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "argc_4",
+          "args": ["x", "x", "x"],
+          "expected": {"returncode": 185, "stdout": "", "stderr": ""}
+        }
+      ]
+    },
+    {
+      "name": "external_tail_returns",
+      "source": "cases/external_tail_returns.c",
+      "description": "Known external integer and pointer results survive direct tail calls and are consumed by their callers.",
+      "cflags": ["-O2", "-fno-builtin"],
+      "binary_checks": [
+        {
+          "description": "integer-return wrapper tail-jumps to labs",
+          "regex": "\\bjmp\\s+[^\\n]*<labs@plt>"
+        },
+        {
+          "description": "pointer-return wrapper tail-jumps to strchr",
+          "regex": "\\bjmp\\s+[^\\n]*<strchr@plt>"
+        }
+      ],
+      "runs": [
+        {
+          "name": "negative_and_front",
+          "args": ["semantic-frontier", "s", "A"],
+          "expected": {"returncode": 250, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "positive_and_middle",
+          "args": ["semantic-frontier", "t", "x"],
+          "expected": {"returncode": 197, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "negative_and_separator",
+          "args": ["semantic-frontier", "-", "!"],
+          "expected": {"returncode": 220, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "positive_and_missing",
+          "args": ["semantic-frontier", "z", "z"],
+          "expected": {"returncode": 135, "stdout": "", "stderr": ""}
+        }
+      ]
+    },
+    {
+      "name": "scaled_memory_test_setcc",
+      "source": "cases/scaled_memory_test_setcc.c",
+      "description": "A scaled memory TEST supplies one flag definition to complementary zero, sign, and parity SETcc consumers.",
+      "cflags": ["-O2"],
+      "binary_checks": [
+        {
+          "description": "TEST reads a base-plus-index-times-four memory operand",
+          "regex": "\\btest[l]?\\s+%e[a-z0-9]+,\\(%r[a-z0-9]+,%r[a-z0-9]+,4\\)"
+        },
+        {"description": "zero SETcc consumer", "regex": "\\bsete\\s"},
+        {"description": "nonzero SETcc consumer", "regex": "\\bsetne\\s"},
+        {"description": "sign SETcc consumer", "regex": "\\bsets\\s"},
+        {"description": "non-sign SETcc consumer", "regex": "\\bsetns\\s"},
+        {"description": "parity SETcc consumer", "regex": "\\bsetp\\s"},
+        {"description": "non-parity SETcc consumer", "regex": "\\bsetnp\\s"}
+      ],
+      "runs": [
+        {
+          "name": "zero_even_parity",
+          "args": [],
+          "expected": {"returncode": 25, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "negative_even_parity",
+          "args": ["x"],
+          "expected": {"returncode": 22, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "positive_odd_parity",
+          "args": ["x", "x"],
+          "expected": {"returncode": 42, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "masked_positive_even_parity",
+          "args": ["x", "x", "x"],
+          "expected": {"returncode": 26, "stdout": "", "stderr": ""}
+        }
+      ]
+    },
+    {
+      "name": "indexed_scaled_movsd",
+      "source": "cases/indexed_scaled_movsd.c",
+      "description": "Legacy and VEX scalar-double moves preserve exact bits through base-plus-index-times-eight loads and stores.",
+      "cflags": ["-O2", "-mavx"],
+      "binary_checks": [
+        {
+          "description": "legacy MOVSD scaled indexed load",
+          "regex": "\\bmovsd\\s+(?:0x[0-9a-f]+)?\\(%r[a-z0-9]+,%r[a-z0-9]+,8\\),%xmm[0-9]+"
+        },
+        {
+          "description": "legacy MOVSD scaled indexed store",
+          "regex": "\\bmovsd\\s+%xmm[0-9]+,(?:0x[0-9a-f]+)?\\(%r[a-z0-9]+,%r[a-z0-9]+,8\\)"
+        },
+        {
+          "description": "VEX VMOVSD scaled indexed load",
+          "regex": "\\bvmovsd\\s+(?:0x[0-9a-f]+)?\\(%r[a-z0-9]+,%r[a-z0-9]+,8\\),%xmm[0-9]+"
+        },
+        {
+          "description": "VEX VMOVSD scaled indexed store",
+          "regex": "\\bvmovsd\\s+%xmm[0-9]+,(?:0x[0-9a-f]+)?\\(%r[a-z0-9]+,%r[a-z0-9]+,8\\)"
+        }
+      ],
+      "runs": [
+        {
+          "name": "nan_payload_and_subnormal",
+          "args": [],
+          "expected": {"returncode": 52, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "subnormal_and_pi",
+          "args": ["x"],
+          "expected": {"returncode": 1, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "infinity_and_nan_payload",
+          "args": ["x", "x"],
+          "expected": {"returncode": 52, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "pi_and_infinity",
+          "args": ["x", "x", "x"],
+          "expected": {"returncode": 1, "stdout": "", "stderr": ""}
+        }
+      ]
+    },
+    {
+      "name": "indexed_memory_imul",
+      "source": "cases/indexed_memory_imul.c",
+      "description": "A two-operand indexed-memory IMUL loads through its full base-plus-index-times-four address before updating the accumulator.",
+      "cflags": ["-O2"],
+      "binary_checks": [
+        {
+          "description": "IMUL reads a negative-displacement base-plus-index-times-four memory operand",
+          "regex": "\\bimul[l]?\\s+-0x8\\(%r[a-z0-9]+,%r[a-z0-9]+,4\\),%e[a-z0-9]+"
+        },
+        {
+          "description": "indexed IMUL result flows through a compare and conditional move",
+          "regex": "\\bimul[l]?\\s+-0x8\\(%r[a-z0-9]+,%r[a-z0-9]+,4\\),%e[a-z0-9]+(?:.|\\n){0,240}\\bcmp[l]?\\s+[^\\n]+(?:.|\\n){0,240}\\bcmov[a-z]+\\s+%e[a-z0-9]+,%e[a-z0-9]+"
+        }
+      ],
+      "runs": [
+        {
+          "name": "word_0",
+          "args": [],
+          "expected": {"returncode": 50, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "word_1",
+          "args": ["x"],
+          "expected": {"returncode": 50, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "word_2",
+          "args": ["x", "x"],
+          "expected": {"returncode": 77, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "word_3",
+          "args": ["x", "x", "x"],
+          "expected": {"returncode": 91, "stdout": "", "stderr": ""}
+        }
+      ]
+    },
+    {
+      "name": "imul3_memory_address_forms",
+      "source": "cases/imul3_memory_address_forms.c",
+      "description": "Three-operand IMUL loads exactly from base, indexed, scalar-SP, and RIP-global memory before applying its immediate to a write-only destination.",
+      "cflags": ["-O2"],
+      "binary_checks": [
+        {
+          "description": "simple base-only IMUL3 memory source",
+          "regex": "\\bimul[l]?\\s+\\$0x3,\\(%r[a-z0-9]+\\),%e[a-z0-9]+"
+        },
+        {
+          "description": "indexed IMUL3 memory source",
+          "regex": "\\bimul[l]?\\s+\\$0x5,-0x8\\(%r[a-z0-9]+,%r[a-z0-9]+,4\\),%e[a-z0-9]+"
+        },
+        {
+          "description": "scalar SP-slot IMUL3 memory source",
+          "regex": "\\bimul[l]?\\s+\\$0x7,-0x4\\(%rsp\\),%e[a-z0-9]+"
+        },
+        {
+          "description": "RIP-global IMUL3 memory source",
+          "regex": "\\bimul[l]?\\s+\\$0x83,(?:0x[0-9a-f]+)?\\(%rip\\),%e[a-z0-9]+"
+        }
+      ],
+      "runs": [
+        {
+          "name": "index_0",
+          "args": [],
+          "expected": {"returncode": 16, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "index_1",
+          "args": ["x"],
+          "expected": {"returncode": 36, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "index_2",
+          "args": ["x", "x"],
+          "expected": {"returncode": 69, "stdout": "", "stderr": ""}
+        },
+        {
+          "name": "index_3",
+          "args": ["x", "x", "x"],
+          "expected": {"returncode": 92, "stdout": "", "stderr": ""}
+        }
+      ]
+    }
+  ]
+}
