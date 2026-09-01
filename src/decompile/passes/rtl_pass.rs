@@ -315,6 +315,21 @@ fn positive_integral_extent(constant: &Constant) -> Option<i64> {
     }
 }
 
+fn bounded_external_integral_extent(constant: &Constant) -> Option<i64> {
+    positive_integral_extent(constant).filter(|extent| *extent <= (1 << 20))
+}
+
+fn bounded_external_element_extent(
+    element_size: &Constant,
+    element_count: &Constant,
+) -> Option<i64> {
+    let element_size = bounded_external_integral_extent(element_size)?;
+    let element_count = bounded_external_integral_extent(element_count)?;
+    element_size
+        .checked_mul(element_count)
+        .filter(|extent| *extent <= (1 << 20))
+}
+
 // A direct induction pointer changes by one compile-time byte displacement on
 // every trip around the loop. Keep this deliberately narrower than generic
 // integer addition: a second value operand would need its own loop-invariance
@@ -744,6 +759,7 @@ ascent_par! {
     relation settled_block_dom_set(Address, Address, Set<Address>);
     relation settled_frame_write_state(Address, Address, Set<FrameWriteOrigin>);
     relation settled_sp_entry_offset(Address, Address, i64);
+    relation fixed_stack_probe_allocation(Address, i64);
     relation emit_clight_stmt(Address, Node, ClightStmt);
     relation emit_goto_target(Address, Node);
     relation emit_loop_body(Address, Node, Node);
@@ -793,6 +809,12 @@ ascent_par! {
     // Bytes an external function writes through a pointer parameter, from the ABI
     // rather than from anything observable in this binary (name, param index, bytes).
     relation known_func_param_pointee_size(Symbol, usize, usize);
+    // Interface-level buffer capacities. The byte form names
+    // (function, buffer position, byte-count position); the element form names
+    // (function, buffer position, element-size position, element-count
+    // position), as used by fread/fwrite.
+    relation known_func_param_byte_capacity(Symbol, usize, usize);
+    relation known_func_param_element_capacity(Symbol, usize, usize, usize);
 
     relation ltl_inst(Node, LTLInst);
     relation ltl_succ(Node, Node);
@@ -8303,6 +8325,13 @@ ascent_par! {
         if stack_address_within_local_frame(*ofs, *frame_size),
         !incoming_stack_tail_base(func, node, _, dst);
 
+    renderable_frame_stack_addr_lea_def(*func, *node, *dst, *ofs, *width) <--
+        exact_stack_addr_lea_def(func, node, dst, ofs, width),
+        exact_frame_stack_lea(func, node, ofs),
+        fixed_stack_probe_allocation(func, allocation),
+        if *ofs >= 0 && *ofs < *allocation,
+        !incoming_stack_tail_base(func, node, _, dst);
+
     // Bind pointer authority to the raw definition identity for this exact
     // decoded machine destination.  `fresh_xtl_reg` is the same definition id
     // used by ordinary register lifting; deriving this fact from the settled
@@ -9325,6 +9354,47 @@ ascent_par! {
         reg_holds_slot_addr(func_start, def_addr, *ofs, dst_reg),
         arg_setup_candidate(def_addr, dst_reg, _);
 
+    // A point-local exact frame address passed directly by the definition's
+    // machine register is an escaped storage object even when an unrelated
+    // incomplete/indirect control-flow arm prevents whole-function provenance.
+    // This deliberately does not follow copies or phi-like joins: those remain
+    // under reg_holds_slot_addr's MUST-origin lattice above.  The direct form is
+    // enough for common out-parameter pairs (`lea slot, %arg; call *%reg`) and
+    // lets their post-call reloads name the same C object the callee modified.
+    #[local] relation direct_renderable_slot_argument(Address, Address, i64, Node, Mreg);
+    direct_renderable_slot_argument(*func, *lea_addr, *ofs, *call, *dst_reg) <--
+        renderable_frame_stack_addr_lea_def(func, lea_addr, dst_reg, ofs, width),
+        abi_pointer_size(width),
+        arg_setup_candidate(lea_addr, dst_reg, call);
+
+    #[local] relation direct_renderable_slot_escaped(Address, Address, i64);
+    direct_renderable_slot_escaped(func, lea_addr, ofs) <--
+        direct_renderable_slot_argument(func, lea_addr, ofs, call, _),
+        ltl_inst(call, ?LTLInst::Lcall(Either::Left(_)));
+    direct_renderable_slot_escaped(func, lea_addr, ofs) <--
+        direct_renderable_slot_argument(func, lea_addr, ofs, call, _),
+        ltl_inst(call, ?LTLInst::Ltailcall(Either::Left(_)));
+
+    // A direct named call is less conservative: only a tabled buffer whose
+    // accessible extent is carried by another argument gets whole-slot
+    // identity.  This is what joins a probe-allocated `read`/`fread` backing
+    // object to the caller's later byte accesses.  Fixed-size out parameters
+    // such as `fstat(&st)` deliberately stay on the region-only path below;
+    // treating their base as the entire frame can swallow adjacent locals.
+    direct_renderable_slot_escaped(func, lea_addr, ofs) <--
+        direct_renderable_slot_argument(func, lea_addr, ofs, call, arg_mreg),
+        abi_int_arg_position(arg_mreg, pos),
+        external_call_site(call, _, name),
+        known_func_param_byte_capacity(name, pos, _);
+    direct_renderable_slot_escaped(func, lea_addr, ofs) <--
+        direct_renderable_slot_argument(func, lea_addr, ofs, call, arg_mreg),
+        abi_int_arg_position(arg_mreg, pos),
+        external_call_site(call, _, name),
+        known_func_param_element_capacity(name, pos, _, _);
+
+    slot_addr_escaped(func, lea_addr, ofs) <--
+        direct_renderable_slot_escaped(func, lea_addr, ofs);
+
     alias_edge(reload_rtl, lea_rtl) <--
         ltl_inst(reload_addr, ?LTLInst::Lgetstack(_slot, ofs, _typ, _dst)),
         instr_in_function(reload_addr, func_start),
@@ -9460,17 +9530,58 @@ ascent_par! {
     // here, so one relation serves both escape rules and the candidate scan is
     // paid once instead of once per surviving argument tuple.
     #[local] relation param_base_field_access(Address, RTLReg, i64, MemoryChunk);
+    #[local] relation param_base_field_store(Address, RTLReg, i64, MemoryChunk);
     param_base_field_access(*func, base, *field_ofs, *chunk) <--
         rtl_inst_candidate(access, ?RTLInst::Iload(chunk, Addressing::Aindexed(field_ofs), args, _)),
         if *field_ofs >= 0 && args.len() == 1,
         let base = args[0],
         instr_in_function(access, func);
 
-    param_base_field_access(*func, base, *field_ofs, *chunk) <--
+    param_base_field_store(*func, base, *field_ofs, *chunk) <--
         rtl_inst_candidate(access, ?RTLInst::Istore(chunk, Addressing::Aindexed(field_ofs), args, _)),
         if *field_ofs >= 0 && args.len() == 1,
         let base = args[0],
         instr_in_function(access, func);
+
+    param_base_field_access(func, base, field_ofs, chunk) <--
+        param_base_field_store(func, base, field_ofs, chunk);
+
+    // A direct internal callee is not a license to unify the caller's whole
+    // slot: many internal helpers merely inspect an address, and broad escape
+    // there can absorb unrelated frame values.  Project only fields that a
+    // recovered callee body structurally stores through this exact parameter.
+    // Parameter provenance follows explicit copies and internal forwarding,
+    // so a thin wrapper retains the same proof without call-name heuristics.
+    #[local] relation direct_renderable_internal_written_field_candidate(Address, Address, i64, Node, i64, MemoryChunk);
+    direct_renderable_internal_written_field_candidate(*caller, *lea, *base, *call, *field_ofs, *chunk) <--
+        direct_renderable_slot_argument(caller, lea, base, call, arg_mreg),
+        // Superset ownership may attach a neighboring machine function to the
+        // emitted caller.  Stack coordinates are frame-local, so require both
+        // endpoints of this evidence to remain inside the caller's physical
+        // symbol/FDE span before allowing it to own storage.
+        func_span(_, caller, caller_end),
+        if *lea >= *caller && *lea < *caller_end,
+        if *call >= *caller && *call < *caller_end,
+        abi_int_arg_position(arg_mreg, pos),
+        call_target_func(call, callee),
+        param_origin_carrier(callee, pos, current, param_rtl),
+        param_base_field_store(current, param_rtl, field_ofs, chunk);
+
+    // The direct-renderable path exists precisely because ordinary
+    // whole-function MUST provenance was unavailable.  If two different call
+    // sites claim the same frame coordinate, their lifetimes may belong to
+    // different arms or to functions superposed by coverage ownership.  Do
+    // not collapse that MAY set into one backing object.
+    #[local] relation direct_renderable_internal_written_site_conflict(Address, i64);
+    direct_renderable_internal_written_site_conflict(caller, base) <--
+        direct_renderable_internal_written_field_candidate(caller, left_lea, base, left_call, _, _),
+        direct_renderable_internal_written_field_candidate(caller, right_lea, base, right_call, _, _),
+        if left_lea != right_lea || left_call != right_call;
+
+    #[local] relation direct_renderable_internal_written_field(Address, i64, i64, MemoryChunk);
+    direct_renderable_internal_written_field(caller, base, field_ofs, chunk) <--
+        direct_renderable_internal_written_field_candidate(caller, _, base, _, field_ofs, chunk),
+        !direct_renderable_internal_written_site_conflict(caller, base);
 
     // A runtime-indexed address into the local frame is still one physical C
     // object when the index has a structural finite bound.  Unsigned immediate
@@ -9640,6 +9751,9 @@ ascent_par! {
         call_target_func(call_addr, callee),
         param_origin_carrier(callee, pos, current, param_rtl),
         param_base_field_access(current, param_rtl, field_ofs, chunk);
+
+    escaped_stack_region_field(caller, base_ofs, field_ofs, chunk) <--
+        direct_renderable_internal_written_field(caller, base_ofs, field_ofs, chunk);
 
     // Projecting the callee's own accesses only works when the callee has a body
     // in this binary.  Everything an EXTERNAL callee writes through an escaped
@@ -10719,6 +10833,48 @@ ascent_par! {
         call_arg_exact_stack_base_candidate(caller, call_addr, pos, base),
         !call_arg_exact_stack_base_conflict(caller, call_addr, pos);
 
+    // Normalize the two ways a real external call is represented.  A local
+    // implementation which happens to share a libc name is deliberately not
+    // admitted by the named-LTL fallback.
+    #[local] relation exact_external_named_call(Node, Symbol);
+    exact_external_named_call(*call_addr, *name) <--
+        external_call_site(call_addr, _, name);
+    exact_external_named_call(*call_addr, *name) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Right(name)))),
+        !emit_function(_, name, _);
+
+    // A stack-derived call argument paired with exact positive capacity
+    // arguments proves how much backing storage the emitted C object needs.
+    // This is an ABI/dataflow contract: nonconstant, overflowing, zero, and
+    // implausibly large requests publish no extent.
+    relation external_stack_buffer_extent(Address, i64, i64);
+    external_stack_buffer_extent(*caller, *base, extent) <--
+        call_arg_exact_stack_base(caller, call_addr, buffer_pos, base),
+        exact_external_named_call(call_addr, name),
+        known_func_param_byte_capacity(name, buffer_pos, capacity_pos),
+        call_arg_mapping(call_addr, capacity_pos, capacity_rtl),
+        single_def_const(capacity_rtl, capacity),
+        if let Some(extent) = bounded_external_integral_extent(capacity);
+
+    external_stack_buffer_extent(*caller, *base, extent) <--
+        call_arg_exact_stack_base(caller, call_addr, buffer_pos, base),
+        exact_external_named_call(call_addr, name),
+        known_func_param_element_capacity(name, buffer_pos, size_pos, count_pos),
+        call_arg_mapping(call_addr, size_pos, size_rtl),
+        single_def_const(size_rtl, element_size),
+        call_arg_mapping(call_addr, count_pos, count_rtl),
+        single_def_const(count_rtl, element_count),
+        if let Some(extent) = bounded_external_element_extent(element_size, element_count);
+
+    // Exact physical intervals established by an external ABI.  Keep this
+    // narrower than escaped_stack_region_extent: the latter also contains
+    // inferred walk/initialization bounds, while storage-range reconciliation
+    // needs an independently authoritative interval before merging it with an
+    // indexed frame access.
+    relation external_stack_object_extent(Address, i64, i64);
+    external_stack_object_extent(caller, *base, *extent) <--
+        external_stack_buffer_extent(caller, base, extent);
+
     #[local] relation known_extern_out_param_slot(Address, i64, usize);
     known_extern_out_param_slot(caller, *base, *bytes) <--
         call_arg_exact_stack_base(caller, call_addr, pos, base),
@@ -10753,6 +10909,11 @@ ascent_par! {
         // A local definition sharing a tabled libc name is not that libc call.
         !emit_function(_, name, _),
         known_func_param_pointee_size(name, pos, bytes);
+
+    external_stack_object_extent(caller, *base, extent) <--
+        known_extern_out_param_slot(caller, base, bytes),
+        if let Ok(extent) = i64::try_from(*bytes),
+        if extent > 0 && extent <= (1 << 20);
 
     // Exact reads inside a fixed-size external out-parameter belong to that
     // region even when an older frame definition also reaches the read: the
@@ -10892,6 +11053,9 @@ ascent_par! {
     escaped_stack_region_caller_field(caller, *base, 0, MemoryChunk::MInt8Unsigned) <--
         internal_capacity_param_slot(caller, base, _);
 
+    escaped_stack_region_caller_field(caller, *base, 0, MemoryChunk::MInt8Unsigned) <--
+        external_stack_buffer_extent(caller, base, _);
+
     #[local] relation escaped_region_base(Address, i64);
     escaped_region_base(func, *base) <-- escaped_region_cell(func, base, _);
 
@@ -10914,6 +11078,13 @@ ascent_par! {
         let limit = size_i64;
 
     relation escaped_stack_region_extent(Address, i64, i64);
+    escaped_stack_region_extent(caller, base, extent) <--
+        direct_renderable_internal_written_field(caller, base, field_ofs, chunk),
+        let width = crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk) as i64,
+        if width > 0,
+        if let Some(extent) = field_ofs.checked_add(width),
+        if extent > 0 && extent <= (1 << 20);
+
     escaped_stack_region_extent(caller, *base, *extent) <--
         bounded_indexed_stack_call_access(caller, base, _, _, _, _, extent);
 
@@ -10939,6 +11110,9 @@ ascent_par! {
 
     escaped_stack_region_extent(caller, *base, *extent) <--
         internal_capacity_param_slot(caller, base, extent);
+
+    escaped_stack_region_extent(caller, *base, *extent) <--
+        external_stack_buffer_extent(caller, base, extent);
 
     // Canonical caller locals for every callee-observed field.  RTL DSE reads
     // this alongside slot_escaped_canonical so stores into neighboring cells
@@ -12002,6 +12176,28 @@ ascent_par! {
         push_call_argument_index(func, call, push, index),
         push_arg_stack(push, use_ofs),
         stack_xtl(func, push, *use_ofs, value),
+        call_stack_arg_base_position(call, first_pos),
+        let pos = *first_pos + *index;
+
+    // Capstone exposes a memory PUSH's frame source as an exact decoded read,
+    // even when the legacy stack def-use relation records only PUSH's implicit
+    // write to the newly allocated outgoing slot.  Recover the source value
+    // from the finalized frame coordinate and its canonical local, then reuse
+    // the same reverse structural PUSH index.  Requiring one full ABI slot
+    // excludes partial/odd-width pushes and no instruction-address ordering is
+    // used to associate the value with the call.
+    raw_call_outgoing_stack_arg(*call, pos, *value) <--
+        push_call_argument_index(func, call, push, index),
+        instruction(push, _, _, "PUSH", operand, _, _, _, _, _),
+        op_indirect(operand, _, base_name, index_name, _, _, operand_width),
+        if matches!(Mreg::x86(*base_name), Mreg::SP | Mreg::BP),
+        if *index_name == "NONE" || index_name.is_empty(),
+        frame_stack_read_bytes(func, push, frame_ofs, read_width),
+        abi_stack_slot_size(slot_size),
+        if usize::try_from(*slot_size).ok() == Some(*operand_width)
+            && *read_width == *operand_width,
+        direct_renderable_slot_argument(func, _, frame_ofs, _, _),
+        stack_xtl(func, _, frame_ofs, value),
         call_stack_arg_base_position(call, first_pos),
         let pos = *first_pos + *index;
 
@@ -15991,7 +16187,8 @@ mod tests {
     use crate::x86::asm::TestCond;
     use crate::x86::op::{Addressing, Comparison, Condition, Operation, TestResultCondition};
     use crate::x86::types::{
-        Address, BuiltinArg, LTLInst, MemoryChunk, Node, RTLInst, RTLReg, Slot, Typ, XType,
+        Address, BuiltinArg, Constant, LTLInst, MemoryChunk, Node, RTLInst, RTLReg, Slot, Typ,
+        XType,
     };
     use ascent::lattice::set::Set;
     use either::Either;
@@ -18086,6 +18283,83 @@ mod tests {
     }
 
     #[test]
+    fn memory_push_uses_exact_frame_local_as_second_stack_argument() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x1160;
+            let push_memory = 0x1168;
+            let between = 0x1170;
+            let push_immediate = 0x1178;
+            let call = 0x1180;
+            let end = 0x1188;
+            let owner_site = 0x1158;
+            let owner_call = 0x1150;
+            let frame_value = 0x9100;
+            let block = func;
+
+            prog.next.extend([
+                (func, push_memory),
+                (push_memory, between),
+                (between, push_immediate),
+                (push_immediate, call),
+                (call, end),
+            ]);
+            for node in [func, push_memory, between, push_immediate, call, end] {
+                prog.instr_in_function.push((node, func));
+                prog.code_in_block.push((node, block));
+            }
+            prog.instruction
+                .push((func, 1, "", "XOR", "", "", "", "", 0, 0));
+            prog.instruction
+                .push((push_memory, 7, "", "PUSH", "frame_value", "", "", "", 0, 0));
+            prog.op_indirect
+                .push(("frame_value", "", "RSP", "NONE", 1, 168, 8));
+            prog.frame_stack_read_bytes
+                .push((func, push_memory, 168, 8));
+            prog.direct_renderable_slot_argument.push((
+                func,
+                owner_site,
+                168,
+                owner_call,
+                Mreg::AX,
+            ));
+            prog.stack_xtl.push((func, owner_site, 168, frame_value));
+            prog.xtl_canonical.push((frame_value, frame_value));
+            prog.instruction
+                .push((between, 1, "", "MOV", "", "", "", "", 0, 0));
+            prog.instruction.push((
+                push_immediate,
+                1,
+                "",
+                "PUSH",
+                "immediate_zero",
+                "",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.op_immediate.push(("immediate_zero", 0, 8));
+            prog.ltl_inst
+                .push((call, LTLInst::Lcall(Either::Left(Mreg::BX))));
+            prog.abi_first_stack_arg_position.push((6,));
+            prog.abi_outgoing_stack_base.push((0,));
+            prog.abi_stack_slot_size.push((8,));
+
+            prog.run();
+
+            assert!(prog
+                .raw_call_outgoing_stack_arg
+                .iter()
+                .any(|fact| fact == &(call, 7, frame_value)));
+            assert!(prog
+                .call_arg_mapping
+                .iter()
+                .any(|fact| fact == &(call, 7, frame_value)));
+        });
+    }
+
+    #[test]
     fn sp_relative_memory_push_recovers_exact_incoming_stack_parameter() {
         on_large_stack(|| {
             let mut prog = RTLPassProgram::default();
@@ -19168,6 +19442,325 @@ mod tests {
                 .stack_var
                 .iter()
                 .any(|(_, node, _, _)| *node == outside));
+        });
+    }
+
+    #[test]
+    fn probe_allocation_renders_absorbed_tail_frame_without_static_stack_size() {
+        on_large_stack(|| {
+            let [func, lea] = synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+            prog.abi_pointer_size.push((8,));
+            prog.instr_in_function.push((lea, func));
+            prog.ltl_inst.push((
+                lea,
+                LTLInst::Lop(
+                    Operation::Oleal(Addressing::Ainstack(16)),
+                    Arc::new(vec![]),
+                    Mreg::R15,
+                ),
+            ));
+            prog.exact_frame_stack_lea.push((func, lea, 16));
+            prog.fixed_stack_probe_allocation.push((func, 65536));
+
+            prog.run();
+
+            assert!(prog
+                .renderable_frame_stack_addr_lea_def
+                .iter()
+                .any(|fact| fact == &(func, lea, Mreg::R15, 16, 8)));
+            assert!(prog
+                .renderable_stack_addr_result
+                .iter()
+                .any(|(node, ofs, _)| (*node, *ofs) == (lea, 16)));
+            assert!(prog
+                .stack_var
+                .iter()
+                .any(|(owner, node, ofs, _)| (*owner, *node, *ofs) == (func, lea, 16)));
+            assert!(!prog
+                .exact_local_stack_addr_lea_def
+                .iter()
+                .any(|(_, node, _, _, _)| *node == lea));
+        });
+    }
+
+    #[test]
+    fn direct_renderable_call_argument_unifies_post_call_stack_reload() {
+        on_large_stack(|| {
+            let [func, lea, call, reload] = synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+            prog.abi_pointer_size.push((8,));
+            prog.ltl_inst.push((
+                lea,
+                LTLInst::Lop(
+                    Operation::Oleal(Addressing::Ainstack(8)),
+                    Arc::new(vec![]),
+                    Mreg::DX,
+                ),
+            ));
+            prog.ltl_inst.push((
+                reload,
+                LTLInst::Lgetstack(Slot::Local, 8, Typ::Tany64, Mreg::CX),
+            ));
+            prog.ltl_inst
+                .push((call, LTLInst::Lcall(Either::Left(Mreg::BX))));
+            for node in [lea, reload] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.exact_frame_stack_lea.push((func, lea, 8));
+            prog.fixed_stack_probe_allocation.push((func, 65536));
+            prog.arg_setup_candidate.push((lea, Mreg::DX, call));
+
+            prog.run();
+
+            assert!(prog
+                .slot_addr_escaped
+                .iter()
+                .any(|fact| fact == &(func, lea, 8)));
+            let lea_locals: std::collections::BTreeSet<_> = prog
+                .stack_var
+                .iter()
+                .filter_map(|(owner, node, ofs, local)| {
+                    (*owner == func && *node == lea && *ofs == 8).then_some(*local)
+                })
+                .collect();
+            let reload_locals: std::collections::BTreeSet<_> = prog
+                .stack_var
+                .iter()
+                .filter_map(|(owner, node, ofs, local)| {
+                    (*owner == func && *node == reload && *ofs == 8).then_some(*local)
+                })
+                .collect();
+            assert_eq!(lea_locals.len(), 1);
+            assert_eq!(lea_locals, reload_locals);
+            assert!(!prog
+                .exact_local_stack_addr_lea_def
+                .iter()
+                .any(|(_, node, _, _, _)| *node == lea));
+        });
+    }
+
+    #[test]
+    fn direct_named_call_does_not_gain_incomplete_whole_slot_escape() {
+        on_large_stack(|| {
+            let [func, lea, call] = synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+            prog.abi_pointer_size.push((8,));
+            prog.instr_in_function.push((lea, func));
+            prog.ltl_inst.push((
+                lea,
+                LTLInst::Lop(
+                    Operation::Oleal(Addressing::Ainstack(16)),
+                    Arc::new(vec![]),
+                    Mreg::SI,
+                ),
+            ));
+            prog.ltl_inst.push((
+                call,
+                LTLInst::Lcall(Either::Right(Either::Right("external_writer"))),
+            ));
+            prog.exact_frame_stack_lea.push((func, lea, 16));
+            prog.fixed_stack_probe_allocation.push((func, 65536));
+            prog.arg_setup_candidate.push((lea, Mreg::SI, call));
+
+            prog.run();
+
+            assert!(prog
+                .direct_renderable_slot_argument
+                .iter()
+                .any(|fact| fact == &(func, lea, 16, call, Mreg::SI)));
+            assert!(!prog
+                .direct_renderable_slot_escaped
+                .iter()
+                .any(|fact| fact == &(func, lea, 16)));
+            assert!(!prog
+                .slot_addr_escaped
+                .iter()
+                .any(|fact| fact == &(func, lea, 16)));
+        });
+    }
+
+    #[test]
+    fn direct_internal_call_projects_only_structurally_written_field() {
+        on_large_stack(|| {
+            let [func, lea, call, callee, store] = synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+            prog.abi_pointer_size.push((8,));
+            prog.abi_int_arg_position.push((Mreg::CX, 3));
+            prog.instr_in_function.push((lea, func));
+            prog.ltl_inst.push((
+                lea,
+                LTLInst::Lop(
+                    Operation::Oleal(Addressing::Ainstack(16)),
+                    Arc::new(vec![]),
+                    Mreg::CX,
+                ),
+            ));
+            prog.ltl_inst
+                .push((call, LTLInst::Lcall(Either::Right(Either::Left(0x5000)))));
+            prog.exact_frame_stack_lea.push((func, lea, 16));
+            prog.fixed_stack_probe_allocation.push((func, 65536));
+            prog.arg_setup_candidate.push((lea, Mreg::CX, call));
+            prog.func_span.push(("caller", func, call + 1));
+            let param_rtl = 0x8100;
+            prog.func_param_validated.push((callee, Mreg::CX));
+            prog.reg_rtl.push((callee, Mreg::CX, param_rtl));
+            prog.call_target_func.push((call, callee));
+            prog.instr_in_function.push((store, callee));
+            prog.rtl_inst_candidate.push((
+                store,
+                RTLInst::Istore(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed(0),
+                    Arc::new(vec![param_rtl]),
+                    0x8200,
+                ),
+            ));
+
+            prog.run();
+
+            assert!(!prog
+                .direct_renderable_slot_escaped
+                .iter()
+                .any(|fact| fact == &(func, lea, 16)));
+            assert!(!prog
+                .slot_addr_escaped
+                .iter()
+                .any(|fact| fact == &(func, lea, 16)));
+            assert!(prog
+                .escaped_stack_region_field
+                .iter()
+                .any(|fact| fact == &(func, 16, 0, MemoryChunk::MAny64)));
+            assert!(prog
+                .escaped_stack_region_extent
+                .iter()
+                .any(|fact| fact == &(func, 16, 8)));
+        });
+    }
+
+    #[test]
+    fn superset_borrowed_internal_call_cannot_lend_stack_field() {
+        on_large_stack(|| {
+            let caller = 0x1000;
+            let lea = 0x900;
+            let call = 0x910;
+            let callee = 0x2000;
+            let store = 0x2010;
+            let mut prog = RTLPassProgram::default();
+            prog.abi_pointer_size.push((8,));
+            prog.abi_int_arg_position.push((Mreg::CX, 3));
+            prog.instr_in_function.push((lea, caller));
+            prog.ltl_inst.push((
+                lea,
+                LTLInst::Lop(
+                    Operation::Oleal(Addressing::Ainstack(16)),
+                    Arc::new(vec![]),
+                    Mreg::CX,
+                ),
+            ));
+            prog.ltl_inst
+                .push((call, LTLInst::Lcall(Either::Right(Either::Left(callee)))));
+            prog.exact_frame_stack_lea.push((caller, lea, 16));
+            prog.fixed_stack_probe_allocation.push((caller, 65536));
+            prog.arg_setup_candidate.push((lea, Mreg::CX, call));
+            // Superset membership says the sites belong to caller, but its
+            // physical function span does not contain either address.
+            prog.func_span.push(("caller", caller, 0x1100));
+            let param_rtl = 0x8100;
+            prog.func_param_validated.push((callee, Mreg::CX));
+            prog.reg_rtl.push((callee, Mreg::CX, param_rtl));
+            prog.call_target_func.push((call, callee));
+            prog.instr_in_function.push((store, callee));
+            prog.rtl_inst_candidate.push((
+                store,
+                RTLInst::Istore(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed(0),
+                    Arc::new(vec![param_rtl]),
+                    0x8200,
+                ),
+            ));
+
+            prog.run();
+
+            assert!(prog
+                .direct_renderable_slot_argument
+                .iter()
+                .any(|fact| fact == &(caller, lea, 16, call, Mreg::CX)));
+            assert!(!prog
+                .escaped_stack_region_field
+                .iter()
+                .any(|fact| fact.0 == caller && fact.1 == 16));
+            assert!(!prog
+                .escaped_stack_region_extent
+                .iter()
+                .any(|fact| fact.0 == caller && fact.1 == 16));
+        });
+    }
+
+    #[test]
+    fn multiple_internal_write_sites_at_one_slot_remain_ambiguous() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let caller = 0x3000;
+            let base = 16_i64;
+            prog.direct_renderable_internal_written_field_candidate
+                .extend([
+                    (caller, 0x3010, base, 0x3020, 0_i64, MemoryChunk::MAny64),
+                    (caller, 0x3030, base, 0x3040, 0_i64, MemoryChunk::MAny64),
+                ]);
+
+            prog.run();
+
+            assert!(prog
+                .direct_renderable_internal_written_site_conflict
+                .iter()
+                .any(|fact| fact == &(caller, base)));
+            assert!(!prog
+                .direct_renderable_internal_written_field
+                .iter()
+                .any(|fact| fact.0 == caller && fact.1 == base));
+            assert!(!prog
+                .escaped_stack_region_field
+                .iter()
+                .any(|fact| fact.0 == caller && fact.1 == base));
+        });
+    }
+
+    #[test]
+    fn direct_named_sized_buffer_gains_whole_slot_escape() {
+        on_large_stack(|| {
+            let [func, lea, call] = synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+            prog.abi_pointer_size.push((8,));
+            prog.abi_int_arg_position.push((Mreg::SI, 1));
+            prog.instr_in_function.push((lea, func));
+            prog.ltl_inst.push((
+                lea,
+                LTLInst::Lop(
+                    Operation::Oleal(Addressing::Ainstack(16)),
+                    Arc::new(vec![]),
+                    Mreg::SI,
+                ),
+            ));
+            prog.ltl_inst
+                .push((call, LTLInst::Lcall(Either::Right(Either::Right("read")))));
+            prog.exact_frame_stack_lea.push((func, lea, 16));
+            prog.fixed_stack_probe_allocation.push((func, 65536));
+            prog.arg_setup_candidate.push((lea, Mreg::SI, call));
+            prog.external_call_site.push((call, 0x4000, "read"));
+            prog.known_func_param_byte_capacity.push(("read", 1, 2));
+
+            prog.run();
+
+            assert!(prog
+                .direct_renderable_slot_escaped
+                .iter()
+                .any(|fact| fact == &(func, lea, 16)));
+            assert!(prog
+                .slot_addr_escaped
+                .iter()
+                .any(|fact| fact == &(func, lea, 16)));
         });
     }
 
@@ -21492,6 +22085,63 @@ mod tests {
             assert!(prog.escaped_stack_region_caller_field.iter().any(
                 |(func, base, field_ofs, _)| {
                     *func == caller && *base == base_ofs && *field_ofs == 0
+                }
+            ));
+        });
+    }
+
+    #[test]
+    fn external_element_capacity_sizes_exact_stack_buffer_with_checked_product() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let caller = 0x600_u64;
+            let call = 0x610_u64;
+            let oversized_call = 0x620_u64;
+            let base_ofs = 16_i64;
+            let size_rtl = 0x8100_u64;
+            let count_rtl = 0x8200_u64;
+            let oversized_count_rtl = 0x8300_u64;
+
+            prog.call_arg_exact_stack_base.extend([
+                (caller, call, 0, base_ofs),
+                (caller, oversized_call, 0, base_ofs),
+            ]);
+            prog.external_call_site.extend([
+                (call, 0x3000, "fread_unlocked"),
+                (oversized_call, 0x3000, "fread_unlocked"),
+            ]);
+            prog.known_func_param_element_capacity
+                .push(("fread_unlocked", 0, 1, 2));
+            prog.call_arg_mapping.extend([
+                (call, 1, size_rtl),
+                (call, 2, count_rtl),
+                (oversized_call, 1, size_rtl),
+                (oversized_call, 2, oversized_count_rtl),
+            ]);
+            prog.single_def_const.extend([
+                (size_rtl, Constant::Ointconst(1)),
+                (count_rtl, Constant::Ointconst(65536)),
+                (oversized_count_rtl, Constant::Ointconst(2 << 20)),
+            ]);
+
+            prog.run();
+
+            assert!(prog
+                .external_stack_buffer_extent
+                .iter()
+                .any(|fact| fact == &(caller, base_ofs, 65536)));
+            assert!(!prog
+                .external_stack_buffer_extent
+                .iter()
+                .any(|fact| fact == &(caller, base_ofs, 2 << 20)));
+            assert!(prog
+                .escaped_stack_region_extent
+                .iter()
+                .any(|fact| fact == &(caller, base_ofs, 65536)));
+            assert!(prog.escaped_stack_region_caller_field.iter().any(
+                |(func, base, field_ofs, chunk)| {
+                    (*func, *base, *field_ofs, *chunk)
+                        == (caller, base_ofs, 0, MemoryChunk::MInt8Unsigned)
                 }
             ));
         });

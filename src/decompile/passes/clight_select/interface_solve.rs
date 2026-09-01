@@ -1732,6 +1732,7 @@ mod tests {
             candidate_idx: [((callee_addr, 1), Some(0)), ((caller_addr, 2), Some(0))]
                 .into_iter()
                 .collect(),
+            structure_world: HashMap::new(),
             var_decl_idx: [((callee_addr, param), 0), ((caller_addr, caller_arg), 0)]
                 .into_iter()
                 .collect(),
@@ -1864,6 +1865,7 @@ mod tests {
         };
         let state = ProgramSelectionState {
             candidate_idx: [((wrapper_addr, call), Some(0))].into_iter().collect(),
+            structure_world: HashMap::new(),
             var_decl_idx: [((wrapper_addr, param), 0)].into_iter().collect(),
             var_type_override: HashMap::new(),
         };
@@ -1928,6 +1930,7 @@ mod tests {
             &[],
             &ProgramSelectionState {
                 candidate_idx: HashMap::new(),
+                structure_world: HashMap::new(),
                 var_decl_idx: HashMap::new(),
                 var_type_override: HashMap::new(),
             },
@@ -2015,6 +2018,7 @@ mod tests {
             &[],
             &ProgramSelectionState {
                 candidate_idx: HashMap::new(),
+                structure_world: HashMap::new(),
                 var_decl_idx: HashMap::new(),
                 var_type_override: HashMap::new(),
             },
@@ -2066,6 +2070,7 @@ mod tests {
         );
         let state = ProgramSelectionState {
             candidate_idx: [((address, 3), Some(0))].into_iter().collect(),
+            structure_world: HashMap::new(),
             var_decl_idx: [((address, reg), 0)].into_iter().collect(),
             var_type_override: HashMap::new(),
         };
@@ -2113,6 +2118,7 @@ mod tests {
         );
         let state = ProgramSelectionState {
             candidate_idx: [((address, node), Some(0))].into_iter().collect(),
+            structure_world: HashMap::new(),
             var_decl_idx: [((address, reg), 0)].into_iter().collect(),
             var_type_override: HashMap::new(),
         };

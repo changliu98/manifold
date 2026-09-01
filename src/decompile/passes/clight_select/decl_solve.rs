@@ -1006,6 +1006,8 @@ mod tests {
             param_regs: vec![reg],
             param_types: vec![ParamType::Integer],
             stack_size: 0,
+            structure_world:
+                crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_STRUCTURED,
             statements: [(0x1010, stmt)].into_iter().collect(),
             selected_candidate_nodes: [0x1010].into_iter().collect(),
             selected_write_bytes: HashMap::new(),

@@ -1712,6 +1712,9 @@ const CLIGHT_EMIT_INPUTS: &[&str] = &[
     "committed_interfaces",
     "interface_vars",
     "emit_clight_stmt",
+    "emit_clight_stmt_world",
+    "emit_next_world",
+    "structure_world",
     "emit_function",
     "func_entry_node",
     "emit_function_param",
@@ -1788,6 +1791,9 @@ const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
     "web_class_fp",
     // Load/store memory chunks, the flow theory's per-node width/class anchors.
     "rtl_inst",
+    // Preferred no-model fallback for the deliberately advanced subword
+    // signedness siblings published after RTL finalization.
+    "rtl_superset_authoritative_chunk",
     "is_varargs_fn",
     "known_varargs_function",
     "known_global_type",

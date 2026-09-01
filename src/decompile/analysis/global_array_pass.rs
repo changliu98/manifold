@@ -402,6 +402,14 @@ ascent_par! {
         array_coalesce_candidate(base, member, member_ofs),
         global_access_ev(member, ofs, chunk, is_load, is_var);
 
+    // The unified evidence relation carries bridged and folded offsets that
+    // the legacy direct-address relation never sees.  Array admission and
+    // count recovery must consume the same representation as stride
+    // validation; otherwise a table with many indexed base displacements is
+    // validated correctly but still declared from the lone direct offset 0.
+    global_distinct_offset(ident, *ofs) <--
+        global_access_ev(ident, ofs, _, _, _);
+
     #[local] relation ev_has_var(Ident);
     ev_has_var(ident) <-- global_access_ev(ident, _, _, _, true);
 
@@ -424,6 +432,41 @@ ascent_par! {
     // ---- candidate stride generation (bounded; validation prunes) ----
     #[local] relation ev_offset(Ident, i64);
     ev_offset(ident, ofs) <-- global_access_ev(ident, ofs, _, _, _);
+
+    // Base displacements of variable-indexed families.  Repeated tiled tables
+    // often expose no bound for the dynamic index itself, but multiple bases
+    // expose one complete period: [base_i, base_i + gcd(base deltas)).  The
+    // last observed base plus that period is therefore a structural minimum
+    // extent, independent of symbol names and section-label density.
+    #[local] relation ev_var_offset(Ident, i64);
+    ev_var_offset(ident, ofs) <-- global_access_ev(ident, ofs, _, _, true);
+
+    #[local] relation ev_var_offset_count(Ident, usize);
+    ev_var_offset_count(ident, count) <--
+        ev_var_offset(ident, _),
+        agg count = count_items(ofs) in ev_var_offset(ident, ofs);
+
+    #[local] relation ev_var_min(Ident, i64);
+    ev_var_min(ident, minimum) <--
+        ev_var_offset(ident, _),
+        agg minimum = min_i64(ofs) in ev_var_offset(ident, ofs);
+
+    #[local] relation ev_var_diff(Ident, i64);
+    ev_var_diff(ident, ofs - minimum) <--
+        ev_var_offset(ident, ofs),
+        ev_var_min(ident, minimum),
+        if ofs > minimum;
+
+    #[local] relation ev_var_period(Ident, i64);
+    ev_var_period(ident, period as i64) <--
+        ev_var_diff(ident, _),
+        agg period = gcd_aggregator(diff) in ev_var_diff(ident, diff),
+        if period > 0;
+
+    #[local] relation ev_var_max(Ident, i64);
+    ev_var_max(ident, maximum) <--
+        ev_var_offset(ident, _),
+        agg maximum = max_i64(ofs) in ev_var_offset(ident, ofs);
 
     #[local] relation ev_min(Ident, i64);
     ev_min(ident, m) <--
@@ -589,6 +632,37 @@ ascent_par! {
         global_base_addr(ident, base),
         agg next = ascent::aggregators::min(a) in global_next_object(ident, a);
 
+    // Stripped images commonly synthesize an `L_<addr>` label for an interior
+    // constant or indexed access.  Such a label is useful as an expression
+    // anchor but is not evidence that a new storage object begins there.  For
+    // variable-indexed unsized arrays, also bound storage by the next global
+    // owner that actually participates in a memory access, else the section
+    // end. `global_var_ref` is intentionally insufficient: it also contains
+    // label-only interior references in stripped images. Keep this separate from
+    // global_gap_extent, whose stricter all-symbol boundary remains the exact
+    // authority for bounded-access physical extents.
+    #[local] relation represented_global_object(Address);
+    represented_global_object(*base) <-- global_base_addr(_, base);
+
+    #[local] relation global_next_represented_object(Ident, Address);
+    global_next_represented_object(ident, *other) <--
+        global_base_addr(ident, base),
+        global_section_end(ident, sec_end),
+        ev_max_end(ident, observed_end),
+        if *observed_end > 0,
+        if let Ok(observed_end_u64) = u64::try_from(*observed_end),
+        if let Some(minimum_end) = base.checked_add(observed_end_u64),
+        represented_global_object(other),
+        if *other >= minimum_end && *other < *sec_end;
+    global_next_represented_object(ident, *sec_end) <--
+        global_section_end(ident, sec_end);
+
+    #[local] relation global_represented_gap_extent(Ident, i64);
+    global_represented_gap_extent(ident, (next - *base) as i64) <--
+        global_base_addr(ident, base),
+        agg next = ascent::aggregators::min(a)
+            in global_next_represented_object(ident, a);
+
     #[local] relation global_sym_size_known(Ident);
     global_sym_size_known(ident) <--
         global_base_addr(ident, addr),
@@ -634,6 +708,24 @@ ascent_par! {
         !global_sym_size_known(ident),
         global_gap_extent(ident, extent),
         if *extent >= *elem_size as i64;
+
+    array_count_cand(ident, (*extent as usize) / elem_size) <--
+        inferred_element_size(ident, elem_size),
+        if *elem_size > 0,
+        ev_has_var(ident),
+        !global_sym_size_known(ident),
+        global_represented_gap_extent(ident, extent),
+        if *extent >= *elem_size as i64 && *extent % (*elem_size as i64) == 0;
+
+    array_count_cand(ident, (extent as usize) / elem_size) <--
+        inferred_element_size(ident, elem_size),
+        if *elem_size > 0,
+        ev_var_offset_count(ident, count),
+        if *count >= 2,
+        ev_var_max(ident, maximum),
+        ev_var_period(ident, period),
+        if let Some(extent) = maximum.checked_add(*period),
+        if extent > 0 && extent % (*elem_size as i64) == 0;
 
     #[local] relation array_count(Ident, usize);
     array_count(ident, c) <--
@@ -1141,5 +1233,86 @@ mod relocated_string_array_tests {
             .global_storage_extent
             .iter()
             .any(|fact| fact.0 == owner && fact.1 != 64));
+    }
+
+    #[test]
+    fn synthetic_interior_label_does_not_truncate_unsized_indexed_array() {
+        let mut prog = GlobalArrayPassProgram::default();
+        let owner: Ident = 0x1000;
+        let synthetic_interior: Address = 0x1010;
+        let next_owner: Ident = 0x1400;
+        let section_end: Address = 0x2000;
+
+        prog.global_addr_access
+            .push((owner, 0, 0x300, MemoryChunk::MAny64));
+        prog.global_addr_access
+            .push((synthetic_interior as Ident, 0, 0x350, MemoryChunk::MAny64));
+        prog.global_addr_access
+            .push((next_owner, 0, 0x400, MemoryChunk::MInt8Unsigned));
+        prog.global_access_ev
+            .push((owner, 0x100, MemoryChunk::MAny64, true, true));
+        prog.global_scale_hint.push((owner, 8));
+        prog.symbols.push((synthetic_interior, "L_1010", "OBJECT"));
+        prog.global_var_ref.push((synthetic_interior as Ident,));
+        prog.data_section_range
+            .push((owner as Address, section_end));
+
+        prog.run();
+
+        assert!(prog
+            .is_global_array
+            .iter()
+            .any(|fact| fact == &(owner, 8, 128)));
+        assert!(!prog
+            .is_global_array
+            .iter()
+            .any(|fact| fact.0 == owner && fact.2 == 2));
+    }
+
+    #[test]
+    fn repeated_indexed_bases_extend_through_one_complete_period() {
+        let mut prog = GlobalArrayPassProgram::default();
+        let owner: Ident = 0x1000;
+        let next_owner: Ident = owner + 0x4000;
+        let element_size = 8_usize;
+        let table_period = 0x800_i64;
+
+        prog.global_addr_access
+            .push((owner, 0, 0x2000, MemoryChunk::MAny64));
+        for index in 0_i64..8 {
+            prog.global_access_ev.push((
+                owner,
+                index * table_period,
+                MemoryChunk::MAny64,
+                true,
+                true,
+            ));
+        }
+        prog.global_scale_hint.push((owner, element_size as i64));
+        prog.global_addr_access
+            .push((next_owner, 0, 0x2100, MemoryChunk::MInt8Unsigned));
+        prog.global_access_ev
+            .push((next_owner, 0, MemoryChunk::MInt8Unsigned, true, false));
+        // A synthetic label immediately above the base makes the legacy symbol
+        // gap claim only two elements.  The indexed-base period must win.
+        prog.symbols
+            .push((owner as Address + 16, "L_1010", "OBJECT"));
+        prog.data_section_range
+            .push((owner as Address, owner as Address + 0x8000));
+
+        prog.run();
+
+        assert!(prog
+            .inferred_element_size
+            .iter()
+            .any(|fact| fact == &(owner, element_size)));
+        assert!(prog
+            .is_global_array
+            .iter()
+            .any(|fact| fact == &(owner, element_size, 2048)));
+        assert!(!prog
+            .is_global_array
+            .iter()
+            .any(|fact| fact.0 == owner && fact.2 == 2));
     }
 }

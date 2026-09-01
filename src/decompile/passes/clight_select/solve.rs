@@ -1204,9 +1204,10 @@ fn solve_function(
     HashMap<Node, Option<usize>>,
     HashMap<RTLReg, usize>,
     HashMap<RTLReg, CandType>,
+    u8,
 ) {
     match solve_function_engine(func, name_to_ident, &[], maximal_flow_certification) {
-        Ok((c, ty, ov, grade)) => {
+        Ok((c, ty, ov, structure_world, grade)) => {
             if matches!(grade, SatResult::Unknown) {
                 TYPE_SOLVE_PARTIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 eprintln!(
@@ -1217,7 +1218,7 @@ fn solve_function(
                     func.var_type_candidates.len()
                 );
             }
-            (c, ty, ov)
+            (c, ty, ov, structure_world)
         }
         Err(first) => {
             TYPE_SOLVE_NO_MODEL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1233,7 +1234,12 @@ fn solve_function(
                 func.node_statements.len(),
                 func.var_type_candidates.len()
             );
-            (HashMap::new(), HashMap::new(), HashMap::new())
+            (
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                func.authoritative_structure_world,
+            )
         }
     }
 }
@@ -1243,6 +1249,8 @@ struct BuiltFunction {
     t: TypeDt,
     regs: Vec<RTLReg>,
     tyvar: HashMap<RTLReg, Dynamic>,
+    structure_worlds: Vec<u8>,
+    structure_world_var: HashMap<u8, Bool>,
     nodes: Vec<Node>,
     selvar: HashMap<Node, Vec<Bool>>,
     recorded: HashMap<Node, Vec<Vec<RecordedCond>>>,
@@ -1327,22 +1335,101 @@ fn build_function_constraints(
                 if stmts.len() > 1 || dbg.contains("Ederef") {
                     eprintln!("  node {:#x} ({} cand stmts):", n, stmts.len());
                     for (i, s) in stmts.iter().enumerate() {
-                        eprintln!("    [{}] {:?}", i, s);
+                        eprintln!(
+                            "    [{}] worlds={:?} {:?}",
+                            i,
+                            func.candidate_structure_worlds
+                                .get(n)
+                                .and_then(|masks| masks.get(i)),
+                            s
+                        );
                     }
                 }
             }
         }
 
-        // Statement-selection booleans for multi-candidate nodes (exactly one per node).
+        // Function-level structure worlds are one-hot.  Statement choices are
+        // then guarded by their world provenance, so an Sswitch can never be
+        // combined with raw comparison-chain members and flat back edges can
+        // never enter an assembled loop.
+        let mut structure_worlds = func.structure_worlds.clone();
+        structure_worlds.sort_unstable();
+        structure_worlds.dedup();
+        if structure_worlds.is_empty() {
+            structure_worlds.push(func.authoritative_structure_world);
+        }
+        if let Some(position) = structure_worlds
+            .iter()
+            .position(|world| *world == func.authoritative_structure_world)
+        {
+            structure_worlds.swap(0, position);
+        } else {
+            structure_worlds.insert(0, func.authoritative_structure_world);
+        }
+        let mut structure_world_var: HashMap<u8, Bool> = HashMap::new();
+        if structure_worlds.len() > 1 {
+            let vars: Vec<Bool> = structure_worlds
+                .iter()
+                .map(|_| Bool::fresh_const("structure_world"))
+                .collect();
+            let refs: Vec<(&Bool, i32)> = vars.iter().map(|var| (var, 1)).collect();
+            backend.assert_hard(&Bool::pb_eq(&refs, 1));
+            for (&world, var) in structure_worlds.iter().zip(vars) {
+                structure_world_var.insert(world, var);
+            }
+        }
+
+        // Statement-selection booleans are also needed for a one-candidate
+        // node that is absent from one world: false means the chosen world
+        // omits that node entirely.
         let mut nodes: Vec<Node> = func.node_statements.keys().copied().collect();
         nodes.sort();
         let mut selvar: HashMap<Node, Vec<Bool>> = HashMap::new();
+        let all_worlds: BTreeSet<u8> = structure_worlds.iter().copied().collect();
         for &node in &nodes {
             let m = func.node_statements[&node].len();
-            if m > 1 {
+            let masks = func
+                .candidate_structure_worlds
+                .get(&node)
+                .cloned()
+                .unwrap_or_else(|| vec![all_worlds.clone(); m]);
+            let world_conditional = structure_worlds.len() > 1
+                && (masks.len() != m || masks.iter().any(|mask| mask != &all_worlds));
+            if m > 1 || world_conditional {
                 let vars: Vec<Bool> = (0..m).map(|_| Bool::fresh_const("s")).collect();
-                let refs: Vec<(&Bool, i32)> = vars.iter().map(|b| (b, 1)).collect();
-                backend.assert_hard(&Bool::pb_eq(&refs, 1));
+                if structure_worlds.len() == 1 {
+                    let refs: Vec<(&Bool, i32)> = vars.iter().map(|b| (b, 1)).collect();
+                    backend.assert_hard(&Bool::pb_eq(&refs, 1));
+                } else {
+                    for (candidate, selected) in vars.iter().enumerate() {
+                        let allowed = masks.get(candidate).unwrap_or(&all_worlds);
+                        let allowed_vars: Vec<Bool> = allowed
+                            .iter()
+                            .filter_map(|world| structure_world_var.get(world).cloned())
+                            .collect();
+                        if allowed_vars.is_empty() {
+                            backend.assert_hard(&selected.not());
+                        } else {
+                            backend.assert_hard(&selected.implies(Bool::or(&allowed_vars)));
+                        }
+                    }
+                    for world in &structure_worlds {
+                        let allowed_candidates: Vec<(&Bool, i32)> = vars
+                            .iter()
+                            .enumerate()
+                            .filter(|(candidate, _)| {
+                                masks.get(*candidate).unwrap_or(&all_worlds).contains(world)
+                            })
+                            .map(|(_, selected)| (selected, 1))
+                            .collect();
+                        if !allowed_candidates.is_empty() {
+                            backend.assert_hard(
+                                &structure_world_var[world]
+                                    .implies(Bool::pb_eq(&allowed_candidates, 1)),
+                            );
+                        }
+                    }
+                }
                 selvar.insert(node, vars);
             }
         }
@@ -1352,8 +1439,30 @@ fn build_function_constraints(
             other => clight_to_ty(&t, other),
         };
 
-        // Weight strata: priors 1 < SEL-AGREE 2 < cast nudges 8 < dominant compat_w. A x4 rescale with a separate canonical stratum was reverted, sending maxres from 13s to 75s on ls.
-        let compat_w: u64 = (regs.len() + selvar.len()) as u64 + 1;
+        // Weight strata must remain identical to the authoritative pipeline.
+        // World-conditional singleton nodes and flat-only alternatives are a
+        // representation expansion, not new baseline choices; counting them
+        // in compat_w changes unrelated candidate/type optima even when world
+        // zero wins.  Count only nodes that were genuinely refinable inside
+        // the authoritative world.
+        let authoritative_refinable_nodes = nodes
+            .iter()
+            .filter(|node| {
+                func.candidate_structure_worlds.get(node).map_or(
+                    func.node_statements[node].len() > 1,
+                    |masks| {
+                        masks
+                            .iter()
+                            .filter(|worlds| worlds.contains(&func.authoritative_structure_world))
+                            .count()
+                            > 1
+                    },
+                )
+            })
+            .count();
+        // Weight strata: priors 1 < SEL-AGREE 2 < cast nudges 8 < dominant
+        // compat_w.  Preserve the pre-world formula exactly.
+        let compat_w: u64 = (regs.len() + authoritative_refinable_nodes) as u64 + 1;
         let sink = ConstraintSink::new(backend, compat_w);
 
         // Emit constraints for every candidate statement, guarded by its selection boolean when refinable; multi-candidate nodes also record their conditions for the post-solve re-pick.
@@ -1407,7 +1516,30 @@ fn build_function_constraints(
         let mut sel_nodes: Vec<Node> = selvar.keys().copied().collect();
         sel_nodes.sort();
         for node in &sel_nodes {
-            sink.assert_soft_raw(&selvar[node][0], 1u64);
+            let authoritative_candidates: Vec<usize> = func
+                .candidate_structure_worlds
+                .get(node)
+                .map(|masks| {
+                    masks
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, worlds)| {
+                            worlds
+                                .contains(&func.authoritative_structure_world)
+                                .then_some(index)
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|| (0..func.node_statements[node].len()).collect());
+            // The legacy solver had a statement prior only at a node with
+            // multiple authoritative candidates.  Do not let a newly added
+            // flat sibling create a fresh objective term.
+            if authoritative_candidates.len() > 1 {
+                sink.assert_soft_raw(&selvar[node][authoritative_candidates[0]], 1u64);
+            }
+        }
+        if let Some(authoritative) = structure_world_var.get(&func.authoritative_structure_world) {
+            sink.assert_soft_raw(authoritative, 1u64);
         }
         // (No canonical tie-break clauses: the width/signedness/float-size payload dimensions that created solver-side ties were REMOVED from the datatype -- see the TypeDt comment. Class-level ties cannot reach the output: the anchor maps each class to one deterministic candidate.)
 
@@ -1415,6 +1547,8 @@ fn build_function_constraints(
             t,
             regs,
             tyvar,
+            structure_worlds,
+            structure_world_var,
             nodes,
             selvar,
             recorded,
@@ -1433,15 +1567,27 @@ fn extract_selection(
     HashMap<Node, Option<usize>>,
     HashMap<RTLReg, usize>,
     HashMap<RTLReg, CandType>,
+    u8,
 ) {
     let BuiltFunction {
         t,
         regs,
         tyvar,
+        structure_worlds,
+        structure_world_var,
         nodes,
         selvar,
         recorded,
     } = built;
+    let selected_structure_world = structure_worlds
+        .iter()
+        .find(|world| {
+            structure_world_var
+                .get(world)
+                .is_some_and(|var| m.truth(var).unwrap_or(false))
+        })
+        .copied()
+        .unwrap_or(func.authoritative_structure_world);
     let mut cand_out: HashMap<Node, Option<usize>> = HashMap::new();
     let mut ty_out: HashMap<RTLReg, usize> = HashMap::new();
     let mut ty_override: HashMap<RTLReg, CandType> = HashMap::new();
@@ -1497,19 +1643,29 @@ fn extract_selection(
         match selvar.get(&node) {
             Some(vars) => {
                 // z3's own pick (consistent with every asserted constraint) is the fallback when nothing was recorded.
-                let mut chosen = 0usize;
-                for (i, b) in vars.iter().enumerate() {
-                    if m.truth(b).unwrap_or(false) {
-                        chosen = i;
-                        break;
-                    }
-                }
+                let Some(mut chosen) = vars
+                    .iter()
+                    .position(|selected| m.truth(selected).unwrap_or(false))
+                else {
+                    // This node does not exist in the selected structural
+                    // world.  It must remain absent through tree assembly.
+                    cand_out.insert(node, None);
+                    continue;
+                };
                 // Exact-wt re-pick (P3): with the model fixed, score each candidate by fewest exact frontend errors, then structural conditions, then soft weight, then index, and take the minimum.
                 if let Some(per_cand) = recorded.get(&node) {
                     let truth = |c: &Bool| m.truth(c).unwrap_or(true);
                     let cands = &func.node_statements[&node];
                     let mut best: Option<(u64, u64, u64, u64, usize)> = None;
                     for (ci, conds) in per_cand.iter().enumerate() {
+                        let allowed = func
+                            .candidate_structure_worlds
+                            .get(&node)
+                            .and_then(|masks| masks.get(ci))
+                            .map_or(true, |worlds| worlds.contains(&selected_structure_world));
+                        if !allowed {
+                            continue;
+                        }
                         let wt = cands
                             .get(ci)
                             .map(|stmt| {
@@ -1586,7 +1742,7 @@ fn extract_selection(
         }
     }
 
-    (cand_out, ty_out, ty_override)
+    (cand_out, ty_out, ty_override, selected_structure_world)
 }
 
 // The per-function selection a solve produces, plus the SatResult that yielded it.
@@ -1594,6 +1750,7 @@ type SolveOutcome = (
     HashMap<Node, Option<usize>>,
     HashMap<RTLReg, usize>,
     HashMap<RTLReg, CandType>,
+    u8,
     SatResult,
 );
 
@@ -1653,9 +1810,9 @@ fn solve_function_z3(
         match model {
             Some(m) => {
                 report_cost("optimize", func, &m, &softs);
-                let (cand_out, ty_out, ty_override) =
+                let (cand_out, ty_out, ty_override, structure_world) =
                     extract_selection(&m, &built, func, name_to_ident);
-                Ok((cand_out, ty_out, ty_override, check_result))
+                Ok((cand_out, ty_out, ty_override, structure_world, check_result))
             }
             None => Err(check_result),
         }
@@ -1937,7 +2094,7 @@ fn solve_function_propagator_attempt(
         let result = match model {
             Some(m) => {
                 report_cost("propagator", func, &m, &clauses);
-                let (cand_out, ty_out, ty_override) =
+                let (cand_out, ty_out, ty_override, structure_world) =
                     extract_selection(&m, &built, func, name_to_ident);
                 // Guess-surface proxy. When the flow theory named a node in a
                 // clause and that node's final pick is not candidate 0, the
@@ -1953,7 +2110,7 @@ fn solve_function_propagator_attempt(
                     let mut g = FLOW_STATS.lock().unwrap();
                     g.ties_determined_by_flow += ties;
                 }
-                Ok((cand_out, ty_out, ty_override, check_result))
+                Ok((cand_out, ty_out, ty_override, structure_world, check_result))
             }
             None => Err(check_result),
         };
@@ -2406,11 +2563,12 @@ pub(crate) fn infer_select_program(
         HashMap<Node, Option<usize>>,
         HashMap<RTLReg, usize>,
         HashMap<RTLReg, CandType>,
+        u8,
     )> = functions
         .par_iter()
         .map(|f| {
-            let (c, t, o) = solve_function(f, name_to_ident, maximal_flow_certification);
-            (f.address, c, t, o)
+            let (c, t, o, world) = solve_function(f, name_to_ident, maximal_flow_certification);
+            (f.address, c, t, o, world)
         })
         .collect();
 
@@ -2449,9 +2607,11 @@ pub(crate) fn infer_select_program(
     }
 
     let mut candidate_idx = HashMap::new();
+    let mut structure_world = HashMap::new();
     let mut var_decl_idx = HashMap::new();
     let mut var_type_override = HashMap::new();
-    for (addr, cmap, tmap, omap) in per_func {
+    for (addr, cmap, tmap, omap, world) in per_func {
+        structure_world.insert(addr, world);
         for (node, idx) in cmap {
             candidate_idx.insert((addr, node), idx);
         }
@@ -2465,6 +2625,7 @@ pub(crate) fn infer_select_program(
 
     let state = ProgramSelectionState {
         candidate_idx,
+        structure_world,
         var_decl_idx,
         var_type_override,
     };
@@ -2482,6 +2643,9 @@ fn dump_selection(stage: &str, state: &ProgramSelectionState) {
     let mut lines: Vec<String> = Vec::new();
     for ((addr, node), idx) in &state.candidate_idx {
         lines.push(format!("stmt {:#x} {:#x} {:?}", addr, node, idx));
+    }
+    for (addr, world) in &state.structure_world {
+        lines.push(format!("world {:#x} {}", addr, world));
     }
     for ((addr, reg), idx) in &state.var_decl_idx {
         lines.push(format!("decl {:#x} {:#x} {}", addr, reg, idx));
@@ -2625,8 +2789,9 @@ pub(crate) fn resolve_dirty_functions(
             &pins,
             maximal_flow_certification,
         ) {
-            Ok((candidates, declarations, overrides, SatResult::Sat)) => {
+            Ok((candidates, declarations, overrides, structure_world, SatResult::Sat)) => {
                 *func = resolve_func;
+                state.structure_world.insert(func.address, structure_world);
                 state
                     .candidate_idx
                     .retain(|(address, _), _| *address != func.address);
@@ -2649,7 +2814,7 @@ pub(crate) fn resolve_dirty_functions(
                 }
                 resolved_count += 1;
             }
-            Ok((_, _, _, grade)) => {
+            Ok((_, _, _, _, grade)) => {
                 fallback_count += 1;
                 eprintln!(
                     "[interface-solve] WARN: dirty re-solve for {} ({:#x}) returned {:?}; retaining Stage-A selection",
@@ -2719,6 +2884,49 @@ mod tests {
     }
 
     #[test]
+    fn structure_world_selection_never_mixes_correlated_node_candidates() {
+        let func_addr = 0x1000;
+        let first = 0x1010;
+        let second = 0x1020;
+        let structured = crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_STRUCTURED;
+        let flat = crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_FLAT;
+        let mut func = FunctionData::new(
+            func_addr,
+            "world_atomicity".into(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            0,
+            first,
+            true,
+        );
+        func.structure_worlds = vec![structured, flat];
+        func.authoritative_structure_world = structured;
+        // Opposite local candidate orders make an independent node selector
+        // prefer the unsound mixed pair.  World masks must force (0, 1) or
+        // (1, 0), never (0, 0) or (1, 1).
+        func.node_statements
+            .insert(first, vec![ClightStmt::Sgoto(1), ClightStmt::Sgoto(2)]);
+        func.candidate_structure_worlds.insert(
+            first,
+            vec![BTreeSet::from([structured]), BTreeSet::from([flat])],
+        );
+        func.node_statements
+            .insert(second, vec![ClightStmt::Sgoto(3), ClightStmt::Sgoto(4)]);
+        func.candidate_structure_worlds.insert(
+            second,
+            vec![BTreeSet::from([flat]), BTreeSet::from([structured])],
+        );
+
+        let (choices, _, _, selected_world) = solve_function(&func, &HashMap::new(), false);
+        let first_choice = choices[&first].expect("first node is active");
+        let second_choice = choices[&second].expect("second node is active");
+        assert!(func.candidate_structure_worlds[&first][first_choice].contains(&selected_world));
+        assert!(func.candidate_structure_worlds[&second][second_choice].contains(&selected_world));
+        assert!(matches!((first_choice, second_choice), (0, 1) | (1, 0)));
+    }
+
+    #[test]
     fn dirty_unsat_preserves_stage_a_candidate_indices() {
         let [address] = synthetic_ids();
         let reg = 11;
@@ -2737,6 +2945,7 @@ mod tests {
         let before = func.var_type_candidates.clone();
         let stage_a = ProgramSelectionState {
             candidate_idx: HashMap::new(),
+            structure_world: HashMap::new(),
             var_decl_idx: [((address, reg), 1)].into_iter().collect(),
             var_type_override: HashMap::new(),
         };
@@ -2773,6 +2982,7 @@ mod tests {
             .insert(reg, vec![CandType::PtrVoid, CandType::F64]);
         let stage_a = ProgramSelectionState {
             candidate_idx: HashMap::new(),
+            structure_world: HashMap::new(),
             var_decl_idx: [((address, reg), 0)].into_iter().collect(),
             var_type_override: HashMap::new(),
         };
@@ -2810,6 +3020,7 @@ mod tests {
         func.must_pointer_regs.insert(reg);
         let stage_a = ProgramSelectionState {
             candidate_idx: HashMap::new(),
+            structure_world: HashMap::new(),
             var_decl_idx: [((address, reg), 0)].into_iter().collect(),
             var_type_override: HashMap::new(),
         };
@@ -2854,6 +3065,7 @@ mod tests {
         committed.globals.insert(symbol, XType::Xfloat);
         let stage_a = ProgramSelectionState {
             candidate_idx: HashMap::new(),
+            structure_world: HashMap::new(),
             var_decl_idx: HashMap::new(),
             var_type_override: HashMap::new(),
         };
@@ -3215,7 +3427,7 @@ mod tests {
             )],
         );
 
-        let (statement_idx, declaration_idx, _) = solve_function(&func, &HashMap::new(), false);
+        let (statement_idx, declaration_idx, _, _) = solve_function(&func, &HashMap::new(), false);
         assert_eq!(declaration_idx.get(&reg), Some(&1));
         assert_eq!(statement_idx.get(&load_node), Some(&Some(1)));
     }
@@ -3267,7 +3479,7 @@ mod tests {
             ],
         );
 
-        let (statement_idx, _, _) = solve_function(&func, &HashMap::new(), false);
+        let (statement_idx, _, _, _) = solve_function(&func, &HashMap::new(), false);
         assert_eq!(statement_idx.get(&store_node), Some(&Some(1)));
     }
 
@@ -3290,7 +3502,7 @@ mod tests {
         func.var_type_candidates
             .insert(reg, vec![CandType::I32(Sign::Signed), CandType::PtrChar]);
 
-        let (_, declarations, _) = solve_function(&func, &HashMap::new(), false);
+        let (_, declarations, _, _) = solve_function(&func, &HashMap::new(), false);
 
         assert_eq!(declarations.get(&reg), Some(&1));
     }

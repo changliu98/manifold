@@ -1532,6 +1532,10 @@ impl IRPass for RTLOptimizePass {
 
     fn outputs(&self) -> &'static [&'static str] {
         &[
+            // trim_direct_call_args_to_callee_arity rewrites this relation in
+            // place before finalization.  Declare the write so later readers
+            // cannot race the patched argument inventory.
+            "rtl_inst_candidate",
             "rtl_inst",
             "rtl_succ",
             "rtl_next",
@@ -1573,6 +1577,221 @@ impl IRPass for RTLOptimizePass {
             "stack_def_used",
             "func_stacksz",
         ]
+    }
+}
+
+/// The only deliberate generic RTL superset currently produced upstream is the
+/// signed/unsigned spelling of byte and word loads/stores.  Keep this whitelist
+/// exact: equal bit width alone would incorrectly mix bool, integer, and float
+/// memory semantics, while integer operation width pairs include known decoder
+/// ambiguities (DIV and LEA in particular).
+fn compatible_memory_chunks(left: &MemoryChunk, right: &MemoryChunk) -> bool {
+    matches!(
+        (left, right),
+        (MemoryChunk::MInt8Signed, MemoryChunk::MInt8Unsigned)
+            | (MemoryChunk::MInt8Unsigned, MemoryChunk::MInt8Signed)
+            | (MemoryChunk::MInt16Signed, MemoryChunk::MInt16Unsigned)
+            | (MemoryChunk::MInt16Unsigned, MemoryChunk::MInt16Signed)
+    )
+}
+
+/// Candidate-local compatibility boundary for the post-RTL superset.
+///
+/// The final optimizer world remains authoritative.  An unchosen raw
+/// interpretation may advance only when choosing it cannot alter the node set,
+/// CFG, or cross-node SSA dependencies: the ordered def/use footprint is exact,
+/// and only the producer's explicit subword signedness spelling differs. Calls,
+/// arithmetic, control, constants, copies, killed/expansion nodes, and shared
+/// owners therefore stay single-valued until the pipeline has world/bundle
+/// provenance capable of selecting them atomically.
+fn locally_compatible_rtl_candidate(selected: &RTLInst, candidate: &RTLInst) -> bool {
+    if selected == candidate {
+        return true;
+    }
+    if inst_def_use(selected) != inst_def_use(candidate) {
+        return false;
+    }
+
+    match (selected, candidate) {
+        (
+            RTLInst::Iload(selected_chunk, selected_addr, _, _),
+            RTLInst::Iload(candidate_chunk, candidate_addr, _, _),
+        ) => {
+            selected_addr == candidate_addr
+                && compatible_memory_chunks(selected_chunk, candidate_chunk)
+        }
+        (
+            RTLInst::Istore(selected_chunk, selected_addr, _, _),
+            RTLInst::Istore(candidate_chunk, candidate_addr, _, _),
+        ) => {
+            selected_addr == candidate_addr
+                && compatible_memory_chunks(selected_chunk, candidate_chunk)
+        }
+        _ => false,
+    }
+}
+
+fn load_signedness_types_are_selectable(
+    selected: &RTLInst,
+    candidate: &RTLInst,
+    var_types: &HashMap<RTLReg, HashSet<XType>>,
+) -> bool {
+    let (selected_chunk, candidate_chunk, dst) = match (selected, candidate) {
+        (
+            RTLInst::Iload(selected_chunk, _, _, selected_dst),
+            RTLInst::Iload(candidate_chunk, _, _, candidate_dst),
+        ) if selected_dst == candidate_dst => (selected_chunk, candidate_chunk, *selected_dst),
+        (RTLInst::Istore(..), RTLInst::Istore(..)) => return true,
+        _ => return false,
+    };
+    let xtype = |chunk: &MemoryChunk| match chunk {
+        MemoryChunk::MInt8Signed => Some(XType::Xint8signed),
+        MemoryChunk::MInt8Unsigned => Some(XType::Xint8unsigned),
+        MemoryChunk::MInt16Signed => Some(XType::Xint16signed),
+        MemoryChunk::MInt16Unsigned => Some(XType::Xint16unsigned),
+        _ => None,
+    };
+    let Some(selected_type) = xtype(selected_chunk) else {
+        return false;
+    };
+    let Some(candidate_type) = xtype(candidate_chunk) else {
+        return false;
+    };
+    var_types
+        .get(&dst)
+        .is_some_and(|types| types.contains(&selected_type) && types.contains(&candidate_type))
+}
+
+/// Publish the candidate superset only after SignatureReconciliation has made
+/// `rtl_inst` final.  Keeping this as a separate pass prevents stale call rows
+/// from the pre-signature optimizer boundary from re-entering Cminor.
+pub struct RTLSupersetPass;
+
+impl IRPass for RTLSupersetPass {
+    fn name(&self) -> &'static str {
+        "rtl_superset"
+    }
+
+    fn run(&self, db: &mut DecompileDB) {
+        let emitted_functions: HashSet<Address> = db
+            .rel_iter::<(Address, Symbol, Node)>("emit_function")
+            .map(|(func, _, _)| *func)
+            .collect();
+        let mut owners: HashMap<Node, HashSet<Address>> = HashMap::new();
+        for (node, func) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+            if emitted_functions.contains(func) {
+                owners.entry(*node).or_default().insert(*func);
+            }
+        }
+
+        let mut finalized: HashMap<Node, Vec<RTLInst>> = HashMap::new();
+        for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+            finalized.entry(*node).or_default().push(inst.clone());
+        }
+        for instructions in finalized.values_mut() {
+            instructions.sort_by_cached_key(|inst| format!("{inst:?}"));
+            instructions.dedup();
+        }
+
+        let mut raw: HashMap<Node, Vec<RTLInst>> = HashMap::new();
+        for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate") {
+            raw.entry(*node).or_default().push(inst.clone());
+        }
+        for instructions in raw.values_mut() {
+            instructions.sort_by_cached_key(|inst| format!("{inst:?}"));
+            instructions.dedup();
+        }
+        let mut var_types: HashMap<RTLReg, HashSet<XType>> = HashMap::new();
+        for (reg, xtype) in db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate") {
+            var_types.entry(*reg).or_default().insert(*xtype);
+        }
+
+        // Multi-node RTL expansions are correlated bundles.  Even a member
+        // whose local def/use happens to match cannot be varied independently.
+        let expansion_nodes: HashSet<Node> = db
+            .rel_iter::<(Node, Node)>("rtl_expansion_edge")
+            .flat_map(|(src, dst)| [*src, *dst])
+            .collect();
+
+        // Always retain every authoritative row.  Extra interpretations require
+        // one functional finalized instruction and one emitted-function owner.
+        let mut superset: Vec<(Node, RTLInst)> = finalized
+            .iter()
+            .flat_map(|(&node, instructions)| {
+                instructions.iter().cloned().map(move |inst| (node, inst))
+            })
+            .collect();
+        let authoritative_rows = superset.len();
+        let mut authoritative_chunks: Vec<(Node, MemoryChunk)> = Vec::new();
+        for (&node, instructions) in &finalized {
+            let [selected] = instructions.as_slice() else {
+                continue;
+            };
+            if owners.get(&node).map_or(0, HashSet::len) != 1 {
+                continue;
+            }
+            if expansion_nodes.contains(&node) {
+                continue;
+            }
+            if let Some(candidates) = raw.get(&node) {
+                let alternatives: Vec<RTLInst> = candidates
+                    .iter()
+                    .filter(|candidate| {
+                        *candidate != selected
+                            && locally_compatible_rtl_candidate(selected, candidate)
+                            && load_signedness_types_are_selectable(selected, candidate, &var_types)
+                    })
+                    .cloned()
+                    .collect();
+                if !alternatives.is_empty() {
+                    let chunk = match selected {
+                        RTLInst::Iload(chunk, _, _, _) | RTLInst::Istore(chunk, _, _, _) => *chunk,
+                        _ => unreachable!("compatibility admits only loads and stores"),
+                    };
+                    authoritative_chunks.push((node, chunk));
+                    superset.extend(alternatives.into_iter().map(|candidate| (node, candidate)));
+                }
+            }
+        }
+
+        superset.sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
+        superset.dedup();
+        db.rel_set(
+            "rtl_inst_superset",
+            superset
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<(Node, RTLInst)>>(),
+        );
+        authoritative_chunks.sort_unstable_by_key(|(node, chunk)| (*node, format!("{chunk:?}")));
+        authoritative_chunks.dedup();
+        let alternative_rows = authoritative_chunks.len();
+        db.rel_set(
+            "rtl_superset_authoritative_chunk",
+            authoritative_chunks
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<(Node, MemoryChunk)>>(),
+        );
+        eprintln!(
+            "[rtl-superset] authoritative={} alternative-nodes={} total={}",
+            authoritative_rows,
+            alternative_rows,
+            authoritative_rows + alternative_rows
+        );
+    }
+
+    fn inputs(&self) -> &'static [&'static str] {
+        &[
+            "rtl_inst_candidate",
+            "rtl_inst",
+            "rtl_expansion_edge",
+            "emit_var_type_candidate",
+            "instr_in_function",
+            "emit_function",
+        ]
+    }
+
+    fn outputs(&self) -> &'static [&'static str] {
+        &["rtl_inst_superset", "rtl_superset_authoritative_chunk"]
     }
 }
 
@@ -3147,14 +3366,14 @@ pub(crate) fn find_inline_temps(
 mod tests {
     use super::{
         copy_propagation, dead_store_elimination, find_inline_temps, fold_static_eq_branches,
-        observable_stack_storage_regs, optimize_rtl_candidates,
+        locally_compatible_rtl_candidate, observable_stack_storage_regs, optimize_rtl_candidates,
         protect_exact_stack_address_definitions, reachable_from, unique_external_cfg_entry,
-        DefUseInfo, FunctionCFG, LivenessInfo, PassContext, RTLOptimizePass,
+        DefUseInfo, FunctionCFG, LivenessInfo, PassContext, RTLOptimizePass, RTLSupersetPass,
     };
     use crate::decompile::elevator::DecompileDB;
     use crate::decompile::passes::pass::IRPass;
     use crate::x86::op::{Addressing, Comparison, Condition, Operation};
-    use crate::x86::types::{Constant, MemoryChunk, RTLInst};
+    use crate::x86::types::{Constant, MemoryChunk, RTLInst, XType};
     use either::Either;
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::sync::Arc;
@@ -3190,6 +3409,260 @@ mod tests {
             multi_def_slot_regs: HashSet::new(),
             shared_nodes: HashSet::new(),
         }
+    }
+
+    fn superset_rows(db: &DecompileDB, node: u64) -> Vec<RTLInst> {
+        let mut rows: Vec<_> = db
+            .rel_iter::<(u64, RTLInst)>("rtl_inst_superset")
+            .filter_map(|(candidate_node, inst)| (*candidate_node == node).then_some(inst.clone()))
+            .collect();
+        rows.sort_by_cached_key(|inst| format!("{inst:?}"));
+        rows
+    }
+
+    #[test]
+    fn rtl_superset_advances_only_same_footprint_subword_signedness_alternatives() {
+        let func: u64 = 0x1000;
+        let node: u64 = 0x1010;
+        let source_a = 1;
+        let result = 3;
+        let args = Arc::new(vec![source_a]);
+        let selected = RTLInst::Iload(
+            MemoryChunk::MInt8Unsigned,
+            Addressing::Aindexed(4),
+            args.clone(),
+            result,
+        );
+        let compatible = RTLInst::Iload(
+            MemoryChunk::MInt8Signed,
+            Addressing::Aindexed(4),
+            args.clone(),
+            result,
+        );
+        let wrong_class = RTLInst::Iload(
+            MemoryChunk::MBool,
+            Addressing::Aindexed(4),
+            args.clone(),
+            result,
+        );
+        let wrong_address = RTLInst::Iload(
+            MemoryChunk::MInt8Signed,
+            Addressing::Aindexed(8),
+            args.clone(),
+            result,
+        );
+        let arithmetic = RTLInst::Iop(Operation::Oadd, args, result);
+
+        let mut db = DecompileDB::default();
+        db.rel_push("emit_function", (func, "superset", node));
+        db.rel_push("instr_in_function", (node, func));
+        db.rel_push("rtl_inst", (node, selected.clone()));
+        db.rel_push("emit_var_type_candidate", (result, XType::Xint8unsigned));
+        db.rel_push("emit_var_type_candidate", (result, XType::Xint8signed));
+        for candidate in [
+            selected.clone(),
+            compatible.clone(),
+            wrong_class,
+            wrong_address,
+            arithmetic,
+        ] {
+            db.rel_push("rtl_inst_candidate", (node, candidate));
+        }
+
+        RTLSupersetPass.run(&mut db);
+
+        assert_eq!(superset_rows(&db, node), {
+            let mut expected = vec![selected, compatible];
+            expected.sort_by_cached_key(|inst| format!("{inst:?}"));
+            expected
+        });
+    }
+
+    #[test]
+    fn rtl_superset_does_not_revive_killed_control_or_shared_candidates() {
+        let func_a: u64 = 0x2000;
+        let func_b: u64 = 0x3000;
+        let killed = 0x2010;
+        let control = 0x2020;
+        let shared = 0x2030;
+        let expansion = 0x2060;
+        let selected_control = RTLInst::Icond(
+            Condition::Ccomp(Comparison::Ceq),
+            Arc::new(vec![1, 2]),
+            Either::Right(0x2040),
+            Either::Right(0x2050),
+        );
+        let selected_shared = RTLInst::Iload(
+            MemoryChunk::MInt16Unsigned,
+            Addressing::Aindexed(0),
+            Arc::new(vec![1]),
+            3,
+        );
+
+        let mut db = DecompileDB::default();
+        db.rel_push("emit_function", (func_a, "owner_a", control));
+        db.rel_push("emit_function", (func_b, "owner_b", shared));
+        for (node, func) in [
+            (killed, func_a),
+            (control, func_a),
+            (shared, func_a),
+            (shared, func_b),
+            (expansion, func_a),
+        ] {
+            db.rel_push("instr_in_function", (node, func));
+        }
+        // No finalized row exists for `killed`, exactly as after DSE+nop collapse.
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                killed,
+                RTLInst::Iload(
+                    MemoryChunk::MInt8Signed,
+                    Addressing::Aindexed(0),
+                    Arc::new(vec![1]),
+                    4,
+                ),
+            ),
+        );
+        let selected_expansion = RTLInst::Iload(
+            MemoryChunk::MInt8Unsigned,
+            Addressing::Aindexed(0),
+            Arc::new(vec![1]),
+            5,
+        );
+        db.rel_push("rtl_inst", (expansion, selected_expansion.clone()));
+        db.rel_push(
+            "rtl_inst_candidate",
+            (expansion, selected_expansion.clone()),
+        );
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                expansion,
+                RTLInst::Iload(
+                    MemoryChunk::MInt8Signed,
+                    Addressing::Aindexed(0),
+                    Arc::new(vec![1]),
+                    5,
+                ),
+            ),
+        );
+        db.rel_push("rtl_expansion_edge", (expansion, control));
+        db.rel_push("rtl_inst", (control, selected_control.clone()));
+        db.rel_push("rtl_inst_candidate", (control, selected_control.clone()));
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                control,
+                RTLInst::Icond(
+                    Condition::Ccomp(Comparison::Cne),
+                    Arc::new(vec![1, 2]),
+                    Either::Right(0x2040),
+                    Either::Right(0x2050),
+                ),
+            ),
+        );
+        db.rel_push("rtl_inst", (shared, selected_shared.clone()));
+        db.rel_push("rtl_inst_candidate", (shared, selected_shared.clone()));
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                shared,
+                RTLInst::Iload(
+                    MemoryChunk::MInt16Signed,
+                    Addressing::Aindexed(0),
+                    Arc::new(vec![1]),
+                    3,
+                ),
+            ),
+        );
+
+        RTLSupersetPass.run(&mut db);
+
+        assert!(superset_rows(&db, killed).is_empty());
+        assert_eq!(superset_rows(&db, control), vec![selected_control]);
+        assert_eq!(superset_rows(&db, shared), vec![selected_shared]);
+        assert_eq!(superset_rows(&db, expansion), vec![selected_expansion]);
+    }
+
+    #[test]
+    fn rtl_superset_memory_alternatives_require_the_same_address_and_width() {
+        let args = Arc::new(vec![1]);
+        let selected = RTLInst::Iload(
+            MemoryChunk::MInt8Unsigned,
+            Addressing::Aindexed(8),
+            args.clone(),
+            2,
+        );
+        let signedness = RTLInst::Iload(
+            MemoryChunk::MInt8Signed,
+            Addressing::Aindexed(8),
+            args.clone(),
+            2,
+        );
+        let different_width = RTLInst::Iload(
+            MemoryChunk::MInt16Signed,
+            Addressing::Aindexed(8),
+            args.clone(),
+            2,
+        );
+        let different_address = RTLInst::Iload(
+            MemoryChunk::MInt8Signed,
+            Addressing::Aindexed(16),
+            args.clone(),
+            2,
+        );
+        let boolean = RTLInst::Iload(MemoryChunk::MBool, Addressing::Aindexed(8), args.clone(), 2);
+        let floating = RTLInst::Iload(
+            MemoryChunk::MFloat32,
+            Addressing::Aindexed(8),
+            args.clone(),
+            2,
+        );
+        let generic = RTLInst::Iload(MemoryChunk::MAny32, Addressing::Aindexed(8), args, 2);
+
+        assert!(locally_compatible_rtl_candidate(&selected, &signedness));
+        assert!(!locally_compatible_rtl_candidate(
+            &selected,
+            &different_width
+        ));
+        assert!(!locally_compatible_rtl_candidate(
+            &selected,
+            &different_address
+        ));
+        assert!(!locally_compatible_rtl_candidate(&selected, &boolean));
+        assert!(!locally_compatible_rtl_candidate(&selected, &floating));
+        assert!(!locally_compatible_rtl_candidate(&selected, &generic));
+    }
+
+    #[test]
+    fn rtl_superset_load_fails_closed_without_both_type_candidates() {
+        let func: u64 = 0x4000;
+        let node: u64 = 0x4010;
+        let dst = 2;
+        let selected = RTLInst::Iload(
+            MemoryChunk::MInt8Unsigned,
+            Addressing::Aindexed(0),
+            Arc::new(vec![1]),
+            dst,
+        );
+        let alternate = RTLInst::Iload(
+            MemoryChunk::MInt8Signed,
+            Addressing::Aindexed(0),
+            Arc::new(vec![1]),
+            dst,
+        );
+        let mut db = DecompileDB::default();
+        db.rel_push("emit_function", (func, "missing_type", node));
+        db.rel_push("instr_in_function", (node, func));
+        db.rel_push("rtl_inst", (node, selected.clone()));
+        db.rel_push("rtl_inst_candidate", (node, selected.clone()));
+        db.rel_push("rtl_inst_candidate", (node, alternate));
+        db.rel_push("emit_var_type_candidate", (dst, XType::Xint8unsigned));
+
+        RTLSupersetPass.run(&mut db);
+
+        assert_eq!(superset_rows(&db, node), vec![selected]);
     }
 
     fn run_copy_propagation(mut func: FunctionCFG) -> (usize, HashMap<u64, u64>, HashSet<u64>) {

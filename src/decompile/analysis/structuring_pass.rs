@@ -15,6 +15,14 @@ use std::collections::{HashMap, HashSet};
 
 type CsharpStmtCandidates = HashMap<Node, Vec<CsharpminorStmt>>;
 
+/// Function-scoped structural interpretations carried to the Clight selector.
+/// World zero is deliberately the pre-existing pipeline result so a missing
+/// model or an incomplete downstream consumer remains byte-for-byte
+/// compatible.  The flat world retains the optimized Csharpminor CFG before
+/// loop/if/switch materialization and must be selected atomically.
+pub const STRUCTURE_WORLD_STRUCTURED: u8 = 0;
+pub const STRUCTURE_WORLD_FLAT: u8 = 1;
+
 fn stmt_candidate_key(stmt: &CsharpminorStmt) -> (bool, String) {
     // Snop is a last-resort conversion failure, never the semantic
     // representative when the same node has a real statement candidate.
@@ -264,6 +272,7 @@ impl IRPass for StructuringPass {
                 if stmts.len() <= 1 {
                     return (
                         *func_addr,
+                        stmts.clone(),
                         StructuringResult {
                             stmts: stmts.clone(),
                             switch_chain_members: vec![],
@@ -287,12 +296,24 @@ impl IRPass for StructuringPass {
                     &cminor_preds,
                     &packed_alu_nodes,
                 );
-                (*func_addr, structured)
+                (*func_addr, stmts.clone(), structured)
             })
+            .collect();
+
+        // Cshminor already derives loop structure in Ascent.  Structuring's
+        // own Ascent program derives joins and switch candidates below.  A
+        // function with either kind of structural metadata needs a flat world
+        // even when its statement values happen to be unchanged.
+        let loop_structured_functions: HashSet<Address> = db
+            .rel_iter::<(Address, Node, Node)>("emit_loop_body")
+            .map(|(func, _, _)| *func)
             .collect();
 
         // Merge results
         let mut result_stmts: Vec<(Node, CsharpminorStmt)> = Vec::new();
+        let mut structure_worlds: Vec<(Address, u8, bool)> = Vec::new();
+        let mut csharp_stmt_worlds: Vec<(Address, u8, Node, CsharpminorStmt)> = Vec::new();
+        let mut structure_unchanged_nodes: Vec<(Address, Node)> = Vec::new();
         let mut all_switch_members: Vec<(Address, Node, Node, u64, i64, Node)> = Vec::new();
         let mut all_valid_switches: Vec<(Address, Node, u64)> = Vec::new();
         let mut all_switch_defaults: Vec<(Address, Node, Node)> = Vec::new();
@@ -300,7 +321,44 @@ impl IRPass for StructuringPass {
         let mut all_ifbody_false: Vec<(Address, Node, Node)> = Vec::new();
         let mut all_join_points: Vec<(Address, Node, Node)> = Vec::new();
         let mut all_scond_no_join: Vec<(Address, Node)> = Vec::new();
-        for (func_addr, structured) in per_func_results {
+        for (func_addr, flat_stmts, structured) in per_func_results {
+            let flat_canonical: HashMap<Node, CsharpminorStmt> =
+                flat_stmts.iter().cloned().collect();
+            let structured_canonical: HashMap<Node, CsharpminorStmt> =
+                structured.stmts.iter().cloned().collect();
+            let has_flat_world = flat_canonical != structured_canonical
+                || !structured.valid_switches.is_empty()
+                || !structured.ifbody_true.is_empty()
+                || !structured.ifbody_false.is_empty()
+                || !structured.join_points.is_empty()
+                || !structured.scond_no_join.is_empty()
+                || loop_structured_functions.contains(&func_addr);
+            structure_worlds.push((func_addr, STRUCTURE_WORLD_STRUCTURED, true));
+            if has_flat_world {
+                structure_worlds.push((func_addr, STRUCTURE_WORLD_FLAT, false));
+                for (node, _) in &flat_stmts {
+                    if let Some(stmts) = candidates.get(node) {
+                        csharp_stmt_worlds.extend(
+                            stmts
+                                .iter()
+                                .cloned()
+                                .map(|stmt| (func_addr, STRUCTURE_WORLD_FLAT, *node, stmt)),
+                        );
+                    }
+                }
+            }
+
+            let switch_nodes: HashSet<Node> = structured
+                .valid_switches
+                .iter()
+                .map(|(head, _)| *head)
+                .chain(
+                    structured
+                        .switch_chain_members
+                        .iter()
+                        .map(|(_, member, _, _, _)| *member),
+                )
+                .collect();
             for (node, stmt) in structured.stmts {
                 // A structurally unchanged node retains every optimized data
                 // candidate.  A control-flow rewrite is intentionally
@@ -309,10 +367,24 @@ impl IRPass for StructuringPass {
                 if working.get(&node) == Some(&stmt) {
                     if let Some(stmts) = candidates.get(&node) {
                         result_stmts.extend(stmts.iter().cloned().map(|s| (node, s)));
+                        csharp_stmt_worlds.extend(
+                            stmts
+                                .iter()
+                                .cloned()
+                                .map(|s| (func_addr, STRUCTURE_WORLD_STRUCTURED, node, s)),
+                        );
+                        // Switch materialization is metadata-driven: the raw
+                        // Scond may be byte-identical in both worlds while the
+                        // structured world suppresses the comparison chain.
+                        // Do not mark its head shared.
+                        if has_flat_world && !switch_nodes.contains(&node) {
+                            structure_unchanged_nodes.push((func_addr, node));
+                        }
                         continue;
                     }
                 }
-                result_stmts.push((node, stmt));
+                result_stmts.push((node, stmt.clone()));
+                csharp_stmt_worlds.push((func_addr, STRUCTURE_WORLD_STRUCTURED, node, stmt));
             }
             for (head, member, reg, val, target) in &structured.switch_chain_members {
                 all_switch_members.push((func_addr, *head, *member, *reg, *val, *target));
@@ -413,6 +485,33 @@ impl IRPass for StructuringPass {
             scond_no_join_rel.push(tuple);
         }
         db.rel_set("emit_scond_no_join", scond_no_join_rel);
+
+        structure_worlds.sort_unstable();
+        structure_worlds.dedup();
+        db.rel_set(
+            "structure_world",
+            structure_worlds
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<(Address, u8, bool)>>(),
+        );
+        csharp_stmt_worlds.sort_by_cached_key(|(func, world, node, stmt)| {
+            (*func, *world, *node, stmt_candidate_key(stmt))
+        });
+        csharp_stmt_worlds.dedup();
+        db.rel_set(
+            "csharp_stmt_world",
+            csharp_stmt_worlds
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<(Address, u8, Node, CsharpminorStmt)>>(),
+        );
+        structure_unchanged_nodes.sort_unstable();
+        structure_unchanged_nodes.dedup();
+        db.rel_set(
+            "structure_unchanged_node",
+            structure_unchanged_nodes
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<(Address, Node)>>(),
+        );
     }
 
     fn inputs(&self) -> &'static [&'static str] {
@@ -433,6 +532,7 @@ impl IRPass for StructuringPass {
             "func_entry_node",
             "emit_function_param_candidate",
             "packed_alu_addr",
+            "emit_loop_body",
             // Authoritative semantic CFG.  Both are read imperatively; without
             // declaring them the parallel scheduler supplies empty relations.
             "cminor_succ",
@@ -455,6 +555,9 @@ impl IRPass for StructuringPass {
             "emit_join_point",
             "emit_scond_no_join",
             "emit_var_type_candidate",
+            "structure_world",
+            "csharp_stmt_world",
+            "structure_unchanged_node",
         ]
     }
 }
@@ -4626,7 +4729,9 @@ fn inline_single_use_temps(
 
 #[cfg(test)]
 mod candidate_handoff_tests {
-    use super::{stable_stmt_candidates, StructuringPass};
+    use super::{
+        stable_stmt_candidates, StructuringPass, STRUCTURE_WORLD_FLAT, STRUCTURE_WORLD_STRUCTURED,
+    };
     use crate::decompile::elevator::DecompileDB;
     use crate::decompile::passes::pass::IRPass;
     use crate::x86::types::{
@@ -4690,6 +4795,43 @@ mod candidate_handoff_tests {
 
         assert_eq!(forward, reverse);
         assert_eq!(forward.len(), 3);
+    }
+
+    #[test]
+    fn loop_metadata_publishes_atomic_structured_and_flat_worlds() {
+        let func = 0x1000;
+        let node = 0x1010;
+        let stmt = CsharpminorStmt::Sset(7, CsharpminorExpr::Evar(11));
+        let mut db = DecompileDB::default();
+        db.rel_push("csharp_stmt_candidate", (node, stmt.clone()));
+        db.rel_push("instr_in_function", (node, func));
+        db.rel_push("emit_function", (func, "worlds", node));
+        // Cshminor's Ascent loop analysis is a structural interpretation even
+        // when this one-node fixture leaves the statement value unchanged.
+        db.rel_push("emit_loop_body", (func, node, node));
+
+        StructuringPass.run(&mut db);
+
+        let mut worlds: Vec<_> = db
+            .rel_iter::<(u64, u8, bool)>("structure_world")
+            .copied()
+            .collect();
+        worlds.sort_unstable();
+        assert_eq!(
+            worlds,
+            vec![
+                (func, STRUCTURE_WORLD_STRUCTURED, true),
+                (func, STRUCTURE_WORLD_FLAT, false),
+            ]
+        );
+        for world in [STRUCTURE_WORLD_STRUCTURED, STRUCTURE_WORLD_FLAT] {
+            assert!(db
+                .rel_iter::<(u64, u8, Node, CsharpminorStmt)>("csharp_stmt_world")
+                .any(|row| row == &(func, world, node, stmt.clone())));
+        }
+        assert!(db
+            .rel_iter::<(u64, Node)>("structure_unchanged_node")
+            .any(|row| row == &(func, node)));
     }
 
     #[test]

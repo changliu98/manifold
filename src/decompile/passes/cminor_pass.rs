@@ -18,6 +18,13 @@ ascent_par! {
 
 
     relation rtl_inst(Node, RTLInst);
+    // Final authoritative RTL plus the post-signature, dependency-compatible
+    // width/chunk alternatives published by RTLSupersetPass.  Keep rtl_inst in
+    // the union so focused relation tests and partial pipelines remain valid.
+    relation rtl_inst_superset(Node, RTLInst);
+    #[local] relation rtl_inst_for_cminor(Node, RTLInst);
+    rtl_inst_for_cminor(node, inst.clone()) <-- rtl_inst(node, inst);
+    rtl_inst_for_cminor(node, inst.clone()) <-- rtl_inst_superset(node, inst);
     relation rtl_succ(Node, Node);
     relation rtl_expansion_edge(Node, Node);
     #[local] relation rtl_expansion_member(Node);
@@ -51,7 +58,7 @@ ascent_par! {
     // a BP-relative local rebased into the common frame coordinate does not
     // fall back to a literal integer address.
     cminor_stmt(node, stmt), stack_addr_resolved(node) <--
-        rtl_inst(node, ?RTLInst::Iop(op, args, dst)),
+        rtl_inst_for_cminor(node, ?RTLInst::Iop(op, args, dst)),
         if matches!(op, Operation::Olea(Addressing::Ainstack(_)) | Operation::Oleal(Addressing::Ainstack(_))),
         if args.is_empty(),
         renderable_stack_addr_result(node, normalized_ofs, dst),
@@ -62,7 +69,7 @@ ascent_par! {
 
     // Olea(Ainstack(ofs)) with a known stack variable -> Econst(Oaddrstack(ofs))
     cminor_stmt(node, stmt), stack_addr_resolved(node) <--
-        rtl_inst(node, ?RTLInst::Iop(op, args, dst)),
+        rtl_inst_for_cminor(node, ?RTLInst::Iop(op, args, dst)),
         if let Operation::Olea(Addressing::Ainstack(ofs)) = op,
         if args.is_empty(),
         instr_in_function(node, func_start),
@@ -71,7 +78,7 @@ ascent_par! {
 
     // Oleal(Ainstack(ofs)) with a known stack variable -> Econst(Oaddrstack(ofs))
     cminor_stmt(node, stmt), stack_addr_resolved(node) <--
-        rtl_inst(node, ?RTLInst::Iop(op, args, dst)),
+        rtl_inst_for_cminor(node, ?RTLInst::Iop(op, args, dst)),
         if let Operation::Oleal(Addressing::Ainstack(ofs)) = op,
         if args.is_empty(),
         instr_in_function(node, func_start),
@@ -80,11 +87,11 @@ ascent_par! {
 
 
     cminor_stmt(node, CminorStmt::Snop) <--
-        rtl_inst(node, ?RTLInst::Iop(Operation::Omove, args, dst)),
+        rtl_inst_for_cminor(node, ?RTLInst::Iop(Operation::Omove, args, dst)),
         if args.len() == 1 && args[0] == *dst;
 
     cminor_stmt(node, stmt) <--
-        rtl_inst(node, ?RTLInst::Iop(op, args, dst)),
+        rtl_inst_for_cminor(node, ?RTLInst::Iop(op, args, dst)),
         if !(*op == Operation::Omove && args.len() == 1 && args[0] == *dst),
         !stack_addr_resolved(node),
         let converted = {
@@ -116,59 +123,59 @@ ascent_par! {
 
 
     cminor_stmt(node, stmt) <--
-        rtl_inst(node, ?RTLInst::Iload(chunk, addr, args, dst)),
+        rtl_inst_for_cminor(node, ?RTLInst::Iload(chunk, addr, args, dst)),
         let converted = CminorExpr::Eload(chunk.clone(), addr.clone(), args.clone()),
         let stmt = CminorStmt::Sassign(*dst, converted);
 
     cminor_stmt(node, stmt) <--
-        rtl_inst(node, ?RTLInst::Istore(chunk, addr, args, src)),
+        rtl_inst_for_cminor(node, ?RTLInst::Istore(chunk, addr, args, src)),
         let stmt = CminorStmt::Sstore(chunk.clone(), addr.clone(), args.clone(), *src);
 
     cminor_stmt(node, stmt) <--
-        rtl_inst(node, ?RTLInst::Ibuiltin(name, args, res)),
+        rtl_inst_for_cminor(node, ?RTLInst::Ibuiltin(name, args, res)),
         let stmt = CminorStmt::Sbuiltin(None, name.clone(), args.clone(), res.clone());
 
     cminor_stmt(node, stmt) <--
-        rtl_inst(node, ?RTLInst::Icond(cond, args, Either::Right(ifso), Either::Right(ifnot))),
+        rtl_inst_for_cminor(node, ?RTLInst::Icond(cond, args, Either::Right(ifso), Either::Right(ifnot))),
         let stmt = CminorStmt::Sifthenelse(cond.clone(), args.clone(), *ifso, *ifnot);
 
     cminor_stmt(node, stmt) <--
-        rtl_inst(node, ?RTLInst::Icond(cond, args, Either::Left(_sym), Either::Right(ifnot))),
+        rtl_inst_for_cminor(node, ?RTLInst::Icond(cond, args, Either::Left(_sym), Either::Right(ifnot))),
         let stmt = CminorStmt::Sjump(*ifnot);
 
     cminor_stmt(node, stmt) <--
-        rtl_inst(node, ?RTLInst::Icond(cond, args, Either::Right(ifso), Either::Left(_sym))),
+        rtl_inst_for_cminor(node, ?RTLInst::Icond(cond, args, Either::Right(ifso), Either::Left(_sym))),
         let stmt = CminorStmt::Sjump(*ifso);
 
     cminor_stmt(node, CminorStmt::Snop) <--
-        rtl_inst(node, ?RTLInst::Icond(_, _, Either::Left(_), Either::Left(_)));
+        rtl_inst_for_cminor(node, ?RTLInst::Icond(_, _, Either::Left(_), Either::Left(_)));
 
     cminor_stmt(node, stmt) <--
-        rtl_inst(node, ?RTLInst::Ijumptable(arg, targets)),
+        rtl_inst_for_cminor(node, ?RTLInst::Ijumptable(arg, targets)),
         let stmt = CminorStmt::Sjumptable(*arg, targets.clone());
 
     cminor_stmt(node, stmt) <--
-        rtl_inst(node, ?RTLInst::Ibranch(Either::Right(target))),
+        rtl_inst_for_cminor(node, ?RTLInst::Ibranch(Either::Right(target))),
         let stmt = CminorStmt::Sjump(*target);
 
     cminor_stmt(node, CminorStmt::Sbuiltin(None, "__builtin_unreachable".to_string(), vec![], BuiltinArg::BAInt(0))) <--
-        rtl_inst(node, ?RTLInst::Ibranch(Either::Left(_sym)));
+        rtl_inst_for_cminor(node, ?RTLInst::Ibranch(Either::Left(_sym)));
 
     cminor_stmt(node, stmt) <--
-        rtl_inst(node, ?RTLInst::Ireturn(opt)),
+        rtl_inst_for_cminor(node, ?RTLInst::Ireturn(opt)),
         let stmt = CminorStmt::Sreturn(*opt);
 
     cminor_stmt(node, CminorStmt::Snop) <--
-        rtl_inst(node, RTLInst::Inop);
+        rtl_inst_for_cminor(node, RTLInst::Inop);
 
 
     cminor_stmt(node, stmt) <--
-        rtl_inst(node, ?RTLInst::Icall(sig, callee, args, dst, _succ)),
+        rtl_inst_for_cminor(node, ?RTLInst::Icall(sig, callee, args, dst, _succ)),
         let stmt = CminorStmt::Scall(*dst, sig.clone(), callee.clone(), args.clone());
 
 
     cminor_stmt(node, stmt) <--
-        rtl_inst(node, ?RTLInst::Itailcall(sig, callee, args)),
+        rtl_inst_for_cminor(node, ?RTLInst::Itailcall(sig, callee, args)),
         let stmt = CminorStmt::Stailcall(sig.clone(), callee.clone(), args.clone());
 
     // Derive fallthrough from rtl_succ for synthetic nodes whose addresses break
@@ -223,7 +230,7 @@ mod expansion_cfg_tests {
     use super::{csharp_expr_from_cminor, CminorPassProgram};
     use crate::x86::op::{Addressing, Comparison, Operation, TestResultCondition};
     use crate::x86::types::{
-        CminorBinop, CminorExpr, CminorStmt, Constant, CsharpminorExpr, RTLInst,
+        CminorBinop, CminorExpr, CminorStmt, Constant, CsharpminorExpr, MemoryChunk, RTLInst,
     };
     use std::sync::Arc;
 
@@ -279,6 +286,69 @@ mod expansion_cfg_tests {
                 CminorStmt::Sassign(dst, CminorExpr::Econst(Constant::Oaddrstack(16))),
             )
         }));
+    }
+
+    #[test]
+    fn dependency_compatible_subword_signedness_alternatives_both_reach_cminor() {
+        let node = 0x240;
+        let base = 1;
+        let dst = 3;
+        let args = Arc::new(vec![base]);
+        let mut prog = CminorPassProgram::default();
+        prog.rtl_inst.push((
+            node,
+            RTLInst::Iload(
+                MemoryChunk::MInt8Unsigned,
+                Addressing::Aindexed(4),
+                args.clone(),
+                dst,
+            ),
+        ));
+        prog.rtl_inst_superset.extend([
+            (
+                node,
+                RTLInst::Iload(
+                    MemoryChunk::MInt8Unsigned,
+                    Addressing::Aindexed(4),
+                    args.clone(),
+                    dst,
+                ),
+            ),
+            (
+                node,
+                RTLInst::Iload(MemoryChunk::MInt8Signed, Addressing::Aindexed(4), args, dst),
+            ),
+        ]);
+
+        prog.run();
+
+        let statements: Vec<_> = prog
+            .cminor_stmt
+            .iter()
+            .filter_map(|(candidate_node, stmt)| (*candidate_node == node).then_some(stmt))
+            .collect();
+        assert!(statements.iter().any(|stmt| matches!(
+            stmt,
+            CminorStmt::Sassign(
+                reg,
+                CminorExpr::Eload(
+                    MemoryChunk::MInt8Unsigned,
+                    Addressing::Aindexed(4),
+                    load_args,
+                )
+            ) if *reg == dst && load_args.as_slice() == [base]
+        )));
+        assert!(statements.iter().any(|stmt| matches!(
+            stmt,
+            CminorStmt::Sassign(
+                reg,
+                CminorExpr::Eload(
+                    MemoryChunk::MInt8Signed,
+                    Addressing::Aindexed(4),
+                    load_args,
+                )
+            ) if *reg == dst && load_args.as_slice() == [base]
+        )));
     }
 
     #[test]

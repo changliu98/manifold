@@ -19,6 +19,28 @@ fn exact_stack_offset(offsets: &Set<i64>) -> Option<i64> {
         .flatten()
 }
 
+// GCC/Clang stack-clash protection lowers one fixed allocation into a page
+// probe loop:
+//
+//   target = sp - total
+//   do { sp -= page; touch *sp; } while (sp != target)
+//
+// The ordinary MUST lattice must reject the loop header because its SP really
+// does differ between iterations.  Once the exact target definition reaches
+// the loop comparison, however, the fallthrough edge has one architectural
+// state: the entry SP minus `total`.  Return the extra delta to apply after the
+// first (ordinary) page subtraction already represented in the loop body.
+fn fixed_stack_probe_exit_delta(target_displacement: i64, page_size: i64) -> Option<i64> {
+    if target_displacement >= 0 || page_size <= 0 {
+        return None;
+    }
+    let total = target_displacement.checked_neg()?;
+    if total < page_size || total > (1 << 20) || total % page_size != 0 {
+        return None;
+    }
+    page_size.checked_sub(total)
+}
+
 fn x86_gpr_view_width(reg: &str) -> Option<i64> {
     match reg {
         "RAX" | "RBX" | "RCX" | "RDX" | "RSI" | "RDI" | "RBP" | "RSP" | "R8" | "R9" | "R10"
@@ -42,6 +64,7 @@ ascent_par! {
     relation abi_pointer_size(i64);
     relation call_targets_noreturn(Node);
     relation code_in_block(Address, Address);
+    relation decoded_stack_write_bytes(Address, Symbol, i64, usize);
     relation decoded_stack_pointer_delta(Address, i64);
     relation ddisasm_cfg_edge(Address, Address, Symbol);
     relation function_has_ltl_body(Address);
@@ -55,6 +78,7 @@ ascent_par! {
     relation op_immediate(Symbol, i64, usize);
     relation op_register(Symbol, &'static str);
     relation padd(Address, Symbol, Symbol);
+    relation pcmp(Address, Symbol, Symbol);
     relation plea(Address, Symbol, Symbol);
     relation ppop(Address, Symbol);
     relation ppush(Address, Symbol);
@@ -77,6 +101,129 @@ ascent_par! {
         code_in_block(src, block),
         code_in_block(dst, block),
         !call_targets_noreturn(src);
+
+    // The two raw operand orders of CMP share one normalized statement: the
+    // current full-width SP is compared with the exact full-width target value
+    // defined by the preheader LEA.  Mreg alone aliases partial register views,
+    // so retain the decoder spellings as width evidence on both operands.
+    #[local] relation stack_probe_target_cmp(Address, Mreg, Address);
+    stack_probe_target_cmp(*target_def, target_reg, *cmp) <--
+        plea(target_def, target_dst, _),
+        op_register(target_dst, target_name),
+        abi_pointer_size(pointer_width),
+        if x86_gpr_view_width(target_name) == Some(*pointer_width),
+        let target_reg = Mreg::x86(*target_name),
+        pcmp(cmp, left, right),
+        op_register(left, left_name),
+        op_register(right, right_name),
+        if Mreg::x86(*left_name) == Mreg::SP,
+        if x86_gpr_view_width(left_name) == Some(*pointer_width),
+        if Mreg::x86(*right_name) == target_reg,
+        if x86_gpr_view_width(right_name) == Some(*pointer_width);
+    stack_probe_target_cmp(*target_def, target_reg, *cmp) <--
+        plea(target_def, target_dst, _),
+        op_register(target_dst, target_name),
+        abi_pointer_size(pointer_width),
+        if x86_gpr_view_width(target_name) == Some(*pointer_width),
+        let target_reg = Mreg::x86(*target_name),
+        pcmp(cmp, left, right),
+        op_register(left, left_name),
+        op_register(right, right_name),
+        if Mreg::x86(*left_name) == target_reg,
+        if x86_gpr_view_width(left_name) == Some(*pointer_width),
+        if Mreg::x86(*right_name) == Mreg::SP,
+        if x86_gpr_view_width(right_name) == Some(*pointer_width);
+
+    // A fixed stack-probe certificate.  The target LEA and the first SUB are
+    // adjacent in the preheader/header transition; the SUB, page touch, CMP,
+    // and conditional latch are one straight-line probe block.  The latch's
+    // backedge is dominance-proven and its other structural successor is the
+    // summarized exit.  No address ordering participates in the proof.
+    #[local] relation fixed_stack_probe(
+        Address, Address, Address, Address, Address, Address, Address, i64
+    );
+    fixed_stack_probe(
+        *func, *target_def, *header, *touch, *cmp, *latch, *exit, exit_delta
+    ) <--
+        plea(target_def, target_dst, target_mem),
+        op_register(target_dst, target_name),
+        abi_pointer_size(pointer_width),
+        if x86_gpr_view_width(target_name) == Some(*pointer_width),
+        let target_reg = Mreg::x86(*target_name),
+        if target_reg != Mreg::SP && !target_reg.is_unknown(),
+        op_indirect(target_mem, _, target_base, target_index, _, target_disp, target_width),
+        if Mreg::x86(*target_base) == Mreg::SP,
+        if x86_gpr_view_width(target_base) == Some(*pointer_width),
+        if *target_index == "NONE" || target_index.is_empty(),
+        if i64::try_from(*target_width).ok() == Some(*pointer_width),
+        next(target_def, header),
+        psub(header, stack_dst, page_operand),
+        op_register(stack_dst, stack_name),
+        if Mreg::x86(*stack_name) == Mreg::SP,
+        if x86_gpr_view_width(stack_name) == Some(*pointer_width),
+        op_immediate(page_operand, page_size, _),
+        if *page_size > 0,
+        next(header, touch),
+        decoded_stack_write_bytes(touch, touch_base, touch_ofs, touch_width),
+        if Mreg::x86(*touch_base) == Mreg::SP,
+        if *touch_ofs == 0 && *touch_width > 0,
+        next(touch, cmp),
+        stack_probe_target_cmp(target_def, target_reg, cmp),
+        next(cmp, latch),
+        !reg_def(header, target_reg),
+        !reg_def(touch, target_reg),
+        !reg_def(cmp, target_reg),
+        !reg_def(latch, target_reg),
+        frame_cfg_step(latch, header),
+        frame_cfg_step(latch, exit),
+        if exit != header,
+        code_in_block(header, header_block),
+        code_in_block(touch, header_block),
+        code_in_block(cmp, header_block),
+        code_in_block(latch, latch_block),
+        settled_block_dom_set(func, latch_block, latch_dominators),
+        if latch_dominators.0.contains(header_block),
+        reachable_frame_node(func, target_def),
+        reachable_frame_node(func, header),
+        reachable_frame_node(func, touch),
+        reachable_frame_node(func, cmp),
+        reachable_frame_node(func, latch),
+        reachable_frame_node(func, exit),
+        if let Some(exit_delta) = fixed_stack_probe_exit_delta(*target_disp, *page_size);
+
+    #[local] relation frame_stack_probe_back_edge(Address, Address, Address);
+    frame_stack_probe_back_edge(func, *latch, *header) <--
+        fixed_stack_probe(func, _, header, _, _, latch, _, _);
+
+    #[local] relation frame_stack_probe_exit_edge(Address, Address, Address, i64);
+    frame_stack_probe_exit_edge(func, *latch, *exit, *delta) <--
+        fixed_stack_probe(func, _, _, _, _, latch, exit, delta);
+
+    // Public physical bound for downstream frame-address rendering.  This is
+    // deliberately not folded into func_stacksz: that legacy relation sums
+    // static SUB sites, while a probe loop executes one SUB repeatedly.  The
+    // exact target displacement is the allocation contract for this owner,
+    // including absorbed tail targets whose symbol span contains no SUB at all.
+    relation fixed_stack_probe_allocation(Address, i64);
+    fixed_stack_probe_allocation(func, total) <--
+        fixed_stack_probe(func, target_def, _, _, _, _, _, _),
+        plea(target_def, _, target_mem),
+        op_indirect(target_mem, _, _, _, _, target_disp, _),
+        if let Some(total) = target_disp.checked_neg(),
+        if total > 0 && total <= (1 << 20);
+
+    // Probe-body points intentionally retain no public exact coordinate: their
+    // SP differs on every iteration.  The private first-iteration state exists
+    // only to calculate the certified exit state below.
+    #[local] relation frame_stack_probe_body_node(Address, Address);
+    frame_stack_probe_body_node(func, *header) <--
+        fixed_stack_probe(func, _, header, _, _, _, _, _);
+    frame_stack_probe_body_node(func, *touch) <--
+        fixed_stack_probe(func, _, _, touch, _, _, _, _);
+    frame_stack_probe_body_node(func, *cmp) <--
+        fixed_stack_probe(func, _, _, _, cmp, _, _, _);
+    frame_stack_probe_body_node(func, *latch) <--
+        fixed_stack_probe(func, _, _, _, _, latch, _, _);
     frame_cfg_step(*src, *dst) <--
         ddisasm_cfg_edge(src, dst, edge_type),
         if *edge_type != "call" && *edge_type != "indirect" && *edge_type != "indirect_call",
@@ -261,6 +408,8 @@ ascent_par! {
         frame_cfg_step(node, succ),
         reachable_frame_node(func, node),
         reachable_frame_node(func, succ),
+        !frame_stack_probe_back_edge(func, node, succ),
+        !frame_stack_probe_exit_edge(func, node, succ, _),
         frame_exact_stack_delta(node, delta);
 
     frame_stack_offset(*func, *succ, Dual(offsets.0.clone())) <--
@@ -268,6 +417,8 @@ ascent_par! {
         frame_cfg_step(node, succ),
         reachable_frame_node(func, node),
         reachable_frame_node(func, succ),
+        !frame_stack_probe_back_edge(func, node, succ),
+        !frame_stack_probe_exit_edge(func, node, succ, _),
         !frame_stack_delta_unknown(node),
         !frame_exact_stack_delta(node, _);
 
@@ -278,7 +429,58 @@ ascent_par! {
         frame_cfg_step(node, succ),
         reachable_frame_node(func, node),
         reachable_frame_node(func, succ),
+        !frame_stack_probe_back_edge(func, node, succ),
+        !frame_stack_probe_exit_edge(func, node, succ, _),
         frame_stack_delta_unknown(node);
+
+    frame_stack_offset(*func, *succ, Dual(shift_stack_offsets(&offsets.0, *delta))) <--
+        frame_stack_offset(func, node, offsets),
+        frame_stack_probe_exit_edge(func, node, succ, delta),
+        reachable_frame_node(func, node),
+        reachable_frame_node(func, succ);
+
+    // A dynamic `and sp, -alignment` before a fixed probe destroys the
+    // entry-relative coordinate, correctly making frame_stack_offset unknown.
+    // It does not destroy local coordinates after the alignment.  Restart a
+    // separate MUST lattice at the certified probe target and use it only for
+    // post-probe frame shifts; it is never published as an entry-SP offset.
+    #[local] lattice probe_relative_stack_offset(Address, Address, Dual<Set<i64>>);
+    probe_relative_stack_offset(*func, *target_def, Dual(Set::singleton(0))) <--
+        fixed_stack_probe(func, target_def, _, _, _, _, _, _);
+
+    probe_relative_stack_offset(*func, *succ, Dual(shift_stack_offsets(&offsets.0, *delta))) <--
+        probe_relative_stack_offset(func, node, offsets),
+        frame_cfg_step(node, succ),
+        reachable_frame_node(func, node),
+        reachable_frame_node(func, succ),
+        !frame_stack_probe_back_edge(func, node, succ),
+        !frame_stack_probe_exit_edge(func, node, succ, _),
+        frame_exact_stack_delta(node, delta);
+
+    probe_relative_stack_offset(*func, *succ, Dual(offsets.0.clone())) <--
+        probe_relative_stack_offset(func, node, offsets),
+        frame_cfg_step(node, succ),
+        reachable_frame_node(func, node),
+        reachable_frame_node(func, succ),
+        !frame_stack_probe_back_edge(func, node, succ),
+        !frame_stack_probe_exit_edge(func, node, succ, _),
+        !frame_stack_delta_unknown(node),
+        !frame_exact_stack_delta(node, _);
+
+    probe_relative_stack_offset(*func, *succ, Dual(Set::<i64>::default())) <--
+        probe_relative_stack_offset(func, node, _),
+        frame_cfg_step(node, succ),
+        reachable_frame_node(func, node),
+        reachable_frame_node(func, succ),
+        !frame_stack_probe_back_edge(func, node, succ),
+        !frame_stack_probe_exit_edge(func, node, succ, _),
+        frame_stack_delta_unknown(node);
+
+    probe_relative_stack_offset(*func, *succ, Dual(shift_stack_offsets(&offsets.0, *delta))) <--
+        probe_relative_stack_offset(func, node, offsets),
+        frame_stack_probe_exit_edge(func, node, succ, delta),
+        reachable_frame_node(func, node),
+        reachable_frame_node(func, succ);
 }
 
 pub struct FrameCoordinatePass;
@@ -297,13 +499,30 @@ impl IRPass for FrameCoordinatePass {
         // is ambiguous and deliberately publishes no exact shift.
         let mut state_points = std::collections::BTreeSet::new();
         let mut exact_offsets = std::collections::BTreeMap::new();
+        let probe_body_points: std::collections::BTreeSet<_> =
+            prog.frame_stack_probe_body_node.iter().copied().collect();
         for row in prog.frame_stack_offset.iter() {
             let row = row
                 .read()
                 .expect("frame-coordinate lattice row lock poisoned");
             state_points.insert((row.0, row.1));
-            if let Some(offset) = exact_stack_offset(&row.2 .0) {
-                exact_offsets.insert((row.0, row.1), offset);
+            if !probe_body_points.contains(&(row.0, row.1)) {
+                if let Some(offset) = exact_stack_offset(&row.2 .0) {
+                    exact_offsets.insert((row.0, row.1), offset);
+                }
+            }
+        }
+        let mut probe_state_points = std::collections::BTreeSet::new();
+        let mut probe_exact_offsets = std::collections::BTreeMap::new();
+        for row in prog.probe_relative_stack_offset.iter() {
+            let row = row
+                .read()
+                .expect("probe-relative frame-coordinate lattice row lock poisoned");
+            probe_state_points.insert((row.0, row.1));
+            if !probe_body_points.contains(&(row.0, row.1)) {
+                if let Some(offset) = exact_stack_offset(&row.2 .0) {
+                    probe_exact_offsets.insert((row.0, row.1), offset);
+                }
             }
         }
 
@@ -367,8 +586,90 @@ impl IRPass for FrameCoordinatePass {
             };
             settled.push((func, node, depth));
         }
+
+        let probe_calls_by_function: std::collections::BTreeSet<(Address, Address)> = prog
+            .instr_in_function
+            .iter()
+            .filter_map(|(node, func)| {
+                (call_sites.contains(node) && probe_state_points.contains(&(*func, *node)))
+                    .then_some((*func, *node))
+            })
+            .collect();
+        let probe_invalid_functions: std::collections::BTreeSet<Address> = probe_calls_by_function
+            .iter()
+            .filter_map(|(func, call)| {
+                (!probe_exact_offsets.contains_key(&(*func, *call))).then_some(*func)
+            })
+            .collect();
+        let mut probe_frame_origins = std::collections::BTreeMap::<Address, i64>::new();
+        for (func, call) in probe_calls_by_function {
+            let Some(offset) = probe_exact_offsets.get(&(func, call)).copied() else {
+                continue;
+            };
+            probe_frame_origins
+                .entry(func)
+                .and_modify(|origin| *origin = (*origin).max(offset))
+                .or_insert(offset);
+        }
+        for ((func, node), offset) in probe_exact_offsets {
+            if probe_invalid_functions.contains(&func) {
+                continue;
+            }
+            let depth = if let Some(origin) = probe_frame_origins.get(&func) {
+                if offset > *origin {
+                    continue;
+                }
+                origin.saturating_sub(offset)
+            } else {
+                0
+            };
+            settled.push((func, node, depth));
+        }
+
+        // Entry-relative and probe-relative coordinates should normalize to the
+        // same local depth when both are available.  Any disagreement is a
+        // conflict, not a choice: publish only singleton point depths.
+        let mut settled_candidates =
+            std::collections::BTreeMap::<(Address, Address), std::collections::BTreeSet<i64>>::new(
+            );
+        for (func, node, depth) in settled {
+            settled_candidates
+                .entry((func, node))
+                .or_default()
+                .insert(depth);
+        }
+        let mut settled: Vec<_> = settled_candidates
+            .into_iter()
+            .filter_map(|((func, node), depths)| {
+                (depths.len() == 1)
+                    .then(|| {
+                        depths
+                            .iter()
+                            .next()
+                            .copied()
+                            .map(|depth| (func, node, depth))
+                    })
+                    .flatten()
+            })
+            .collect();
         settled.sort_unstable();
-        settled.dedup();
+
+        let summarized_probes: std::collections::BTreeSet<_> = prog
+            .fixed_stack_probe
+            .iter()
+            .map(|row| (row.0, row.1, row.2, row.6))
+            .collect();
+        if !summarized_probes.is_empty() {
+            eprintln!(
+                "[frame-coordinates] fixed-stack-probe-certificates={} summarized-exits={}",
+                summarized_probes.len(),
+                summarized_probes
+                    .iter()
+                    .map(|(func, _, _, exit)| (*func, *exit))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+            );
+        }
 
         if db.measure_rule_times {
             let pass_name = "FrameCoordinatePassProgram".to_string();
@@ -402,7 +703,11 @@ impl IRPass for FrameCoordinatePass {
     }
 
     fn outputs(&self) -> &'static [&'static str] {
-        &["settled_sp_entry_offset", "settled_sp_frame_shift"]
+        &[
+            "settled_sp_entry_offset",
+            "settled_sp_frame_shift",
+            "fixed_stack_probe_allocation",
+        ]
     }
 }
 
@@ -504,6 +809,132 @@ mod tests {
             .collect();
         assert!(!shifts.iter().any(|(_, node, _)| *node == header));
         assert!(!shifts.iter().any(|(_, node, _)| *node == exit));
+    }
+
+    #[test]
+    fn fixed_page_probe_recovers_local_state_after_dynamic_stack_alignment() {
+        let func = 0x8000_u64;
+        let align = 0x8008_u64;
+        let target = 0x8010_u64;
+        let header = 0x8020_u64;
+        let touch = 0x8030_u64;
+        let cmp = 0x8040_u64;
+        let latch = 0x8050_u64;
+        let exit = 0x8060_u64;
+        let tail_alloc = 0x8070_u64;
+        let buffer_lea = 0x8080_u64;
+        let call = 0x8090_u64;
+        let end = 0x80a0_u64;
+        let entry_block = func;
+        let probe_block = header;
+        let exit_block = exit;
+        let mut db = DecompileDB::default();
+        db.rel_push("abi_pointer_size", (8_i64,));
+
+        for (node, block) in [
+            (func, entry_block),
+            (align, entry_block),
+            (target, entry_block),
+            (header, probe_block),
+            (touch, probe_block),
+            (cmp, probe_block),
+            (latch, probe_block),
+            (exit, exit_block),
+            (tail_alloc, exit_block),
+            (buffer_lea, exit_block),
+            (call, exit_block),
+            (end, exit_block),
+        ] {
+            db.rel_push("instr_in_function", (node, func));
+            db.rel_push("code_in_block", (node, block));
+        }
+        for (block, dominators) in [
+            (entry_block, vec![entry_block]),
+            (probe_block, vec![entry_block, probe_block]),
+            (exit_block, vec![entry_block, probe_block, exit_block]),
+        ] {
+            db.rel_push(
+                "settled_block_dom_set",
+                (func, block, Set(dominators.into_iter().collect())),
+            );
+        }
+
+        for edge in [
+            (func, align),
+            (align, target),
+            (target, header),
+            (header, touch),
+            (touch, cmp),
+            (cmp, latch),
+            (exit, tail_alloc),
+            (tail_alloc, buffer_lea),
+            (buffer_lea, call),
+            (call, end),
+        ] {
+            db.rel_push("next", edge);
+        }
+        for edge in [
+            (target, header, "fallthrough"),
+            (latch, header, "branch"),
+            (latch, exit, "fallthrough"),
+        ] {
+            db.rel_push("ddisasm_cfg_edge", edge);
+        }
+
+        db.rel_push("ppush", (func, "saved_reg"));
+        // Models `and rsp, -64`: entry-relative state must remain unknown, but
+        // the certified probe target establishes a new local-frame origin.
+        db.rel_push("reg_def", (align, Mreg::SP));
+        db.rel_push("plea", (target, "target_dst", "target_mem"));
+        db.rel_push("op_register", ("target_dst", "R11"));
+        db.rel_push(
+            "op_indirect",
+            ("target_mem", "", "RSP", "NONE", 1_i64, -16384_i64, 8_usize),
+        );
+        db.rel_push("psub", (header, "probe_rsp", "probe_page"));
+        db.rel_push("op_register", ("probe_rsp", "RSP"));
+        db.rel_push("op_immediate", ("probe_page", 4096_i64, 8_usize));
+        db.rel_push("stack_delta", (header, -4096_i64));
+        db.rel_push("decoded_stack_write_bytes", (touch, "RSP", 0_i64, 8_usize));
+        db.rel_push("pcmp", (cmp, "cmp_rsp", "cmp_target"));
+        db.rel_push("op_register", ("cmp_rsp", "RSP"));
+        db.rel_push("op_register", ("cmp_target", "R11"));
+
+        db.rel_push("psub", (tail_alloc, "tail_rsp", "tail_size"));
+        db.rel_push("op_register", ("tail_rsp", "RSP"));
+        db.rel_push("stack_delta", (tail_alloc, -32_i64));
+        db.rel_push(
+            "instruction",
+            (
+                call, 5_usize, "", "CALL", "callee", "", "", "", 0_usize, 0_usize,
+            ),
+        );
+
+        FrameCoordinatePass.run(&mut db);
+
+        let entry_offsets: std::collections::BTreeSet<_> = db
+            .rel_iter::<(u64, u64, i64)>("settled_sp_entry_offset")
+            .copied()
+            .collect();
+        assert!(!entry_offsets
+            .iter()
+            .any(|(owner, node, _)| *owner == func && [buffer_lea, call].contains(node)));
+        for probe_node in [header, touch, cmp, latch] {
+            assert!(!entry_offsets
+                .iter()
+                .any(|(owner, node, _)| (*owner, *node) == (func, probe_node)));
+        }
+
+        let shifts: std::collections::BTreeSet<_> = db
+            .rel_iter::<(u64, u64, i64)>("settled_sp_frame_shift")
+            .copied()
+            .collect();
+        assert!(shifts.contains(&(func, buffer_lea, 0)));
+        assert!(shifts.contains(&(func, call, 0)));
+        assert!(!shifts.iter().any(|(_, node, _)| *node == target));
+        assert!(db
+            .rel_iter::<(u64, i64)>("fixed_stack_probe_allocation")
+            .any(|fact| fact == &(func, 16384)));
     }
 
     #[test]

@@ -73,6 +73,13 @@ ascent_par! {
 
     relation cminor_succ(Node, Node);
     relation csharp_stmt(Node, CsharpminorStmt);
+    // Function-scoped structural worlds published by StructuringPass.  They
+    // stay separate from csharp_stmt: unioning raw and rewritten control rows
+    // here would contaminate goto threading, dead-chain suppression, and CFG
+    // ownership before the selector can choose a world atomically.
+    relation structure_world(Address, u8, bool);
+    relation csharp_stmt_world(Address, u8, Node, CsharpminorStmt);
+    relation structure_unchanged_node(Address, Node);
     relation emit_loop_body(Address, Node, Node);
     relation emit_loop_exit(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node);
     relation emit_switch_chain(Address, Node, RTLReg);
@@ -102,8 +109,10 @@ ascent_par! {
     relation efield_to_struct(Node, i64, i64, Ident, MemoryChunk);
     relation eligible_node_for_sseq(Node);
     relation emit_clight_stmt(Address, Node, ClightStmt);
+    relation emit_clight_stmt_world(Address, u8, Node, ClightStmt);
     relation emit_goto_target(Address, Node);
     relation emit_next(Node, Node);
+    relation emit_next_world(Address, u8, Node, Node);
     lattice clight_function_owners(Node, Set<Address>);
     relation clight_targeted_nop_owner(Address, Node);
     relation emit_struct_fields(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>);
@@ -1097,6 +1106,42 @@ ascent_par! {
         clight_stmt_for_func_raw(addr, node, stmt),
         !clight_node_dead(addr, node);
 
+    // The established structured result remains the authoritative/no-model
+    // fallback.  Unchanged nodes share all of its rich statement/type
+    // alternatives with every non-authoritative world.
+    emit_clight_stmt_world(*addr, *world, *node, stmt.clone()) <--
+        structure_world(addr, world, authoritative),
+        if *authoritative,
+        emit_clight_stmt(addr, node, stmt);
+
+    emit_clight_stmt_world(*addr, *world, *node, stmt.clone()) <--
+        structure_world(addr, world, authoritative),
+        if !*authoritative,
+        structure_unchanged_node(addr, node),
+        emit_clight_stmt(addr, node, stmt);
+
+    // A structurally changed flat-world node bypasses authoritative
+    // switch/member suppression and is converted directly from its exact
+    // pre-structure Csharpminor row.  This recursive converter is deliberately
+    // only a fallback spelling: unchanged data nodes above retain the full
+    // ordinary Clight candidate inventory.
+    emit_clight_stmt_world(*addr, *world, *node, labeled) <--
+        structure_world(addr, world, authoritative),
+        if !*authoritative,
+        csharp_stmt_world(addr, world, node, csharp),
+        !structure_unchanged_node(addr, node),
+        abi_pointer_size(ptr_size),
+        all_var_types_global(all_var_types),
+        agg func_syms = collect_func_symbols(ident, sym) in ident_to_symbol(ident, sym),
+        let converted = crate::decompile::passes::clight_pass::convert_csharp_stmt_to_clight(
+            csharp,
+            all_var_types,
+            &func_syms,
+            *ptr_size,
+        ),
+        if let Some(checked) = check_clight_stmt(&converted),
+        let labeled = ClightStmt::Slabel(ident_from_node(*node), Box::new(checked));
+
 
     eligible_node_for_sseq(node) <--
         clight_stmt(node, stmt),
@@ -1229,6 +1274,23 @@ ascent_par! {
         clight_function_owners(src, owners),
         emit_next(src, dst);
 
+    // World-scoped successor inventories.  The structured world reuses the
+    // current Clight-visible graph; the flat world uses the authoritative
+    // pre-structure semantic CFG and therefore cannot inherit a switch/loop
+    // rewrite from another world.
+    emit_next_world(*func, *world, *src, *dst) <--
+        structure_world(func, world, authoritative),
+        if *authoritative,
+        emit_next(src, dst),
+        clight_function_owners(src, owners),
+        if owners.0.contains(func);
+
+    emit_next_world(*func, *world, *src, *dst) <--
+        structure_world(func, world, authoritative),
+        if !*authoritative,
+        cminor_succ(src, dst),
+        instr_in_function(src, func);
+
     #[local] relation has_cminor_stmt(Node);
     has_cminor_stmt(*node) <-- cminor_stmt(node, _);
 
@@ -1319,6 +1381,157 @@ impl IRPass for ClightPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clight_keeps_rewritten_and_flat_control_in_separate_worlds() {
+        let func = 0x1000;
+        let node = 0x1010;
+        let structured_target = 0x1020;
+        let flat_target = 0x1030;
+        let structured_stmt = ClightStmt::Slabel(
+            ident_from_node(node),
+            Box::new(ClightStmt::Sgoto(ident_from_node(structured_target))),
+        );
+        let mut prog = ClightPassProgram::default();
+        prog.abi_pointer_size.push((8,));
+        prog.structure_world.push((
+            func,
+            crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_STRUCTURED,
+            true,
+        ));
+        prog.structure_world.push((
+            func,
+            crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_FLAT,
+            false,
+        ));
+        prog.emit_clight_stmt
+            .push((func, node, structured_stmt.clone()));
+        prog.csharp_stmt_world.push((
+            func,
+            crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_FLAT,
+            node,
+            CsharpminorStmt::Sjump(flat_target),
+        ));
+        prog.instr_in_function.push((node, func));
+        prog.cminor_succ.push((node, flat_target));
+
+        prog.run();
+
+        assert!(prog.emit_clight_stmt_world.iter().any(|row| {
+            row == &(
+                func,
+                crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_STRUCTURED,
+                node,
+                structured_stmt.clone(),
+            )
+        }));
+        assert!(prog
+            .emit_clight_stmt_world
+            .iter()
+            .any(|(got_func, world, got_node, stmt)| {
+                *got_func == func
+                    && *world == crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_FLAT
+                    && *got_node == node
+                    && matches!(
+                        stmt,
+                        ClightStmt::Slabel(label, inner)
+                            if *label == ident_from_node(node)
+                                && **inner == ClightStmt::Sgoto(ident_from_node(flat_target))
+                    )
+            }));
+        assert!(!prog
+            .emit_clight_stmt_world
+            .iter()
+            .any(|(_, world, _, stmt)| {
+                *world == crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_FLAT
+                    && *stmt == structured_stmt
+            }));
+        assert!(prog.emit_next_world.iter().any(|row| {
+            row == &(
+                func,
+                crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_FLAT,
+                node,
+                flat_target,
+            )
+        }));
+    }
+
+    #[test]
+    fn field_pass_refreshes_final_candidates_without_leaking_changed_control() {
+        let func = 0x2000;
+        let unchanged = 0x2010;
+        let changed = 0x2020;
+        let structured = crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_STRUCTURED;
+        let flat = crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_FLAT;
+        let base = ClightStmt::Slabel(
+            ident_from_node(unchanged),
+            Box::new(ClightStmt::Sset(
+                1,
+                ClightExpr::EconstInt(0, default_int_type()),
+            )),
+        );
+        let field = ClightStmt::Slabel(
+            ident_from_node(unchanged),
+            Box::new(ClightStmt::Sset(
+                1,
+                ClightExpr::Efield(
+                    Box::new(ClightExpr::Etempvar(2, default_void_ptr_type())),
+                    3,
+                    default_int_type(),
+                ),
+            )),
+        );
+        let structured_control = ClightStmt::Slabel(
+            ident_from_node(changed),
+            Box::new(ClightStmt::Sgoto(ident_from_node(0x2030))),
+        );
+        let flat_control = ClightStmt::Slabel(
+            ident_from_node(changed),
+            Box::new(ClightStmt::Sgoto(ident_from_node(0x2040))),
+        );
+        let mut db = DecompileDB::default();
+        db.rel_push("structure_world", (func, structured, true));
+        db.rel_push("structure_world", (func, flat, false));
+        db.rel_push("structure_unchanged_node", (func, unchanged));
+        for stmt in [base.clone(), field.clone()] {
+            db.rel_push("emit_clight_stmt", (func, unchanged, stmt));
+        }
+        db.rel_push(
+            "emit_clight_stmt",
+            (func, changed, structured_control.clone()),
+        );
+        db.rel_push(
+            "emit_clight_stmt_world",
+            (func, structured, unchanged, base.clone()),
+        );
+        db.rel_push(
+            "emit_clight_stmt_world",
+            (func, flat, changed, flat_control.clone()),
+        );
+
+        refresh_clight_structure_worlds(&mut db);
+
+        let rows: HashSet<_> = db
+            .rel_iter::<(Address, u8, Node, ClightStmt)>("emit_clight_stmt_world")
+            .cloned()
+            .collect();
+        for world in [structured, flat] {
+            assert!(rows.contains(&(func, world, unchanged, base.clone())));
+            assert!(rows.contains(&(func, world, unchanged, field.clone())));
+        }
+        assert!(rows.contains(&(func, structured, changed, structured_control)));
+        assert!(rows.contains(&(func, flat, changed, flat_control)));
+        assert!(!rows.iter().any(|(got_func, world, node, stmt)| {
+            *got_func == func
+                && *world == flat
+                && *node == changed
+                && matches!(
+                    stmt,
+                    ClightStmt::Slabel(_, inner)
+                        if **inner == ClightStmt::Sgoto(ident_from_node(0x2030))
+                )
+        }));
+    }
 
     fn synthetic_ids<const N: usize>() -> [u64; N] {
         std::array::from_fn(|index| index as u64 + 1)
@@ -1891,6 +2104,24 @@ mod tests {
                 .get(&func)
                 .and_then(|buffers| buffers.get(&local)),
             Some(&280),
+        );
+    }
+
+    #[test]
+    fn exact_external_capacity_sizes_probe_allocated_buffer_without_static_frame_top() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x1800;
+        let local: RTLReg = 0x8000_0000_0000_5678;
+        db.rel_push("slot_escaped_region_canonical", (func, 16_i64, local));
+        db.rel_push("external_stack_buffer_extent", (func, 16_i64, 65536_i64));
+
+        size_opaque_escaped_frame_buffers(&mut db);
+
+        assert_eq!(
+            db.stack_struct_buffers
+                .get(&func)
+                .and_then(|buffers| buffers.get(&local)),
+            Some(&65536),
         );
     }
 
@@ -2695,6 +2926,44 @@ mod tests {
     }
 
     #[test]
+    fn exact_external_intervals_coalesce_preincremented_index_anchor() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x7950;
+        let stat_base: RTLReg = 0x8000_0000_0000_7950;
+        let scan_anchor: RTLReg = 0x8000_0000_0000_7951;
+        let read_base: RTLReg = 0x8000_0000_0000_7952;
+
+        // The indexed expression is `anchor[index]`, with index starting at
+        // one.  Its conservative physical interval overlaps the last byte of
+        // the preceding fixed object and the complete read buffer.
+        db.rel_push("stack_pointer_walk_region", (func, 143_i64, 8360_i64));
+        for (node, offset, local) in [
+            (0x7953_u64, 0_i64, stat_base),
+            (0x7954_u64, 143_i64, scan_anchor),
+            (0x7955_u64, 144_i64, read_base),
+        ] {
+            db.rel_push("stack_var", (func, node, offset, local));
+        }
+        db.rel_push("external_stack_object_extent", (func, 0_i64, 144_i64));
+        db.rel_push("external_stack_object_extent", (func, 144_i64, 8192_i64));
+
+        size_indexed_stack_arrays(&mut db);
+
+        assert_eq!(
+            db.stack_struct_buffers
+                .get(&func)
+                .and_then(|buffers| buffers.get(&stat_base)),
+            Some(&8360),
+        );
+        assert!(!db.stack_array_buffers.contains_key(&func));
+        for (member, offset) in [(scan_anchor, 143_usize), (read_base, 144_usize)] {
+            assert!(db
+                .rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_alias")
+                .any(|alias| alias == &(func, member, stat_base, offset)));
+        }
+    }
+
+    #[test]
     fn field_pass_sizes_opaque_storage_without_struct_fields() {
         let mut db = DecompileDB::default();
         db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
@@ -3443,6 +3712,71 @@ mod tests {
 
 pub struct ClightFieldPass;
 
+/// Refresh structural-world provenance after the field pass has rewritten and
+/// extended `emit_clight_stmt`.  Tagging in ClightPass alone is too early: it
+/// would make the selector ignore every authoritative struct/field candidate
+/// introduced here.  Changed flat-control nodes retain their pre-field raw
+/// spelling; unchanged nodes inherit the complete finalized candidate set.
+fn refresh_clight_structure_worlds(db: &mut DecompileDB) {
+    let mut worlds: HashMap<Address, Vec<(u8, bool)>> = HashMap::new();
+    for (func, world, authoritative) in db.rel_iter::<(Address, u8, bool)>("structure_world") {
+        worlds
+            .entry(*func)
+            .or_default()
+            .push((*world, *authoritative));
+    }
+    if worlds.is_empty() {
+        return;
+    }
+    for entries in worlds.values_mut() {
+        entries.sort_unstable();
+        entries.dedup();
+    }
+
+    let unchanged: HashSet<(Address, Node)> = db
+        .rel_iter::<(Address, Node)>("structure_unchanged_node")
+        .copied()
+        .collect();
+    let old_world_rows: Vec<(Address, u8, Node, ClightStmt)> = db
+        .rel_iter::<(Address, u8, Node, ClightStmt)>("emit_clight_stmt_world")
+        .cloned()
+        .collect();
+    let finalized: Vec<(Address, Node, ClightStmt)> = db
+        .rel_iter::<(Address, Node, ClightStmt)>("emit_clight_stmt")
+        .cloned()
+        .collect();
+
+    let mut rows = Vec::new();
+    for (func, node, stmt) in finalized {
+        if let Some(function_worlds) = worlds.get(&func) {
+            for &(world, authoritative) in function_worlds {
+                if authoritative || unchanged.contains(&(func, node)) {
+                    rows.push((func, world, node, stmt.clone()));
+                }
+            }
+        }
+    }
+    for (func, world, node, stmt) in old_world_rows {
+        let authoritative = worlds
+            .get(&func)
+            .into_iter()
+            .flatten()
+            .any(|(candidate_world, authoritative)| *candidate_world == world && *authoritative);
+        if !authoritative && !unchanged.contains(&(func, node)) {
+            rows.push((func, world, node, stmt));
+        }
+    }
+    rows.sort_by_cached_key(|(func, world, node, stmt)| {
+        (*func, *world, *node, format!("{stmt:?}"))
+    });
+    rows.dedup();
+    db.rel_set(
+        "emit_clight_stmt_world",
+        rows.into_iter()
+            .collect::<ascent::boxcar::Vec<(Address, u8, Node, ClightStmt)>>(),
+    );
+}
+
 impl IRPass for ClightFieldPass {
     fn name(&self) -> &'static str {
         "clight_field"
@@ -3450,6 +3784,7 @@ impl IRPass for ClightFieldPass {
 
     fn run(&self, db: &mut DecompileDB) {
         rewrite_clight_stmts_with_struct_fields(db);
+        refresh_clight_structure_worlds(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
@@ -3459,6 +3794,9 @@ impl IRPass for ClightFieldPass {
             "instr_in_function",
             "clight_stmt",
             "emit_clight_stmt",
+            "emit_clight_stmt_world",
+            "structure_world",
+            "structure_unchanged_node",
             "clight_stmt_dead",
             "mach_imm_stack_init",
             "global_struct_catalog",
@@ -3482,6 +3820,7 @@ impl IRPass for ClightFieldPass {
             // an escaped object from the caller's own accesses alone.
             "escaped_stack_region_caller_field",
             "escaped_stack_region_extent",
+            "external_stack_object_extent",
             "slot_escaped_region_canonical",
             "pmov",
             "op_indirect",
@@ -3495,6 +3834,7 @@ impl IRPass for ClightFieldPass {
         &[
             "clight_stmt",
             "emit_clight_stmt",
+            "emit_clight_stmt_world",
             "clight_stmt_dead",
             "reg_to_struct_id",
             "emit_struct_fields",
@@ -7722,6 +8062,19 @@ fn size_opaque_escaped_frame_buffers(db: &mut DecompileDB) {
             .and_modify(|current| *current = (*current).max(*extent))
             .or_insert(*extent);
     }
+    // An exact constant capacity on a recognized external memory interface is
+    // sufficient backing-size evidence even when the machine frame was
+    // allocated by a stack-probe loop and therefore has no ordinary static
+    // func_stacksz row for an absorbed tail target.
+    let mut external_capacity_extent: HashMap<(Address, i64), i64> = HashMap::new();
+    for (func, base_ofs, extent) in
+        db.rel_iter::<(Address, i64, i64)>("external_stack_buffer_extent")
+    {
+        external_capacity_extent
+            .entry((*func, *base_ofs))
+            .and_modify(|current| *current = (*current).max(*extent))
+            .or_insert(*extent);
+    }
     // Whole-slot unification lets a slot's canonical local also be the name of a
     // register-resident value, and such a local is a variable, not storage: it
     // is negated, compared and passed by value, none of which an array
@@ -7747,24 +8100,34 @@ fn size_opaque_escaped_frame_buffers(db: &mut DecompileDB) {
         value_regs.extend(defs.into_iter().flatten());
     }
 
-    let escaped: Vec<(Address, i64, RTLReg)> = db
+    let mut escaped: BTreeSet<(Address, i64, RTLReg)> = db
         .rel_iter::<(Address, i64, RTLReg)>("slot_escaped_canonical")
         .copied()
         .collect();
+    escaped.extend(
+        db.rel_iter::<(Address, i64, RTLReg)>("slot_escaped_region_canonical")
+            .filter(|(func, ofs, _)| external_capacity_extent.contains_key(&(*func, *ofs)))
+            .copied(),
+    );
 
     for (func, ofs, local) in escaped {
         // An Ainstack offset counts upward from the stack pointer, so the frame
         // occupies [0, stacksize) and anything at or above the top belongs to
         // the caller: an incoming stack argument, not storage to widen here.
-        let Some(frame_top) = frame_sizes
+        // A missing static top is accepted only for an independently exact
+        // external capacity derived from this same stack-address value.
+        let frame_top = frame_sizes
             .get(&func)
             .copied()
-            .and_then(|size| i64::try_from(size).ok())
-        else {
+            .and_then(|size| i64::try_from(size).ok());
+        let exact_external_floor = external_capacity_extent.get(&(func, ofs)).copied();
+        if frame_top.is_none() && exact_external_floor.is_none() {
             continue;
-        };
-        if ofs < 0 || ofs >= frame_top {
-            continue;
+        }
+        if let Some(frame_top) = frame_top {
+            if ofs < 0 || ofs >= frame_top {
+                continue;
+            }
         }
         if directly_accessed
             .get(&func)
@@ -7783,18 +8146,45 @@ fn size_opaque_escaped_frame_buffers(db: &mut DecompileDB) {
             continue;
         }
         let own_fields = region_fields.get(&(func, ofs));
-        let limit = boundaries
-            .get(&func)
-            .and_then(|offsets| {
-                offsets
-                    .range((ofs + 1)..=frame_top)
-                    .find(|boundary| !own_fields.is_some_and(|fields| fields.contains(boundary)))
-                    .copied()
-            })
-            .unwrap_or(frame_top);
-        let gap = limit - ofs;
         let floor = region_extent.get(&(func, ofs)).copied().unwrap_or(0);
-        let Some(size) = Some(gap.max(floor)).filter(|size| *size > 0) else {
+        let size = if let Some(frame_top) = frame_top {
+            let limit = boundaries
+                .get(&func)
+                .and_then(|offsets| {
+                    offsets
+                        .range((ofs + 1)..=frame_top)
+                        .find(|boundary| {
+                            !own_fields.is_some_and(|fields| fields.contains(boundary))
+                        })
+                        .copied()
+                })
+                .unwrap_or(frame_top);
+            (limit - ofs).max(floor)
+        } else {
+            let Some(size) = exact_external_floor.filter(|size| *size > 0 && *size <= (1 << 20))
+            else {
+                continue;
+            };
+            let Some(end) = ofs.checked_add(size) else {
+                continue;
+            };
+            let Some(first_interior) = ofs.checked_add(1) else {
+                continue;
+            };
+            // Do not create two independent C objects over the same bytes. If
+            // another modeled local cuts through the exact capacity and is not
+            // already one of this region's fields, leave the layout unresolved
+            // for the alias reconciliation layer rather than swallowing it.
+            if boundaries.get(&func).is_some_and(|offsets| {
+                offsets
+                    .range(first_interior..end)
+                    .any(|boundary| !own_fields.is_some_and(|fields| fields.contains(boundary)))
+            }) {
+                continue;
+            }
+            size
+        };
+        if size <= 0 {
             continue;
         };
         db.stack_struct_buffers
@@ -8414,6 +8804,42 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
                 kind: RangeKind::ByteBuffer,
             });
         }
+    }
+    // The RTL ABI proof is an exact physical interval even when opaque-slot
+    // sizing declined to turn its base local into a byte buffer (for example,
+    // because the same address also appears as a call operand).  Feed that
+    // interval directly to overlap reconciliation.  It becomes storage only
+    // when a proven indexed range actually overlaps it; otherwise the normal
+    // escaped-region layout remains authoritative.
+    for (func, start, extent) in db.rel_iter::<(Address, i64, i64)>("external_stack_object_extent")
+    {
+        if *extent <= 0 || *extent > 1 << 20 {
+            continue;
+        }
+        let Some(end) = start.checked_add(*extent) else {
+            continue;
+        };
+        let Some(locals) = slot_locals.get(&(*func, *start)) else {
+            continue;
+        };
+        let mut locals = locals.iter();
+        let Some(&local) = locals.next() else {
+            continue;
+        };
+        if locals.next().is_some()
+            || local_offsets
+                .get(&(*func, local))
+                .is_none_or(|offsets| offsets.len() != 1 || !offsets.contains(start))
+        {
+            continue;
+        }
+        ranges.push(StorageRange {
+            func: *func,
+            start: *start,
+            end,
+            local,
+            kind: RangeKind::ByteBuffer,
+        });
     }
     ranges.sort_by_key(|range| {
         (

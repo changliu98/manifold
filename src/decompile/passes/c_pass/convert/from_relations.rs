@@ -2537,7 +2537,19 @@ pub(crate) fn recovered_global_array_declarations(
         let candidate = (*elem_size, *count);
         logical
             .entry(*ident)
-            .and_modify(|winner| *winner = (*winner).min(candidate))
+            .and_modify(|winner| {
+                if winner.0 == candidate.0 {
+                    // Every producer publishes a minimum represented extent.
+                    // For one agreed element width, the larger count subsumes
+                    // the shorter observed prefix; choosing the smaller count
+                    // makes indexed accesses run beyond the C declaration.
+                    winner.1 = winner.1.max(candidate.1);
+                } else {
+                    // Preserve the established weakest-type choice when the
+                    // logical element interpretations themselves disagree.
+                    *winner = (*winner).min(candidate);
+                }
+            })
             .or_insert(candidate);
     }
 
@@ -10334,6 +10346,27 @@ mod escaped_stack_array_tests {
             recovered_global_array_declarations(&db).get(&typed_owner),
             Some(&(4, 4)),
             "an exact logical layout should retain its element type",
+        );
+    }
+
+    #[test]
+    fn equal_width_global_layouts_keep_the_largest_represented_count() {
+        let owner = 0x404080_usize;
+        let mut db = DecompileDB::default();
+        db.rel_push("is_global_array", (owner, 8_usize, 2_usize));
+        db.rel_push("is_global_array", (owner, 8_usize, 2064_usize));
+
+        assert_eq!(
+            recovered_global_array_declarations(&db).get(&owner),
+            Some(&(8, 2064)),
+            "a short relocation prefix must not truncate a larger same-width indexed layout",
+        );
+
+        db.rel_push("global_storage_extent", (owner, 16_usize));
+        assert_eq!(
+            recovered_global_array_declarations(&db).get(&owner),
+            Some(&(1, 16)),
+            "an exact physical extent must still override a larger logical interpretation",
         );
     }
 

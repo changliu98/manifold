@@ -1905,6 +1905,9 @@ pub fn pipeline_passes() -> Vec<Box<dyn crate::decompile::passes::pass::IRPass>>
         Box::new(ptr_to_pass::PtrToPass),
         Box::new(struct_recovery_pass::StructRecoveryPass),
         Box::new(signature_pass::SignatureReconciliationPass),
+        // Recover only dependency- and control-compatible local RTL
+        // interpretations after signatures make the authoritative RTL final.
+        Box::new(rtl_optimize_pass::RTLSupersetPass),
         Box::new(cminor_pass::CminorPass),
         Box::new(csh_pass::CshPass),
         Box::new(cshminor_pass::CshminorPass),

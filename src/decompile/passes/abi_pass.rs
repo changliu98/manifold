@@ -23,6 +23,7 @@ impl IRPass for AbiPass {
         populate_hardcoded_signatures(db);
         populate_known_global_types(db);
         populate_known_func_param_pointee_size(db);
+        populate_known_func_buffer_capacity(db);
     }
 
     fn outputs(&self) -> &'static [&'static str] {
@@ -52,6 +53,8 @@ impl IRPass for AbiPass {
             "known_global_type",
             "known_varargs_function",
             "known_func_param_pointee_size",
+            "known_func_param_byte_capacity",
+            "known_func_param_element_capacity",
         ]
     }
 }
@@ -920,6 +923,52 @@ fn populate_known_func_param_pointee_size(db: &mut DecompileDB) {
             "known_func_param_pointee_size",
             (name, idx, layout.size_of(obj)),
         );
+    }
+}
+
+/// Parameters whose accessible byte extent is carried by another argument.
+///
+/// Unlike `known_func_param_pointee_size`, these are interface contracts rather
+/// than target-specific libc layouts.  The RTL consumer still requires the
+/// capacity arguments to be exact positive constants before allocating C
+/// backing storage.  Element-capacity rows keep `fread`/`fwrite`'s checked
+/// `size * nmemb` semantics explicit instead of pretending either argument is
+/// independently a byte count.
+fn populate_known_func_buffer_capacity(db: &mut DecompileDB) {
+    let byte_capacities: &[(Symbol, usize, usize)] = &[
+        ("read", 1, 2),
+        ("write", 1, 2),
+        ("pread", 1, 2),
+        ("pread64", 1, 2),
+        ("pwrite", 1, 2),
+        ("pwrite64", 1, 2),
+        ("recv", 1, 2),
+        ("send", 1, 2),
+        ("getrandom", 0, 1),
+        ("readlink", 1, 2),
+        ("readlinkat", 2, 3),
+        ("memcpy", 0, 2),
+        ("memcpy", 1, 2),
+        ("memmove", 0, 2),
+        ("memmove", 1, 2),
+        ("memcmp", 0, 2),
+        ("memcmp", 1, 2),
+        ("memset", 0, 2),
+        ("__memcpy_chk", 0, 2),
+        ("__memcpy_chk", 1, 2),
+    ];
+    for &fact in byte_capacities {
+        db.rel_push("known_func_param_byte_capacity", fact);
+    }
+
+    let element_capacities: &[(Symbol, usize, usize, usize)] = &[
+        ("fread", 0, 1, 2),
+        ("fread_unlocked", 0, 1, 2),
+        ("fwrite", 0, 1, 2),
+        ("fwrite_unlocked", 0, 1, 2),
+    ];
+    for &fact in element_capacities {
+        db.rel_push("known_func_param_element_capacity", fact);
     }
 }
 

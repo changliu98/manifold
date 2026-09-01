@@ -2457,6 +2457,8 @@ mod tests {
             param_regs: Vec::new(),
             param_types: Vec::new(),
             stack_size: 0,
+            structure_world:
+                crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_STRUCTURED,
             selected_candidate_nodes: statements.keys().copied().collect(),
             statements,
             selected_write_bytes: Default::default(),

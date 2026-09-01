@@ -707,6 +707,79 @@ mod schedule_tests {
     }
 
     #[test]
+    fn rtl_superset_waits_for_final_signatures_and_precedes_cminor() {
+        let passes = pipeline_passes();
+        let schedule = PassScheduler::build_schedule(&passes);
+        let optimizer = passes
+            .iter()
+            .find(|pass| pass.name() == "rtl_optimize")
+            .expect("RTL optimizer must be registered");
+        let superset = passes
+            .iter()
+            .find(|pass| pass.name() == "rtl_superset")
+            .expect("RTL superset pass must be registered");
+        let cminor = passes
+            .iter()
+            .find(|pass| pass.name() == "cminor")
+            .expect("Cminor pass must be registered");
+
+        assert!(optimizer.outputs().contains(&"rtl_inst_candidate"));
+        assert!(superset.inputs().contains(&"rtl_inst_candidate"));
+        assert!(superset.inputs().contains(&"rtl_inst"));
+        assert!(superset.inputs().contains(&"rtl_expansion_edge"));
+        assert!(superset.inputs().contains(&"emit_var_type_candidate"));
+        assert!(superset.outputs().contains(&"rtl_inst_superset"));
+        assert!(superset
+            .outputs()
+            .contains(&"rtl_superset_authoritative_chunk"));
+        assert!(cminor.inputs().contains(&"rtl_inst_superset"));
+        assert!(
+            stage_of(&schedule, "signature-reconciliation") < stage_of(&schedule, "rtl_superset")
+        );
+        assert!(stage_of(&schedule, "rtl_superset") < stage_of(&schedule, "cminor"));
+        assert!(stage_of(&schedule, "rtl_superset") < stage_of(&schedule, "clight_select"));
+    }
+
+    #[test]
+    fn structure_world_superset_reaches_clight_before_selection() {
+        let passes = pipeline_passes();
+        let schedule = PassScheduler::build_schedule(&passes);
+        let structuring = passes
+            .iter()
+            .find(|pass| pass.name() == "Structuring")
+            .expect("Structuring pass must be registered");
+        let clight = passes
+            .iter()
+            .find(|pass| pass.name() == "clight")
+            .expect("Clight pass must be registered");
+        let field = passes
+            .iter()
+            .find(|pass| pass.name() == "clight_field")
+            .expect("Clight field pass must be registered");
+        let select = passes
+            .iter()
+            .find(|pass| pass.name() == "clight_select")
+            .expect("Clight selector must be registered");
+
+        for relation in [
+            "structure_world",
+            "csharp_stmt_world",
+            "structure_unchanged_node",
+        ] {
+            assert!(structuring.outputs().contains(&relation));
+            assert!(clight.inputs().contains(&relation));
+        }
+        assert!(clight.outputs().contains(&"emit_clight_stmt_world"));
+        assert!(clight.outputs().contains(&"emit_next_world"));
+        assert!(field.inputs().contains(&"emit_clight_stmt_world"));
+        assert!(field.outputs().contains(&"emit_clight_stmt_world"));
+        assert!(select.inputs().contains(&"emit_clight_stmt_world"));
+        assert!(stage_of(&schedule, "Structuring") < stage_of(&schedule, "clight"));
+        assert!(stage_of(&schedule, "clight") < stage_of(&schedule, "clight_field"));
+        assert!(stage_of(&schedule, "clight_field") < stage_of(&schedule, "clight_select"));
+    }
+
+    #[test]
     fn post_emit_audit_checkpoints_cover_every_tree_writer() {
         let passes = pipeline_passes();
         let writers: Vec<_> = passes

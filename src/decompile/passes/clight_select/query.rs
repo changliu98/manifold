@@ -320,6 +320,20 @@ pub struct FunctionData {
 
     pub node_statements: HashMap<Node, Vec<ClightStmt>>,
 
+    /// Function-level structural interpretations.  Statement candidates carry
+    /// aligned world sets below; the solver chooses exactly one world and can
+    /// therefore never combine a structured switch with its raw comparison
+    /// members or a structured loop with the flat back-edge CFG.
+    pub structure_worlds: Vec<u8>,
+    pub authoritative_structure_world: u8,
+    pub candidate_structure_worlds: HashMap<Node, Vec<BTreeSet<u8>>>,
+    pub successors_by_structure_world: HashMap<u8, HashMap<Node, Vec<Node>>>,
+
+    /// At nodes where RTL deliberately advances both subword signedness
+    /// spellings, retain the post-optimizer chunk as the deterministic
+    /// no-model/UNSAT fallback.  Z3 may still select its sibling.
+    pub rtl_superset_authoritative_chunks: HashMap<Node, MemoryChunk>,
+
     pub successors: HashMap<Node, Vec<Node>>,
 
     pub used_regs: HashSet<RTLReg>,
@@ -723,6 +737,14 @@ impl FunctionData {
             param_types,
             stack_size,
             node_statements: HashMap::new(),
+            structure_worlds: vec![
+                crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_STRUCTURED,
+            ],
+            authoritative_structure_world:
+                crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_STRUCTURED,
+            candidate_structure_worlds: HashMap::new(),
+            successors_by_structure_world: HashMap::new(),
+            rtl_superset_authoritative_chunks: HashMap::new(),
             successors: HashMap::new(),
             used_regs: HashSet::new(),
             must_pointer_regs: HashSet::new(),
@@ -2000,6 +2022,43 @@ fn common_function_owners(
     common
 }
 
+fn structure_world_candidate_is_owned(
+    authoritative: bool,
+    semantically_owned: bool,
+    owned_control_anchor: bool,
+    exact_world_node: bool,
+) -> bool {
+    if authoritative {
+        semantically_owned || owned_control_anchor
+    } else {
+        exact_world_node
+    }
+}
+
+#[cfg(test)]
+mod structure_world_ownership_tests {
+    use super::structure_world_candidate_is_owned;
+
+    #[test]
+    fn authoritative_world_rejects_shared_implementation_rows_without_final_ownership() {
+        assert!(!structure_world_candidate_is_owned(
+            true, false, false, true,
+        ));
+        assert!(structure_world_candidate_is_owned(true, true, false, false,));
+        assert!(structure_world_candidate_is_owned(true, false, true, false,));
+    }
+
+    #[test]
+    fn flat_world_uses_its_exact_function_scoped_snapshot() {
+        assert!(structure_world_candidate_is_owned(
+            false, false, false, true,
+        ));
+        assert!(!structure_world_candidate_is_owned(
+            false, true, true, false,
+        ));
+    }
+}
+
 // Every statement candidate for a goto target must carry the target label.
 // Candidate sources are heterogeneous: ordinary Clight statements arrive
 // pre-labeled, while recovered escaped-memory effects are appended directly
@@ -2261,32 +2320,127 @@ pub fn extract_functions(
         .map(|(addr, target)| (*addr, *target))
         .collect();
 
-    for (addr, node, stmt) in db.rel_iter::<(Address, Node, ClightStmt)>("emit_clight_stmt") {
-        let is_goto_target = goto_targets.contains(&(*addr, *node));
-        if !is_nonempty_stmt(stmt) && !is_goto_target {
-            continue;
+    let world_rows_present = db
+        .rel_iter::<(Address, u8, Node, ClightStmt)>("emit_clight_stmt_world")
+        .next()
+        .is_some();
+    if world_rows_present {
+        let mut authoritative_worlds: HashSet<(Address, u8)> = HashSet::new();
+        for (addr, world, authoritative) in db.rel_iter::<(Address, u8, bool)>("structure_world") {
+            if let Some(func) = func_map.get_mut(addr) {
+                if !func.structure_worlds.contains(world) {
+                    func.structure_worlds.push(*world);
+                }
+                if *authoritative {
+                    func.authoritative_structure_world = *world;
+                    authoritative_worlds.insert((*addr, *world));
+                }
+            }
         }
-        let is_semantically_owned = function_owners
-            .get(node)
-            .is_some_and(|owners| owners.0.contains(addr));
-        let is_owned_control_anchor = targeted_nop_owners
-            .get(node)
-            .is_some_and(|owners| owners.contains(addr));
-        if !is_semantically_owned && !is_owned_control_anchor {
-            continue;
+        let csharp_world_nodes: HashSet<(Address, u8, Node)> = db
+            .rel_iter::<(Address, u8, Node, CsharpminorStmt)>("csharp_stmt_world")
+            .map(|(func, world, node, _)| (*func, *world, *node))
+            .collect();
+
+        let mut grouped: HashMap<(Address, Node), HashMap<ClightStmt, BTreeSet<u8>>> =
+            HashMap::new();
+        for (addr, world, node, stmt) in
+            db.rel_iter::<(Address, u8, Node, ClightStmt)>("emit_clight_stmt_world")
+        {
+            let is_goto_target = goto_targets.contains(&(*addr, *node));
+            if !is_nonempty_stmt(stmt) && !is_goto_target {
+                continue;
+            }
+            let is_semantically_owned = function_owners
+                .get(node)
+                .is_some_and(|owners| owners.0.contains(addr));
+            let is_owned_control_anchor = targeted_nop_owners
+                .get(node)
+                .is_some_and(|owners| owners.contains(addr));
+            let is_scoped_to_world = structure_world_candidate_is_owned(
+                authoritative_worlds.contains(&(*addr, *world)),
+                is_semantically_owned,
+                is_owned_control_anchor,
+                csharp_world_nodes.contains(&(*addr, *world, *node)),
+            );
+            if !is_scoped_to_world {
+                continue;
+            }
+            grouped
+                .entry((*addr, *node))
+                .or_default()
+                .entry(stmt.clone())
+                .or_default()
+                .insert(*world);
         }
-        if let Some(func) = func_map.get_mut(addr) {
-            func.node_statements
-                .entry(*node)
-                .or_insert_with(Vec::new)
-                .push(stmt.clone());
+        for ((addr, node), by_stmt) in grouped {
+            let Some(func) = func_map.get_mut(&addr) else {
+                continue;
+            };
+            let mut candidates: Vec<(ClightStmt, BTreeSet<u8>)> = by_stmt.into_iter().collect();
+            candidates.sort_by_cached_key(|(stmt, _)| format!("{stmt:?}"));
+            let (stmts, worlds): (Vec<_>, Vec<_>) = candidates.into_iter().unzip();
+            func.node_statements.insert(node, stmts);
+            func.candidate_structure_worlds.insert(node, worlds);
+        }
+        for func in func_map.values_mut() {
+            func.structure_worlds.sort_unstable();
+            func.structure_worlds.dedup();
+            if !func
+                .structure_worlds
+                .contains(&func.authoritative_structure_world)
+            {
+                func.structure_worlds
+                    .insert(0, func.authoritative_structure_world);
+            }
+        }
+    } else {
+        // Focused relation tests and partial pipelines may omit the world
+        // handoff.  Preserve the legacy single-world behavior exactly.
+        for (addr, node, stmt) in db.rel_iter::<(Address, Node, ClightStmt)>("emit_clight_stmt") {
+            let is_goto_target = goto_targets.contains(&(*addr, *node));
+            if !is_nonempty_stmt(stmt) && !is_goto_target {
+                continue;
+            }
+            let is_semantically_owned = function_owners
+                .get(node)
+                .is_some_and(|owners| owners.0.contains(addr));
+            let is_owned_control_anchor = targeted_nop_owners
+                .get(node)
+                .is_some_and(|owners| owners.contains(addr));
+            if !is_semantically_owned && !is_owned_control_anchor {
+                continue;
+            }
+            if let Some(func) = func_map.get_mut(addr) {
+                func.node_statements
+                    .entry(*node)
+                    .or_insert_with(Vec::new)
+                    .push(stmt.clone());
+            }
+        }
+        // Vec index 0 is semantic (UNSAT-fallback candidate); sort to
+        // lex-smallest debug form so selection is identical across runs.
+        for func in func_map.values_mut() {
+            for (node, stmts) in &mut func.node_statements {
+                if stmts.len() > 1 {
+                    stmts.sort_by_cached_key(|s| format!("{s:?}"));
+                }
+                func.candidate_structure_worlds.insert(
+                    *node,
+                    vec![BTreeSet::from([func.authoritative_structure_world]); stmts.len()],
+                );
+            }
         }
     }
-    // Vec index 0 is semantic (UNSAT-fallback candidate); sort to lex-smallest debug form so selection is identical across runs despite non-deterministic Ascent set order.
+
+    let authoritative_chunks: HashMap<Node, MemoryChunk> = db
+        .rel_iter::<(Node, MemoryChunk)>("rtl_superset_authoritative_chunk")
+        .copied()
+        .collect();
     for func in func_map.values_mut() {
-        for stmts in func.node_statements.values_mut() {
-            if stmts.len() > 1 {
-                stmts.sort_by_cached_key(|s| format!("{:?}", s));
+        for node in func.node_statements.keys() {
+            if let Some(chunk) = authoritative_chunks.get(node) {
+                func.rtl_superset_authoritative_chunks.insert(*node, *chunk);
             }
         }
     }
@@ -2314,6 +2468,23 @@ pub fn extract_functions(
         }
     }
 
+    // Label synthesis can introduce a skip-only control anchor after the
+    // world-tagged candidates were grouped.  Such an anchor is valid in every
+    // world; keep the parallel provenance vectors total and aligned.
+    for func in func_map.values_mut() {
+        let all_worlds: BTreeSet<u8> = func.structure_worlds.iter().copied().collect();
+        for (node, stmts) in &func.node_statements {
+            let masks = func
+                .candidate_structure_worlds
+                .entry(*node)
+                .or_insert_with(Vec::new);
+            while masks.len() < stmts.len() {
+                masks.push(all_worlds.clone());
+            }
+            masks.truncate(stmts.len());
+        }
+    }
+
     for (from_node, to_node) in db.rel_iter::<(Node, Node)>("emit_next") {
         let mut owners = function_owners
             .get(from_node)
@@ -2336,6 +2507,28 @@ pub fn extract_functions(
         for succs in func.successors.values_mut() {
             succs.sort();
             succs.dedup();
+        }
+        func.successors_by_structure_world
+            .insert(func.authoritative_structure_world, func.successors.clone());
+    }
+    for (addr, world, from_node, to_node) in
+        db.rel_iter::<(Address, u8, Node, Node)>("emit_next_world")
+    {
+        if let Some(func) = func_map.get_mut(addr) {
+            func.successors_by_structure_world
+                .entry(*world)
+                .or_default()
+                .entry(*from_node)
+                .or_default()
+                .push(*to_node);
+        }
+    }
+    for func in func_map.values_mut() {
+        for successors in func.successors_by_structure_world.values_mut() {
+            for succs in successors.values_mut() {
+                succs.sort_unstable();
+                succs.dedup();
+            }
         }
     }
 

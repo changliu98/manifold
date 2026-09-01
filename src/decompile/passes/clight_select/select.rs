@@ -17,10 +17,56 @@ struct SelectionState {
     candidate_idx: HashMap<Node, Option<usize>>,
 }
 
-#[derive(Clone)]
+fn primary_memory_type(expr: &ClightExpr) -> Option<&ClightType> {
+    match expr {
+        ClightExpr::Ederef(_, ty)
+        | ClightExpr::Efield(_, _, ty)
+        | ClightExpr::Evar(_, ty)
+        | ClightExpr::Etempvar(_, ty) => Some(ty),
+        ClightExpr::Eunop(_, inner, _) | ClightExpr::Ecast(inner, _) => primary_memory_type(inner),
+        _ => None,
+    }
+}
+
+fn stmt_primary_memory_type(stmt: &ClightStmt) -> Option<&ClightType> {
+    match stmt {
+        ClightStmt::Sset(_, rhs) => primary_memory_type(rhs),
+        ClightStmt::Sassign(lhs, _) => primary_memory_type(lhs),
+        ClightStmt::Slabel(_, inner) => stmt_primary_memory_type(inner),
+        ClightStmt::Ssequence(statements) if statements.len() == 1 => {
+            stmt_primary_memory_type(&statements[0])
+        }
+        _ => None,
+    }
+}
+
+fn stmt_matches_authoritative_chunk(stmt: &ClightStmt, chunk: MemoryChunk) -> bool {
+    let expected = crate::decompile::passes::csh_pass::clight_type_from_chunk(&chunk);
+    stmt_primary_memory_type(stmt) == Some(&expected)
+}
+
+fn superset_provenance_priority(
+    stmt: &ClightStmt,
+    authoritative_chunk: Option<MemoryChunk>,
+    has_authoritative_spelling: bool,
+) -> u8 {
+    if has_authoritative_spelling
+        && authoritative_chunk.is_some_and(|chunk| stmt_matches_authoritative_chunk(stmt, chunk))
+    {
+        0
+    } else if has_authoritative_spelling {
+        1
+    } else {
+        0
+    }
+}
+
+#[derive(Clone, Default)]
 pub(crate) struct ProgramSelectionState {
     /// (func_addr, node) -> candidate index
     pub(crate) candidate_idx: HashMap<(Address, Node), Option<usize>>,
+    /// One atomic CFG/structure interpretation per function.
+    pub(crate) structure_world: HashMap<Address, u8>,
     /// (func_addr, reg) -> type candidate index
     pub(crate) var_decl_idx: HashMap<(Address, RTLReg), usize>,
     /// (func_addr, reg) -> inferred type-string for registers whose inferred type is not among the enumerated candidates (generic-inference path only, empty otherwise); applied as a synthetic candidate.
@@ -37,6 +83,7 @@ pub struct SelectedFunction {
     pub param_regs: Vec<RTLReg>,
     pub param_types: Vec<ParamType>,
     pub stack_size: u64,
+    pub structure_world: u8,
 
     pub statements: HashMap<Node, ClightStmt>,
 
@@ -115,13 +162,48 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
         }
     }
 
-    // Sort candidates deterministically: prefer Efield form over raw pointer-deref-with-cast (so search starts on the recovered-field variant when both compile); secondary key is a deterministic hash (Ascent parallel order is arbitrary).
+    // Sort candidates deterministically.  A post-RTL superset node keeps the
+    // authoritative memory spelling first for no-model/UNSAT fallback; Z3 can
+    // still select its signedness sibling.  Existing field/byte-address
+    // preferences remain the next strata.
     for func in &mut functions {
-        for candidates in func.node_statements.values_mut() {
+        let mut nodes: Vec<Node> = func.node_statements.keys().copied().collect();
+        nodes.sort_unstable();
+        for node in nodes {
+            let authoritative_structure_world = func.authoritative_structure_world;
+            let candidates = func
+                .node_statements
+                .get_mut(&node)
+                .expect("candidate node collected above");
+            let all_worlds: BTreeSet<u8> = func.structure_worlds.iter().copied().collect();
+            let mut world_masks = func
+                .candidate_structure_worlds
+                .remove(&node)
+                .unwrap_or_else(|| vec![all_worlds.clone(); candidates.len()]);
+            while world_masks.len() < candidates.len() {
+                world_masks.push(all_worlds.clone());
+            }
+            world_masks.truncate(candidates.len());
             if candidates.len() > 1 {
                 // When a node offers a byte-addressed `(char *)base + c` alongside a bare `base + c` on a non-char pointer, both compile but the bare form silently re-scales the constant by the element size (B2 mis-scaling), so demote it and search the byte-correct char-cast candidate first.
                 let has_byte_cast = candidates.iter().any(stmt_uses_charcast_ptr_arith);
-                candidates.sort_by_key(|s| {
+                let authoritative_chunk =
+                    func.rtl_superset_authoritative_chunks.get(&node).copied();
+                let has_authoritative_spelling = authoritative_chunk.is_some_and(|chunk| {
+                    candidates
+                        .iter()
+                        .any(|stmt| stmt_matches_authoritative_chunk(stmt, chunk))
+                });
+                let mut paired: Vec<(ClightStmt, BTreeSet<u8>)> =
+                    candidates.drain(..).zip(world_masks.drain(..)).collect();
+                paired.sort_by_key(|(s, worlds)| {
+                    let structure_priority =
+                        u8::from(!worlds.contains(&authoritative_structure_world));
+                    let provenance_priority = superset_provenance_priority(
+                        s,
+                        authoritative_chunk,
+                        has_authoritative_spelling,
+                    );
                     // Lower key sorts first. Field-form gets 0, raw-deref form gets 1.
                     let prefers_field = stmt_uses_efield(s);
                     let priority: u8 = if prefers_field {
@@ -134,9 +216,19 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
                     } else {
                         1
                     };
-                    (priority, stmt_deterministic_hash(s))
+                    (
+                        structure_priority,
+                        provenance_priority,
+                        priority,
+                        stmt_deterministic_hash(s),
+                    )
                 });
+                let (sorted_candidates, sorted_worlds): (Vec<_>, Vec<_>) =
+                    paired.into_iter().unzip();
+                *candidates = sorted_candidates;
+                world_masks = sorted_worlds;
             }
+            func.candidate_structure_worlds.insert(node, world_masks);
         }
     }
 
@@ -392,6 +484,54 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
     }
     db.committed_interfaces = committed_interfaces;
     db.interface_vars = interface_vars;
+
+    for func in &functions {
+        let world = best_state
+            .structure_world
+            .get(&func.address)
+            .copied()
+            .unwrap_or(func.authoritative_structure_world);
+        for (node, masks) in &func.candidate_structure_worlds {
+            let Some(Some(index)) = best_state
+                .candidate_idx
+                .get(&(func.address, *node))
+                .copied()
+            else {
+                continue;
+            };
+            if masks
+                .get(index)
+                .is_some_and(|worlds| !worlds.contains(&world))
+            {
+                return Err(format!(
+                    "selector chose candidate {index} at {node:#x} outside structure world {world} in {:#x}",
+                    func.address
+                ));
+            }
+        }
+    }
+
+    let multi_world_functions = functions
+        .iter()
+        .filter(|func| func.structure_worlds.len() > 1)
+        .count();
+    let flat_selected = functions
+        .iter()
+        .filter(|func| {
+            best_state
+                .structure_world
+                .get(&func.address)
+                .copied()
+                .unwrap_or(func.authoritative_structure_world)
+                != func.authoritative_structure_world
+        })
+        .count();
+    eprintln!(
+        "[structure-superset] multi-world-functions={} flat-selected={} authoritative-selected={}",
+        multi_world_functions,
+        flat_selected,
+        functions.len().saturating_sub(flat_selected),
+    );
 
     // Split result into per-function SelectedFunction
     let selected: Vec<SelectedFunction> = functions
@@ -808,6 +948,16 @@ fn build_selected_function_from_program_state(
     stack_vars: Option<&HashSet<RTLReg>>,
 ) -> SelectedFunction {
     let addr = func.address;
+    let structure_world = program_state
+        .structure_world
+        .get(&addr)
+        .copied()
+        .unwrap_or(func.authoritative_structure_world);
+    let structured_world = structure_world == func.authoritative_structure_world;
+    let successors = func
+        .successors_by_structure_world
+        .get(&structure_world)
+        .unwrap_or(&func.successors);
 
     // Extract per-function SelectionState from the program state
     let mut candidate_idx = HashMap::new();
@@ -865,7 +1015,7 @@ fn build_selected_function_from_program_state(
     let per_func_state = SelectionState { candidate_idx };
 
     // Materialize and post-process
-    let mut statements = materialize_statements(&per_func_state, func);
+    let mut statements = materialize_statements(&per_func_state, func, structure_world);
     let selected_candidate_nodes = statements.keys().copied().collect();
     let selected_write_bytes = statements
         .iter()
@@ -879,51 +1029,58 @@ fn build_selected_function_from_program_state(
         })
         .collect();
     det_fp_stage(func.address, "S1mat", &statements);
-    redirect_gotos_through_selected_away_nodes(&mut statements, &func.successors);
-    duplicate_straight_line_return_tails(&mut statements, &func.successors);
+    redirect_gotos_through_selected_away_nodes(&mut statements, successors);
+    if structured_world {
+        duplicate_straight_line_return_tails(&mut statements, successors);
+    }
     det_fp_stage(func.address, "S1cfg", &statements);
 
-    let func_loop_info = loop_info_all
-        .get(&func.address)
-        .cloned()
-        .unwrap_or_default();
+    let func_loop_info = if structured_world {
+        loop_info_all
+            .get(&func.address)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let applied_sseq_groups = if structured_world {
+        assemble_loops(&mut statements, &func_loop_info, successors);
+        det_fp_stage(func.address, "S2loop", &statements);
 
-    assemble_loops(&mut statements, &func_loop_info, &func.successors);
-    det_fp_stage(func.address, "S2loop", &statements);
+        let func_ite_info = ite_info_all.get(&func.address).cloned().unwrap_or_default();
+        assemble_ite(&mut statements, &func_ite_info, successors);
+        det_fp_stage(func.address, "S3ite", &statements);
 
-    let func_ite_info = ite_info_all.get(&func.address).cloned().unwrap_or_default();
-    assemble_ite(&mut statements, &func_ite_info, &func.successors);
-    det_fp_stage(func.address, "S3ite", &statements);
-
-    let applied_sseq_groups = assemble_sseq_groups(&mut statements, &func.sseq_groups);
-    let protected_sseq_anchors: HashSet<Node> = applied_sseq_groups.keys().copied().collect();
-
-    det_fp_stage(func.address, "S4sseq", &statements);
-    // The remaining passes move or absorb top-level blocks.  Make each unique
-    // live fallthrough explicit first so a success return, join, or error exit
-    // travels with the block that owns it instead of being reinterpreted by
-    // the destination's later C layout.  Loop/ITE assembly above performs the
-    // same preservation while consuming its own body nodes.
-    materialize_cfg_fallthrough_gotos(&mut statements, &func.successors);
-    det_fp_stage(func.address, "S4cfg", &statements);
-    inline_control_flow_bodies(&mut statements, &func.successors, &protected_sseq_anchors);
-    assert_sseq_anchors_survive(&statements, &protected_sseq_anchors, "S5 inlining");
-    det_fp_stage(func.address, "S5inline", &statements);
-    flatten_cascading_ifthenelse_all(&mut statements);
-    det_fp_stage(func.address, "S6flat", &statements);
-    // CF-3 always on (gate removed 2026-06-10): /bin/ls -2.2% gotos; case bodies that stay multi-referenced until CF-6 deduplication become inlinable afterward.
-    inline_switch_case_bodies(&mut statements, &protected_sseq_anchors);
-    assert_sseq_anchors_survive(&statements, &protected_sseq_anchors, "S6 switch inlining");
-    det_fp_stage(func.address, "S6sw", &statements);
-    deduplicate_identical_blocks(&mut statements, &protected_sseq_anchors, &func.successors);
-    assert_sseq_anchors_survive(&statements, &protected_sseq_anchors, "S7 deduplication");
-    det_fp_stage(func.address, "S7dedup", &statements);
-    materialize_cfg_fallthrough_gotos(&mut statements, &func.successors);
-    det_fp_stage(func.address, "S7cfg", &statements);
-    ensure_goto_labels(&mut statements);
-    det_fp_stage(func.address, "S8labels", &statements);
-
-    assert_sseq_anchors_survive(&statements, &protected_sseq_anchors, "final labeling");
+        let applied = assemble_sseq_groups(&mut statements, &func.sseq_groups);
+        let protected: HashSet<Node> = applied.keys().copied().collect();
+        det_fp_stage(func.address, "S4sseq", &statements);
+        materialize_cfg_fallthrough_gotos(&mut statements, successors);
+        det_fp_stage(func.address, "S4cfg", &statements);
+        inline_control_flow_bodies(&mut statements, successors, &protected);
+        assert_sseq_anchors_survive(&statements, &protected, "S5 inlining");
+        det_fp_stage(func.address, "S5inline", &statements);
+        flatten_cascading_ifthenelse_all(&mut statements);
+        det_fp_stage(func.address, "S6flat", &statements);
+        inline_switch_case_bodies(&mut statements, &protected);
+        assert_sseq_anchors_survive(&statements, &protected, "S6 switch inlining");
+        det_fp_stage(func.address, "S6sw", &statements);
+        deduplicate_identical_blocks(&mut statements, &protected, successors);
+        assert_sseq_anchors_survive(&statements, &protected, "S7 deduplication");
+        det_fp_stage(func.address, "S7dedup", &statements);
+        materialize_cfg_fallthrough_gotos(&mut statements, successors);
+        det_fp_stage(func.address, "S7cfg", &statements);
+        ensure_goto_labels(&mut statements);
+        det_fp_stage(func.address, "S8labels", &statements);
+        assert_sseq_anchors_survive(&statements, &protected, "final labeling");
+        applied
+    } else {
+        // Conservative world: retain the flat semantic CFG and make every
+        // fallthrough/target explicit.  No loop, if, switch, straight-line,
+        // or block-inlining transform is allowed to leak in from world zero.
+        materialize_cfg_fallthrough_gotos(&mut statements, successors);
+        ensure_goto_labels(&mut statements);
+        HashMap::new()
+    };
 
     SelectedFunction {
         address: func.address,
@@ -933,18 +1090,27 @@ fn build_selected_function_from_program_state(
         param_regs: func.param_regs.clone(),
         param_types: func.param_types.clone(),
         stack_size: func.stack_size,
+        structure_world,
         statements,
         selected_candidate_nodes,
         selected_write_bytes,
-        successors: func.successors.clone(),
+        successors: successors.clone(),
         used_regs: func.used_regs.clone(),
         struct_fields: func.struct_fields.clone(),
         sseq_groups: applied_sseq_groups,
         var_types: func.var_types.clone(),
         var_type_candidates,
         var_decl_idx,
-        loop_headers: func.loop_headers.clone(),
-        switch_heads: func.switch_heads.clone(),
+        loop_headers: if structured_world {
+            func.loop_headers.clone()
+        } else {
+            HashSet::new()
+        },
+        switch_heads: if structured_world {
+            func.switch_heads.clone()
+        } else {
+            HashSet::new()
+        },
         reg_struct_ids: func.reg_struct_ids.clone(),
         loop_info: func_loop_info,
     }
@@ -953,11 +1119,24 @@ fn build_selected_function_from_program_state(
 fn materialize_statements(
     state: &SelectionState,
     func: &FunctionData,
+    structure_world: u8,
 ) -> HashMap<Node, ClightStmt> {
     let mut statements = HashMap::new();
     for (node, candidates) in &func.node_statements {
-        // A node MISSING from the map means the solver emitted no selection for this function (z3 yielded no model): default to the priority-0 candidate. An explicit None entry = SKIP this node.
-        match state.candidate_idx.get(node).copied().unwrap_or(Some(0)) {
+        // A node MISSING from the map means the solver emitted no selection
+        // for this function (z3 yielded no model): fall back to the first
+        // candidate belonging to the selected structural world.  An explicit
+        // None entry = SKIP this node.
+        let fallback = func
+            .candidate_structure_worlds
+            .get(node)
+            .and_then(|masks| {
+                masks
+                    .iter()
+                    .position(|worlds| worlds.contains(&structure_world))
+            })
+            .or_else(|| (!candidates.is_empty()).then_some(0));
+        match state.candidate_idx.get(node).copied().unwrap_or(fallback) {
             Some(idx) => {
                 if let Some(stmt) = candidates.get(idx).or_else(|| candidates.last()) {
                     statements.insert(*node, stmt.clone());
@@ -4055,6 +4234,72 @@ mod tests {
     }
 
     #[test]
+    fn rtl_superset_fallback_prefers_the_authoritative_subword_chunk() {
+        let address = ClightExpr::Etempvar(
+            1,
+            ClightType::Tlong(ClightSignedness::Unsigned, ClightAttr::default()),
+        );
+        let signed_ty =
+            crate::decompile::passes::csh_pass::clight_type_from_chunk(&MemoryChunk::MInt8Signed);
+        let unsigned_ty =
+            crate::decompile::passes::csh_pass::clight_type_from_chunk(&MemoryChunk::MInt8Unsigned);
+        let assert_prefers_unsigned = |signed: ClightStmt, unsigned: ClightStmt| {
+            let mut candidates = vec![signed, unsigned.clone()];
+            let authoritative = Some(MemoryChunk::MInt8Unsigned);
+            let has_authoritative = candidates
+                .iter()
+                .any(|stmt| stmt_matches_authoritative_chunk(stmt, authoritative.unwrap()));
+            candidates.sort_by_key(|stmt| {
+                (
+                    superset_provenance_priority(stmt, authoritative, has_authoritative),
+                    stmt_deterministic_hash(stmt),
+                )
+            });
+            assert_eq!(candidates[0], unsigned);
+        };
+
+        assert_prefers_unsigned(
+            ClightStmt::Sset(
+                2,
+                ClightExpr::Ederef(Box::new(address.clone()), signed_ty.clone()),
+            ),
+            ClightStmt::Sset(
+                2,
+                ClightExpr::Ederef(Box::new(address.clone()), unsigned_ty.clone()),
+            ),
+        );
+        assert_prefers_unsigned(
+            ClightStmt::Sset(2, ClightExpr::Evar(9, signed_ty.clone())),
+            ClightStmt::Sset(2, ClightExpr::Evar(9, unsigned_ty.clone())),
+        );
+        assert_prefers_unsigned(
+            ClightStmt::Sset(2, ClightExpr::Etempvar(9, signed_ty.clone())),
+            ClightStmt::Sset(2, ClightExpr::Etempvar(9, unsigned_ty.clone())),
+        );
+        assert_prefers_unsigned(
+            ClightStmt::Sset(
+                2,
+                ClightExpr::Efield(Box::new(address.clone()), 3, signed_ty.clone()),
+            ),
+            ClightStmt::Sset(
+                2,
+                ClightExpr::Efield(Box::new(address.clone()), 3, unsigned_ty.clone()),
+            ),
+        );
+
+        // Store provenance comes from the LHS.  An unrelated authoritative-type
+        // dereference in the RHS must not make the signed LHS look preferred.
+        let rhs = ClightExpr::Ederef(Box::new(address.clone()), unsigned_ty.clone());
+        assert_prefers_unsigned(
+            ClightStmt::Sassign(
+                ClightExpr::Ederef(Box::new(address.clone()), signed_ty),
+                rhs.clone(),
+            ),
+            ClightStmt::Sassign(ClightExpr::Ederef(Box::new(address), unsigned_ty), rhs),
+        );
+    }
+
+    #[test]
     fn final_stage_c_global_disagreement_becomes_interface_feedback() {
         let address = 1;
         let symbol = 0x9000usize;
@@ -4097,6 +4342,7 @@ mod tests {
         );
         let state = ProgramSelectionState {
             candidate_idx: HashMap::new(),
+            structure_world: HashMap::new(),
             var_decl_idx: HashMap::new(),
             var_type_override: HashMap::new(),
         };
