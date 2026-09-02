@@ -861,6 +861,7 @@ ascent_par! {
     relation sbb_self_carry_op(Address, Address, Condition, bool, Mreg, Mreg, Mreg);
     relation flags_and_jump_pair(Address, Address, &'static str);
     relation setcc_compare_site(Address, Address);
+    relation setcc_flags_result_site(Address, Address);
     relation test_result_setcc(Address, TestResultCondition, Symbol);
     relation next(Address, Address);
     relation op_immediate(Symbol, i64, usize);
@@ -1336,12 +1337,27 @@ ascent_par! {
         osel_cond_at_flags_result(addr, pos, result_site, result_mreg),
         def_value_rtl(result_site, result_mreg, result_rtl);
 
+    // Arithmetic-result SETE/SETNE observes the definition produced by the
+    // flags-setting ALU node.  Resolving its machine operand at the later
+    // SETcc can fabricate a disconnected live-in identity, after which DSE
+    // removes the complete load/ALU chain and the predicate becomes constant.
+    #[local] relation setcc_arg_at_flags_result(Node, usize, Node, Mreg);
+    setcc_arg_at_flags_result(addr, pos, result_site, *arg) <--
+        ltl_inst(addr, ?LTLInst::Lop(Operation::Ocmp(_), mregs, _)),
+        setcc_flags_result_site(addr, result_site),
+        for (pos, arg) in mregs.iter().enumerate();
+
+    op_arg_mapping(addr, pos, result_rtl) <--
+        setcc_arg_at_flags_result(addr, pos, result_site, result_mreg),
+        def_value_rtl(result_site, result_mreg, result_rtl);
+
     op_arg_mapping(addr, pos, arg_rtl) <--
         ltl_inst(addr, ?LTLInst::Lop(_, mregs, dst_reg)),
         for (pos, arg) in mregs.iter().enumerate(),
         if arg != dst_reg,
         !osel_cond_at_compare(addr, pos, _),
         !osel_cond_at_flags_result(addr, pos, _, _),
+        !setcc_arg_at_flags_result(addr, pos, _, _),
         reg_rtl(addr, *arg, arg_rtl);
 
     op_arg_mapping(addr, pos, arg_rtl) <--
@@ -1350,6 +1366,7 @@ ascent_par! {
         if arg == dst_reg,
         !lop_overwrites_input(addr, *dst_reg),
         !osel_cond_at_flags_result(addr, pos, _, _),
+        !setcc_arg_at_flags_result(addr, pos, _, _),
         reg_rtl(addr, *arg, arg_rtl);
 
     op_arg_mapping(addr, pos, arg_rtl_use) <--
@@ -1358,6 +1375,7 @@ ascent_par! {
         if arg == dst_reg,
         !osel_cond_pos(addr, pos, _),
         !osel_cond_at_flags_result(addr, pos, _, _),
+        !setcc_arg_at_flags_result(addr, pos, _, _),
         lop_overwrite_use_id(addr, *dst_reg, src_xtl),
         xtl_canonical(src_xtl, arg_rtl_use);
 
@@ -7352,17 +7370,14 @@ ascent_par! {
         def_reaches_return(ret_addr, def_addr, *rr),
         func_ax_def(func_start, def_addr, _);
 
-    // Several defs can reach one return, so keep one deterministic representative (max def address); this is a tie-break among structurally-proven candidates, not a reachability decision.
-    relation ax_recovered_killed(Address, Address, Address);
-    ax_recovered_killed(func_start, ret_addr, def_addr) <--
-        ax_recovered_cand(func_start, ret_addr, def_addr),
-        ax_recovered_cand(func_start, ret_addr, other_def),
-        if *other_def > *def_addr;
-
+    // Preserve every structurally reaching definition.  The return-use value
+    // phi above aliases their value webs, while downstream superset selection
+    // can retain distinct candidates if that alias proof is incomplete.  A
+    // numeric instruction-address tie-break would silently choose one branch's
+    // value as though layout order established execution order.
     relation ax_recovered(Address, Address, Address);
     ax_recovered(func_start, ret_addr, def_addr) <--
-        ax_recovered_cand(func_start, ret_addr, def_addr),
-        !ax_recovered_killed(func_start, ret_addr, def_addr);
+        ax_recovered_cand(func_start, ret_addr, def_addr);
 
     ax_value_addr(ret_addr, def_addr) <--
         ax_recovered(_, ret_addr, def_addr),
@@ -9555,13 +9570,13 @@ ascent_par! {
     #[local] relation direct_renderable_internal_written_field_candidate(Address, Address, i64, Node, i64, MemoryChunk);
     direct_renderable_internal_written_field_candidate(*caller, *lea, *base, *call, *field_ofs, *chunk) <--
         direct_renderable_slot_argument(caller, lea, base, call, arg_mreg),
-        // Superset ownership may attach a neighboring machine function to the
-        // emitted caller.  Stack coordinates are frame-local, so require both
-        // endpoints of this evidence to remain inside the caller's physical
-        // symbol/FDE span before allowing it to own storage.
-        func_span(_, caller, caller_end),
-        if *lea >= *caller && *lea < *caller_end,
-        if *call >= *caller && *call < *caller_end,
+        // The LEA's function ownership is already carried by
+        // direct_renderable_slot_argument, and arg_setup_candidate proves that
+        // its definition reaches this call.  Require the call to be reachable
+        // in the same function as well; physical address intervals are not a
+        // control-flow or ownership proof, especially under superset recovery.
+        instr_in_function(lea, caller),
+        instr_in_function(call, caller),
         abi_int_arg_position(arg_mreg, pos),
         call_target_func(call, callee),
         param_origin_carrier(callee, pos, current, param_rtl),
@@ -11037,6 +11052,37 @@ ascent_par! {
         if let Ok(frame_top) = i64::try_from(*frame_size),
         if let Some(object_end) = base.checked_add(extent),
         if object_end <= frame_top;
+
+    // A point-local frame address can still carry a structurally proven
+    // internal buffer contract when an unrelated incomplete arm prevents the
+    // whole-function MUST provenance above.  Keep the fallback frame-local and
+    // single-site: superset ownership or mutually exclusive lifetimes must not
+    // turn two capacity claims into one C object.
+    #[local] relation direct_internal_capacity_slot_candidate(Address, Address, i64, Node, i64);
+    direct_internal_capacity_slot_candidate(*caller, *lea, *base, *call, extent) <--
+        direct_renderable_slot_argument(caller, lea, base, call, arg_mreg),
+        instr_in_function(lea, caller),
+        instr_in_function(call, caller),
+        abi_int_arg_position(arg_mreg, buffer_pos),
+        call_target_func(call, callee),
+        param_byte_capacity_position(callee, buffer_pos, capacity_pos),
+        call_arg_mapping(call, capacity_pos, capacity_rtl),
+        single_def_const(capacity_rtl, constant),
+        if let Some(extent) = positive_integral_extent(constant),
+        func_stacksz(caller, _, _, frame_size),
+        if let Ok(frame_top) = i64::try_from(*frame_size),
+        if let Some(object_end) = base.checked_add(extent),
+        if object_end <= frame_top;
+
+    #[local] relation direct_internal_capacity_slot_conflict(Address, i64);
+    direct_internal_capacity_slot_conflict(caller, base) <--
+        direct_internal_capacity_slot_candidate(caller, left_lea, base, left_call, left_extent),
+        direct_internal_capacity_slot_candidate(caller, right_lea, base, right_call, right_extent),
+        if left_lea != right_lea || left_call != right_call || left_extent != right_extent;
+
+    internal_capacity_param_slot(caller, base, extent) <--
+        direct_internal_capacity_slot_candidate(caller, _, base, _, extent),
+        !direct_internal_capacity_slot_conflict(caller, base);
 
     // The ABI proves the region exists, not just how large it is.  Deriving the
     // base cell here is what admits the common shape the structural sources both
@@ -19581,13 +19627,17 @@ mod tests {
     }
 
     #[test]
-    fn direct_internal_call_projects_only_structurally_written_field() {
+    fn direct_internal_call_uses_structural_ownership_not_address_order() {
         on_large_stack(|| {
-            let [func, lea, call, callee, store] = synthetic_ids();
+            let func = 0x9000;
+            let lea = 0x200;
+            let call = 0x100;
+            let callee = 0x7000;
+            let store = 0x80;
             let mut prog = RTLPassProgram::default();
             prog.abi_pointer_size.push((8,));
             prog.abi_int_arg_position.push((Mreg::CX, 3));
-            prog.instr_in_function.push((lea, func));
+            prog.instr_in_function.extend([(lea, func), (call, func)]);
             prog.ltl_inst.push((
                 lea,
                 LTLInst::Lop(
@@ -19601,7 +19651,6 @@ mod tests {
             prog.exact_frame_stack_lea.push((func, lea, 16));
             prog.fixed_stack_probe_allocation.push((func, 65536));
             prog.arg_setup_candidate.push((lea, Mreg::CX, call));
-            prog.func_span.push(("caller", func, call + 1));
             let param_rtl = 0x8100;
             prog.func_param_validated.push((callee, Mreg::CX));
             prog.reg_rtl.push((callee, Mreg::CX, param_rtl));
@@ -19663,9 +19712,9 @@ mod tests {
             prog.exact_frame_stack_lea.push((caller, lea, 16));
             prog.fixed_stack_probe_allocation.push((caller, 65536));
             prog.arg_setup_candidate.push((lea, Mreg::CX, call));
-            // Superset membership says the sites belong to caller, but its
-            // physical function span does not contain either address.
-            prog.func_span.push(("caller", caller, 0x1100));
+            // The LEA has superset ownership, but the call is not structurally
+            // reachable in this caller. Numeric proximity must not lend it
+            // the caller's frame.
             let param_rtl = 0x8100;
             prog.func_param_validated.push((callee, Mreg::CX));
             prog.reg_rtl.push((callee, Mreg::CX, param_rtl));
@@ -19724,6 +19773,33 @@ mod tests {
                 .escaped_stack_region_field
                 .iter()
                 .any(|fact| fact.0 == caller && fact.1 == base));
+        });
+    }
+
+    #[test]
+    fn return_recovery_keeps_all_structurally_reaching_candidates() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x9000;
+            let ret = 0x100;
+            let high_address_def = 0x8000;
+            let low_address_def = 0x200;
+            prog.ax_recovered_cand
+                .extend([(func, ret, high_address_def), (func, ret, low_address_def)]);
+
+            prog.run();
+
+            let recovered: std::collections::BTreeSet<_> = prog
+                .ax_recovered
+                .iter()
+                .filter_map(|(owner, return_node, def)| {
+                    (*owner == func && *return_node == ret).then_some(*def)
+                })
+                .collect();
+            assert_eq!(
+                recovered,
+                std::collections::BTreeSet::from([high_address_def, low_address_def])
+            );
         });
     }
 
@@ -22242,6 +22318,14 @@ mod tests {
             let nested_buffer = fresh_xtl_reg(nested, Mreg::SI);
             let nested_capacity = fresh_xtl_reg(nested, Mreg::DX);
             let caller_capacity = fresh_xtl_reg(capacity_def, Mreg::DX);
+            // Deliberately place the owned sites below the function entry and
+            // put the call below the LEA numerically. CFG/dataflow relations,
+            // not address order, establish this call setup.
+            let direct_caller = 0xa000;
+            let direct_capacity_def = 0x180;
+            let direct_lea = 0x200;
+            let direct_call = 0x100;
+            let direct_capacity = fresh_xtl_reg(direct_capacity_def, Mreg::DX);
             let stored_value = fresh_xtl_reg(boundary_store, Mreg::DI);
 
             for (reg, pos) in [(Mreg::SI, 1), (Mreg::DX, 2)] {
@@ -22289,6 +22373,31 @@ mod tests {
             ));
             prog.func_stacksz.push((caller, 0x9100, "caller", 280));
 
+            prog.direct_renderable_slot_argument.push((
+                direct_caller,
+                direct_lea,
+                0,
+                direct_call,
+                Mreg::SI,
+            ));
+            prog.instr_in_function
+                .extend([(direct_lea, direct_caller), (direct_call, direct_caller)]);
+            prog.call_target_func.push((direct_call, wrapper));
+            prog.call_arg_mapping
+                .push((direct_call, 2, direct_capacity));
+            prog.instr_in_function
+                .push((direct_capacity_def, direct_caller));
+            prog.rtl_inst_candidate.push((
+                direct_capacity_def,
+                RTLInst::Iop(
+                    Operation::Olongconst(257),
+                    Arc::new(vec![]),
+                    direct_capacity,
+                ),
+            ));
+            prog.func_stacksz
+                .push((direct_caller, 0xa100, "direct_caller", 280));
+
             prog.run();
 
             assert!(prog
@@ -22299,6 +22408,10 @@ mod tests {
                 .escaped_stack_region_extent
                 .iter()
                 .any(|fact| fact == &(caller, 0, 257)));
+            assert!(prog
+                .escaped_stack_region_extent
+                .iter()
+                .any(|fact| fact == &(direct_caller, 0, 257)));
             assert!(prog.escaped_stack_region_caller_field.iter().any(
                 |(func, base, field_ofs, chunk)| {
                     *func == caller
@@ -22307,6 +22420,30 @@ mod tests {
                         && *chunk == MemoryChunk::MInt8Unsigned
                 }
             ));
+        });
+    }
+
+    #[test]
+    fn multiple_direct_internal_capacity_sites_remain_ambiguous() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let caller = 0xb000;
+            let base = 32_i64;
+            prog.direct_internal_capacity_slot_candidate.extend([
+                (caller, 0xb010, base, 0xb020, 257_i64),
+                (caller, 0xb030, base, 0xb040, 257_i64),
+            ]);
+
+            prog.run();
+
+            assert!(prog
+                .direct_internal_capacity_slot_conflict
+                .iter()
+                .any(|fact| fact == &(caller, base)));
+            assert!(!prog
+                .internal_capacity_param_slot
+                .iter()
+                .any(|fact| fact.0 == caller && fact.1 == base));
         });
     }
 
@@ -22797,6 +22934,59 @@ mod tests {
                         RTLInst::Iop(Operation::Osel(_, _), args, _)
                             if args.as_slice()
                                 == [preserve_value, replacement_value, replacement_value]
+                    )
+            }));
+        });
+    }
+
+    #[test]
+    fn arithmetic_result_setcc_uses_the_flags_origin_definition() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let origin = 0x900;
+            let setcc = 0x100;
+            let origin_result = 0x1234;
+            let disconnected_later_value = 0x5678;
+            let boolean_result = 0x9abc;
+
+            prog.setcc_flags_result_site.push((setcc, origin));
+            prog.ltl_inst.push((
+                setcc,
+                LTLInst::Lop(
+                    Operation::Ocmp(Condition::Ccomplimm(Comparison::Ceq, 0)),
+                    Arc::new(vec![Mreg::AX]),
+                    Mreg::R12,
+                ),
+            ));
+            prog.reg_xtl.push((origin, Mreg::AX, origin_result));
+            prog.is_def.push((origin, origin_result));
+            prog.reg_def.push((origin, Mreg::AX));
+            // Model the disconnected identity that ordinary SETcc-site
+            // reaching-register resolution used to select.
+            prog.reg_xtl
+                .push((setcc, Mreg::AX, disconnected_later_value));
+            prog.reg_xtl.push((setcc, Mreg::R12, boolean_result));
+            prog.is_def.push((setcc, boolean_result));
+            prog.reg_def.push((setcc, Mreg::R12));
+
+            prog.run();
+
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    setcc,
+                    RTLInst::Iop(
+                        Operation::Ocmp(Condition::Ccomplimm(Comparison::Ceq, 0)),
+                        Arc::new(vec![origin_result]),
+                        boolean_result,
+                    ),
+                )
+            }));
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == setcc
+                    && matches!(
+                        inst,
+                        RTLInst::Iop(Operation::Ocmp(_), args, _)
+                            if args.as_slice() == [disconnected_later_value]
                     )
             }));
         });

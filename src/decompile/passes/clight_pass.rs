@@ -1383,6 +1383,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn one_argument_signed_condition_casts_an_unsigned_recovered_value() {
+        let reg = 0x1234;
+        let mut types = MultiVarTypeMap::new();
+        types.insert(reg, vec![default_uint_type()]);
+
+        let condition = clight_condition_expr_with_types(
+            &Condition::Ccomp(Comparison::Cgt),
+            &[CsharpminorExpr::Evar(reg)],
+            &types,
+            8,
+        )
+        .expect("signed comparison against implicit zero");
+
+        assert!(matches!(
+            condition,
+            ClightExpr::Ebinop(
+                ClightBinaryOp::Ogt,
+                lhs,
+                rhs,
+                _,
+            ) if matches!(
+                lhs.as_ref(),
+                ClightExpr::Ecast(_, ClightType::Tint(
+                    ClightIntSize::I32,
+                    ClightSignedness::Signed,
+                    _,
+                ))
+            ) && matches!(
+                rhs.as_ref(),
+                ClightExpr::EconstInt(0, ClightType::Tint(
+                    ClightIntSize::I32,
+                    ClightSignedness::Signed,
+                    _,
+                ))
+            )
+        ));
+    }
+
+    #[test]
+    fn signed_cminor_comparison_casts_a_boolean_typed_machine_word() {
+        let reg = 0x5678;
+        let boolean_ty = ClightType::Tint(
+            ClightIntSize::IBool,
+            ClightSignedness::Unsigned,
+            default_attr(),
+        );
+        let comparison = build_binop_expr(
+            &CminorBinop::Ocmp(Comparison::Cgt),
+            ClightExpr::Etempvar(ident_from_reg(reg), boolean_ty),
+            ClightExpr::EconstInt(0, default_int_type()),
+            8,
+        );
+
+        assert!(matches!(
+            comparison,
+            ClightExpr::Ebinop(ClightBinaryOp::Ogt, lhs, rhs, _)
+                if matches!(
+                    lhs.as_ref(),
+                    ClightExpr::Ecast(_, ClightType::Tint(
+                        ClightIntSize::I32,
+                        ClightSignedness::Signed,
+                        _,
+                    ))
+                ) && matches!(
+                    rhs.as_ref(),
+                    ClightExpr::EconstInt(0, ClightType::Tint(
+                        ClightIntSize::I32,
+                        ClightSignedness::Signed,
+                        _,
+                    ))
+                )
+        ));
+    }
+
+    #[test]
     fn clight_keeps_rewritten_and_flat_control_in_separate_worlds() {
         let func = 0x1000;
         let node = 0x1010;
@@ -2104,6 +2179,28 @@ mod tests {
                 .get(&func)
                 .and_then(|buffers| buffers.get(&local)),
             Some(&280),
+        );
+    }
+
+    #[test]
+    fn fixed_external_object_sizes_a_directly_read_base_exactly() {
+        let mut db = DecompileDB::default();
+        let func: Address = 0x1400;
+        let local: RTLReg = 0x8000_0000_0000_3456;
+        db.rel_push("func_stacksz", (func, 0x1600_u64, "fixed", 360_u64));
+        db.rel_push("stack_var_chunk", (func, 144_i64, MemoryChunk::MInt64));
+        db.rel_push(
+            "external_stack_object_local",
+            (func, 144_i64, local, 144_i64),
+        );
+
+        size_opaque_escaped_frame_buffers(&mut db);
+
+        assert_eq!(
+            db.stack_struct_buffers
+                .get(&func)
+                .and_then(|buffers| buffers.get(&local)),
+            Some(&144),
         );
     }
 
@@ -3821,6 +3918,7 @@ impl IRPass for ClightFieldPass {
             "escaped_stack_region_caller_field",
             "escaped_stack_region_extent",
             "external_stack_object_extent",
+            "external_stack_object_local",
             "slot_escaped_region_canonical",
             "pmov",
             "op_indirect",
@@ -5494,6 +5592,20 @@ pub fn build_binop_expr(
             rhs_scaled,
             Some(default_ulong_type()),
         ),
+        // Cminor comparison operators carry signedness independently of the
+        // recovered variable declaration.  Preserve that machine predicate in
+        // C: a signed negative value held in an unsigned-typed web must not
+        // become a large positive operand before Ogt/Olt is evaluated.
+        CminorBinop::Ocmp(_) => (
+            force_int_type_for_32bit_cmp(lhs_scaled, true),
+            force_int_type_for_32bit_cmp(rhs_scaled, true),
+            None,
+        ),
+        CminorBinop::Ocmpl(_) => (
+            force_long_type_for_64bit_cmp(lhs_scaled, true),
+            force_long_type_for_64bit_cmp(rhs_scaled, true),
+            None,
+        ),
         CminorBinop::Ocmpu(_) => (
             to_unsigned(lhs_scaled, default_uint_type()),
             to_unsigned(rhs_scaled, default_uint_type()),
@@ -6670,14 +6782,36 @@ pub(crate) fn clight_condition_expr_with_types(
                 ))
             } else if args.len() == 1 {
                 let lhs = clight_expr_from_csharp_with_multi_types(&args[0], var_types, ptr_size);
+                // TEST reg,reg and arithmetic-result predicates commonly
+                // arrive as one-argument comparisons against implicit zero.
+                // The Condition still owns the machine signedness: leaving an
+                // unsigned recovered declaration untouched turns a negative
+                // signed accumulator into a large positive C value (for
+                // example `setg` after a timespec comparison).  Apply the same
+                // coercion as the two-argument path before constructing zero.
+                let lhs = if matches!(cond, Condition::Ccomp(_) | Condition::Ccompu(_)) {
+                    force_int_type_for_32bit_cmp(lhs, matches!(cond, Condition::Ccomp(_)))
+                } else if matches!(cond, Condition::Ccompl(_) | Condition::Ccomplu(_)) {
+                    force_long_type_for_64bit_cmp(lhs, matches!(cond, Condition::Ccompl(_)))
+                } else {
+                    lhs
+                };
                 let lhs_ty = clight_expr_type(&lhs);
-                let zero_expr = if matches!(lhs_ty, ClightType::Tpointer(_, _)) {
-                    ClightExpr::Ecast(
+                let zero_expr = match &lhs_ty {
+                    ClightType::Tpointer(_, _) => ClightExpr::Ecast(
                         Box::new(ClightExpr::EconstInt(0, default_int_type())),
                         lhs_ty.clone(),
-                    )
-                } else {
-                    ClightExpr::EconstInt(0, default_int_type())
+                    ),
+                    ClightType::Tlong(ClightSignedness::Signed, _) => {
+                        ClightExpr::EconstLong(0, default_long_type())
+                    }
+                    ClightType::Tlong(ClightSignedness::Unsigned, _) => {
+                        ClightExpr::EconstLong(0, default_ulong_type())
+                    }
+                    ClightType::Tint(_, ClightSignedness::Unsigned, _) => {
+                        ClightExpr::EconstInt(0, default_uint_type())
+                    }
+                    _ => ClightExpr::EconstInt(0, default_int_type()),
                 };
                 Some(ClightExpr::Ebinop(
                     clight_cmp_from_condition(comp),
@@ -8100,6 +8234,53 @@ fn size_opaque_escaped_frame_buffers(db: &mut DecompileDB) {
         value_regs.extend(defs.into_iter().flatten());
     }
 
+    // Cshminor can prove the exact emitted local directly from a named Cminor
+    // call whose argument is the SSA result of Oaddrstack.  This is later and
+    // stronger than the RTL alias route: size that local exactly, but reject a
+    // local reused for conflicting physical objects or extents.
+    let mut exact_local_shapes: BTreeMap<(Address, RTLReg), BTreeSet<(i64, i64)>> = BTreeMap::new();
+    for (func, base, local, extent) in
+        db.rel_iter::<(Address, i64, RTLReg, i64)>("external_stack_object_local")
+    {
+        if *extent > 0 && *extent <= 1 << 20 {
+            exact_local_shapes
+                .entry((*func, *local))
+                .or_default()
+                .insert((*base, *extent));
+        }
+    }
+    for ((func, local), shapes) in exact_local_shapes {
+        let mut shapes = shapes.into_iter();
+        let Some((base, extent)) = shapes.next() else {
+            continue;
+        };
+        if shapes.next().is_some() {
+            continue;
+        }
+        let Some(end) = base.checked_add(extent) else {
+            continue;
+        };
+        // The local may already be the canonical backing name of a wider
+        // frame object.  Exact ABI sizing applies only when every physical
+        // offset carrying that local lies inside this one interval; otherwise
+        // shrinking the shared local would leave existing accesses out of
+        // bounds (for example a 3 KiB path buffer that also contains a nested
+        // struct stat).
+        if stack_locals.get(&func).is_some_and(|locals| {
+            locals.iter().any(|(offset, seen_local)| {
+                *seen_local == local && (*offset < base || *offset >= end)
+            })
+        }) {
+            continue;
+        }
+        db.stack_struct_buffers
+            .entry(func)
+            .or_default()
+            .entry(local)
+            .and_modify(|current| *current = (*current).max(extent))
+            .or_insert(extent);
+    }
+
     let mut escaped: BTreeSet<(Address, i64, RTLReg)> = db
         .rel_iter::<(Address, i64, RTLReg)>("slot_escaped_canonical")
         .copied()
@@ -8171,10 +8352,6 @@ fn size_opaque_escaped_frame_buffers(db: &mut DecompileDB) {
             let Some(first_interior) = ofs.checked_add(1) else {
                 continue;
             };
-            // Do not create two independent C objects over the same bytes. If
-            // another modeled local cuts through the exact capacity and is not
-            // already one of this region's fields, leave the layout unresolved
-            // for the alias reconciliation layer rather than swallowing it.
             if boundaries.get(&func).is_some_and(|offsets| {
                 offsets
                     .range(first_interior..end)

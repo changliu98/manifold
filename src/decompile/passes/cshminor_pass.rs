@@ -283,6 +283,8 @@ ascent_par! {
     relation next(Address, Address);
     relation idom(Address, Node, Node);
     relation stack_var(Address, Address, i64, RTLReg);
+    relation func_stacksz(Address, Address, Symbol, u64);
+    relation known_func_param_pointee_size(Symbol, usize, usize);
     relation canonical_stack_slot_local(Address, i64, RTLReg);
     // rtl_pass export: the single escaped canonical local per (func, offset), used to resolve synthetic-only stack loads that have no per-node stack_var.
     relation slot_escaped_canonical(Address, i64, RTLReg);
@@ -305,6 +307,17 @@ ascent_par! {
     relation arith_load_op(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
     relation frame_stack_read_bytes(Address, Address, i64, usize);
     relation escaped_stack_region_extent(Address, i64, i64);
+    relation escaped_stack_region_field(Address, i64, i64, MemoryChunk);
+    relation escaped_stack_region_caller_field(Address, i64, i64, MemoryChunk);
+    // Exact fixed-size external ABI objects (for example struct stat).  These
+    // remain byte-addressed even when the caller reads the first field at the
+    // object's base.
+    relation external_stack_object_extent(Address, i64, i64);
+    // Post-RTL exact external object certificate: function, frame base,
+    // emitted local, byte extent.  Cminor has already joined the named call
+    // argument to the unique SSA result of Oaddrstack, so no earlier alias
+    // reconstruction is needed.
+    relation external_stack_object_local(Address, i64, RTLReg, i64);
     relation reg_rtl(Node, Mreg, RTLReg);
     relation rtl_inst(Node, RTLInst);
     // Noreturn recognition inputs: the always-noreturn symbol set, single-def constants for resolving an error-family status arg, and function_noreturn for user-defined wrappers.
@@ -325,6 +338,75 @@ ascent_par! {
     relation cminor_succ(Node, Node);
     relation func_entry_node(Address, Node);
     relation pred(Address, Node, Node);
+
+    #[local] relation csh_frame_size_member(Address, i64);
+    csh_frame_size_member(*func, frame_size) <--
+        func_stacksz(func, _, _, size),
+        if let Ok(frame_size) = i64::try_from(*size),
+        if frame_size > 0;
+
+    #[local] relation csh_frame_size_conflict(Address);
+    csh_frame_size_conflict(func) <--
+        csh_frame_size_member(func, left),
+        csh_frame_size_member(func, right),
+        if left != right;
+
+    #[local] relation csh_local_frame_size(Address, i64);
+    csh_local_frame_size(func, *size) <--
+        csh_frame_size_member(func, size),
+        !csh_frame_size_conflict(func);
+
+    #[local] relation external_stack_object_local_candidate(
+        Address, i64, RTLReg, i64, Symbol, usize
+    );
+    external_stack_object_local_candidate(*func, *base, *owner, extent, *name, *pos) <--
+        active_cminor_stmt(call, ?CminorStmt::Scall(_, _, Either::Right(Either::Right(name)), args)),
+        known_func_param_pointee_size(name, pos, bytes),
+        if let Some(argument) = args.get(*pos),
+        active_cminor_stmt(lea, ?CminorStmt::Sassign(address, CminorExpr::Econst(Constant::Oaddrstack(base)))),
+        if address == argument,
+        instr_in_function(call, func),
+        instr_in_function(lea, func),
+        stack_var(func, lea, base, owner),
+        csh_local_frame_size(func, frame_size),
+        if let Ok(extent) = i64::try_from(*bytes),
+        if extent > 0 && extent <= (1 << 20),
+        if let Some(end) = base.checked_add(extent),
+        if *base >= 0 && end <= *frame_size;
+
+    #[local] relation external_stack_object_adjacent_peer(Address, i64, RTLReg, i64, Symbol, usize);
+    external_stack_object_adjacent_peer(
+        *func, *base, *owner, *extent, *name, *pos
+    ) <--
+        external_stack_object_local_candidate(func, base, owner, extent, name, pos),
+        external_stack_object_local_candidate(func, peer_base, peer_owner, peer_extent, peer_name, peer_pos),
+        if owner != peer_owner && extent == peer_extent && name == peer_name && pos == peer_pos,
+        if base.checked_add(*extent) == Some(*peer_base)
+            || peer_base.checked_add(*peer_extent) == Some(*base);
+
+    #[local] relation external_stack_object_local_conflict(Address, i64, RTLReg, i64);
+    external_stack_object_local_conflict(*func, *base, *owner, *extent) <--
+        external_stack_object_local_candidate(func, base, owner, extent, _, _),
+        stack_var(func, _, other_offset, owner),
+        if let Some(end) = base.checked_add(*extent),
+        if *other_offset < *base || *other_offset >= end;
+
+    external_stack_object_local_conflict(*func, *base, *owner, *extent) <--
+        external_stack_object_local_candidate(func, base, owner, extent, _, _),
+        escaped_stack_region_field(func, base, field_offset, chunk),
+        let width = crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk) as i64,
+        if *field_offset < 0 || field_offset.checked_add(width).is_none_or(|end| end > *extent);
+
+    external_stack_object_local_conflict(*func, *base, *owner, *extent) <--
+        external_stack_object_local_candidate(func, base, owner, extent, _, _),
+        escaped_stack_region_caller_field(func, base, field_offset, chunk),
+        let width = crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk) as i64,
+        if *field_offset < 0 || field_offset.checked_add(width).is_none_or(|end| end > *extent);
+
+    external_stack_object_local(func, base, owner, extent),
+    external_stack_object_extent(func, base, extent) <--
+        external_stack_object_adjacent_peer(func, base, owner, extent, _, _),
+        !external_stack_object_local_conflict(func, base, owner, extent);
 
     // A call whose callee never returns gets no cminor_succ edge, so its dead tail drops: an always-noreturn symbol, or an error-family symbol with a nonzero constant status arg.
     relation call_node_noreturn(Node);
@@ -752,6 +834,56 @@ ascent_par! {
         if args.is_empty(),
         instr_in_function(node, func_start),
         frame_read_storage_access_owner(func_start, node, *ofs, base_ofs, owner_rtl),
+        if let Some(delta) = ofs.checked_sub(*base_ofs),
+        let owner_ident = ident_from_reg(*owner_rtl),
+        let addr_expr = if delta == 0 {
+            CsharpminorExpr::Eaddrof(owner_ident)
+        } else {
+            CsharpminorExpr::Ebinop(
+                CminorBinop::Oaddl,
+                Box::new(CsharpminorExpr::Eaddrof(owner_ident)),
+                Box::new(CsharpminorExpr::Econst(Constant::Olongconst(delta))),
+            )
+        },
+        let stmt = CsharpminorStmt::Sset(
+            *dst,
+            CsharpminorExpr::Eload(*chunk, Box::new(addr_expr)),
+        );
+
+    // A fixed external out-parameter is one physical byte region.  Resolve
+    // every contained load through its base owner before copy propagation can
+    // replace distinct load temporaries with the same scalar local.  Select
+    // the nearest containing exact base when ABI objects overlap.
+    #[local] relation exact_external_frame_read_candidate(
+        Address, Node, i64, i64, i64, RTLReg, MemoryChunk
+    );
+    exact_external_frame_read_candidate(
+        *func_start, *node, *ofs, *base_ofs, *extent, *owner_rtl, *chunk
+    ) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(_, CminorExpr::Eload(chunk, addr, args))),
+        if let Addressing::Ainstack(ofs) = addr,
+        if args.is_empty(),
+        instr_in_function(node, func_start),
+        external_stack_object_local(func_start, base_ofs, owner_rtl, extent),
+        if *extent > 0,
+        let width = crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk) as i64,
+        if width > 0,
+        if let Some(read_end) = ofs.checked_add(width),
+        if let Some(region_end) = base_ofs.checked_add(*extent),
+        if *ofs >= *base_ofs && read_end <= region_end;
+
+    #[local] relation exact_external_frame_read_shadowed(Address, Node, i64);
+    exact_external_frame_read_shadowed(func, node, base) <--
+        exact_external_frame_read_candidate(func, node, _, base, _, _, _),
+        exact_external_frame_read_candidate(func, node, _, closer, _, _, _),
+        if closer > base;
+
+    csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Eload(chunk, addr, args))),
+        if let Addressing::Ainstack(ofs) = addr,
+        if args.is_empty(),
+        exact_external_frame_read_candidate(func_start, node, ofs, base_ofs, _, owner_rtl, chunk),
+        !exact_external_frame_read_shadowed(func_start, node, base_ofs),
         if let Some(delta) = ofs.checked_sub(*base_ofs),
         let owner_ident = ident_from_reg(*owner_rtl),
         let addr_expr = if delta == 0 {
@@ -2466,6 +2598,174 @@ mod tests {
                 .any(|(node,)| *node == synthetic));
             assert_generic_arith_owner_candidate(&operations, synthetic, result, owner);
         });
+    }
+
+    #[test]
+    fn named_cminor_out_param_publishes_exact_local_object() {
+        let [lea, call, address, owner, peer_lea, peer_call, peer_address, peer_owner] =
+            synthetic_ids();
+        let base = 0;
+        let peer_base = 144;
+        let mut prog = CshminorPassProgram::default();
+        for (lea_node, call_node, address_reg, local, offset) in [
+            (lea, call, address, owner, base),
+            (peer_lea, peer_call, peer_address, peer_owner, peer_base),
+        ] {
+            prog.cminor_stmt.push((
+                lea_node,
+                CminorStmt::Sassign(
+                    address_reg,
+                    CminorExpr::Econst(Constant::Oaddrstack(offset)),
+                ),
+            ));
+            prog.cminor_stmt.push((
+                call_node,
+                CminorStmt::Scall(
+                    None,
+                    None,
+                    Either::Right(Either::Right("stat")),
+                    Arc::new(vec![0xdead, address_reg]),
+                ),
+            ));
+            prog.instr_in_function
+                .extend([(lea_node, FUNC), (call_node, FUNC)]);
+            prog.stack_var.push((FUNC, lea_node, offset, local));
+        }
+        prog.func_stacksz.push((FUNC, peer_call + 1, "caller", 360));
+        prog.known_func_param_pointee_size.push(("stat", 1, 144));
+
+        prog.run();
+
+        assert!(prog
+            .external_stack_object_local
+            .iter()
+            .any(|fact| fact == &(FUNC, base, owner, 144)));
+        assert!(prog
+            .external_stack_object_local
+            .iter()
+            .any(|fact| fact == &(FUNC, peer_base, peer_owner, 144)));
+        assert!(prog
+            .external_stack_object_extent
+            .iter()
+            .any(|fact| fact == &(FUNC, base, 144)));
+    }
+
+    #[test]
+    fn named_cminor_out_param_rejects_a_wider_shared_local() {
+        let [lea, call, address, owner, distant, peer_lea, peer_call, peer_address, peer_owner] =
+            synthetic_ids();
+        let base = 0;
+        let peer_base = 144;
+        let mut prog = CshminorPassProgram::default();
+        for (lea_node, call_node, address_reg, local, offset) in [
+            (lea, call, address, owner, base),
+            (peer_lea, peer_call, peer_address, peer_owner, peer_base),
+        ] {
+            prog.cminor_stmt.push((
+                lea_node,
+                CminorStmt::Sassign(
+                    address_reg,
+                    CminorExpr::Econst(Constant::Oaddrstack(offset)),
+                ),
+            ));
+            prog.cminor_stmt.push((
+                call_node,
+                CminorStmt::Scall(
+                    None,
+                    None,
+                    Either::Right(Either::Right("stat")),
+                    Arc::new(vec![0xdead, address_reg]),
+                ),
+            ));
+            prog.instr_in_function
+                .extend([(lea_node, FUNC), (call_node, FUNC)]);
+            prog.stack_var.push((FUNC, lea_node, offset, local));
+        }
+        prog.stack_var.extend([(FUNC, distant, base + 1024, owner)]);
+        prog.func_stacksz
+            .push((FUNC, peer_call + 1, "caller", 2048));
+        prog.known_func_param_pointee_size.push(("stat", 1, 144));
+        prog.escaped_stack_region_caller_field
+            .push((FUNC, base, 1024, MemoryChunk::MAny64));
+
+        prog.run();
+
+        assert!(prog
+            .external_stack_object_local_conflict
+            .iter()
+            .any(|fact| fact == &(FUNC, base, owner, 144)));
+        assert!(!prog
+            .external_stack_object_local
+            .iter()
+            .any(|fact| fact.0 == FUNC && fact.2 == owner));
+    }
+
+    #[test]
+    fn fixed_external_object_reads_preserve_base_relative_byte_offsets() {
+        let [base_read, interior_read, base_dst, interior_dst, owner] = synthetic_ids();
+        let base = 144;
+        let mut prog = CshminorPassProgram::default();
+        for (node, offset, destination) in [
+            (base_read, base, base_dst),
+            (interior_read, base + 8, interior_dst),
+        ] {
+            prog.cminor_stmt.push((
+                node,
+                CminorStmt::Sassign(
+                    destination,
+                    CminorExpr::Eload(
+                        MemoryChunk::MInt64,
+                        Addressing::Ainstack(offset),
+                        Arc::new(vec![]),
+                    ),
+                ),
+            ));
+            prog.instr_in_function.push((node, FUNC));
+        }
+        prog.external_stack_object_local
+            .push((FUNC, base, owner, 144));
+
+        prog.run();
+
+        for (node, destination, expected_delta) in [
+            (base_read, base_dst, 0_i64),
+            (interior_read, interior_dst, 8_i64),
+        ] {
+            assert!(prog.csharp_stmt_candidate.iter().any(|(candidate, stmt)| {
+                *candidate == node
+                    && matches!(
+                        stmt,
+                        CsharpminorStmt::Sset(
+                            value,
+                            CsharpminorExpr::Eload(MemoryChunk::MInt64, address),
+                        ) if *value == destination
+                            && if expected_delta == 0 {
+                                matches!(
+                                    address.as_ref(),
+                                    CsharpminorExpr::Eaddrof(ident)
+                                        if *ident == ident_from_reg(owner)
+                                )
+                            } else {
+                                matches!(
+                                    address.as_ref(),
+                                    CsharpminorExpr::Ebinop(
+                                        CminorBinop::Oaddl,
+                                        base_address,
+                                        delta,
+                                    ) if matches!(
+                                        base_address.as_ref(),
+                                        CsharpminorExpr::Eaddrof(ident)
+                                            if *ident == ident_from_reg(owner)
+                                    ) && matches!(
+                                        delta.as_ref(),
+                                        CsharpminorExpr::Econst(Constant::Olongconst(value))
+                                            if *value == expected_delta
+                                    )
+                                )
+                            }
+                    )
+            }));
+        }
     }
 
     #[test]

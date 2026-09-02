@@ -792,6 +792,11 @@ ascent_par! {
     // both addresses prevents a scheduled flag-neutral instruction between
     // CMP and SETcc from observing the future boolean value.
     relation setcc_compare_site(Address, Address);
+    // Arithmetic-result SETE/SETNE consumes the value produced by the flags
+    // origin, rather than the compare/test inputs observed there.  RTL needs
+    // the producer address explicitly so it does not invent a disconnected
+    // register identity at the later byte write.
+    relation setcc_flags_result_site(Address, Address);
 
     relation op_indirect(Symbol, &'static str, &'static str, &'static str, i64, i64, usize);
 
@@ -6041,6 +6046,7 @@ ascent_par! {
     setcc_flag_origin(addr) <-- pcmp(addr, _, _);
     setcc_flag_origin(addr) <-- ptest(addr, _, _);
     setcc_flag_origin(addr) <-- psub(addr, _, _);
+    setcc_flag_origin(addr) <-- arith_result_reg(addr, _, _);
 
     // Same-block structural walk from a flag producer to every subsequent
     // instruction that can still observe those flags.  Fixed two-instruction
@@ -6159,6 +6165,64 @@ ascent_par! {
 
     setcc_compare_site(addr_set, addr0) <-- cmp_setcc_link(addr0, addr_set);
     setcc_compare_site(addr_set, addr0) <-- test_setcc_link(addr0, addr_set);
+
+    // A value-producing ALU instruction followed by SETE/SETNE materializes
+    // whether that exact result is zero.  This is the value-producing analogue
+    // of arith_result_jcc: keep the ALU write at its physical instruction and
+    // place the boolean definition at the SETcc.  Carry the result through a
+    // same-block structural walk that crosses only flag-transparent points and
+    // stops before a point that overwrites the result register.  The consumer
+    // itself may alias the result (for example `sete %al` after `or %eax,%eax`)
+    // because its register write occurs after it reads the flags.
+    #[local] relation arith_result_value_walk(Address, Address, Mreg);
+    arith_result_value_walk(*origin, *successor, *result_mreg) <--
+        arith_result_reg(origin, result, _),
+        op_register(result, result_str),
+        ireg_of(result_preg, Ireg::from(result_str)),
+        preg_of(result_mreg, result_preg),
+        next(origin, successor),
+        code_in_block(origin, block),
+        code_in_block(successor, block);
+
+    arith_result_value_walk(*origin, *successor, *result_mreg) <--
+        arith_result_value_walk(origin, current, result_mreg),
+        flags_flow_transparent(current),
+        !reg_def(current, result_mreg),
+        next(current, successor),
+        code_in_block(origin, block),
+        code_in_block(successor, block);
+
+    #[local] relation arith_result_setcc(Address, Address, Mreg, bool, TestCond);
+    arith_result_setcc(origin, setcc, *result_mreg, *is_64, *test_cond) <--
+        arith_result_reg(origin, dst, is_64),
+        setcc_flag_walk(origin, setcc),
+        arith_result_value_walk(origin, setcc, result_mreg),
+        psetcc(setcc, test_cond, _),
+        if matches!(test_cond, TestCond::CondE | TestCond::CondNe);
+
+    setcc_flags_result_site(setcc, origin) <--
+        arith_result_setcc(origin, setcc, _, _, _);
+
+    mach_inst(setcc, MachInst::Mop(
+        Operation::Ocmp(condition),
+        Arc::new(vec![*result_mreg]),
+        *dst_mreg
+    )) <--
+        arith_result_setcc(_, setcc, result_mreg, is_64, test_cond),
+        psetcc(setcc, _, dst),
+        op_register(dst, dst_str),
+        ireg_of(dst_preg, Ireg::from(dst_str)),
+        preg_of(dst_mreg, dst_preg),
+        let comparison = match test_cond {
+            TestCond::CondE => Comparison::Ceq,
+            TestCond::CondNe => Comparison::Cne,
+            _ => unreachable!("arith_result_setcc admits only SETE/SETNE"),
+        },
+        let condition = if *is_64 {
+            Condition::Ccomplimm(comparison, 0)
+        } else {
+            Condition::Ccompimm(comparison, 0)
+        };
 
     // The boolean value materialized by a SETcc, independent of where that
     // byte is written.  Register destinations consume the equivalent Mop
@@ -14717,6 +14781,100 @@ mod structural_dataflow_tests {
             assert!(branch_join.mach_inst.iter().any(|(node, inst)| {
                 *node == LOAD_FIRST
                     && matches!(inst, MachInst::Mload(_, Addressing::Aindexed(_), _, _))
+            }));
+        });
+    }
+
+    #[test]
+    fn logical_result_setcc_materializes_zero_test_after_the_value_write() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let origin = 0x3953;
+            let setcc = 0x3966;
+            let block = 0x3900;
+
+            prog.por.push((origin, "or_result", "or_rhs"));
+            prog.op_register.extend([
+                ("or_result", "RAX"),
+                ("or_rhs", "RDX"),
+                ("setcc_result", "R12B"),
+            ]);
+            prog.next.push((origin, setcc));
+            prog.code_in_block.extend([(origin, block), (setcc, block)]);
+            prog.psetcc.push((setcc, TestCond::CondE, "setcc_result"));
+
+            prog.run();
+
+            assert!(prog.mach_inst.iter().any(|fact| {
+                fact == &(
+                    origin,
+                    MachInst::Mop(
+                        Operation::Oorl,
+                        Arc::new(vec![Mreg::AX, Mreg::DX]),
+                        Mreg::AX,
+                    ),
+                )
+            }));
+            assert!(prog.mach_inst.iter().any(|fact| {
+                fact == &(
+                    setcc,
+                    MachInst::Mop(
+                        Operation::Ocmp(Condition::Ccomplimm(Comparison::Ceq, 0)),
+                        Arc::new(vec![Mreg::AX]),
+                        Mreg::R12,
+                    ),
+                )
+            }));
+            assert!(prog
+                .setcc_flags_result_site
+                .iter()
+                .any(|fact| fact == &(setcc, origin)));
+        });
+    }
+
+    #[test]
+    fn logical_result_setcc_rejects_a_flag_transparent_result_overwrite() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let origin = 0x100;
+            let overwrite = 0x104;
+            let setcc = 0x108;
+            let block = 0x100;
+
+            prog.pxor.push((origin, "xor_result", "xor_rhs"));
+            prog.op_register.extend([
+                ("xor_result", "EAX"),
+                ("xor_rhs", "EDX"),
+                ("setcc_result", "CL"),
+            ]);
+            let overwrite_row = (
+                overwrite,
+                3,
+                "",
+                "MOV",
+                "replacement",
+                "overwritten_eax",
+                "",
+                "",
+                0,
+                0,
+            );
+            prog.instruction.push(overwrite_row);
+            prog.unrefinedinstruction.push(overwrite_row);
+            prog.reg_def.push((overwrite, Mreg::AX));
+            prog.next.extend([(origin, overwrite), (overwrite, setcc)]);
+            prog.code_in_block
+                .extend([(origin, block), (overwrite, block), (setcc, block)]);
+            prog.psetcc.push((setcc, TestCond::CondNe, "setcc_result"));
+
+            prog.run();
+
+            assert!(!prog
+                .arith_result_value_walk
+                .iter()
+                .any(|fact| fact == &(origin, setcc, Mreg::AX)));
+            assert!(!prog.mach_inst.iter().any(|(node, inst)| {
+                *node == setcc && matches!(inst, MachInst::Mop(Operation::Ocmp(_), _, _))
             }));
         });
     }

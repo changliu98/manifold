@@ -947,6 +947,9 @@ fn populate_known_func_buffer_capacity(db: &mut DecompileDB) {
         ("getrandom", 0, 1),
         ("readlink", 1, 2),
         ("readlinkat", 2, 3),
+        // POSIX and GNU variants share the same writable buffer/count
+        // parameters; only their return type differs.
+        ("strerror_r", 1, 2),
         ("memcpy", 0, 2),
         ("memcpy", 1, 2),
         ("memmove", 0, 2),
@@ -1061,5 +1064,17 @@ mod tests {
         ] {
             assert!(pass.extra_reads().contains(&input));
         }
+    }
+
+    #[test]
+    fn strerror_r_publishes_its_exact_buffer_capacity_contract() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
+
+        AbiPass.run(&mut db);
+
+        assert!(db
+            .rel_iter::<(Symbol, usize, usize)>("known_func_param_byte_capacity")
+            .any(|row| row == &("strerror_r", 1, 2)));
     }
 }

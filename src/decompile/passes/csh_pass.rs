@@ -64,35 +64,36 @@ ascent_par! {
         plt_block(addr, sym),
         let clean_name = strip_version_suffix(sym);
 
-    // Absorb contiguous L_XXXX fragments into the preceding non-L_XXXX function; func_extended_end is a monotonic lattice of the function's effective end.
-    lattice func_extended_end(Address, Address);
-
-    func_extended_end(start, *end) <--
-        func_stacksz(start, end, name, _),
-        if !crate::decompile::passes::csh_pass::is_generated_label_name(name);
-
-    func_extended_end(absorber_start, *frag_end) <--
-        func_extended_end(absorber_start, current_end),
-        func_stacksz(frag_start, frag_end, frag_name, _),
-        if crate::decompile::passes::csh_pass::is_generated_label_name(frag_name),
-        if *frag_start == *current_end;
-
-    // Maps the start address of every absorbed L_XXXX fragment to the absorber's name.
-    relation absorbed_fragment_to_func(Address, Symbol);
-
-    absorbed_fragment_to_func(frag_start, *absorber_name) <--
-        func_extended_end(absorber_start, current_end),
-        func_stacksz(absorber_start, _, absorber_name, _),
-        if !crate::decompile::passes::csh_pass::is_generated_label_name(absorber_name),
+    // A generated L_<hex> entry is a fragment of another function only when
+    // CFG-derived function ownership says that the other entry reaches it.
+    // Contiguous or numerically enclosed addresses are layout facts, not
+    // reachability evidence.
+    #[local] relation absorbed_fragment_owner_candidate(Address, Address, Symbol);
+    absorbed_fragment_owner_candidate(*frag_start, *absorber_start, *absorber_name) <--
         func_stacksz(frag_start, _, frag_name, _),
         if crate::decompile::passes::csh_pass::is_generated_label_name(frag_name),
-        if *frag_start >= *absorber_start && *frag_start < *current_end;
+        instr_in_function(frag_start, absorber_start),
+        func_stacksz(absorber_start, _, absorber_name, _),
+        if !crate::decompile::passes::csh_pass::is_generated_label_name(absorber_name),
+        if frag_start != absorber_start;
 
-    // Default mapping: the address falls within the function's own (non-absorbed) range.
+    #[local] relation absorbed_fragment_owner_conflict(Address);
+    absorbed_fragment_owner_conflict(frag_start) <--
+        absorbed_fragment_owner_candidate(frag_start, left_start, left_name),
+        absorbed_fragment_owner_candidate(frag_start, right_start, right_name),
+        if left_start != right_start || left_name != right_name;
+
+    // Maps a fragment entry to its unique structurally recovered owner.
+    relation absorbed_fragment_to_func(Address, Symbol);
+    absorbed_fragment_to_func(frag_start, absorber_name) <--
+        absorbed_fragment_owner_candidate(frag_start, _, absorber_name),
+        !absorbed_fragment_owner_conflict(frag_start);
+
+    // Default mapping is exact entry identity.  A range containing another
+    // entry does not make that entry part of this function.
     ident_to_symbol(ident, name) <--
         addr_to_func_ident(addr, ident),
-        func_stacksz(start, end, name, _),
-        if addr >= start && addr < end,
+        func_stacksz(addr, _, name, _),
         !absorbed_fragment_to_func(addr, _);
 
     // Absorbed fragment: rewrite L_XXXX -> absorbing function name at the fragment entry.
@@ -848,5 +849,61 @@ pub fn make_binarith_check(lhs_ty: &ClightType, rhs_ty: &ClightType) -> bool {
         (Tstruct(id1, _), Tstruct(id2, _)) if id1 == id2 => true,
         (Tunion(id1, _), Tunion(id2, _)) if id1 == id2 => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_fragment_uses_cfg_owner_even_when_addresses_are_reversed() {
+        let mut prog = CshPassProgram::default();
+        let owner = 0x9000;
+        let fragment = 0x1000;
+        prog.emit_function.push((fragment, "L_1000", fragment));
+        prog.func_stacksz.push((owner, 0x9010, "owner", 0));
+        prog.func_stacksz.push((fragment, 0x1010, "L_1000", 0));
+        prog.instr_in_function.push((fragment, owner));
+
+        prog.run();
+
+        assert!(prog
+            .absorbed_fragment_to_func
+            .iter()
+            .any(|row| row == &(fragment, "owner")));
+        assert!(prog
+            .ident_to_symbol
+            .iter()
+            .any(|row| row == &(fragment as Ident, "owner")));
+        assert!(!prog
+            .ident_to_symbol
+            .iter()
+            .any(|row| row == &(fragment as Ident, "L_1000")));
+    }
+
+    #[test]
+    fn numeric_containment_without_cfg_ownership_does_not_absorb_fragment() {
+        let mut prog = CshPassProgram::default();
+        let owner = 0x1000;
+        let fragment = 0x1100;
+        prog.emit_function.push((fragment, "L_1100", fragment));
+        prog.func_stacksz.push((owner, 0x2000, "owner", 0));
+        prog.func_stacksz.push((fragment, 0x1200, "L_1100", 0));
+
+        prog.run();
+
+        assert!(!prog
+            .absorbed_fragment_to_func
+            .iter()
+            .any(|row| row.0 == fragment));
+        assert!(prog
+            .ident_to_symbol
+            .iter()
+            .any(|row| row == &(fragment as Ident, "L_1100")));
+        assert!(!prog
+            .ident_to_symbol
+            .iter()
+            .any(|row| row == &(fragment as Ident, "owner")));
     }
 }
