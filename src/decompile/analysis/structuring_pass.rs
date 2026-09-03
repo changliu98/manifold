@@ -4,7 +4,8 @@ use crate::decompile::passes::rtl_optimize_pass::observable_stack_storage_regs;
 use crate::util::{exec_order_key, is_synthetic_node, semantic_node_address};
 use crate::x86::op::{Comparison, Condition};
 use crate::x86::types::{
-    Address, BuiltinArg, Constant, CsharpminorExpr, CsharpminorStmt, Node, RTLReg, Symbol,
+    Address, BuiltinArg, CminorBinop, Constant, CsharpminorExpr, CsharpminorStmt, Node, RTLReg,
+    Symbol, XType,
 };
 use ascent::ascent_par;
 use ascent::lattice::set::Set;
@@ -116,6 +117,23 @@ fn dom_set_with_self(strict: &Set<Node>, n: Node) -> Set<Node> {
     Set(s)
 }
 
+fn affine_pointer_base(expr: &CsharpminorExpr) -> Option<RTLReg> {
+    match expr {
+        CsharpminorExpr::Evar(reg) => Some(*reg),
+        CsharpminorExpr::Ebinop(CminorBinop::Oaddl, lhs, rhs)
+            if matches!(rhs.as_ref(), CsharpminorExpr::Econst(_)) =>
+        {
+            affine_pointer_base(lhs)
+        }
+        CsharpminorExpr::Ebinop(CminorBinop::Oaddl, lhs, rhs)
+            if matches!(lhs.as_ref(), CsharpminorExpr::Econst(_)) =>
+        {
+            affine_pointer_base(rhs)
+        }
+        _ => None,
+    }
+}
+
 pub struct StructuringPass;
 
 impl IRPass for StructuringPass {
@@ -171,7 +189,9 @@ impl IRPass for StructuringPass {
             .map(|&(a, b)| (a, b))
             .collect();
 
-        // Blocks containing a genuinely-packed SIMD ALU op: the arithmetic vanished, so the surviving stmts are garbage; flagged at block granularity since packed ops leave no stmt node.
+        // Blocks containing an unrepresented optimized operation. Packed ALU
+        // and REP string operations leave no statement at their own address,
+        // so flag the surviving statements at block granularity.
         let code_in_block_map: HashMap<Address, Address> = db
             .rel_iter::<(Address, Address)>("code_in_block")
             .map(|&(a, b)| (a, b))
@@ -184,6 +204,15 @@ impl IRPass for StructuringPass {
                 }
             }
             s
+        };
+        let optimized_gap_blocks: HashSet<Address> = {
+            let mut blocks = packed_alu_blocks.clone();
+            for &(address,) in db.rel_iter::<(Address,)>("optimized_bulk_addr") {
+                if let Some(&block) = code_in_block_map.get(&address) {
+                    blocks.insert(block);
+                }
+            }
+            blocks
         };
         // Stmt nodes in a packed block; node id low bits are the instruction address (top 2 bits are tail-dup copy tags), so mask them to recover it.
         let packed_alu_nodes: HashSet<Node> = if packed_alu_blocks.is_empty() {
@@ -199,6 +228,40 @@ impl IRPass for StructuringPass {
                 })
                 .collect()
         };
+        let optimized_gap_nodes: HashSet<Node> = if optimized_gap_blocks.is_empty() {
+            HashSet::new()
+        } else {
+            db.rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt_candidate")
+                .filter_map(|(node, _)| {
+                    let address = semantic_node_address(*node);
+                    code_in_block_map
+                        .get(&address)
+                        .filter(|block| optimized_gap_blocks.contains(block))
+                        .map(|_| *node)
+                })
+                .collect()
+        };
+        let mut pointer_regs: HashSet<RTLReg> = db
+            .rel_iter::<(RTLReg,)>("is_ptr")
+            .map(|(reg,)| *reg)
+            .collect();
+        pointer_regs.extend(
+            db.rel_iter::<(Address, RTLReg, XType)>("emit_function_param_type")
+                .filter_map(|(_, reg, xtype)| {
+                    matches!(
+                        xtype,
+                        XType::Xptr
+                            | XType::Xcharptr
+                            | XType::Xcharptrptr
+                            | XType::Xintptr
+                            | XType::Xfloatptr
+                            | XType::Xsingleptr
+                            | XType::Xfuncptr
+                            | XType::XstructPtr(_)
+                    )
+                    .then_some(*reg)
+                }),
+        );
 
         // CF-6: include cminor_succ preds so taint-mirror can catch edges clight sees but the function-local stmt view misses (cross-function preds, preds with no csharp stmt); values sorted for determinism.
         let (cminor_succs, cminor_preds): (HashMap<Node, Vec<Node>>, HashMap<Node, Vec<Node>>) = {
@@ -295,6 +358,8 @@ impl IRPass for StructuringPass {
                     declared_entry,
                     &cminor_preds,
                     &packed_alu_nodes,
+                    &optimized_gap_nodes,
+                    &pointer_regs,
                 );
                 (*func_addr, stmts.clone(), structured)
             })
@@ -531,7 +596,10 @@ impl IRPass for StructuringPass {
             "emit_function",
             "func_entry_node",
             "emit_function_param_candidate",
+            "emit_function_param_type",
             "packed_alu_addr",
+            "optimized_bulk_addr",
+            "is_ptr",
             "emit_loop_body",
             // Authoritative semantic CFG.  Both are read imperatively; without
             // declaring them the parallel scheduler supplies empty relations.
@@ -994,6 +1062,10 @@ ascent_par! {
 
     // Auto-vectorized (SIMD) loop bypass: a node whose block held a packed ALU op, whose arithmetic produced no statements and whose computed values are garbage.
     relation packed_alu_node(Node);
+    // Broader optimized gap used for acyclic compiler-versioned arms. This is
+    // packed_alu_node plus unrepresented REP bulk-memory blocks.
+    relation optimized_gap_node(Node);
+    relation pointer_reg(RTLReg);
 
     // A vector loop: a loop whose body contains a packed-ALU node. Its result cannot be trusted.
     relation vector_loop_header(Node);
@@ -1002,6 +1074,70 @@ ascent_par! {
     // A scalar loop (a real loop with no packed op) is gcc's complete fallback behind a runtime alias/size guard, so routing control to it is the correct recovery.
     relation scalar_loop_header(Node);
     scalar_loop_header(*h) <-- loop_header(h), !vector_loop_header(h);
+
+    // The compiler's alias/range versioning guard computes a byte distance
+    // between two pointer values and compares it unsigned against a small
+    // constant.  Require the pointer-producing subtraction to dominate the
+    // guard; no instruction-address ordering substitutes for this proof.
+    relation pointer_carrier_def(Node, RTLReg);
+    pointer_carrier_def(*node, *dst) <--
+        stmt(node, ?CsharpminorStmt::Sset(dst, CsharpminorExpr::Evar(src))),
+        pointer_reg(*src);
+    pointer_carrier_def(*node, *dst) <--
+        stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
+        if let CsharpminorExpr::Ebinop(CminorBinop::Oaddl, lhs, rhs) = expr,
+        if matches!(rhs.as_ref(), CsharpminorExpr::Econst(_)),
+        if let CsharpminorExpr::Evar(src) = lhs.as_ref(),
+        pointer_reg(*src);
+    pointer_carrier_def(*node, *dst) <--
+        stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
+        if let CsharpminorExpr::Ebinop(CminorBinop::Oaddl, lhs, rhs) = expr,
+        if matches!(lhs.as_ref(), CsharpminorExpr::Econst(_)),
+        if let CsharpminorExpr::Evar(src) = rhs.as_ref(),
+        pointer_reg(*src);
+
+    relation pointer_distance_def(Node, RTLReg);
+    pointer_distance_def(*node, *dst) <--
+        stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
+        if let CsharpminorExpr::Ebinop(op, lhs, rhs) = expr,
+        if matches!(op, CminorBinop::Osubl),
+        if let Some(lhs_reg) = affine_pointer_base(lhs),
+        if let Some(rhs_reg) = affine_pointer_base(rhs),
+        pointer_reg(lhs_reg),
+        pointer_reg(rhs_reg);
+    pointer_distance_def(*node, *dst) <--
+        stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
+        if let CsharpminorExpr::Ebinop(CminorBinop::Osubl, lhs, rhs) = expr,
+        if let CsharpminorExpr::Evar(lhs_reg) = lhs.as_ref(),
+        if lhs_reg == dst,
+        if let Some(rhs_reg) = affine_pointer_base(rhs),
+        pointer_reg(rhs_reg),
+        pointer_carrier_def(origin, dst),
+        dom_set(node, dominators),
+        if dominators.0.contains(origin);
+
+    relation alias_range_guard(Node);
+    alias_range_guard(*guard) <--
+        scond_node(guard, _, _),
+        stmt(guard, ?CsharpminorStmt::Scond(cond, args, _, _)),
+        if matches!(cond,
+            Condition::Ccompluimm(Comparison::Cle | Comparison::Clt, _)),
+        if args.len() == 1,
+        if let CsharpminorExpr::Evar(distance) = &args[0],
+        pointer_distance_def(def, distance),
+        dom_set(guard, dominators),
+        if dominators.0.contains(def);
+
+    relation scond_reaches_optimized_gap(Node);
+    scond_reaches_optimized_gap(*target) <--
+        scond_target(target),
+        optimized_gap_node(gap),
+        scond_sources_at(gap, sources),
+        if sources.0.contains(target);
+
+    relation structurally_complete_version_guard(Node);
+    structurally_complete_version_guard(*guard) <-- join_point(guard, _);
+    structurally_complete_version_guard(*guard) <-- scond_no_join(guard);
 
     // Guard whose one CFG target reaches the vector header and whose other reaches a scalar header without it; rewritten to Sjump(scalar_target), making the vector region dead.
     relation scond_reaches_vector(Node);
@@ -1034,6 +1170,26 @@ ascent_par! {
         scond_reaches_vector(f),
         scond_reaches_scalar_loop(t),
         !scond_reaches_vector(t);
+
+    // Fixed-size/unrolled versioning has the same compiler contract but no
+    // natural loops. When exactly one structurally complete guard target can
+    // reach a positively identified optimized gap, route to the other target.
+    // Source-set reachability handles shared scalar targets and rejects a gap
+    // reached only after both arms reconverge.
+    vec_bypass_rewrite(*g, *f) <--
+        alias_range_guard(g),
+        scond_node(g, t, f),
+        structurally_complete_version_guard(g),
+        scond_reaches_optimized_gap(t),
+        !scond_reaches_optimized_gap(f),
+        !loop_body_node(g);
+    vec_bypass_rewrite(*g, *t) <--
+        alias_range_guard(g),
+        scond_node(g, t, f),
+        structurally_complete_version_guard(g),
+        scond_reaches_optimized_gap(f),
+        !scond_reaches_optimized_gap(t),
+        !loop_body_node(g);
 
     // Loop exit condition: Scond where one target stays in the loop and one exits
     relation loop_exit_cond(Node, Node, Node, Node);
@@ -1239,11 +1395,76 @@ mod structural_lattice_tests {
     };
     use crate::util::{MULTI_SYNTH_NODE_BIT, MULTI_SYNTH_STAGE_SHIFT};
     use crate::x86::op::{Comparison, Condition};
-    use crate::x86::types::{CsharpminorExpr, CsharpminorStmt};
+    use crate::x86::types::{CminorBinop, Constant, CsharpminorExpr, CsharpminorStmt};
     use std::collections::{HashMap, HashSet};
 
     fn synthetic_ids<const N: usize>() -> [u64; N] {
         std::array::from_fn(|index| index as u64 + 1)
+    }
+
+    #[test]
+    fn acyclic_alias_versioning_routes_around_unrepresented_optimized_arm() {
+        const PTR_A: u64 = 10;
+        const PTR_B: u64 = 11;
+        const DISTANCE: u64 = 12;
+        let [carrier, distance_def, guard, scalar, optimized] = synthetic_ids();
+
+        let mut prog = StructuringProgram::default();
+        prog.stmt.extend([
+            (
+                carrier,
+                CsharpminorStmt::Sset(DISTANCE, CsharpminorExpr::Evar(PTR_A)),
+            ),
+            (
+                distance_def,
+                CsharpminorStmt::Sset(
+                    DISTANCE,
+                    CsharpminorExpr::Ebinop(
+                        CminorBinop::Osubl,
+                        Box::new(CsharpminorExpr::Evar(DISTANCE)),
+                        Box::new(CsharpminorExpr::Evar(PTR_B)),
+                    ),
+                ),
+            ),
+            (
+                guard,
+                CsharpminorStmt::Scond(
+                    Condition::Ccompluimm(Comparison::Cle, 8),
+                    vec![CsharpminorExpr::Evar(DISTANCE)],
+                    scalar,
+                    optimized,
+                ),
+            ),
+            (
+                scalar,
+                CsharpminorStmt::Sreturn(CsharpminorExpr::Econst(Constant::Olongconst(1))),
+            ),
+            (
+                optimized,
+                CsharpminorStmt::Sreturn(CsharpminorExpr::Econst(Constant::Olongconst(2))),
+            ),
+        ]);
+        prog.seq_next
+            .extend([(carrier, distance_def), (distance_def, guard)]);
+        prog.entry_node.push((carrier,));
+        prog.pointer_reg.extend([(PTR_A,), (PTR_B,)]);
+        prog.optimized_gap_node.push((optimized,));
+
+        prog.run();
+
+        assert!(prog.alias_range_guard.iter().any(|fact| fact == &(guard,)));
+        assert!(prog
+            .vec_bypass_rewrite
+            .iter()
+            .any(|fact| fact == &(guard, scalar)));
+
+        let mut nonpointer = StructuringProgram::default();
+        nonpointer.stmt = prog.stmt.clone();
+        nonpointer.seq_next = prog.seq_next.clone();
+        nonpointer.entry_node.push((carrier,));
+        nonpointer.optimized_gap_node.push((optimized,));
+        nonpointer.run();
+        assert!(nonpointer.vec_bypass_rewrite.is_empty());
     }
 
     #[test]
@@ -1552,6 +1773,8 @@ mod structural_lattice_tests {
             Some(head),
             &preds,
             &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
         );
 
         assert!(structured
@@ -1651,6 +1874,8 @@ mod structural_lattice_tests {
             &HashSet::new(),
             Some(head),
             &preds,
+            &HashSet::new(),
+            &HashSet::new(),
             &HashSet::new(),
         );
 
@@ -1872,6 +2097,8 @@ pub fn structure(
     declared_entry: Option<Node>,
     cminor_preds: &HashMap<Node, Vec<Node>>,
     packed_alu_nodes: &HashSet<Node>,
+    optimized_gap_nodes: &HashSet<Node>,
+    pointer_regs: &HashSet<RTLReg>,
 ) -> StructuringResult {
     if stmts.is_empty() {
         return StructuringResult {
@@ -1932,7 +2159,12 @@ pub fn structure(
         if packed_alu_nodes.contains(node) {
             prog.packed_alu_node.push((*node,));
         }
+        if optimized_gap_nodes.contains(node) {
+            prog.optimized_gap_node.push((*node,));
+        }
     }
+    prog.pointer_reg
+        .extend(pointer_regs.iter().map(|reg| (*reg,)));
 
     let seq_edges =
         compute_sequential_edges(&current_stmts, next_map, cminor_succs, expansion_sources);

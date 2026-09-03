@@ -1422,6 +1422,46 @@ mod tests {
     }
 
     #[test]
+    fn long_immediate_condition_keeps_machine_width_over_narrow_recovered_type() {
+        let reg = 0x2345;
+        let mut types = MultiVarTypeMap::new();
+        types.insert(
+            reg,
+            vec![ClightType::Tint(
+                ClightIntSize::I8,
+                ClightSignedness::Signed,
+                default_attr(),
+            )],
+        );
+
+        let condition = clight_condition_expr_with_types(
+            &Condition::Ccompluimm(Comparison::Cne, 256),
+            &[CsharpminorExpr::Evar(reg)],
+            &types,
+            8,
+        )
+        .expect("64-bit immediate comparison");
+
+        assert!(matches!(
+            condition,
+            ClightExpr::Ebinop(ClightBinaryOp::One, lhs, rhs, _)
+                if matches!(
+                    lhs.as_ref(),
+                    ClightExpr::Ecast(_, ClightType::Tlong(
+                        ClightSignedness::Unsigned,
+                        _,
+                    ))
+                ) && matches!(
+                    rhs.as_ref(),
+                    ClightExpr::EconstLong(256, ClightType::Tlong(
+                        ClightSignedness::Unsigned,
+                        _,
+                    ))
+                )
+        ));
+    }
+
+    #[test]
     fn signed_cminor_comparison_casts_a_boolean_typed_machine_word() {
         let reg = 0x5678;
         let boolean_ty = ClightType::Tint(
@@ -6854,7 +6894,18 @@ pub(crate) fn clight_condition_expr_with_types(
                 };
                 let lhs = clight_expr_from_csharp_with_multi_types(&args[0], var_types, ptr_size);
                 let lhs_ty = clight_expr_type(&lhs);
-                let mut lhs_final = lhs.clone();
+                // The Condition owns the machine width. A recovered narrow
+                // declaration is not permission to turn a 64-bit CMP into a
+                // char/short comparison; doing so can make a predicate such as
+                // a narrowed index compared with 256 impossible. Preserve the
+                // existing pointer-null spelling, otherwise force a real
+                // signed/unsigned 64-bit cast just like the register/register
+                // condition path above.
+                let lhs_final = if *imm == 0 && matches!(lhs_ty, ClightType::Tpointer(_, _)) {
+                    lhs.clone()
+                } else {
+                    force_long_type_for_64bit_cmp(lhs.clone(), signed)
+                };
                 let rhs_final = if *imm == 0 {
                     if matches!(lhs_ty, ClightType::Tpointer(_, _)) {
                         ClightExpr::Ecast(
@@ -6865,11 +6916,6 @@ pub(crate) fn clight_condition_expr_with_types(
                         ClightExpr::EconstLong(0, long_ty.clone())
                     }
                 } else {
-                    if matches!(lhs_ty, ClightType::Tpointer(_, _)) {
-                        let lhs_cast =
-                            ClightExpr::Ecast(Box::new(lhs_final.clone()), long_ty.clone());
-                        lhs_final = lhs_cast;
-                    }
                     normalize_const_expr(ClightExpr::EconstLong(*imm, long_ty.clone()))
                 };
                 Some(ClightExpr::Ebinop(

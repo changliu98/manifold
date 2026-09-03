@@ -608,6 +608,28 @@ fn recover_relocated_pointer_words(
     scalar
 }
 
+/// Convert an exact physical object extent into a pointer-word initializer
+/// layout when the object actually owns a relocation.  This is initializer
+/// evidence only: the final declaration still comes from the independently
+/// recovered physical extent, so a relocation in a neighboring object cannot
+/// turn an arbitrary scalar into a table.
+fn pointer_layout_for_exact_storage(
+    base: usize,
+    extent: usize,
+    pointer_size: usize,
+    reloc_targets: &BTreeMap<u64, u64>,
+) -> Option<(usize, usize)> {
+    if !matches!(pointer_size, 4 | 8) || extent <= pointer_size || extent % pointer_size != 0 {
+        return None;
+    }
+    let start = u64::try_from(base).ok()?;
+    let end = start.checked_add(u64::try_from(extent).ok()?)?;
+    reloc_targets
+        .range(start..end)
+        .next()
+        .map(|_| (pointer_size, extent / pointer_size))
+}
+
 fn consecutive_pointer_run(
     base: u64,
     pointer_size: usize,
@@ -3468,6 +3490,18 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
         layouts
     };
 
+    // A non-scalar ELF object with an exact recovered extent may contain one
+    // relocated pointer followed by raw zero/data words.  Supply that full
+    // extent to atomic pointer-initializer recovery; otherwise the base
+    // relocation degrades to a one-word scalar and truncates the object.
+    for (ident, extent) in db.rel_iter::<(Ident, usize)>("global_storage_extent") {
+        if let Some(layout) =
+            pointer_layout_for_exact_storage(*ident, *extent, db.abi().pointer_size, &reloc_targets)
+        {
+            global_array_layouts.entry(*ident).or_default().push(layout);
+        }
+    }
+
     // A run of adjacent pointer-width relocations to code is itself exact
     // object-layout evidence for a function-pointer table. This closes the
     // memory-indirect-call case where no ordinary global load publishes an
@@ -5178,7 +5212,6 @@ pub fn extract_struct_definitions(db: &DecompileDB) -> Vec<ExtractedStruct> {
                 }
             }
         }
-
         field_tuples.sort_by_key(|(_idx, offset, _, _)| *offset);
 
         let struct_name = format!("struct_{:x}", canonical_id);
@@ -6201,6 +6234,26 @@ mod relocated_pointer_tests {
         );
 
         assert_eq!(words, vec![RelocatedPointerWord::Target(0x2000)]);
+    }
+
+    #[test]
+    fn exact_storage_extent_admits_only_owned_pointer_words() {
+        let reloc_targets = BTreeMap::from([(0x1000, 0x2000), (0x1020, 0x3000)]);
+
+        assert_eq!(
+            pointer_layout_for_exact_storage(0x1000, 16, 8, &reloc_targets),
+            Some((8, 2))
+        );
+        assert_eq!(
+            pointer_layout_for_exact_storage(0x1008, 16, 8, &reloc_targets),
+            None,
+            "a relocation at the first address after the object is not owned"
+        );
+        assert_eq!(
+            pointer_layout_for_exact_storage(0x1000, 10, 8, &reloc_targets),
+            None,
+            "partial pointer words cannot form an initializer layout"
+        );
     }
 
     #[test]

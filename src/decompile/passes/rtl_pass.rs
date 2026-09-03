@@ -467,7 +467,7 @@ fn stack_address_within_local_frame(offset: i64, frame_size: i64) -> bool {
     (offset >= 0 && offset < frame_size) || (offset >= frame_size.saturating_neg() && offset < 0)
 }
 
-fn typ_is_pointer_width(typ: &Typ, pointer_width: i64) -> bool {
+pub(crate) fn typ_is_pointer_width(typ: &Typ, pointer_width: i64) -> bool {
     matches!(
         (pointer_width, typ),
         (4, Typ::Tint | Typ::Tany32) | (8, Typ::Tlong | Typ::Tany64)
@@ -831,6 +831,10 @@ ascent_par! {
     relation simd_dword_lane_event(Address, i64, Address, Address);
     relation simd_dword_lane_frame_store(Address, i64, Address);
     relation movhps_hi_load(Address, Mreg, &'static str, &'static str, i64, i64, bool);
+    relation wide_xmm_hi_load(Address, Mreg, &'static str, &'static str, i64, i64, bool);
+    relation xmm_hi_bitwise_op(Address, i64, Address, Address);
+    relation xmm_hi_not_op(Address, Address);
+    #[local] relation xmm_hi_scalar_op(Address);
     // The upper 8 bytes of a 16-byte frame move, which has no CompCert chunk:
     // (store addr, destination cell, source kind, source reg, source cell, defining site).
     relation xmm_hi_frame_store(Address, i64, i64, Mreg, i64, Address);
@@ -4434,6 +4438,11 @@ ascent_par! {
     // point and must stop the first-successor lattice walk.
     rtl_semantic_node(addr) <-- simd_dword_event_required(addr);
     rtl_semantic_node(addr) <-- simd_dword_frame_store_ready(addr, _, _);
+    // A packed high-half operation can have no ordinary Linear instruction;
+    // it is nevertheless a semantic stop in the raw-CFG successor walk. If
+    // omitted, the preceding wide load skips straight to the later store and
+    // the private high operation becomes unreachable/dead.
+    rtl_semantic_node(addr) <-- xmm_hi_scalar_op(addr);
 
     rtl_raw_cfg_step(src, dst) <--
         next(src, dst),
@@ -5853,11 +5862,19 @@ ascent_par! {
         rtl_next_semantic(func, store, successors),
         for dst in successors.0.iter();
 
-    // Legacy MOVHPS has two simultaneous effects: preserve the low XMM lane
-    // (the ordinary LTL Omove at addr) and load a memory quadword into the high
-    // lane. Materialize that load on a private node. A frame-plus-index source
-    // needs the same explicit Ainstack base split as the other SP/BP-indexed
-    // operations, so it uses two private nodes; all other forms use one.
+    // Legacy MOVHPS and a full-width general-memory XMM load both need an
+    // explicit upper-quadword load.  MOVHPS preserves its low lane, while the
+    // full load already has an ordinary low-half Mach load; below they share
+    // only the private high-load materialization and CFG expansion. A
+    // frame-plus-index source needs the same explicit Ainstack base split as
+    // the other SP/BP-indexed operations, so it uses two private nodes; all
+    // other forms use one.
+    #[local] relation explicit_xmm_hi_load(Address, Mreg, &'static str, &'static str, i64, i64, bool);
+    explicit_xmm_hi_load(*addr, *dst, base, idx, *scale, *disp, *is_frame) <--
+        movhps_hi_load(addr, dst, base, idx, scale, disp, is_frame);
+    explicit_xmm_hi_load(*addr, *dst, base, idx, *scale, *disp, *is_frame) <--
+        wide_xmm_hi_load(addr, dst, base, idx, scale, disp, is_frame);
+
     #[local] relation movhps_hi_direct_ready(Address, Addressing, Args, Mreg);
     #[local] relation movhps_hi_stack_ready(Address, i64, i64, RTLReg, Mreg);
     // Addressability is deliberately independent of SSA resolution. Using a
@@ -5868,48 +5885,48 @@ ascent_par! {
     #[local] relation movhps_hi_chain_tail(Address, Node);
 
     movhps_hi_addressable(*addr, false) <--
-        movhps_hi_load(addr, _, _, idx, _, _, true),
+        explicit_xmm_hi_load(addr, _, _, idx, _, _, true),
         if *idx == "NONE" || idx.is_empty();
     movhps_hi_addressable(*addr, true) <--
-        movhps_hi_load(addr, _, _, idx, _, _, true),
+        explicit_xmm_hi_load(addr, _, _, idx, _, _, true),
         if *idx != "NONE" && !idx.is_empty();
     movhps_hi_addressable(*addr, false) <--
-        movhps_hi_load(addr, _, base, idx, _, _, false),
+        explicit_xmm_hi_load(addr, _, base, idx, _, _, false),
         if is_rip(base),
         if *idx == "NONE" || idx.is_empty(),
         rip_target_addr(addr, target),
         resolved_addr_to_symbol(target, _, _);
     movhps_hi_addressable(*addr, false) <--
-        movhps_hi_load(addr, _, base, idx, _, disp, false),
+        explicit_xmm_hi_load(addr, _, base, idx, _, disp, false),
         if (*base == "NONE" || base.is_empty()) && (*idx == "NONE" || idx.is_empty()),
         resolved_addr_to_symbol(*disp as Address, _, _);
     movhps_hi_addressable(*addr, false) <--
-        movhps_hi_load(addr, _, base, _, _, _, false),
+        explicit_xmm_hi_load(addr, _, base, _, _, _, false),
         if *base != "NONE" && !base.is_empty(),
         if !is_rip(base);
     movhps_hi_addressable(*addr, false) <--
-        movhps_hi_load(addr, _, base, idx, _, _, false),
+        explicit_xmm_hi_load(addr, _, base, idx, _, _, false),
         if *base == "NONE" || base.is_empty(),
         if *idx != "NONE" && !idx.is_empty();
 
     movhps_hi_direct_ready(*addr, Addressing::Ainstack(*disp), Arc::new(vec![]), *dst) <--
-        movhps_hi_load(addr, dst, _, idx, _, disp, true),
+        explicit_xmm_hi_load(addr, dst, _, idx, _, disp, true),
         if *idx == "NONE" || idx.is_empty();
 
     movhps_hi_direct_ready(*addr, Addressing::Aglobal(*ident, *ofs), Arc::new(vec![]), *dst) <--
-        movhps_hi_load(addr, dst, base, idx, _, _, false),
+        explicit_xmm_hi_load(addr, dst, base, idx, _, _, false),
         if is_rip(base),
         if *idx == "NONE" || idx.is_empty(),
         rip_target_addr(addr, target),
         resolved_addr_to_symbol(target, ident, ofs);
 
     movhps_hi_direct_ready(*addr, Addressing::Aglobal(*ident, *ofs), Arc::new(vec![]), *dst) <--
-        movhps_hi_load(addr, dst, base, idx, _, disp, false),
+        explicit_xmm_hi_load(addr, dst, base, idx, _, disp, false),
         if (*base == "NONE" || base.is_empty()) && (*idx == "NONE" || idx.is_empty()),
         resolved_addr_to_symbol(*disp as Address, ident, ofs);
 
     movhps_hi_direct_ready(*addr, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl]), *dst) <--
-        movhps_hi_load(addr, dst, base, idx, _, disp, false),
+        explicit_xmm_hi_load(addr, dst, base, idx, _, disp, false),
         if *base != "NONE" && !base.is_empty(),
         if !is_rip(base),
         if *idx == "NONE" || idx.is_empty(),
@@ -5917,7 +5934,7 @@ ascent_par! {
         reg_rtl(addr, base_mreg, base_rtl);
 
     movhps_hi_direct_ready(*addr, addressing, Arc::new(vec![*base_rtl, *idx_rtl]), *dst) <--
-        movhps_hi_load(addr, dst, base, idx, scale, disp, false),
+        explicit_xmm_hi_load(addr, dst, base, idx, scale, disp, false),
         if *base != "NONE" && !base.is_empty(),
         if !is_rip(base),
         if *idx != "NONE" && !idx.is_empty(),
@@ -5932,14 +5949,14 @@ ascent_par! {
         };
 
     movhps_hi_direct_ready(*addr, Addressing::Ascaled(*scale, *disp), Arc::new(vec![*idx_rtl]), *dst) <--
-        movhps_hi_load(addr, dst, base, idx, scale, disp, false),
+        explicit_xmm_hi_load(addr, dst, base, idx, scale, disp, false),
         if *base == "NONE" || base.is_empty(),
         if *idx != "NONE" && !idx.is_empty(),
         let idx_mreg = Mreg::x86(idx),
         reg_rtl(addr, idx_mreg, idx_rtl);
 
     movhps_hi_stack_ready(*addr, *scale, *disp, *idx_rtl, *dst) <--
-        movhps_hi_load(addr, dst, _, idx, scale, disp, true),
+        explicit_xmm_hi_load(addr, dst, _, idx, scale, disp, true),
         if *idx != "NONE" && !idx.is_empty(),
         let idx_mreg = Mreg::x86(idx),
         reg_rtl(addr, idx_mreg, idx_rtl);
@@ -5962,7 +5979,7 @@ ascent_par! {
     // into stack alias construction, which prevents the canonical-value
     // lattice from being cleanly finalized before its consumers run.
     indexed_synth_stack_base(func_start, base_node, *disp, base_rtl) <--
-        movhps_hi_load(addr, _, _, idx, _, disp, true),
+        explicit_xmm_hi_load(addr, _, _, idx, _, disp, true),
         if *idx != "NONE" && !idx.is_empty(),
         instr_in_function(addr, func_start),
         let base_node = *addr | (1u64 << 62),
@@ -5994,36 +6011,108 @@ ascent_par! {
         movhps_hi_chain_tail(addr, _),
         next_is_materialized_branch(addr, jcc_addr);
 
-    rtl_succ_candidate(addr, synth), instr_in_function(synth, *func_start) <--
+    rtl_succ_candidate(addr, synth), rtl_expansion_edge(addr, synth),
+    instr_in_function(synth, *func_start) <--
         movhps_hi_addressable(addr, false),
         instr_in_function(addr, func_start),
         let synth = *addr | (1u64 << 62);
 
-    rtl_succ_candidate(addr, base_node), instr_in_function(base_node, *func_start) <--
+    rtl_succ_candidate(addr, base_node), rtl_expansion_edge(addr, base_node),
+    instr_in_function(base_node, *func_start) <--
         movhps_hi_addressable(addr, true),
         instr_in_function(addr, func_start),
         let base_node = *addr | (1u64 << 62);
-    rtl_succ_candidate(base_node, load_node), instr_in_function(load_node, *func_start) <--
+    rtl_succ_candidate(base_node, load_node), rtl_expansion_edge(base_node, load_node),
+    instr_in_function(load_node, *func_start) <--
         movhps_hi_addressable(addr, true),
         instr_in_function(addr, func_start),
         let base_node = *addr | (1u64 << 62),
         let load_node = *addr | (1u64 << 63);
 
-    rtl_succ_candidate(tail, next_node) <--
-        movhps_hi_chain_tail(addr, tail),
-        rtl_next(addr, next_node),
-        !next_is_materialized_branch(addr, _);
-    rtl_succ_candidate(tail, jcc_addr) <--
-        movhps_hi_chain_tail(addr, tail),
-        next_is_materialized_branch(addr, jcc_addr);
-    rtl_succ_candidate(tail, dst) <--
+    rtl_succ_candidate(tail, *dst), rtl_expansion_edge(tail, *dst) <--
         movhps_hi_chain_tail(addr, tail),
         instr_in_function(addr, func_start),
-        next(addr, mid),
-        !ltl_inst(*mid, _),
-        !next_is_materialized_branch(addr, _),
-        instr_in_function(*mid, func_start),
-        sp_synth_skip_to_ltl(*mid, *func_start, dst);
+        rtl_next_semantic(func_start, addr, successors),
+        for dst in successors.0.iter();
+
+    // A supported packed bitwise instruction has the ordinary low-quadword
+    // operation at its machine node and this exact upper-quadword operation on
+    // one private successor.  The inputs name explicit high-load or earlier
+    // high-op pseudos, so no memory read is replayed at a later store.
+    xmm_hi_scalar_op(addr) <-- xmm_hi_bitwise_op(addr, _, _, _);
+    xmm_hi_scalar_op(addr) <-- xmm_hi_not_op(addr, _);
+
+    // The packed instruction itself was previously absent from Linear, so its
+    // low 64 bits were copied through unchanged.  Materialize the low-half
+    // operation at the real node using the ordinary XMM low-lane pseudos. The
+    // public high-op fact already proves the mnemonic/operand form and source
+    // provenance; re-reading the decoded operands here only binds those low
+    // pseudos.
+    rtl_inst_candidate(*addr, inst) <--
+        xmm_hi_bitwise_op(addr, kind, _, _),
+        instruction(addr, _, _, _, src_sym, dst_sym, _, _, _, _),
+        op_register(src_sym, src_name),
+        op_register(dst_sym, dst_name),
+        let src_mreg = Mreg::x86(src_name),
+        let dst_mreg = Mreg::x86(dst_name),
+        reg_rtl(addr, src_mreg, src_rtl),
+        reg_rtl(addr, dst_mreg, dst_rtl),
+        let op = match *kind {
+            3 => Operation::Oandl,
+            4 => Operation::Oorl,
+            5 => Operation::Oxorl,
+            _ => unreachable!(),
+        },
+        let inst = RTLInst::Iop(op, Arc::new(vec![*dst_rtl, *src_rtl]), *dst_rtl);
+
+    rtl_inst_candidate(*addr, inst) <--
+        xmm_hi_not_op(addr, _),
+        instruction(addr, _, _, _, _, dst_sym, _, _, _, _),
+        op_register(dst_sym, dst_name),
+        let dst_mreg = Mreg::x86(dst_name),
+        reg_rtl(addr, dst_mreg, dst_rtl),
+        let inst = RTLInst::Iop(Operation::Onotl, Arc::new(vec![*dst_rtl]), *dst_rtl);
+
+    rtl_inst_candidate(synth, inst) <--
+        xmm_hi_bitwise_op(addr, kind, left_site, right_site),
+        let op = match *kind {
+            3 => Operation::Oandl,
+            4 => Operation::Oorl,
+            5 => Operation::Oxorl,
+            _ => unreachable!(),
+        },
+        let left = fresh_xmm_hi_value_reg(*left_site),
+        let right = fresh_xmm_hi_value_reg(*right_site),
+        let result = fresh_xmm_hi_value_reg(*addr),
+        let synth = xmm_hi_lane_node(*addr),
+        let inst = RTLInst::Iop(op, Arc::new(vec![left, right]), result);
+
+    rtl_inst_candidate(synth, inst) <--
+        xmm_hi_not_op(addr, value_site),
+        let value = fresh_xmm_hi_value_reg(*value_site),
+        let result = fresh_xmm_hi_value_reg(*addr),
+        let synth = xmm_hi_lane_node(*addr),
+        let inst = RTLInst::Iop(Operation::Onotl, Arc::new(vec![value]), result);
+
+    rtl_edge_negated(addr, next_node) <--
+        xmm_hi_scalar_op(addr),
+        rtl_next(addr, next_node);
+    rtl_edge_negated(addr, jcc_addr) <--
+        xmm_hi_scalar_op(addr),
+        next_is_materialized_branch(addr, jcc_addr);
+
+    rtl_succ_candidate(addr, synth), rtl_expansion_edge(addr, synth),
+    instr_in_function(synth, *func_start) <--
+        xmm_hi_scalar_op(addr),
+        instr_in_function(addr, func_start),
+        let synth = xmm_hi_lane_node(*addr);
+
+    rtl_succ_candidate(synth, *dst), rtl_expansion_edge(synth, *dst) <--
+        xmm_hi_scalar_op(addr),
+        instr_in_function(addr, func_start),
+        rtl_next_semantic(func_start, addr, successors),
+        for dst in successors.0.iter(),
+        let synth = xmm_hi_lane_node(*addr);
 
     // Upper half of a 16-byte frame move.  asm_pass resolved what the XMM's
     // high lane holds; here it becomes a second frame-cell move, on a private
@@ -6090,6 +6179,16 @@ ascent_par! {
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, hi_ofs, dst_rtl),
         let src_rtl = fresh_xmm_hi_value_reg(*load_addr),
+        let synth = xmm_hi_lane_node(*addr),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![src_rtl]), *dst_rtl);
+
+    // Kind 6 is already materialized at its packed bitwise instruction.
+    rtl_inst_candidate(synth, inst) <--
+        xmm_hi_frame_store(addr, hi_ofs, 6, _, _, op_addr),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, hi_ofs, dst_rtl),
+        xmm_hi_scalar_op(op_addr),
+        let src_rtl = fresh_xmm_hi_value_reg(*op_addr),
         let synth = xmm_hi_lane_node(*addr),
         let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![src_rtl]), *dst_rtl);
 
@@ -6243,6 +6342,14 @@ ascent_par! {
         xmm_hi_mem_store(addr, 4, _, _, load_addr),
         movhps_hi_addressable(load_addr, _),
         let src_rtl = fresh_xmm_hi_value_reg(*load_addr),
+        let value_node = xmm_hi_lane_node(*addr),
+        let value_rtl = fresh_xmm_hi_value_reg(*addr),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![src_rtl]), value_rtl);
+
+    rtl_inst_candidate(value_node, inst), xmm_hi_mem_value(addr, value_rtl) <--
+        xmm_hi_mem_store(addr, 6, _, _, op_addr),
+        xmm_hi_scalar_op(op_addr),
+        let src_rtl = fresh_xmm_hi_value_reg(*op_addr),
         let value_node = xmm_hi_lane_node(*addr),
         let value_rtl = fresh_xmm_hi_value_reg(*addr),
         let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![src_rtl]), value_rtl);
@@ -7454,8 +7561,8 @@ ascent_par! {
         instr_in_function(addr, func_start),
         !stack_var(func_start, addr, ofs, _),
         !lgetstack_is_stack_param(addr),
-        let fresh_src = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_STACK_SRC,
-        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![fresh_src]), *dst_rtl);
+        let chunk = typ_to_chunk(*typ),
+        let inst = RTLInst::Iload(chunk, Addressing::Ainstack(*ofs), Arc::new(vec![]), *dst_rtl);
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lgetstack(slot, ofs, typ, dst)),
@@ -7472,9 +7579,9 @@ ascent_par! {
         instr_in_function(addr, func_start),
         !stack_var(func_start, addr, ofs, _),
         !lgetstack_is_stack_param(addr),
-        let fresh_src = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_STACK_SRC,
         let fresh_dst = fresh_xtl_reg(*addr, *dst) | FRESH_NS_REG_DST,
-        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![fresh_src]), fresh_dst);
+        let chunk = typ_to_chunk(*typ),
+        let inst = RTLInst::Iload(chunk, Addressing::Ainstack(*ofs), Arc::new(vec![]), fresh_dst);
 
     // Reconstruct the dropped reload as the same scalar-stack SSA move used
     // by Lgetstack.  stack_var is canonicalized across every reaching store,
@@ -9286,6 +9393,21 @@ ascent_par! {
         pointer_width_reg_copy(mov_addr, src_reg, dst_reg),
         instr_in_function(mov_addr, func_start),
         reg_def_used(src_def, src_reg, mov_addr),
+        reg_stack_addr_origins(func_start, src_def, src_reg, origins);
+
+    // A pointer-width CMOV/select carries either of its first two value inputs.
+    // Preserve every reaching stack-address arm in the may-origin lattice; the
+    // select's ordinary-definition rule also contributes NonStack, so MUST
+    // projection remains conservative while a fixed external out-parameter can
+    // still size each possible caller-owned stack object.  Condition operands
+    // start at position two and are deliberately excluded.
+    reg_stack_addr_origins(*func_start, *select_addr, *dst_reg, origins.clone()) <--
+        ltl_inst(select_addr, ?LTLInst::Lop(Operation::Osel(_, typ), args, dst_reg)),
+        abi_pointer_size(pointer_width),
+        if typ_is_pointer_width(typ, *pointer_width),
+        for (position, src_reg) in args.iter().enumerate(),
+        if position < 2,
+        reg_def_used(src_def, src_reg, select_addr),
         reg_stack_addr_origins(func_start, src_def, src_reg, origins);
 
     // `reg_def_used` carries only effective definitions.  If another incoming
@@ -14357,16 +14479,17 @@ ascent_par! {
         abi_ret_float_reg(ret_reg),
         let ret_rtl = fresh_xtl_reg(*func_start, *ret_reg);
 
-    // (B) Decl type: inherit the tail-call target's non-void return type by positive recursion within the candidate relation.
+    // (B) Decl type: inherit the tail-call target's non-void return type by
+    // positive recursion within the candidate relation.  This also applies to
+    // a mixed wrapper with an early `return 0`: zero is the null value on that
+    // path, while the tail-call path still fixes the machine return class.
     emit_function_return_type_xtype_candidate(func_start, xtype) <--
         func_tailcalls_local(func_start, target),
-        !func_has_lreturn(func_start),
         emit_function_return_type_xtype_candidate(target, xtype),
         if *xtype != XType::Xvoid;
 
     emit_function_return_type_xtype_candidate(func_start, *return_type) <--
         func_tailcalls_known_extern(func_start, _, return_type),
-        !func_has_lreturn(func_start),
         if *return_type != XType::Xvoid;
 
     emit_function_return_type_candidate(func_start, clight_ty) <--
@@ -15216,7 +15339,6 @@ pub(crate) fn setcc_mnem_testcond(mnem: &str) -> Option<TestCond> {
     })
 }
 
-pub(crate) const FRESH_NS_STACK_SRC: u64 = 1 << 54;
 pub(crate) const FRESH_NS_REG_DST: u64 = 1 << 55;
 pub(crate) const FRESH_NS_SP_BASE: u64 = 1 << 56;
 pub(crate) const FRESH_NS_STACK_PARAM: u64 = 1 << 57;
@@ -15912,6 +16034,10 @@ fn materialize_one_operand_multiply_low_halves(db: &mut DecompileDB) -> usize {
         .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
         .cloned()
         .collect();
+    let def_uses: Vec<(Node, Mreg, Node)> = db
+        .rel_iter::<(Node, Mreg, Node)>("reg_def_used")
+        .copied()
+        .collect();
     let existing_insts: BTreeMap<Node, Vec<RTLInst>> = {
         let mut by_node = BTreeMap::<Node, Vec<RTLInst>>::new();
         for (node, inst) in &existing_rows {
@@ -15922,12 +16048,29 @@ fn materialize_one_operand_multiply_low_halves(db: &mut DecompileDB) -> usize {
 
     let mut expansions = Vec::new();
     for (node, (operand, is_64)) in shapes {
-        let Some(accumulators) = values.get(&(node, Mreg::AX)) else {
-            continue;
+        // When the explicit source is DX, the one-operand instruction reads
+        // the old DX and writes the high product back to DX at the same node.
+        // `reg_rtl(node, DX)` therefore names the result, not the factor.
+        // Recover each input from its reaching definition and retain the old
+        // point-local spelling only as a fallback for isolated fixtures and
+        // non-overlapping registers.
+        let reaching_values = |reg: Mreg| {
+            let mut result = BTreeSet::new();
+            for &(definition, used_reg, use_node) in &def_uses {
+                if use_node != node || used_reg != reg || definition == node {
+                    continue;
+                }
+                if let Some(definition_values) = values.get(&(definition, reg)) {
+                    result.extend(definition_values.iter().copied());
+                }
+            }
+            if result.is_empty() {
+                result.extend(values.get(&(node, reg)).into_iter().flatten().copied());
+            }
+            result
         };
-        let Some(operands) = values.get(&(node, operand)) else {
-            continue;
-        };
+        let accumulators = reaching_values(Mreg::AX);
+        let operands = reaching_values(operand);
         let Some(functions) = owners.get(&node) else {
             continue;
         };
@@ -15975,10 +16118,6 @@ fn materialize_one_operand_multiply_low_halves(db: &mut DecompileDB) -> usize {
     }
     let mut successors: BTreeSet<(Node, Node)> = db
         .rel_iter::<(Node, Node)>("rtl_succ_candidate")
-        .copied()
-        .collect();
-    let def_uses: Vec<(Node, Mreg, Node)> = db
-        .rel_iter::<(Node, Mreg, Node)>("reg_def_used")
         .copied()
         .collect();
     let mut rebind_candidates = BTreeMap::<(Node, RTLReg), BTreeSet<RTLReg>>::new();
@@ -18532,6 +18671,7 @@ mod tests {
     fn one_operand_multiply_sequences_low_product_after_high_product() {
         let mut db = DecompileDB::default();
         let func: Address = 0x1300;
+        let factor_def: Node = 0x1308;
         let multiply: Node = 0x1310;
         let next: Node = 0x1320;
         let accumulator: RTLReg = 0x9500;
@@ -18544,13 +18684,14 @@ mod tests {
                 multiply,
                 LTLInst::Lop(
                     Operation::Omullhu,
-                    Arc::new(vec![Mreg::AX, Mreg::R8]),
+                    Arc::new(vec![Mreg::AX, Mreg::DX]),
                     Mreg::DX,
                 ),
             ),
         );
         db.rel_push("reg_rtl", (multiply, Mreg::AX, accumulator));
-        db.rel_push("reg_rtl", (multiply, Mreg::R8, factor));
+        db.rel_push("reg_rtl", (factor_def, Mreg::DX, factor));
+        db.rel_push("reg_def_used", (factor_def, Mreg::DX, multiply));
         db.rel_push("reg_def_used", (multiply, Mreg::AX, next));
         db.rel_push("reg_rtl", (next, Mreg::AX, return_value));
         db.rel_push("instr_in_function", (multiply, func));
@@ -19261,6 +19402,75 @@ mod tests {
                 .reg_holds_slot_addr
                 .iter()
                 .any(|fact| fact == &(func, copy, 16, Mreg::DI)));
+        });
+    }
+
+    #[test]
+    fn pointer_select_preserves_stack_may_origin_for_external_outparam() {
+        on_large_stack(|| {
+            let [func, lea, select, copy, call] = synthetic_ids();
+            let mut prog = RTLPassProgram::default();
+            let base_ofs = 32_i64;
+            prog.abi_pointer_size.push((8,));
+            prog.abi_int_arg_position.push((Mreg::SI, 1));
+            prog.function_has_ltl_body.push((func,));
+            prog.func_stacksz.push((func, call + 1, "caller", 64));
+
+            for node in [lea, select, copy, call] {
+                prog.instr_in_function.push((node, func));
+            }
+            prog.reg_def
+                .extend([(lea, Mreg::AX), (select, Mreg::R15), (copy, Mreg::SI)]);
+            prog.ltl_inst.extend([
+                (
+                    lea,
+                    LTLInst::Lop(
+                        Operation::Oleal(Addressing::Ainstack(base_ofs)),
+                        Arc::new(vec![]),
+                        Mreg::AX,
+                    ),
+                ),
+                (
+                    select,
+                    LTLInst::Lop(
+                        Operation::Osel(Condition::Ccomplimm(Comparison::Ceq, 0), Typ::Tany64),
+                        Arc::new(vec![Mreg::DI, Mreg::AX]),
+                        Mreg::R15,
+                    ),
+                ),
+                (
+                    copy,
+                    LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::R15]), Mreg::SI),
+                ),
+                (
+                    call,
+                    LTLInst::Lcall(Either::Right(Either::Right("strtoumax"))),
+                ),
+            ]);
+            prog.exact_frame_stack_lea.push((func, lea, base_ofs));
+            prog.reg_def_used
+                .extend([(lea, Mreg::AX, select), (select, Mreg::R15, copy)]);
+            seed_pointer_width_copy(&mut prog, copy, "R15", "RSI");
+            prog.arg_setup_candidate.push((copy, Mreg::SI, call));
+            prog.known_func_param_pointee_size.push(("strtoumax", 1, 8));
+
+            prog.run();
+
+            assert!(prog.reg_stack_addr_origin_member.iter().any(|fact| {
+                fact == &(func, select, Mreg::R15, StackAddrOrigin::Slot(base_ofs, 8))
+            }));
+            assert!(prog
+                .reg_may_hold_slot_addr
+                .iter()
+                .any(|fact| fact == &(func, copy, base_ofs, Mreg::SI)));
+            assert!(!prog
+                .reg_holds_slot_addr
+                .iter()
+                .any(|fact| fact == &(func, copy, base_ofs, Mreg::SI)));
+            assert!(prog
+                .escaped_stack_region_extent
+                .iter()
+                .any(|fact| fact == &(func, base_ofs, 8)));
         });
     }
 
@@ -20761,6 +20971,48 @@ mod tests {
                     reload,
                     RTLInst::Iop(Operation::Omove, Arc::new(vec![stack_rtl]), dst_rtl),
                 )
+            }));
+        });
+    }
+
+    #[test]
+    fn lgetstack_without_resolved_stack_alias_remains_memory_load() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x1000;
+            let unrepresented_def = 0x1100;
+            let reload = 0x1200;
+            let ofs = -632;
+            let dst_rtl = 0x4567;
+
+            prog.ltl_inst.push((
+                reload,
+                LTLInst::Lgetstack(Slot::Local, ofs, Typ::Tany64, Mreg::DX),
+            ));
+            prog.instr_in_function.push((reload, func));
+            prog.reg_xtl.push((reload, Mreg::DX, dst_rtl));
+            // A structural reaching-definition edge suppresses the ordinary
+            // point-local stack seed, but its source need not itself survive
+            // lifting.  This is the shape that previously manufactured an
+            // undefined Omove source for cp's saved-stat-field reload.
+            prog.stack_def_used
+                .push((unrepresented_def, "RSP", ofs, reload, "RSP", ofs));
+
+            prog.run();
+
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    reload,
+                    RTLInst::Iload(
+                        MemoryChunk::MAny64,
+                        Addressing::Ainstack(ofs),
+                        Arc::new(vec![]),
+                        dst_rtl,
+                    ),
+                )
+            }));
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == reload && matches!(inst, RTLInst::Iop(Operation::Omove, _, _))
             }));
         });
     }
@@ -23228,9 +23480,12 @@ mod tests {
                 prog.reg_rtl.push((node, dst, node + 0x10000));
                 prog.reg_def.push((node, dst));
                 prog.ltl_succ.push((node, exit));
+                prog.next.push((node, exit));
+                prog.code_in_block.push((node, func));
                 prog.instr_in_function.push((node, func));
             }
             prog.ltl_inst.push((exit, LTLInst::Lreturn));
+            prog.code_in_block.push((exit, func));
             prog.instr_in_function.push((exit, func));
 
             // A later wide frame store must read the explicit high pseudo made
@@ -23465,6 +23720,133 @@ mod tests {
                 *node == store
                     && matches!(inst, RTLInst::Istore(_, Addressing::Aindexed(0x20), _, _))
             }));
+        });
+    }
+
+    #[test]
+    fn wide_load_and_packed_not_expand_both_halves_along_semantic_cfg() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let func = 0x100;
+            let block = 0x100;
+            let load = 0x510;
+            let packed_not = 0x220;
+            let store = 0x730;
+            let exit = 0x340;
+            let source_base = 0x1111;
+            let destination_base = 0x2222;
+            let index = 0x3333;
+            let low_lane = 0x4444;
+
+            prog.wide_xmm_hi_load
+                .push((load, Mreg::X0, "RDI", "RAX", 1, 8, false));
+            prog.xmm_hi_not_op.push((packed_not, load));
+            prog.sse_wide_mem_store
+                .push((store, Mreg::X0, "RDX", "RAX", 1, 0));
+            prog.xmm_hi_mem_store
+                .push((store, 6, Mreg::Unknown, 0, packed_not));
+
+            prog.instruction.push((
+                packed_not,
+                4,
+                "",
+                "PXOR",
+                "ones_xmm",
+                "value_xmm",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.op_register
+                .extend([("ones_xmm", "XMM1"), ("value_xmm", "XMM0")]);
+
+            prog.ltl_inst.push((
+                load,
+                LTLInst::Lload(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed2(0),
+                    Arc::new(vec![Mreg::DI, Mreg::AX]),
+                    Mreg::X0,
+                ),
+            ));
+            prog.ltl_inst.push((
+                store,
+                LTLInst::Lstore(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed2(0),
+                    Arc::new(vec![Mreg::DX, Mreg::AX]),
+                    Mreg::X0,
+                ),
+            ));
+            prog.ltl_inst.push((exit, LTLInst::Lreturn));
+            prog.ltl_succ.extend([(load, store), (store, exit)]);
+            prog.next
+                .extend([(load, packed_not), (packed_not, store), (store, exit)]);
+            for node in [load, packed_not, store, exit] {
+                prog.code_in_block.push((node, block));
+                prog.instr_in_function.push((node, func));
+            }
+
+            for (node, reg, rtl) in [
+                (load, Mreg::DI, source_base),
+                (load, Mreg::AX, index),
+                (load, Mreg::X0, low_lane),
+                (packed_not, Mreg::X0, low_lane),
+                (store, Mreg::DX, destination_base),
+                (store, Mreg::AX, index),
+                (store, Mreg::X0, low_lane),
+            ] {
+                prog.reg_xtl.push((node, reg, rtl));
+            }
+
+            prog.run();
+
+            let high_load = xmm_hi_lane_node(load);
+            let high_op = xmm_hi_lane_node(packed_not);
+            let high_store_value = xmm_hi_lane_node(store);
+            let high_store = xmm_hi_store_node(store);
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    high_load,
+                    RTLInst::Iload(
+                        MemoryChunk::MAny64,
+                        Addressing::Aindexed2(8),
+                        Arc::new(vec![source_base, index]),
+                        fresh_xmm_hi_value_reg(load),
+                    ),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    packed_not,
+                    RTLInst::Iop(Operation::Onotl, Arc::new(vec![low_lane]), low_lane),
+                )
+            }));
+            assert!(prog.rtl_inst_candidate.iter().any(|fact| {
+                fact == &(
+                    high_op,
+                    RTLInst::Iop(
+                        Operation::Onotl,
+                        Arc::new(vec![fresh_xmm_hi_value_reg(load)]),
+                        fresh_xmm_hi_value_reg(packed_not),
+                    ),
+                )
+            }));
+            for edge in [
+                (load, high_load),
+                (high_load, packed_not),
+                (packed_not, high_op),
+                (high_op, store),
+                (store, high_store_value),
+                (high_store_value, high_store),
+                (high_store, exit),
+            ] {
+                assert!(
+                    prog.rtl_succ_candidate.iter().any(|fact| fact == &edge),
+                    "missing wide-lane semantic CFG edge {edge:?}"
+                );
+            }
         });
     }
 
@@ -26657,6 +27039,9 @@ mod tests {
             let void_tailcall = 0x7810;
             let ordinary_wrapper = 0x7900;
             let ordinary_call = 0x7910;
+            let mixed_wrapper = 0x7a00;
+            let mixed_tailcall = 0x7a10;
+            let mixed_return = 0x7a20;
 
             prog.abi_ret_int_reg.push((Mreg::AX,));
             prog.abi_ret_float_reg.push((Mreg::X0,));
@@ -26705,7 +27090,24 @@ mod tests {
                     XType::Xptr,
                     Arc::new(vec![XType::Xlongunsigned]),
                 ),
+                (
+                    "realloc",
+                    2,
+                    XType::Xptr,
+                    Arc::new(vec![XType::Xptr, XType::Xlongunsigned]),
+                ),
             ]);
+            prog.emit_function
+                .push((mixed_wrapper, "mixed_wrapper", mixed_wrapper));
+            prog.instr_in_function.extend([
+                (mixed_tailcall, mixed_wrapper),
+                (mixed_return, mixed_wrapper),
+            ]);
+            prog.ltl_inst.push((
+                mixed_tailcall,
+                LTLInst::Ltailcall(Either::Right(Either::Right("realloc"))),
+            ));
+            prog.ltl_inst.push((mixed_return, LTLInst::Lreturn));
 
             prog.run();
 
@@ -26749,6 +27151,14 @@ mod tests {
                 .emit_function_return
                 .iter()
                 .any(|(func, _)| *func == ordinary_wrapper));
+            assert!(prog
+                .func_has_lreturn
+                .iter()
+                .any(|(func,)| *func == mixed_wrapper));
+            assert!(prog
+                .emit_function_return_type_xtype_candidate
+                .iter()
+                .any(|row| row == &(mixed_wrapper, XType::Xptr)));
         });
     }
 

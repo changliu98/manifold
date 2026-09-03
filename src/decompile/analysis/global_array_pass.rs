@@ -24,8 +24,15 @@ ascent_par! {
     relation instr_in_function(Node, Address);
     // [start, end) of every allocated data section, the outer bound on how far a global can extend.
     relation data_section_range(Address, Address);
+    // Exact NOBITS/uninitialized section ranges lifted from the object image.
+    // These bytes are all zero at process start and therefore admit a single
+    // byte-backed C owner without reconstructing an initializer.
+    relation uninitialized_data_range(Address, Address);
     relation pointer_in_data(Address, Address);
     relation global_var_ref(Ident);
+    relation global_addr_reg(Ident, RTLReg);
+    relation known_func_param_pointee_size(Symbol, usize, usize);
+    relation emit_function(Address, Symbol, Node);
     relation abi_pointer_size(i64);
     // EDB lifted from the object image immediately before this pass runs.
     relation initialized_data_range(Address, Arc<Vec<u8>>);
@@ -131,6 +138,69 @@ ascent_par! {
     // layout can enlarge storage past the ELF object boundary.
     #[local] relation global_storage_extent_candidate(Ident, usize);
 
+    // A known external ABI can size a global out-parameter just as exactly as
+    // a stack out-parameter.  Join the call argument to one conflict-free
+    // global-address origin and require the complete object to stay in its
+    // allocated section.
+    #[local] relation external_global_object_candidate(Node, usize, Ident, usize);
+    external_global_object_candidate(*call, *pos, *ident, *bytes) <--
+        rtl_inst(call, ?RTLInst::Icall(_, either::Either::Right(either::Either::Right(name)), args, _, _)),
+        !emit_function(_, name, _),
+        known_func_param_pointee_size(name, pos, bytes),
+        if let Some(argument) = args.get(*pos),
+        global_addr_reg(ident, argument),
+        global_var_ref(ident),
+        data_section_range(start, end),
+        let base = *ident as Address,
+        if let Ok(extent) = u64::try_from(*bytes),
+        if *bytes > 0 && *bytes <= (1 << 20),
+        if let Some(object_end) = base.checked_add(extent),
+        if base >= *start && object_end <= *end;
+
+    #[local] relation external_global_object_conflict(Node, usize);
+    external_global_object_conflict(call, pos) <--
+        external_global_object_candidate(call, pos, left, _),
+        external_global_object_candidate(call, pos, right, _),
+        if left != right;
+
+    #[local] relation external_global_object(Ident, usize);
+    external_global_object(ident, bytes) <--
+        external_global_object_candidate(call, pos, ident, bytes),
+        !external_global_object_conflict(call, pos);
+
+    global_storage_extent_candidate(ident, bytes) <--
+        external_global_object(ident, bytes);
+
+    // An ELF data-object extent is authoritative physical storage even when
+    // code reaches the object only through a pointer stored elsewhere (for
+    // example, a static scratch buffer).  Preserve non-scalar objects as one
+    // owner instead of emitting only the first machine word.  Conflicting
+    // aliases at the same address fail closed rather than choosing a size.
+    #[local] relation referenced_symbol_extent_candidate(Ident, usize);
+    referenced_symbol_extent_candidate(ident, *size) <--
+        global_var_ref(ident),
+        symbol_address(ident, addr),
+        symbol_size(addr, size, _),
+        if *size > 0;
+
+    #[local] relation referenced_symbol_extent_conflict(Ident);
+    referenced_symbol_extent_conflict(ident) <--
+        referenced_symbol_extent_candidate(ident, left),
+        referenced_symbol_extent_candidate(ident, right),
+        if left != right;
+
+    #[local] relation exact_referenced_symbol_extent(Ident, usize);
+    exact_referenced_symbol_extent(ident, size) <--
+        referenced_symbol_extent_candidate(ident, size),
+        !referenced_symbol_extent_conflict(ident);
+
+    global_storage_extent_candidate(ident, *size) <--
+        exact_referenced_symbol_extent(ident, size),
+        // Scalar declarations already preserve every directly representable
+        // machine width.  Larger objects need aggregate storage even when no
+        // indexed access exposes their source-level element type.
+        if *size > 8;
+
     global_storage_extent_candidate(base_ident, *size) <--
         interior_to_base_ident(_interior_ident, base_ident, _offset),
         symbol_address(base_ident, base_addr),
@@ -188,6 +258,51 @@ ascent_par! {
     global_storage_extent(ident, extent) <--
         global_storage_extent_candidate(ident, _),
         agg extent = max_usize(candidate) in global_storage_extent_candidate(ident, candidate);
+
+    // Once physical storage has an exact owner, every separately referenced
+    // interior label is a byte coordinate of that owner.  Select the nearest
+    // containing owner when extents nest; this prevents an interior label from
+    // becoming a second C object that does not observe external writes.
+    #[local] relation storage_extent_referenced_ident(Ident);
+    storage_extent_referenced_ident(ident) <-- global_var_ref(ident);
+    storage_extent_referenced_ident(ident) <-- global_addr_access(ident, _, _, _);
+
+    #[local] relation storage_extent_member_candidate(Ident, Ident, i64);
+    storage_extent_member_candidate(*member, *owner, offset) <--
+        global_storage_extent(owner, extent),
+        storage_extent_referenced_ident(member),
+        let base = *owner as Address,
+        let member_address = *member as Address,
+        if member_address > base,
+        if let Ok(extent_u64) = u64::try_from(*extent),
+        if let Some(end) = base.checked_add(extent_u64),
+        if member_address < end,
+        if let Ok(offset) = i64::try_from(member_address - base);
+
+    #[local] relation storage_extent_member_has_nearer_owner(Ident, Ident);
+    storage_extent_member_has_nearer_owner(member, owner) <--
+        storage_extent_member_candidate(member, owner, _),
+        !external_global_object(owner, _),
+        storage_extent_member_candidate(member, authoritative, _),
+        external_global_object(authoritative, _),
+        if authoritative != owner;
+    storage_extent_member_has_nearer_owner(member, owner) <--
+        storage_extent_member_candidate(member, owner, _),
+        external_global_object(owner, _),
+        storage_extent_member_candidate(member, nearer, _),
+        external_global_object(nearer, _),
+        if nearer > owner;
+    storage_extent_member_has_nearer_owner(member, owner) <--
+        storage_extent_member_candidate(member, owner, _),
+        !external_global_object(owner, _),
+        storage_extent_member_candidate(member, nearer, _),
+        !external_global_object(nearer, _),
+        if nearer > owner;
+
+    #[local] relation storage_extent_member(Ident, Ident, i64);
+    storage_extent_member(member, owner, offset) <--
+        storage_extent_member_candidate(member, owner, offset),
+        !storage_extent_member_has_nearer_owner(member, owner);
 
     relation global_distinct_offset(Ident, i64);
 
@@ -609,6 +724,13 @@ ascent_par! {
     #[local] relation global_base_addr(Ident, Address);
     global_base_addr(*ident, *ident as Address) <--
         global_addr_access(ident, _, _, _);
+    global_base_addr(*ident, *ident as Address) <--
+        global_addr_reg(ident, _);
+    global_base_addr(target_ident, *target) <--
+        pointer_in_data(_, target),
+        uninitialized_data_range(start, end),
+        if *target >= *start && *target < *end,
+        if let Ok(target_ident) = Ident::try_from(*target);
 
     #[local] relation global_section_end(Ident, Address);
     global_section_end(ident, *end) <--
@@ -662,6 +784,83 @@ ascent_par! {
         global_base_addr(ident, base),
         agg next = ascent::aggregators::min(a)
             in global_next_represented_object(ident, a);
+
+    // In a stripped NOBITS section, anonymous local object sizes are absent.
+    // Represent a variable-indexed object or a relocation target as one byte
+    // region up to the next independently rooted object.  Constant-only
+    // labels inside that interval become offsets of the same owner rather
+    // than tiny overlapping declarations.  A root is independent only when
+    // it has its own variable indexing, is pointed to, has multiple observed
+    // fields, or retains an authoritative ELF size.
+    #[local] relation sized_data_root(Address);
+    sized_data_root(*addr) <--
+        symbol_size(addr, size, _),
+        if *size > 0;
+
+    #[local] relation uninitialized_region_owner(Ident, Address, Address);
+    uninitialized_region_owner(*ident, *start, *end) <--
+        ev_has_var(ident),
+        global_base_addr(ident, base),
+        uninitialized_data_range(start, end),
+        if *base >= *start && *base < *end,
+        !sized_data_root(base);
+    uninitialized_region_owner(owner, *start, *end) <--
+        pointer_in_data(_, target),
+        uninitialized_data_range(start, end),
+        if *target >= *start && *target < *end,
+        if let Ok(owner) = Ident::try_from(*target),
+        !sized_data_root(target);
+    uninitialized_region_owner(*ident, *start, *end) <--
+        global_addr_reg(ident, _),
+        global_base_addr(ident, base),
+        uninitialized_data_range(start, end),
+        if *base >= *start && *base < *end,
+        !sized_data_root(base);
+
+    #[local] relation uninitialized_independent_root(Address);
+    uninitialized_independent_root(*owner as Address) <--
+        uninitialized_region_owner(owner, _, _);
+    uninitialized_independent_root(*ident as Address) <--
+        global_base_addr(ident, base),
+        array_offset_count(ident, count),
+        if *count >= 2,
+        uninitialized_data_range(start, end),
+        if *base >= *start && *base < *end;
+    uninitialized_independent_root(*addr) <--
+        sized_data_root(addr),
+        uninitialized_data_range(start, end),
+        if *addr >= *start && *addr < *end;
+
+    #[local] relation uninitialized_region_boundary(Ident, Address);
+    uninitialized_region_boundary(owner, *other) <--
+        uninitialized_region_owner(owner, _, end),
+        let base = *owner as Address,
+        uninitialized_independent_root(other),
+        if *other > base && *other < *end;
+    uninitialized_region_boundary(owner, *end) <--
+        uninitialized_region_owner(owner, _, end);
+
+    #[local] relation uninitialized_region_end(Ident, Address);
+    uninitialized_region_end(owner, end) <--
+        uninitialized_region_boundary(owner, _),
+        agg end = ascent::aggregators::min(boundary)
+            in uninitialized_region_boundary(owner, boundary);
+
+    global_storage_extent_candidate(*owner, extent) <--
+        uninitialized_region_end(owner, end),
+        let base = *owner as Address,
+        if let Some(extent_u64) = end.checked_sub(base),
+        if let Ok(extent) = usize::try_from(extent_u64),
+        if extent > 8;
+
+    #[local] relation uninitialized_region_member(Ident, Ident, i64);
+    uninitialized_region_member(*member, *owner, offset) <--
+        uninitialized_region_end(owner, end),
+        global_var_ref(member),
+        let base = *owner as Address,
+        let member_address = *member as Address,
+        if member_address > base && member_address < *end,
+        if let Ok(offset) = i64::try_from(member_address - base);
 
     #[local] relation global_sym_size_known(Ident);
     global_sym_size_known(ident) <--
@@ -762,6 +961,12 @@ ascent_par! {
         interior_to_base_ident(interior_ident, base_ident, offset),
         symbol_address(base_ident, base_addr),
         symbol_size(base_addr, _size, name);
+    emit_address_as_offset(interior_ident, *name, offset) <--
+        uninitialized_region_member(interior_ident, base_ident, offset),
+        base_ident_to_symbol(base_ident, name);
+    emit_address_as_offset(interior_ident, *name, offset) <--
+        storage_extent_member(interior_ident, base_ident, offset),
+        base_ident_to_symbol(base_ident, name);
 
     // Relocation-backed string tables.  Object bytes remain an EDB concern;
     // once lifted, slot classification, same-stride runs, maximality, and the
@@ -827,10 +1032,19 @@ ascent_par! {
         if *slot >= terminator,
         if *slot < terminator_end;
 
-    is_global_array(ident, element_size, *real_count + 1) <--
+    #[local] relation relocated_single_terminator_has_relocation(Address);
+    relocated_single_terminator_has_relocation(*base) <--
+        relocated_string_slot(base),
+        abi_pointer_size(pointer_size),
+        if let Ok(stride) = u64::try_from(*pointer_size),
+        if let Some(terminator) = base.checked_add(stride),
+        if let Some(terminator_end) = terminator.checked_add(stride),
+        pointer_in_data(slot, _),
+        if *slot >= terminator && *slot < terminator_end;
+
+    #[local] relation relocated_valid_string_run(Address, u64, usize);
+    relocated_valid_string_run(*base, *stride, *real_count) <--
         relocated_maximal_string_run(base, stride, last, real_count),
-        if let Ok(ident) = Ident::try_from(*base),
-        if let Ok(element_size) = usize::try_from(*stride),
         initialized_data_range(range_start, bytes),
         if initialized_range_supports_relocated_layout(
             *range_start,
@@ -840,6 +1054,70 @@ ascent_par! {
             *real_count,
         ),
         !relocated_run_terminator_has_relocation(base, stride, last);
+
+    #[local] relation relocated_single_string_boundary(Address);
+    relocated_single_string_boundary(*base) <--
+        relocated_string_slot(base),
+        abi_pointer_size(pointer_size),
+        if let Ok(pointer_width) = usize::try_from(*pointer_size),
+        if let Some(extent) = pointer_width.checked_mul(2),
+        symbol_size(base, size, _),
+        if *size == extent;
+    relocated_single_string_boundary(*base) <--
+        relocated_string_slot(base),
+        abi_pointer_size(pointer_size),
+        if let Ok(stride) = u64::try_from(*pointer_size),
+        if let Some(extent) = stride.checked_mul(2),
+        if let Some(boundary) = base.checked_add(extent),
+        symbol_size(next, size, _),
+        if *next == boundary && *size > 0;
+    relocated_single_string_boundary(*base) <--
+        relocated_string_slot(base),
+        abi_pointer_size(pointer_size),
+        if let Ok(stride) = u64::try_from(*pointer_size),
+        if let Some(extent) = stride.checked_mul(2),
+        if let Some(boundary) = base.checked_add(extent),
+        pointer_in_data(next_slot, _),
+        if *next_slot == boundary;
+    relocated_single_string_boundary(*base) <--
+        relocated_string_slot(base),
+        abi_pointer_size(pointer_size),
+        if let Ok(stride) = u64::try_from(*pointer_size),
+        if let Some(extent) = stride.checked_mul(2),
+        if let Some(boundary) = base.checked_add(extent),
+        data_section_range(start, section_end),
+        if *base >= *start && boundary == *section_end;
+
+    // A single relocated string pointer followed by one complete zero word is
+    // the one-element form of the same null-terminated table recognized by
+    // relocated_maximal_string_run.  The initialized image and pointer width
+    // prove the two-slot minimum even though there is no second relocation
+    // from which to infer a stride.
+    is_global_array(ident, element_size, 2usize) <--
+        relocated_candidate_base(base),
+        relocated_string_slot(base),
+        relocated_single_string_boundary(base),
+        !relocated_valid_string_run(base, _, _),
+        abi_pointer_size(pointer_size),
+        if matches!(*pointer_size, 4 | 8),
+        if let Ok(stride) = u64::try_from(*pointer_size),
+        if let Ok(element_size) = usize::try_from(stride),
+        initialized_data_range(range_start, bytes),
+        if initialized_range_supports_relocated_layout(
+            *range_start,
+            bytes.as_slice(),
+            *base,
+            stride,
+            1,
+        ),
+        !relocated_single_terminator_has_relocation(base),
+        if let Ok(ident) = Ident::try_from(*base);
+
+    is_global_array(ident, element_size, *real_count + 1) <--
+        relocated_valid_string_run(base, stride, real_count),
+        if let Ok(ident) = Ident::try_from(*base),
+        if let Ok(element_size) = usize::try_from(*stride),
+        if *real_count >= 2;
 
 }
 
@@ -971,6 +1249,31 @@ fn load_initialized_data_ranges(
     Ok(ranges)
 }
 
+fn load_uninitialized_data_ranges(
+    binary_path: &std::path::Path,
+) -> Result<Vec<(Address, Address)>, String> {
+    let bytes = std::fs::read(binary_path)
+        .map_err(|error| format!("failed to read {}: {error}", binary_path.display()))?;
+    let object = object::File::parse(&*bytes)
+        .map_err(|error| format!("failed to parse {}: {error}", binary_path.display()))?;
+    let mut ranges = Vec::new();
+    for section in object.sections() {
+        if section.kind() != object::SectionKind::UninitializedData
+            || section.address() == 0
+            || section.size() == 0
+        {
+            continue;
+        }
+        let Some(end) = section.address().checked_add(section.size()) else {
+            continue;
+        };
+        ranges.push((section.address(), end));
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    Ok(ranges)
+}
+
 impl IRPass for GlobalArrayPass {
     fn name(&self) -> &'static str {
         "global_array"
@@ -980,8 +1283,18 @@ impl IRPass for GlobalArrayPass {
         // Lift initialized object bytes into EDB facts.  Parsing the object is
         // frontend work; all classification and aggregation happens below in
         // GlobalArrayPassProgram.
-        if let Some(binary_path) = db.binary_path.as_deref() {
-            match load_initialized_data_ranges(binary_path) {
+        if let Some(binary_path) = db.binary_path.clone() {
+            match load_uninitialized_data_ranges(&binary_path) {
+                Ok(ranges) => {
+                    for range in ranges {
+                        db.rel_push("uninitialized_data_range", range);
+                    }
+                }
+                Err(error) => {
+                    log::warn!("global_array: cannot inspect uninitialized data ranges: {error}")
+                }
+            }
+            match load_initialized_data_ranges(&binary_path) {
                 Ok(data_ranges) => {
                     for (start, bytes) in data_ranges {
                         db.rel_push("initialized_data_range", (start, Arc::new(bytes)));
@@ -1174,6 +1487,7 @@ mod relocated_string_array_tests {
         assert!(pass.inputs().contains(&"pointer_in_data"));
         assert!(pass.inputs().contains(&"global_var_ref"));
         assert!(pass.inputs().contains(&"initialized_data_range"));
+        assert!(pass.inputs().contains(&"uninitialized_data_range"));
         assert!(pass.inputs().contains(&"bounded_absolute_data_access"));
         assert!(pass.outputs().contains(&"retained_initialized_data_range"));
         assert!(pass.outputs().contains(&"is_global_array"));
@@ -1197,6 +1511,171 @@ mod relocated_string_array_tests {
             .global_storage_extent
             .iter()
             .any(|fact| *fact == (owner, 16)));
+    }
+
+    #[test]
+    fn referenced_sized_object_publishes_exact_non_scalar_storage() {
+        let owner = 0x404030;
+        let mut prog = GlobalArrayPassProgram::default();
+        prog.global_var_ref.push((owner,));
+        prog.base_ident_to_symbol.push((owner, "scratch"));
+        prog.symbols.push((owner as Address, "scratch", "OBJECT"));
+        prog.symbol_size.push((owner as Address, 256, "scratch"));
+
+        prog.run();
+
+        assert!(prog
+            .global_storage_extent
+            .iter()
+            .any(|fact| *fact == (owner, 256)));
+
+        let mut conflicting = GlobalArrayPassProgram::default();
+        conflicting.global_var_ref.push((owner,));
+        conflicting.base_ident_to_symbol.push((owner, "scratch"));
+        conflicting
+            .symbols
+            .push((owner as Address, "scratch", "OBJECT"));
+        conflicting
+            .symbol_size
+            .extend([(owner as Address, 128, "a"), (owner as Address, 256, "b")]);
+        conflicting.run();
+
+        assert!(!conflicting
+            .global_storage_extent
+            .iter()
+            .any(|fact| fact.0 == owner));
+    }
+
+    #[test]
+    fn uninitialized_indexed_region_absorbs_constant_interior_labels() {
+        let owner: Ident = 0x1000;
+        let interior: Ident = 0x100a;
+        let next: Ident = 0x1100;
+        let mut prog = GlobalArrayPassProgram::default();
+        prog.uninitialized_data_range.push((0x800, 0x1400));
+        prog.global_addr_access
+            .push((owner, 0, 0x200, MemoryChunk::MInt8Unsigned));
+        prog.global_access_ev
+            .push((owner, 0, MemoryChunk::MInt8Unsigned, true, true));
+        prog.global_addr_access.extend([
+            (next, 0, 0x300, MemoryChunk::MAny64),
+            (next, 8, 0x308, MemoryChunk::MAny64),
+        ]);
+        prog.global_var_ref.extend([(owner,), (interior,), (next,)]);
+        prog.base_ident_to_symbol
+            .extend([(owner, "buffer"), (interior, "inside"), (next, "next")]);
+
+        prog.run();
+
+        assert!(prog
+            .global_storage_extent
+            .iter()
+            .any(|fact| *fact == (owner, 0x100)));
+        assert!(prog
+            .emit_address_as_offset
+            .iter()
+            .any(|fact| *fact == (interior, "buffer", 10)));
+    }
+
+    #[test]
+    fn uninitialized_relocation_target_stops_at_multifield_root() {
+        let owner: Ident = 0x1200;
+        let next: Ident = 0x1300;
+        let mut prog = GlobalArrayPassProgram::default();
+        prog.uninitialized_data_range.push((0x1000, 0x1400));
+        prog.pointer_in_data.push((0x900, owner as Address));
+        prog.global_var_ref.extend([(owner,), (next,)]);
+        prog.global_addr_access.extend([
+            (next, 0, 0x300, MemoryChunk::MAny64),
+            (next, 8, 0x308, MemoryChunk::MAny64),
+        ]);
+
+        prog.run();
+
+        assert!(prog
+            .global_storage_extent
+            .iter()
+            .any(|fact| *fact == (owner, 0x100)));
+    }
+
+    #[test]
+    fn external_abi_sizes_global_object_and_owns_interior_label() {
+        let call = 0x400;
+        let argument = 0x500;
+        let owner: Ident = 0x1200;
+        let interior: Ident = owner + 16;
+        let mut prog = GlobalArrayPassProgram::default();
+        prog.rtl_inst.push((
+            call,
+            RTLInst::Icall(
+                None,
+                either::Either::Right(either::Either::Right("sigemptyset")),
+                Arc::new(vec![argument]),
+                None,
+                call + 1,
+            ),
+        ));
+        prog.global_addr_reg.push((owner, argument));
+        prog.global_var_ref.push((owner,));
+        prog.global_addr_access
+            .push((interior, 0, call + 2, MemoryChunk::MAny64));
+        prog.base_ident_to_symbol
+            .extend([(owner, "signals"), (interior, "signals_inside")]);
+        prog.data_section_range.push((0x1000, 0x2000));
+        prog.known_func_param_pointee_size
+            .push(("sigemptyset", 0, 128));
+
+        prog.run();
+
+        assert!(prog
+            .global_storage_extent
+            .iter()
+            .any(|fact| *fact == (owner, 128)));
+        assert!(prog
+            .emit_address_as_offset
+            .iter()
+            .any(|fact| *fact == (interior, "signals", 16)));
+    }
+
+    #[test]
+    fn address_taken_uninitialized_buffers_bound_each_other() {
+        let first: Ident = 0x1000;
+        let second: Ident = 0x41000;
+        let mut prog = GlobalArrayPassProgram::default();
+        prog.uninitialized_data_range.push((0x800, 0x82000));
+        prog.global_addr_reg.extend([(first, 1), (second, 2)]);
+        prog.global_var_ref.extend([(first,), (second,)]);
+
+        prog.run();
+
+        assert!(prog
+            .global_storage_extent
+            .iter()
+            .any(|fact| *fact == (first, 0x40000)));
+    }
+
+    #[test]
+    fn single_relocated_string_plus_zero_word_is_a_pointer_array() {
+        let base: Address = 0x1000;
+        let target: Address = 0x2000;
+        let mut prog = GlobalArrayPassProgram::default();
+        prog.abi_pointer_size.push((8,));
+        prog.global_var_ref.push((base as Ident,));
+        prog.pointer_in_data.push((base, target));
+        prog.pointer_in_data.push((base + 16, 0x3000));
+        prog.initialized_data_range
+            .push((base, Arc::new(vec![0; 16])));
+        prog.initialized_data_range
+            .push((target, Arc::new(b"-\0".to_vec())));
+        prog.initialized_data_range
+            .push((0x3000, Arc::new(vec![1, 2, 3, 4])));
+
+        prog.run();
+
+        assert!(prog
+            .is_global_array
+            .iter()
+            .any(|fact| *fact == (base as Ident, 8, 2)));
     }
 
     #[test]

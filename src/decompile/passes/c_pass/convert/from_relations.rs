@@ -6163,7 +6163,10 @@ fn pointee_scales_ctype(pointee: &CType) -> bool {
     )
 }
 
-/// True when e is the char*-rebased byte-address shape this fix materializes, returning the inner char* expression and T *, so a further byte offset FOLDS in instead of re-scaling.
+/// Recognize a typed pointer already rebased through char-sized arithmetic.
+/// Ordinary machine address arithmetic can fold a later raw byte offset into
+/// this expression; an actual dereference/memcpy address must instead preserve
+/// the explicit T-pointer element stride selected by Clight.
 fn peel_char_byte_rebase(e: &CExpr) -> Option<(CType, CExpr)> {
     let (ptr_ty, inner) = match e {
         CExpr::Cast(CType::Pointer(pointee, q), inner) if pointee_scales_ctype(pointee) => {
@@ -6172,36 +6175,42 @@ fn peel_char_byte_rebase(e: &CExpr) -> Option<(CType, CExpr)> {
         _ => return None,
     };
     let byte_expr = match inner {
-        CExpr::Paren(p) => p.as_ref(),
+        CExpr::Paren(inner) => inner.as_ref(),
         other => other,
     };
-    // The byte expression must itself be additive arithmetic whose left operand is a `(char *)` base, i.e. already byte-addressed.
-    if let CExpr::Binary(BinaryOp::Add | BinaryOp::Sub, l, _) = byte_expr {
-        let l_is_char_ptr = matches!(
-            l.as_ref(),
-            CExpr::Cast(CType::Pointer(p, _), _) if matches!(p.as_ref(), CType::Int(IntSize::Char, _))
+    if let CExpr::Binary(BinaryOp::Add | BinaryOp::Sub, lhs, _) = byte_expr {
+        let char_base = matches!(
+            lhs.as_ref(),
+            CExpr::Cast(CType::Pointer(pointee, _), _)
+                if matches!(pointee.as_ref(), CType::Int(IntSize::Char, _))
         );
-        if l_is_char_ptr {
+        if char_base {
             return Some((ptr_ty, byte_expr.clone()));
         }
     }
     None
 }
 
-/// A pointer base whose sibling integral operand is a raw BYTE offset that must not be re-scaled: a bare T * Var whose B2 rebase did not fire, or the char*-rebased shape this fix produces.
+/// A scaling pointer whose sibling integral operand is a raw byte offset.
+/// Bare pointer variables always need byte rebasing. An already-rebased typed
+/// pointer does so only outside a proven memory-access address.
 fn scaling_ptr_byte_base(
     e: &CExpr,
     types: &HashMap<String, CType>,
+    preserve_typed_stride: bool,
 ) -> Option<(CType, Option<CExpr>)> {
     match e {
-        CExpr::Paren(inner) => scaling_ptr_byte_base(inner, types),
+        CExpr::Paren(inner) => scaling_ptr_byte_base(inner, types, preserve_typed_stride),
         CExpr::Var(name) => match types.get(name) {
             Some(CType::Pointer(pointee, _)) if pointee_scales_ctype(pointee) => {
                 Some((types.get(name).cloned().unwrap(), None))
             }
             _ => None,
         },
-        _ => peel_char_byte_rebase(e).map(|(ty, inner)| (ty, Some(inner))),
+        _ if !preserve_typed_stride => {
+            peel_char_byte_rebase(e).map(|(ty, inner)| (ty, Some(inner)))
+        }
+        _ => None,
     }
 }
 
@@ -6300,6 +6309,14 @@ fn transform_for_initializer(init: &ForInit, transform: &impl Fn(&CExpr) -> CExp
 }
 
 fn repair_arith_expr(e: &CExpr, types: &HashMap<String, CType>) -> CExpr {
+    repair_arith_expr_context(e, types, false)
+}
+
+fn repair_arith_expr_context(
+    e: &CExpr,
+    types: &HashMap<String, CType>,
+    preserve_typed_stride: bool,
+) -> CExpr {
     // &arr on an array-typed local is pointer-to-array, so &arr + i strides by whole arrays; rewrite it to the bare name, which decays to an element pointer.
     if let CExpr::Unary(UnaryOp::AddrOf, inner) = e {
         if let CExpr::Var(name) = inner.as_ref() {
@@ -6310,12 +6327,14 @@ fn repair_arith_expr(e: &CExpr, types: &HashMap<String, CType>) -> CExpr {
     }
     match e {
         CExpr::Binary(op, l, r) => {
-            let l_raw = repair_arith_expr(l, types);
-            let r_raw = repair_arith_expr(r, types);
-            // Byte-offset re-scaling fix on the UN-stripped children: re-express a scaling base plus a raw byte offset through char*, since stripping would forge a bare Var and hide a genuine element index.
+            let l_raw = repair_arith_expr_context(l, types, preserve_typed_stride);
+            let r_raw = repair_arith_expr_context(r, types, preserve_typed_stride);
+            // Byte-offset re-scaling fix on the UN-stripped children:
+            // re-express a bare scaling base plus a raw byte offset through
+            // char*. Explicit pointer casts keep their C element stride.
             if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
-                let l_byte_base = scaling_ptr_byte_base(&l_raw, types);
-                let r_byte_base = scaling_ptr_byte_base(&r_raw, types);
+                let l_byte_base = scaling_ptr_byte_base(&l_raw, types, preserve_typed_stride);
+                let r_byte_base = scaling_ptr_byte_base(&r_raw, types, preserve_typed_stride);
                 match (l_byte_base, r_byte_base) {
                     (Some((lty, inner)), None) if !cexpr_is_pointer(&r_raw, types) => {
                         return rebase_byte_add_through_char(*op, l_raw, inner, r_raw, lty);
@@ -6408,7 +6427,8 @@ fn repair_arith_expr(e: &CExpr, types: &HashMap<String, CType>) -> CExpr {
             CExpr::Binary(*op, Box::new(l), Box::new(r))
         }
         CExpr::Unary(op, inner) => {
-            let inner = repair_arith_expr(inner, types);
+            let child_preserves_stride = preserve_typed_stride || matches!(op, UnaryOp::Deref);
+            let inner = repair_arith_expr_context(inner, types, child_preserves_stride);
             // `-ptr` and `~ptr` are invalid C; cast the pointer operand to long (Deref/AddrOf/Not are valid on pointers and left alone).
             let inner = if matches!(op, UnaryOp::Neg | UnaryOp::BitNot)
                 && cexpr_is_pointer(&inner, types)
@@ -6427,57 +6447,102 @@ fn repair_arith_expr(e: &CExpr, types: &HashMap<String, CType>) -> CExpr {
         }
         CExpr::Assign(op, l, r) => CExpr::Assign(
             *op,
-            Box::new(repair_arith_expr(l, types)),
-            Box::new(repair_arith_expr(r, types)),
+            Box::new(repair_arith_expr_context(l, types, preserve_typed_stride)),
+            Box::new(repair_arith_expr_context(r, types, preserve_typed_stride)),
         ),
         CExpr::Ternary(c, t, f) => CExpr::Ternary(
-            Box::new(repair_arith_expr(c, types)),
-            Box::new(repair_arith_expr(t, types)),
-            Box::new(repair_arith_expr(f, types)),
+            Box::new(repair_arith_expr_context(c, types, preserve_typed_stride)),
+            Box::new(repair_arith_expr_context(t, types, preserve_typed_stride)),
+            Box::new(repair_arith_expr_context(f, types, preserve_typed_stride)),
         ),
-        CExpr::Call(f, args) => CExpr::Call(
-            Box::new(repair_arith_expr(f, types)),
-            args.iter().map(|a| repair_arith_expr(a, types)).collect(),
-        ),
-        CExpr::Cast(ty, inner) => {
-            CExpr::Cast(ty.clone(), Box::new(repair_arith_expr(inner, types)))
+        CExpr::Call(f, args) => {
+            let is_memcpy = matches!(f.as_ref(), CExpr::Var(name) if name == "__builtin_memcpy");
+            CExpr::Call(
+                Box::new(repair_arith_expr_context(f, types, preserve_typed_stride)),
+                args.iter()
+                    .enumerate()
+                    .map(|(index, arg)| {
+                        repair_arith_expr_context(
+                            arg,
+                            types,
+                            preserve_typed_stride || (is_memcpy && index < 2),
+                        )
+                    })
+                    .collect(),
+            )
         }
+        CExpr::Cast(ty, inner) => CExpr::Cast(
+            ty.clone(),
+            Box::new(repair_arith_expr_context(
+                inner,
+                types,
+                preserve_typed_stride,
+            )),
+        ),
         CExpr::Member(inner, fld) => {
             // `e.field` where e is a pointer must be `e->field`; type recovery sometimes declares the base as a pointer while emitting a value member access ("X is a pointer; use ->").
-            let inner = repair_arith_expr(inner, types);
+            let inner = repair_arith_expr_context(inner, types, preserve_typed_stride);
             if cexpr_is_pointer(&inner, types) {
                 CExpr::MemberPtr(Box::new(inner), fld.clone())
             } else {
                 CExpr::Member(Box::new(inner), fld.clone())
             }
         }
-        CExpr::MemberPtr(inner, fld) => {
-            CExpr::MemberPtr(Box::new(repair_arith_expr(inner, types)), fld.clone())
-        }
-        CExpr::Index(a, i) => CExpr::Index(
-            Box::new(repair_arith_expr(a, types)),
-            Box::new(repair_arith_expr(i, types)),
+        CExpr::MemberPtr(inner, fld) => CExpr::MemberPtr(
+            Box::new(repair_arith_expr_context(
+                inner,
+                types,
+                preserve_typed_stride,
+            )),
+            fld.clone(),
         ),
-        CExpr::SizeofExpr(inner) => CExpr::SizeofExpr(Box::new(repair_arith_expr(inner, types))),
-        CExpr::Paren(inner) => CExpr::Paren(Box::new(repair_arith_expr(inner, types))),
+        CExpr::Index(a, i) => CExpr::Index(
+            Box::new(repair_arith_expr_context(a, types, preserve_typed_stride)),
+            Box::new(repair_arith_expr_context(i, types, preserve_typed_stride)),
+        ),
+        CExpr::SizeofExpr(inner) => CExpr::SizeofExpr(Box::new(repair_arith_expr_context(
+            inner,
+            types,
+            preserve_typed_stride,
+        ))),
+        CExpr::Paren(inner) => CExpr::Paren(Box::new(repair_arith_expr_context(
+            inner,
+            types,
+            preserve_typed_stride,
+        ))),
         CExpr::CompoundLit(ty, initializers) => CExpr::CompoundLit(
             ty.clone(),
             initializers
                 .iter()
                 .map(|init| {
-                    transform_initializer_exprs(init, &|expr| repair_arith_expr(expr, types))
+                    transform_initializer_exprs(init, &|expr| {
+                        repair_arith_expr_context(expr, types, preserve_typed_stride)
+                    })
                 })
                 .collect(),
         ),
         CExpr::Generic(selector, arms) => CExpr::Generic(
-            Box::new(repair_arith_expr(selector, types)),
+            Box::new(repair_arith_expr_context(
+                selector,
+                types,
+                preserve_typed_stride,
+            )),
             arms.iter()
-                .map(|(ty, arm)| (ty.clone(), repair_arith_expr(arm, types)))
+                .map(|(ty, arm)| {
+                    (
+                        ty.clone(),
+                        repair_arith_expr_context(arm, types, preserve_typed_stride),
+                    )
+                })
                 .collect(),
         ),
         CExpr::StmtExpr(stmts, inner) => CExpr::StmtExpr(
             stmts.iter().map(|s| repair_arith_stmt(s, types)).collect(),
-            Box::new(repair_arith_expr(inner, types)),
+            Box::new(repair_arith_expr_context(
+                inner,
+                types,
+                preserve_typed_stride,
+            )),
         ),
         other => other.clone(),
     }
@@ -9868,6 +9933,59 @@ mod escaped_stack_array_tests {
             ),
             "late storage coalescing changed an int-pointer stride: {lhs:?}",
         );
+    }
+
+    #[test]
+    fn explicit_typed_pointer_after_byte_rebase_keeps_element_stride() {
+        let int_ptr = CType::ptr(CType::int());
+        let byte_address = CExpr::Cast(
+            int_ptr.clone(),
+            Box::new(CExpr::Paren(Box::new(CExpr::Binary(
+                BinaryOp::Add,
+                Box::new(CExpr::Cast(
+                    CType::ptr(CType::char_signed()),
+                    Box::new(CExpr::var("base")),
+                )),
+                Box::new(CExpr::var("byte_offset")),
+            )))),
+        );
+        let expression = CExpr::Binary(
+            BinaryOp::Add,
+            Box::new(byte_address.clone()),
+            Box::new(CExpr::int(1)),
+        );
+        let types = HashMap::from([
+            ("base".to_string(), int_ptr.clone()),
+            ("byte_offset".to_string(), CType::long()),
+        ]);
+
+        let ordinary = repair_arith_expr(&expression, &types);
+        assert!(matches!(ordinary, CExpr::Cast(ty, _) if ty == int_ptr));
+
+        let repaired = repair_arith_expr_context(&expression, &types, true);
+        assert!(matches!(
+            repaired,
+            CExpr::Binary(BinaryOp::Add, lhs, rhs)
+                if lhs.as_ref() == &byte_address && rhs.as_ref() == &CExpr::int(1)
+        ));
+
+        let store = memcpy_store_expr(CType::int(), expression, CExpr::int(7));
+        let repaired_store = repair_arith_expr(&store, &types);
+        assert!(matches!(
+            repaired_store,
+            CExpr::Call(_, args)
+                if matches!(
+                    args.first(),
+                    Some(CExpr::Cast(CType::Pointer(pointee, _), address))
+                        if pointee.as_ref() == &CType::Void
+                            && matches!(
+                                address.as_ref(),
+                                CExpr::Binary(BinaryOp::Add, lhs, rhs)
+                                    if lhs.as_ref() == &byte_address
+                                        && rhs.as_ref() == &CExpr::int(1)
+                            )
+                )
+        ));
     }
 
     #[test]

@@ -336,6 +336,8 @@ fn is_packed_alu_mnem(mnem: &str) -> bool {
         | "PUNPCKLBW" | "PUNPCKLWD" | "PUNPCKLDQ" | "PUNPCKLQDQ"
         | "PUNPCKHBW" | "PUNPCKHWD" | "PUNPCKHDQ" | "PUNPCKHQDQ"
         | "PACKSSWB" | "PACKSSDW" | "PACKUSWB" | "PACKUSDW" | "PBLENDW" | "PBLENDVB"
+        // packed floating-point lane permutations
+        | "SHUFPS" | "SHUFPD" | "UNPCKLPS" | "UNPCKHPS" | "UNPCKLPD" | "UNPCKHPD"
         // movemask / packed-vector convert (note scalar forms are CVTSI2SS/CVTSS2SI etc.)
         | "PMOVMSKB" | "CVTDQ2PS" | "CVTDQ2PD" | "CVTPS2DQ" | "CVTTPS2DQ" | "CVTPD2DQ" | "CVTTPD2DQ"
         // packed float arithmetic (scalar forms are ADDSS/MULSS/...; these are the *PS/*PD lanes)
@@ -344,6 +346,15 @@ fn is_packed_alu_mnem(mnem: &str) -> bool {
         // packed shifts by immediate/reg (vector lane shifts; scalar is SHL/SHR/SAR)
         | "PSLLW" | "PSLLD" | "PSLLQ" | "PSRLW" | "PSRLD" | "PSRLQ" | "PSRAW" | "PSRAD"
     )
+}
+
+// Bulk string stores/moves are optimized memory regions whose repeated effect
+// currently has no scalar Mach/RTL instruction.  Publish the site so the
+// structurer can prefer a compiler-emitted scalar fallback behind an exact
+// alias/range guard, just as it already does for unrepresented packed loops.
+fn is_unrepresented_bulk_memory_mnem(mnem: &str) -> bool {
+    let upper = mnem.to_ascii_uppercase();
+    upper.starts_with("REP STOS") || upper.starts_with("REP MOVS")
 }
 
 // A whole-register SSE/AVX move: both 64-bit lanes of the destination come from
@@ -977,6 +988,11 @@ ascent_par! {
         instruction(addr, _, _, mnem, _, _, _, _, _, _),
         if is_packed_alu_mnem(mnem);
 
+    relation optimized_bulk_addr(Address);
+    optimized_bulk_addr(*addr) <--
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if is_unrepresented_bulk_memory_mnem(mnem);
+
     relation por(Address, Symbol, Symbol);
     por(addr, dst, src)<--
         instruction(addr, _, _, "OR", src, dst, _, _, _, _);
@@ -1419,6 +1435,11 @@ ascent_par! {
     // quadword. Carry its normalized memory operand to RTL, where the second
     // effect is materialized on a private node.
     relation movhps_hi_load(Address, Mreg, &'static str, &'static str, i64, i64, bool);
+    // A full 16-byte load through a general base has the same missing upper
+    // quadword in CompCert's 64-bit Mach vocabulary.  Keep it separate from
+    // MOVHPS because the low half of a full load is already a real Mach load;
+    // RTL shares only the private high-load expansion.
+    relation wide_xmm_hi_load(Address, Mreg, &'static str, &'static str, i64, i64, bool);
 
     relation mach_inst(Address, MachInst);
     relation func_stacksz(Address, Address, Symbol, u64);
@@ -4274,6 +4295,22 @@ ascent_par! {
         instr_in_function(addr, func),
         func_has_frame_pointer(func);
 
+    // General-base full-width loads need an explicit upper-quadword load at
+    // displacement+8.  Frame and RIP-relative forms already have the exact
+    // kind-2/kind-3 provenance below, so excluding them avoids two competing
+    // high-lane definitions at one machine event.
+    wide_xmm_hi_load(*addr, Mreg::x86(dststr), base, idx, *scale, hi_disp, false) <--
+        pmov(addr, dst, src),
+        !avx_masked_site(addr),
+        op_register(dst, dststr),
+        reg_xmm(dststr),
+        op_indirect(src, _, base, idx, scale, disp, msize),
+        if *msize == 16,
+        if *base != "NONE" && !base.is_empty(),
+        if Mreg::x86(base) != Mreg::SP && Mreg::x86(base) != Mreg::BP,
+        !reg_ip(base),
+        if let Some(hi_disp) = disp.checked_add(8);
+
     // MOVHPS is a partial register write: its low 64 bits are unchanged while
     // the memory operand replaces bits 64..127. A low-lane Omove preserves the
     // part represented by ordinary Mach registers; movhps_hi_load carries the
@@ -4412,6 +4449,14 @@ ascent_par! {
         instr_in_function(addr, func),
         func_has_wide_xmm_store(func);
 
+    // Kind 4 also names the private upper-quadword value emitted for a full
+    // general-memory XMM load.  The source site is enough to identify its
+    // fresh RTL pseudo, just as it is for MOVHPS.
+    xmm_hi_seed(*addr, *dst, 4, Mreg::Unknown, *addr as i64, *addr) <--
+        wide_xmm_hi_load(addr, dst, _, _, _, _, _),
+        instr_in_function(addr, func),
+        func_has_wide_xmm_store(func);
+
     // A whole-register move carries the source's high lane to the destination,
     // so it neither defines a primitive source nor kills what it copies.
     #[local] relation xmm_hi_reg_copy(Address, Mreg, Mreg);
@@ -4539,6 +4584,171 @@ ascent_par! {
         xmm_hi_in(addr, state),
         for (xmm, kind, src, ofs, site) in state.0.iter(),
         if xmm == copied;
+
+    // Packed AND/OR/XOR are bitwise over each entire 64-bit half.  Track the
+    // small closed source alphabet needed here independently of xmm_hi_in:
+    // public operation facts feed xmm_hi_in, so using that recursive lattice
+    // under a uniqueness negation would be unstratified.  This base lattice
+    // instead carries only general-memory loads and self-compare all-ones
+    // constants, with an explicit unknown element at entry and unsupported
+    // definitions. Kind 6 below names the private operation result.
+    #[local] relation xmm_hi_bitwise_raw(Address, i64, Mreg, Mreg);
+    xmm_hi_bitwise_raw(*addr, kind, Mreg::x86(dst_name), Mreg::x86(src_name)) <--
+        instruction(addr, _, _, mnem, src, dst, _, _, _, _),
+        !avx_masked_site(addr),
+        if !mnem.starts_with('V'),
+        if matches!(*mnem, "PAND" | "POR" | "PXOR"),
+        let kind = match *mnem {
+            "PAND" => 3,
+            "POR" => 4,
+            "PXOR" => 5,
+            _ => unreachable!(),
+        },
+        op_register(src, src_name),
+        reg_xmm(src_name),
+        op_register(dst, dst_name),
+        reg_xmm(dst_name),
+        if src_name != dst_name;
+
+    #[local] relation xmm_hi_base_tracked_reg(Address, Mreg);
+    xmm_hi_base_tracked_reg(*func, *dst) <--
+        xmm_hi_bitwise_raw(addr, _, dst, _),
+        instr_in_function(addr, func);
+    xmm_hi_base_tracked_reg(*func, *src) <--
+        xmm_hi_bitwise_raw(addr, _, _, src),
+        instr_in_function(addr, func);
+
+    #[local] relation xmm_hi_base_load(Address, Mreg);
+    xmm_hi_base_load(*addr, *dst) <-- wide_xmm_hi_load(addr, dst, _, _, _, _, _);
+
+    #[local] relation xmm_hi_base_all_ones(Address, Mreg);
+    xmm_hi_base_all_ones(*addr, Mreg::x86(dststr)) <--
+        instruction(addr, _, _, mnem, src, dst, _, _, _, _),
+        !avx_masked_site(addr),
+        if simd_self_all_ones_mnem(mnem),
+        op_register(dst, dststr),
+        reg_xmm(dststr),
+        op_register(src, srcstr),
+        if srcstr == dststr;
+
+    // Tuple: (function, tracked XMM, kind, defining site). Kind -1 is a real
+    // unknown path state; 4 is an explicit high load and 5 is all ones.
+    #[local] lattice xmm_hi_base_in(Address, Set<(Address, Mreg, i64, Address)>);
+    #[local] lattice xmm_hi_base_out(Address, Set<(Address, Mreg, i64, Address)>);
+
+    xmm_hi_base_in(*func, Set::singleton((*func, *xmm, -1, *func))) <--
+        xmm_hi_base_tracked_reg(func, xmm),
+        instr_in_function(func, func);
+    xmm_hi_base_in(*succ, Set::singleton((*func, *xmm, *kind, *site))) <--
+        xmm_hi_base_out(addr, state),
+        for (func, xmm, kind, site) in state.0.iter(),
+        cfg_step(addr, succ),
+        instr_in_function(succ, func);
+
+    xmm_hi_base_out(*addr, Set::singleton((*func, *xmm, *kind, *site))) <--
+        xmm_hi_base_in(addr, state),
+        for (func, xmm, kind, site) in state.0.iter(),
+        !reg_def(*addr, *xmm),
+        !xmm_hi_barrier(*addr);
+    xmm_hi_base_out(*addr, Set::singleton((*func, *dst, 4, *addr))) <--
+        xmm_hi_base_load(addr, dst),
+        instr_in_function(addr, func),
+        xmm_hi_base_tracked_reg(func, dst);
+    xmm_hi_base_out(*addr, Set::singleton((*func, *dst, 5, *addr))) <--
+        xmm_hi_base_all_ones(addr, dst),
+        instr_in_function(addr, func),
+        xmm_hi_base_tracked_reg(func, dst);
+    xmm_hi_base_out(*addr, Set::singleton((*func, *xmm, -1, *addr))) <--
+        reg_def(addr, xmm),
+        instr_in_function(addr, func),
+        xmm_hi_base_tracked_reg(func, xmm),
+        !xmm_hi_base_load(addr, xmm),
+        !xmm_hi_base_all_ones(addr, xmm),
+        !xmm_hi_barrier(addr);
+    xmm_hi_base_out(*addr, Set::singleton((*func, *xmm, -1, *addr))) <--
+        xmm_hi_barrier(addr),
+        instr_in_function(addr, func),
+        xmm_hi_base_tracked_reg(func, xmm);
+
+    #[local] relation xmm_hi_bitwise_candidate(Address, i64, Address, Address);
+    xmm_hi_bitwise_candidate(*addr, *kind, *left_site, *right_site) <--
+        xmm_hi_bitwise_raw(addr, kind, dst, src),
+        instr_in_function(addr, func),
+        xmm_hi_base_in(addr, state),
+        for (active_func, active_dst, left_kind, left_site) in state.0.iter(),
+        if active_func == func && active_dst == dst && *left_kind == 4,
+        for (active_func2, active_src, right_kind, right_site) in state.0.iter(),
+        if active_func2 == func && active_src == src && *right_kind == 4;
+
+    #[local] relation xmm_hi_bitwise_uncertain(Address);
+    xmm_hi_bitwise_uncertain(*addr) <--
+        xmm_hi_bitwise_raw(addr, _, dst, src),
+        instr_in_function(addr, func),
+        xmm_hi_base_in(addr, state),
+        for (active_func, active_xmm, kind, _) in state.0.iter(),
+        if active_func == func && (active_xmm == dst || active_xmm == src) && *kind < 0;
+
+    #[local] relation xmm_hi_bitwise_conflict(Address);
+    xmm_hi_bitwise_conflict(*addr) <--
+        xmm_hi_bitwise_candidate(addr, kind, left, right),
+        xmm_hi_bitwise_candidate(addr, kind2, left2, right2),
+        if kind != kind2 || left != left2 || right != right2;
+
+    #[local] relation xmm_hi_scalar_candidate_conflict(Address);
+
+    relation xmm_hi_bitwise_op(Address, i64, Address, Address);
+    xmm_hi_bitwise_op(*addr, *kind, *left, *right) <--
+        xmm_hi_bitwise_candidate(addr, kind, left, right),
+        !xmm_hi_bitwise_conflict(addr),
+        !xmm_hi_bitwise_uncertain(addr),
+        !xmm_hi_scalar_candidate_conflict(addr);
+
+    // XOR with a proven all-ones high half is an exact 64-bit complement.  It
+    // covers the compiler's PCMPEQD-self followed by PXOR vectorized NOT loop
+    // without inventing a general packed-compare representation.
+    #[local] relation xmm_hi_not_candidate(Address, Address);
+    xmm_hi_not_candidate(*addr, *value_site) <--
+        xmm_hi_bitwise_raw(addr, kind, dst, src),
+        if *kind == 5,
+        instr_in_function(addr, func),
+        xmm_hi_base_in(addr, state),
+        for (active_func, active_dst, value_kind, value_site) in state.0.iter(),
+        if active_func == func && active_dst == dst && *value_kind == 4,
+        for (active_func2, active_src, ones_kind, _) in state.0.iter(),
+        if active_func2 == func && active_src == src && *ones_kind == 5;
+    xmm_hi_not_candidate(*addr, *value_site) <--
+        xmm_hi_bitwise_raw(addr, kind, dst, src),
+        if *kind == 5,
+        instr_in_function(addr, func),
+        xmm_hi_base_in(addr, state),
+        for (active_func, active_dst, ones_kind, _) in state.0.iter(),
+        if active_func == func && active_dst == dst && *ones_kind == 5,
+        for (active_func2, active_src, value_kind, value_site) in state.0.iter(),
+        if active_func2 == func && active_src == src && *value_kind == 4;
+
+    #[local] relation xmm_hi_not_conflict(Address);
+    xmm_hi_not_conflict(*addr) <--
+        xmm_hi_not_candidate(addr, value),
+        xmm_hi_not_candidate(addr, value2),
+        if value != value2;
+
+    xmm_hi_scalar_candidate_conflict(addr) <--
+        xmm_hi_bitwise_candidate(addr, _, _, _),
+        xmm_hi_not_candidate(addr, _);
+
+    relation xmm_hi_not_op(Address, Address);
+    xmm_hi_not_op(*addr, *value) <--
+        xmm_hi_not_candidate(addr, value),
+        !xmm_hi_not_conflict(addr),
+        !xmm_hi_bitwise_uncertain(addr),
+        !xmm_hi_scalar_candidate_conflict(addr);
+
+    xmm_hi_out(*addr, Set::singleton((*dst, 6, Mreg::Unknown, 0, *addr))) <--
+        xmm_hi_bitwise_raw(addr, _, dst, _),
+        xmm_hi_bitwise_op(addr, _, _, _);
+    xmm_hi_out(*addr, Set::singleton((*dst, 6, Mreg::Unknown, 0, *addr))) <--
+        xmm_hi_bitwise_raw(addr, _, dst, _),
+        xmm_hi_not_op(addr, _);
 
     // Two different sources reaching one high lane would need a phi the frame
     // cell cannot express, so those stores keep only their recovered low half.
@@ -12491,6 +12701,123 @@ fn finalize_simd_dword_event_chains(prog: &mut AsmPassProgram) {
         .collect();
 }
 
+// A general 16-byte load is only safe to expand when its upper quadword has a
+// complete represented consumer chain.  The Ascent high-lane state needs every
+// raw load while it computes those chains, but publishing every load to RTL
+// would take over CFG even when an unsupported packed operation immediately
+// kills the value.  Retain exactly the loads referenced by an accepted
+// bitwise/not event or a resolved kind-4 upper-half store.
+fn finalize_xmm_hi_consumers(prog: &mut AsmPassProgram) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut store_xmms = BTreeMap::<Address, BTreeSet<Mreg>>::new();
+    for (store, xmm, _, _, _, _) in &prog.sse_wide_mem_store {
+        store_xmms.entry(*store).or_default().insert(*xmm);
+    }
+    for (store, xmm, _) in &prog.sse_wide_global_store {
+        store_xmms.entry(*store).or_default().insert(*xmm);
+    }
+    for (store, xmm, _) in &prog.sse_wide_frame_store {
+        store_xmms.entry(*store).or_default().insert(*xmm);
+    }
+
+    let mut settled = BTreeMap::<Address, BTreeSet<(i64, Mreg, i64, Address)>>::new();
+    for row in &prog.xmm_hi_in {
+        let row = row.read().unwrap();
+        let (store, state) = &*row;
+        let Some(xmms) = store_xmms.get(store) else {
+            continue;
+        };
+        for (xmm, kind, src, ofs, site) in state.0.iter() {
+            if xmms.contains(xmm) {
+                settled
+                    .entry(*store)
+                    .or_default()
+                    .insert((*kind, *src, *ofs, *site));
+            }
+        }
+    }
+    let exact: BTreeMap<_, _> = settled
+        .into_iter()
+        .filter_map(|(store, values)| {
+            (values.len() == 1).then(|| (store, *values.iter().next().unwrap()))
+        })
+        .collect();
+
+    prog.xmm_hi_mem_store = prog
+        .xmm_hi_mem_store
+        .iter()
+        .filter(|(store, kind, src, ofs, site)| {
+            exact.get(store) == Some(&(*kind, *src, *ofs, *site))
+        })
+        .copied()
+        .collect();
+    prog.xmm_hi_frame_store = prog
+        .xmm_hi_frame_store
+        .iter()
+        .filter(|(store, _, kind, src, ofs, site)| {
+            exact.get(store) == Some(&(*kind, *src, *ofs, *site))
+        })
+        .copied()
+        .collect();
+
+    // Kind 6 names a supported bitwise/not event. If no exact final store
+    // consumes that result, expanding the event is unnecessary and can
+    // interpose CFG inside a larger unsupported vector expression.
+    let required_ops: BTreeSet<Address> = prog
+        .xmm_hi_mem_store
+        .iter()
+        .filter_map(|(_, kind, _, _, site)| (*kind == 6).then_some(*site))
+        .chain(
+            prog.xmm_hi_frame_store
+                .iter()
+                .filter_map(|(_, _, kind, _, _, site)| (*kind == 6).then_some(*site)),
+        )
+        .collect();
+    prog.xmm_hi_bitwise_op = prog
+        .xmm_hi_bitwise_op
+        .iter()
+        .filter(|(address, _, _, _)| required_ops.contains(address))
+        .copied()
+        .collect();
+    prog.xmm_hi_not_op = prog
+        .xmm_hi_not_op
+        .iter()
+        .filter(|(address, _)| required_ops.contains(address))
+        .copied()
+        .collect();
+}
+
+fn finalize_wide_xmm_hi_loads(prog: &mut AsmPassProgram) {
+    use std::collections::BTreeSet;
+
+    let mut required = BTreeSet::new();
+    for (_, _, left, right) in &prog.xmm_hi_bitwise_op {
+        required.insert(*left);
+        required.insert(*right);
+    }
+    for (_, value) in &prog.xmm_hi_not_op {
+        required.insert(*value);
+    }
+    for (_, kind, _, _, site) in &prog.xmm_hi_mem_store {
+        if *kind == 4 {
+            required.insert(*site);
+        }
+    }
+    for (_, _, kind, _, _, site) in &prog.xmm_hi_frame_store {
+        if *kind == 4 {
+            required.insert(*site);
+        }
+    }
+
+    prog.wide_xmm_hi_load = prog
+        .wide_xmm_hi_load
+        .iter()
+        .filter(|(address, _, _, _, _, _, _)| required.contains(address))
+        .copied()
+        .collect();
+}
+
 pub struct AsmPass;
 
 impl IRPass for AsmPass {
@@ -12525,6 +12852,37 @@ impl IRPass for AsmPass {
             trace_simd_dword_state(&prog, func, "pre-finalize");
         }
         finalize_simd_dword_event_chains(&mut prog);
+        finalize_xmm_hi_consumers(&mut prog);
+        finalize_wide_xmm_hi_loads(&mut prog);
+        // These packed bitwise events now have complete low/high scalar RTL
+        // expansions.  They are no longer evidence for the structurer's
+        // unrepresented-vector fallback and must not retain the generic
+        // unhandled-def diagnostic. Preserve the physical event just like an
+        // accepted four-dword expansion so Linear cannot erase its anchor.
+        let recovered_high_ops: std::collections::BTreeSet<Address> = prog
+            .xmm_hi_bitwise_op
+            .iter()
+            .map(|(address, _, _, _)| *address)
+            .chain(prog.xmm_hi_not_op.iter().map(|(address, _)| *address))
+            .collect();
+        if !recovered_high_ops.is_empty() {
+            prog.packed_alu_addr = prog
+                .packed_alu_addr
+                .iter()
+                .filter(|(address,)| !recovered_high_ops.contains(address))
+                .copied()
+                .collect();
+            prog.unhandled_reg_def_site = prog
+                .unhandled_reg_def_site
+                .iter()
+                .filter(|(address, _)| !recovered_high_ops.contains(address))
+                .copied()
+                .collect();
+            let mut preserved: std::collections::BTreeSet<(Address,)> =
+                prog.node_unlowered_side_effect.iter().copied().collect();
+            preserved.extend(recovered_high_ops.iter().map(|address| (*address,)));
+            prog.node_unlowered_side_effect = preserved.into_iter().collect();
+        }
         if let Some(func) = trace_simd_func {
             trace_simd_dword_state(&prog, func, "post-finalize");
         }
@@ -12574,8 +12932,8 @@ impl IRPass for AsmPass {
 mod structural_dataflow_tests {
     use super::{
         chunk_from_mnem, exact_stack_offset, finalize_simd_dword_event_chains,
-        integer_memory_chunk, recover_unsigned_divisor, refine_direct_load_chunk, AsmPass,
-        AsmPassProgram,
+        finalize_wide_xmm_hi_loads, finalize_xmm_hi_consumers, integer_memory_chunk,
+        recover_unsigned_divisor, refine_direct_load_chunk, AsmPass, AsmPassProgram,
     };
     use crate::decompile::passes::pass::IRPass;
     use crate::mreg::Mreg;
@@ -16339,6 +16697,205 @@ mod structural_dataflow_tests {
                 .xmm_hi_frame_store
                 .iter()
                 .any(|(addr, _, _, _, _, _)| *addr == store));
+        });
+    }
+
+    #[test]
+    fn general_wide_load_pand_store_tracks_upper_half_by_cfg() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let func = 0x100;
+            let load_left = 0x510;
+            let load_right = 0x220;
+            let packed_and = 0x730;
+            let store = 0x340;
+
+            for (addr, src, dst, base, xmm) in [
+                (load_left, "left_mem", "left_xmm", "RDI", Mreg::X0),
+                (load_right, "right_mem", "right_xmm", "RSI", Mreg::X2),
+            ] {
+                prog.instruction
+                    .push((addr, 5, "", "MOVDQU", src, dst, "", "", 0, 0));
+                prog.pmov.push((addr, dst, src));
+                prog.op_indirect.push((src, "", base, "RAX", 1, 0, 16));
+                prog.reg_def.push((addr, xmm));
+            }
+            prog.op_register
+                .extend([("left_xmm", "XMM0"), ("right_xmm", "XMM2")]);
+
+            prog.instruction.push((
+                packed_and, 4, "", "PAND", "and_src", "and_dst", "", "", 0, 0,
+            ));
+            prog.op_register
+                .extend([("and_src", "XMM2"), ("and_dst", "XMM0")]);
+            prog.reg_def.push((packed_and, Mreg::X0));
+
+            prog.instruction.push((
+                store,
+                5,
+                "",
+                "MOVUPS",
+                "store_xmm",
+                "store_mem",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.pmov.push((store, "store_mem", "store_xmm"));
+            prog.op_register.push(("store_xmm", "XMM0"));
+            prog.op_indirect
+                .push(("store_mem", "", "RDX", "RAX", 1, 0, 16));
+
+            for edge in [
+                (func, load_left),
+                (load_left, load_right),
+                (load_right, packed_and),
+                (packed_and, store),
+            ] {
+                prog.ddisasm_cfg_edge.push((edge.0, edge.1, "fallthrough"));
+            }
+            for node in [func, load_left, load_right, packed_and, store] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            prog.run();
+            finalize_xmm_hi_consumers(&mut prog);
+            finalize_wide_xmm_hi_loads(&mut prog);
+
+            assert!(prog
+                .wide_xmm_hi_load
+                .iter()
+                .any(|fact| { fact == &(load_left, Mreg::X0, "RDI", "RAX", 1, 8, false) }));
+            assert!(prog
+                .wide_xmm_hi_load
+                .iter()
+                .any(|fact| { fact == &(load_right, Mreg::X2, "RSI", "RAX", 1, 8, false) }));
+            assert!(prog
+                .xmm_hi_bitwise_op
+                .iter()
+                .any(|fact| fact == &(packed_and, 3, load_left, load_right)));
+            assert!(prog
+                .xmm_hi_mem_store
+                .iter()
+                .any(|fact| fact == &(store, 6, Mreg::Unknown, 0, packed_and)));
+        });
+    }
+
+    #[test]
+    fn general_wide_load_xor_all_ones_tracks_upper_complement() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let func = 0x100;
+            let all_ones = 0x810;
+            let load = 0x220;
+            let packed_xor = 0x730;
+            let store = 0x340;
+
+            prog.instruction.push((
+                all_ones, 4, "", "PCMPEQD", "ones_src", "ones_dst", "", "", 0, 0,
+            ));
+            prog.op_register
+                .extend([("ones_src", "XMM1"), ("ones_dst", "XMM1")]);
+            prog.reg_def.push((all_ones, Mreg::X1));
+
+            prog.instruction
+                .push((load, 5, "", "MOVDQU", "load_mem", "load_xmm", "", "", 0, 0));
+            prog.pmov.push((load, "load_xmm", "load_mem"));
+            prog.op_register.push(("load_xmm", "XMM0"));
+            prog.op_indirect
+                .push(("load_mem", "", "RCX", "RAX", 1, 0, 16));
+            prog.reg_def.push((load, Mreg::X0));
+
+            prog.instruction.push((
+                packed_xor, 4, "", "PXOR", "xor_src", "xor_dst", "", "", 0, 0,
+            ));
+            prog.op_register
+                .extend([("xor_src", "XMM1"), ("xor_dst", "XMM0")]);
+            prog.reg_def.push((packed_xor, Mreg::X0));
+
+            prog.instruction.push((
+                store,
+                5,
+                "",
+                "MOVUPS",
+                "store_xmm",
+                "store_mem",
+                "",
+                "",
+                0,
+                0,
+            ));
+            prog.pmov.push((store, "store_mem", "store_xmm"));
+            prog.op_register.push(("store_xmm", "XMM0"));
+            prog.op_indirect
+                .push(("store_mem", "", "RDX", "RAX", 1, 0, 16));
+
+            for edge in [
+                (func, all_ones),
+                (all_ones, load),
+                (load, packed_xor),
+                (packed_xor, store),
+            ] {
+                prog.ddisasm_cfg_edge.push((edge.0, edge.1, "fallthrough"));
+            }
+            for node in [func, all_ones, load, packed_xor, store] {
+                prog.instr_in_function.push((node, func));
+            }
+
+            prog.run();
+            finalize_xmm_hi_consumers(&mut prog);
+            finalize_wide_xmm_hi_loads(&mut prog);
+
+            assert!(prog
+                .xmm_hi_not_op
+                .iter()
+                .any(|fact| fact == &(packed_xor, load)));
+            assert!(prog
+                .xmm_hi_mem_store
+                .iter()
+                .any(|fact| fact == &(store, 6, Mreg::Unknown, 0, packed_xor)));
+        });
+    }
+
+    #[test]
+    fn stale_unsettled_wide_store_does_not_take_over_rtl_cfg() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let load = 0x510;
+            let store = 0x730;
+            prog.wide_xmm_hi_load
+                .push((load, Mreg::X0, "RDI", "RAX", 1, 8, false));
+            prog.sse_wide_mem_store
+                .push((store, Mreg::X0, "RDX", "RAX", 1, 0));
+            // Model a transient projection observed before an intervening
+            // unsupported packed definition kills X0. No settled xmm_hi_in
+            // value at the store confirms this source.
+            prog.xmm_hi_mem_store
+                .push((store, 4, Mreg::Unknown, load as i64, load));
+
+            finalize_xmm_hi_consumers(&mut prog);
+            finalize_wide_xmm_hi_loads(&mut prog);
+
+            assert!(prog.xmm_hi_mem_store.is_empty());
+            assert!(prog.wide_xmm_hi_load.is_empty());
+        });
+    }
+
+    #[test]
+    fn rep_string_store_publishes_optimized_gap_site() {
+        on_large_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let store = 0x510;
+            prog.instruction
+                .push((store, 3, "REP", "REP STOSQ", "src", "dst", "", "", 0, 0));
+
+            prog.run();
+
+            assert!(prog
+                .optimized_bulk_addr
+                .iter()
+                .any(|fact| fact == &(store,)));
         });
     }
 

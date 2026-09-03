@@ -3,7 +3,7 @@ use crate::decompile::passes::pass::IRPass;
 use crate::{declare_io_from, run_pass};
 
 use crate::decompile::passes::cminor_pass::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::mreg::Mreg;
@@ -374,6 +374,94 @@ ascent_par! {
         if let Some(end) = base.checked_add(extent),
         if *base >= 0 && end <= *frame_size;
 
+    // A pointer-width select can pass either a caller-provided object or a
+    // local fallback to a fixed-layout external out-parameter.  The external
+    // call may therefore write the complete ABI object into every stack arm.
+    // Recover each explicit Oaddrstack arm structurally; condition operands
+    // begin at position two and cannot be storage origins.
+    #[local] relation external_stack_object_selected_local_candidate(
+        Address, i64, RTLReg, i64, Symbol, usize
+    );
+
+    // A Cminor register copy commonly separates the select from its call use.
+    // Reject a copied destination if any active alternative gives it a
+    // different definition.  Keeping this as one conflict relation avoids a
+    // large transitive auxiliary program while retaining the exact real-world
+    // handoff produced by Cminor.
+    #[local] relation cminor_copy_destination_conflict(RTLReg);
+    cminor_copy_destination_conflict(*destination) <--
+        active_cminor_stmt(_, ?CminorStmt::Sassign(destination, CminorExpr::Evar(left))),
+        active_cminor_stmt(_, ?CminorStmt::Sassign(other, CminorExpr::Evar(right))),
+        if destination == other && left != right;
+    cminor_copy_destination_conflict(*destination) <--
+        active_cminor_stmt(_, ?CminorStmt::Sassign(destination, CminorExpr::Evar(_))),
+        active_cminor_stmt(_, ?CminorStmt::Sassign(other, expression)),
+        if destination == other,
+        if !matches!(expression, CminorExpr::Evar(_));
+    cminor_copy_destination_conflict(*destination) <--
+        active_cminor_stmt(_, ?CminorStmt::Sassign(destination, CminorExpr::Evar(_))),
+        active_cminor_stmt(_, ?CminorStmt::Scall(Some(other), _, _, _)),
+        if destination == other;
+    cminor_copy_destination_conflict(*destination) <--
+        active_cminor_stmt(_, ?CminorStmt::Sassign(destination, CminorExpr::Evar(_))),
+        active_cminor_stmt(_, ?CminorStmt::Sbuiltin(Some(other), _, _, _)),
+        if destination == other;
+
+    external_stack_object_selected_local_candidate(
+        *func, *base, *owner, extent, *name, *pos
+    ) <--
+        active_cminor_stmt(call, ?CminorStmt::Scall(_, _, Either::Right(Either::Right(name)), call_args)),
+        known_func_param_pointee_size(name, pos, bytes),
+        if let Some(argument) = call_args.get(*pos),
+        active_cminor_stmt(select, ?CminorStmt::Sassign(selected, CminorExpr::Eop(Operation::Osel(_, typ), select_args))),
+        if selected == argument,
+        abi_pointer_size(pointer_width),
+        if crate::decompile::passes::rtl_pass::typ_is_pointer_width(typ, *pointer_width),
+        for (arm_position, address) in select_args.iter().enumerate(),
+        if arm_position < 2,
+        active_cminor_stmt(lea, ?CminorStmt::Sassign(address_value, CminorExpr::Econst(Constant::Oaddrstack(base)))),
+        if address_value == address,
+        instr_in_function(call, func),
+        instr_in_function(select, func),
+        instr_in_function(lea, func),
+        stack_var(func, lea, base, owner),
+        csh_local_frame_size(func, frame_size),
+        if let Ok(extent) = i64::try_from(*bytes),
+        if extent > 0 && extent <= (1 << 20),
+        if let Some(end) = base.checked_add(extent),
+        if *base >= 0 && end <= *frame_size;
+
+    external_stack_object_selected_local_candidate(
+        *func, *base, *owner, extent, *name, *pos
+    ) <--
+        active_cminor_stmt(call, ?CminorStmt::Scall(_, _, Either::Right(Either::Right(name)), call_args)),
+        known_func_param_pointee_size(name, pos, bytes),
+        if let Some(argument) = call_args.get(*pos),
+        active_cminor_stmt(copy, ?CminorStmt::Sassign(copied, CminorExpr::Evar(copy_source))),
+        if copied == argument,
+        !cminor_copy_destination_conflict(copied),
+        active_cminor_stmt(select, ?CminorStmt::Sassign(selected, CminorExpr::Eop(Operation::Osel(_, typ), select_args))),
+        if copy_source == selected,
+        abi_pointer_size(pointer_width),
+        if crate::decompile::passes::rtl_pass::typ_is_pointer_width(typ, *pointer_width),
+        for (arm_position, address) in select_args.iter().enumerate(),
+        if arm_position < 2,
+        active_cminor_stmt(lea, ?CminorStmt::Sassign(address_value, CminorExpr::Econst(Constant::Oaddrstack(base)))),
+        if address_value == address,
+        instr_in_function(call, func),
+        instr_in_function(copy, func),
+        instr_in_function(select, func),
+        instr_in_function(lea, func),
+        stack_var(func, lea, base, owner),
+        csh_local_frame_size(func, frame_size),
+        if let Ok(extent) = i64::try_from(*bytes),
+        if extent > 0 && extent <= (1 << 20),
+        if let Some(end) = base.checked_add(extent),
+        if *base >= 0 && end <= *frame_size;
+
+    external_stack_object_local_candidate(func, base, owner, extent, name, pos) <--
+        external_stack_object_selected_local_candidate(func, base, owner, extent, name, pos);
+
     #[local] relation external_stack_object_adjacent_peer(Address, i64, RTLReg, i64, Symbol, usize);
     external_stack_object_adjacent_peer(
         *func, *base, *owner, *extent, *name, *pos
@@ -406,6 +494,11 @@ ascent_par! {
     external_stack_object_local(func, base, owner, extent),
     external_stack_object_extent(func, base, extent) <--
         external_stack_object_adjacent_peer(func, base, owner, extent, _, _),
+        !external_stack_object_local_conflict(func, base, owner, extent);
+
+    external_stack_object_local(func, base, owner, extent),
+    external_stack_object_extent(func, base, extent) <--
+        external_stack_object_selected_local_candidate(func, base, owner, extent, _, _),
         !external_stack_object_local_conflict(func, base, owner, extent);
 
     // A call whose callee never returns gets no cminor_succ edge, so its dead tail drops: an always-noreturn symbol, or an error-family symbol with a nonzero constant status arg.
@@ -1682,6 +1775,288 @@ ascent_par! {
 pub struct CshminorPass;
 
 impl CshminorPass {
+    fn prepare_internal_struct_stack_objects(db: &mut DecompileDB) {
+        const MAX_OBJECT_BYTES: usize = 1 << 20;
+
+        let mut struct_sizes: HashMap<usize, HashSet<usize>> = HashMap::new();
+        for &(struct_id, _, bytes) in db.rel_iter::<(usize, usize, usize)>("emit_struct_def") {
+            if bytes > 0 && bytes <= MAX_OBJECT_BYTES {
+                struct_sizes.entry(struct_id).or_default().insert(bytes);
+            }
+        }
+        let exact_struct_sizes: HashMap<usize, usize> = struct_sizes
+            .into_iter()
+            .filter_map(|(struct_id, sizes)| {
+                (sizes.len() == 1).then(|| (struct_id, *sizes.iter().next().unwrap()))
+            })
+            .collect();
+
+        let mut param_sizes: HashMap<(Address, usize), HashSet<usize>> = HashMap::new();
+        for &(callee, position, struct_id) in
+            db.rel_iter::<(Address, usize, usize)>("func_param_struct_type_candidate")
+        {
+            if let Some(&bytes) = exact_struct_sizes.get(&struct_id) {
+                param_sizes
+                    .entry((callee, position))
+                    .or_default()
+                    .insert(bytes);
+            }
+        }
+        let exact_param_sizes: HashMap<(Address, usize), usize> = param_sizes
+            .into_iter()
+            .filter_map(|(key, sizes)| {
+                (sizes.len() == 1).then(|| (key, *sizes.iter().next().unwrap()))
+            })
+            .collect();
+        let mut stack_addresses: HashMap<RTLReg, Vec<(Node, i64)>> = HashMap::new();
+        let mut calls: Vec<(Node, Address, Args)> = Vec::new();
+        for (node, statement) in db.rel_iter::<(Node, CminorStmt)>("cminor_stmt") {
+            match statement {
+                CminorStmt::Sassign(
+                    destination,
+                    CminorExpr::Econst(Constant::Oaddrstack(base)),
+                ) => {
+                    stack_addresses
+                        .entry(*destination)
+                        .or_default()
+                        .push((*node, *base));
+                }
+                CminorStmt::Scall(_, _, Either::Right(Either::Left(callee)), arguments) => {
+                    calls.push((*node, *callee, arguments.clone()))
+                }
+                _ => {}
+            }
+        }
+
+        let mut node_functions: HashMap<Node, HashSet<Address>> = HashMap::new();
+        for &(node, function) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+            node_functions.entry(node).or_default().insert(function);
+        }
+        let stack_vars: Vec<(Address, Node, i64, RTLReg)> = db
+            .rel_iter::<(Address, Node, i64, RTLReg)>("stack_var")
+            .copied()
+            .collect();
+        let mut frame_sizes: HashMap<Address, HashSet<i64>> = HashMap::new();
+        for &(function, _, _, bytes) in
+            db.rel_iter::<(Address, Address, Symbol, u64)>("func_stacksz")
+        {
+            if let Ok(bytes) = i64::try_from(bytes) {
+                if bytes > 0 {
+                    frame_sizes.entry(function).or_default().insert(bytes);
+                }
+            }
+        }
+        let exact_frame_sizes: HashMap<Address, i64> = frame_sizes
+            .into_iter()
+            .filter_map(|(function, sizes)| {
+                (sizes.len() == 1).then(|| (function, *sizes.iter().next().unwrap()))
+            })
+            .collect();
+
+        let mut candidates: HashMap<(Address, i64), HashSet<(RTLReg, i64)>> = HashMap::new();
+        for (call, callee, arguments) in calls {
+            let Some(call_functions) = node_functions.get(&call) else {
+                continue;
+            };
+            for (&(candidate_callee, position), &bytes) in &exact_param_sizes {
+                if candidate_callee != callee {
+                    continue;
+                }
+                let Some(argument) = arguments.get(position) else {
+                    continue;
+                };
+                let Some(addresses) = stack_addresses.get(argument) else {
+                    continue;
+                };
+                let Ok(extent) = i64::try_from(bytes) else {
+                    continue;
+                };
+                for &(lea, base) in addresses {
+                    let Some(lea_functions) = node_functions.get(&lea) else {
+                        continue;
+                    };
+                    for &function in call_functions.intersection(lea_functions) {
+                        let Some(&frame_size) = exact_frame_sizes.get(&function) else {
+                            continue;
+                        };
+                        let Some(end) = base.checked_add(extent) else {
+                            continue;
+                        };
+                        if base < 0 || end > frame_size {
+                            continue;
+                        }
+                        let owners: HashSet<RTLReg> = stack_vars
+                            .iter()
+                            .filter_map(|&(owner_func, owner_node, offset, owner)| {
+                                (owner_func == function && owner_node == lea && offset == base)
+                                    .then_some(owner)
+                            })
+                            .collect();
+                        if owners.len() != 1 {
+                            continue;
+                        }
+                        candidates
+                            .entry((function, base))
+                            .or_default()
+                            .insert((*owners.iter().next().unwrap(), extent));
+                    }
+                }
+            }
+        }
+
+        // Some post-RTL contracts prove a complete physical region without a
+        // source-level struct classification: an initialized span, an
+        // endpoint-bounded pointer walk. Fixed external ABI objects already
+        // have a direct Cminor ownership path; re-projecting all of them here
+        // shrinks conservative alias regions and changes unrelated lifetimes.
+        // Materialize only those independently inspectable sources after
+        // Cminor has established the final stack-address spelling.  The generic
+        // escaped_stack_region_extent union also contains field and frame-gap
+        // lower bounds, so consuming it here changed lifetime-overlaid locals
+        // and regressed behavior.
+        let mut projected_region_extents: HashMap<(Address, i64), i64> = HashMap::new();
+        for &(function, base, extent) in
+            db.rel_iter::<(Address, i64, i64)>("initialized_stack_region_extent")
+        {
+            if extent <= 0 || extent > MAX_OBJECT_BYTES as i64 {
+                continue;
+            }
+            projected_region_extents
+                .entry((function, base))
+                .and_modify(|current| *current = (*current).max(extent))
+                .or_insert(extent);
+        }
+        for &(function, low, high) in
+            db.rel_iter::<(Address, i64, i64)>("stack_pointer_walk_region")
+        {
+            let Some(extent) = high.checked_sub(low) else {
+                continue;
+            };
+            if extent <= 0 || extent > MAX_OBJECT_BYTES as i64 {
+                continue;
+            }
+            projected_region_extents
+                .entry((function, low))
+                .and_modify(|current| *current = (*current).max(extent))
+                .or_insert(extent);
+        }
+
+        let mut canonical_base_locals: HashMap<(Address, i64), HashSet<RTLReg>> = HashMap::new();
+        for &(function, base, local) in
+            db.rel_iter::<(Address, i64, RTLReg)>("canonical_stack_slot_local")
+        {
+            canonical_base_locals
+                .entry((function, base))
+                .or_default()
+                .insert(local);
+        }
+        // Focused pass fixtures can invoke this helper without first running
+        // prepare_canonical_stack_slot_locals.  Preserve the production rule's
+        // fail-closed behavior by accepting the raw stack mapping only when it
+        // names one owner at the base.
+        let mut raw_base_locals: HashMap<(Address, i64), HashSet<RTLReg>> = HashMap::new();
+        for &(function, _, base, local) in &stack_vars {
+            raw_base_locals
+                .entry((function, base))
+                .or_default()
+                .insert(local);
+        }
+        for (key, locals) in raw_base_locals {
+            canonical_base_locals.entry(key).or_insert(locals);
+        }
+        for ((function, base), extent) in projected_region_extents {
+            let Some(owners) = canonical_base_locals.get(&(function, base)) else {
+                continue;
+            };
+            if owners.len() != 1 {
+                continue;
+            }
+            let owner = *owners.iter().next().unwrap();
+            candidates
+                .entry((function, base))
+                .or_default()
+                .insert((owner, extent));
+        }
+
+        let escaped_fields: Vec<(Address, i64, i64, MemoryChunk)> = db
+            .rel_iter::<(Address, i64, i64, MemoryChunk)>("escaped_stack_region_field")
+            .copied()
+            .chain(
+                db.rel_iter::<(Address, i64, i64, MemoryChunk)>(
+                    "escaped_stack_region_caller_field",
+                )
+                .copied(),
+            )
+            .collect();
+        let existing_locals: HashSet<(Address, i64, RTLReg, i64)> = db
+            .rel_iter::<(Address, i64, RTLReg, i64)>("external_stack_object_local")
+            .copied()
+            .collect();
+        let existing_extents: HashSet<(Address, i64, i64)> = db
+            .rel_iter::<(Address, i64, i64)>("external_stack_object_extent")
+            .copied()
+            .collect();
+
+        let mut rows = Vec::new();
+        for ((function, base), layouts) in candidates {
+            let owners: HashSet<RTLReg> = layouts.iter().map(|(owner, _)| *owner).collect();
+            if owners.len() != 1 {
+                continue;
+            }
+            let owner = *owners.iter().next().unwrap();
+            // Every row is a storage lower bound for this same physical owner.
+            // The widest one satisfies all observed accesses; choosing a
+            // smaller struct candidate would recreate the overflow this bridge
+            // is intended to prevent.
+            let Some(extent) = layouts.iter().map(|(_, extent)| *extent).max() else {
+                continue;
+            };
+            let Some(end) = base.checked_add(extent) else {
+                continue;
+            };
+            let shared_owner_outside =
+                stack_vars
+                    .iter()
+                    .any(|&(owner_func, _, other_offset, other_owner)| {
+                        owner_func == function
+                            && other_owner == owner
+                            && (other_offset < base || other_offset >= end)
+                    });
+            let field_outside =
+                escaped_fields
+                    .iter()
+                    .any(|&(field_func, field_base, field_offset, chunk)| {
+                        if field_func != function || field_base != base {
+                            return false;
+                        }
+                        let width =
+                            crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(
+                                &chunk,
+                            ) as i64;
+                        field_offset < 0
+                            || field_offset
+                                .checked_add(width)
+                                .is_none_or(|field_end| field_end > extent)
+                    });
+            if !shared_owner_outside && !field_outside {
+                rows.push((function, base, owner, extent));
+            }
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        for (function, base, owner, extent) in rows {
+            if !existing_locals.contains(&(function, base, owner, extent)) {
+                db.rel_push(
+                    "external_stack_object_local",
+                    (function, base, owner, extent),
+                );
+            }
+            if !existing_extents.contains(&(function, base, extent)) {
+                db.rel_push("external_stack_object_extent", (function, base, extent));
+            }
+        }
+    }
+
     fn prepare_canonical_stack_slot_locals(db: &mut DecompileDB) {
         let rows = compute_canonical_stack_slot_locals(
             db.rel_iter::<(Address, Address, i64, RTLReg)>("stack_var")
@@ -1818,6 +2193,7 @@ impl IRPass for CshminorPass {
     fn run(&self, db: &mut DecompileDB) {
         Self::prepare_jump_tables(db);
         Self::prepare_canonical_stack_slot_locals(db);
+        Self::prepare_internal_struct_stack_objects(db);
 
         run_pass!(db, CshminorPassProgram);
     }
@@ -1830,6 +2206,10 @@ impl IRPass for CshminorPass {
             "jump_table_index_reg",
             "reg_rtl",
             "stack_var",
+            "func_param_struct_type_candidate",
+            "emit_struct_def",
+            "initialized_stack_region_extent",
+            "stack_pointer_walk_region",
         ]
     }
 
@@ -1840,13 +2220,14 @@ impl IRPass for CshminorPass {
 mod tests {
     use super::{
         compute_canonical_stack_slot_locals, ident_from_reg, unique_external_cfg_entry,
-        CshminorPassProgram,
+        CshminorPass, CshminorPassProgram,
     };
+    use crate::decompile::elevator::DecompileDB;
     use crate::mreg::Mreg;
     use crate::x86::op::{Addressing, Comparison, Condition, Operation};
     use crate::x86::types::{
         CminorBinop, CminorExpr, CminorStmt, Constant, CsharpminorExpr, CsharpminorStmt,
-        MemoryChunk, RTLInst,
+        MemoryChunk, RTLInst, Typ,
     };
     use either::Either;
     use std::collections::HashSet;
@@ -2651,6 +3032,172 @@ mod tests {
     }
 
     #[test]
+    fn selected_stack_arm_publishes_fixed_external_object() {
+        let [lea, select, copy, call, address, selected, copied, owner, incoming, condition] =
+            synthetic_ids();
+        let base = 32_i64;
+        let mut prog = CshminorPassProgram::default();
+        prog.abi_pointer_size.push((8,));
+        prog.cminor_stmt.extend([
+            (
+                lea,
+                CminorStmt::Sassign(address, CminorExpr::Econst(Constant::Oaddrstack(base))),
+            ),
+            (
+                select,
+                CminorStmt::Sassign(
+                    selected,
+                    CminorExpr::Eop(
+                        Operation::Osel(Condition::Ccomplimm(Comparison::Cne, 0), Typ::Tany64),
+                        Arc::new(vec![incoming, address, condition]),
+                    ),
+                ),
+            ),
+            (
+                copy,
+                CminorStmt::Sassign(copied, CminorExpr::Evar(selected)),
+            ),
+            (
+                call,
+                CminorStmt::Scall(
+                    None,
+                    None,
+                    Either::Right(Either::Right("strtoumax")),
+                    Arc::new(vec![incoming, copied, condition]),
+                ),
+            ),
+        ]);
+        prog.instr_in_function
+            .extend([(lea, FUNC), (select, FUNC), (copy, FUNC), (call, FUNC)]);
+        prog.stack_var.push((FUNC, lea, base, owner));
+        prog.func_stacksz.push((FUNC, call + 1, "caller", 64));
+        prog.known_func_param_pointee_size.push(("strtoumax", 1, 8));
+
+        prog.run();
+
+        assert!(prog
+            .external_stack_object_selected_local_candidate
+            .iter()
+            .any(|fact| fact == &(FUNC, base, owner, 8, "strtoumax", 1)));
+        assert!(prog
+            .external_stack_object_local
+            .iter()
+            .any(|fact| fact == &(FUNC, base, owner, 8)));
+        assert!(prog
+            .external_stack_object_extent
+            .iter()
+            .any(|fact| fact == &(FUNC, base, 8)));
+    }
+
+    #[test]
+    fn internal_struct_parameter_sizes_exact_caller_local() {
+        let [lea, call, address, owner] = synthetic_ids();
+        let callee = 0x9000;
+        let struct_id: usize = 0x1234;
+        let base = 16_i64;
+        let mut db = DecompileDB::default();
+        for row in [
+            (
+                lea,
+                CminorStmt::Sassign(address, CminorExpr::Econst(Constant::Oaddrstack(base))),
+            ),
+            (
+                call,
+                CminorStmt::Scall(
+                    None,
+                    None,
+                    Either::Right(Either::Left(callee)),
+                    Arc::new(vec![address]),
+                ),
+            ),
+        ] {
+            db.rel_push("cminor_stmt", row);
+        }
+        db.rel_push("instr_in_function", (lea, FUNC));
+        db.rel_push("instr_in_function", (call, FUNC));
+        db.rel_push("stack_var", (FUNC, lea, base, owner));
+        db.rel_push("func_stacksz", (FUNC, call + 1, "caller", 64_u64));
+        db.rel_push(
+            "func_param_struct_type_candidate",
+            (callee, 0_usize, struct_id),
+        );
+        db.rel_push("emit_struct_def", (struct_id, 3_usize, 21_usize));
+
+        CshminorPass::prepare_internal_struct_stack_objects(&mut db);
+
+        assert!(db
+            .rel_iter::<(u64, i64, u64, i64)>("external_stack_object_local")
+            .any(|fact| fact == &(FUNC, base, owner, 21)));
+        assert!(db
+            .rel_iter::<(u64, i64, i64)>("external_stack_object_extent")
+            .any(|fact| fact == &(FUNC, base, 21)));
+    }
+
+    #[test]
+    fn post_rtl_internal_field_projection_does_not_claim_whole_object() {
+        let [lea, owner] = synthetic_ids();
+        let base = 16_i64;
+        let mut db = DecompileDB::default();
+        db.rel_push("stack_var", (FUNC, lea, base, owner));
+        db.rel_push("func_stacksz", (FUNC, lea + 1, "caller", 64_u64));
+        // A visible internal access is a useful field lower bound, but does not
+        // prove the complete object or the lifetime of overlaid caller slots.
+        db.rel_push(
+            "escaped_stack_region_field",
+            (FUNC, base, 20_i64, MemoryChunk::MAny64),
+        );
+        db.rel_push("escaped_stack_region_extent", (FUNC, base, 28_i64));
+
+        CshminorPass::prepare_internal_struct_stack_objects(&mut db);
+
+        assert!(!db
+            .rel_iter::<(u64, i64, u64, i64)>("external_stack_object_local")
+            .any(|fact| fact.0 == FUNC && fact.1 == base));
+        assert!(!db
+            .rel_iter::<(u64, i64, i64)>("external_stack_object_extent")
+            .any(|fact| fact.0 == FUNC && fact.1 == base));
+    }
+
+    #[test]
+    fn independently_proven_region_sizes_caller_without_enumerated_fields() {
+        let [lea, owner] = synthetic_ids();
+        let base = 32_i64;
+        let mut db = DecompileDB::default();
+        db.rel_push("stack_var", (FUNC, lea, base, owner));
+        db.rel_push("func_stacksz", (FUNC, lea + 1, "caller", 512_u64));
+        db.rel_push("initialized_stack_region_extent", (FUNC, base, 257_i64));
+
+        CshminorPass::prepare_internal_struct_stack_objects(&mut db);
+
+        assert!(db
+            .rel_iter::<(u64, i64, u64, i64)>("external_stack_object_local")
+            .any(|fact| fact == &(FUNC, base, owner, 257)));
+    }
+
+    #[test]
+    fn copied_select_argument_rejects_a_noncopy_redefinition() {
+        let [copy, redefine, source, destination] = synthetic_ids();
+        let mut prog = CshminorPassProgram::default();
+        prog.cminor_stmt.extend([
+            (
+                copy,
+                CminorStmt::Sassign(destination, CminorExpr::Evar(source)),
+            ),
+            (
+                redefine,
+                CminorStmt::Sassign(destination, CminorExpr::Econst(Constant::Olongconst(0))),
+            ),
+        ]);
+
+        prog.run();
+
+        assert!(prog
+            .cminor_copy_destination_conflict
+            .iter()
+            .any(|fact| fact.0 == destination));
+    }
+
+    #[test]
     fn named_cminor_out_param_rejects_a_wider_shared_local() {
         let [lea, call, address, owner, distant, peer_lea, peer_call, peer_address, peer_owner] =
             synthetic_ids();
@@ -2977,114 +3524,124 @@ mod tests {
 
     #[test]
     fn exclusively_loop_owned_abort_tail_is_folded() {
-        let mut prog = abort_candidate();
+        on_large_stack(|| {
+            let mut prog = abort_candidate();
 
-        prog.run();
+            prog.run();
 
-        assert!(!prog
-            .loop_abort_unsafe_region
-            .iter()
-            .any(|fact| fact == &(FUNC, HEADER, ABORT_ENTRY)));
-        assert!(prog
-            .loop_abort_region
-            .iter()
-            .any(|fact| fact == &(FUNC, HEADER, ABORT_ENTRY)));
-        assert!(prog
-            .loop_abort_region
-            .iter()
-            .any(|fact| fact == &(FUNC, HEADER, ABORT_SINK)));
+            assert!(!prog
+                .loop_abort_unsafe_region
+                .iter()
+                .any(|fact| fact == &(FUNC, HEADER, ABORT_ENTRY)));
+            assert!(prog
+                .loop_abort_region
+                .iter()
+                .any(|fact| fact == &(FUNC, HEADER, ABORT_ENTRY)));
+            assert!(prog
+                .loop_abort_region
+                .iter()
+                .any(|fact| fact == &(FUNC, HEADER, ABORT_SINK)));
+        });
     }
 
     #[test]
     fn externally_shared_abort_entry_is_not_folded() {
-        let mut prog = abort_candidate();
-        prog.cminor_succ.push((OUTSIDE_PRED, ABORT_ENTRY));
+        on_large_stack(|| {
+            let mut prog = abort_candidate();
+            prog.cminor_succ.push((OUTSIDE_PRED, ABORT_ENTRY));
 
-        prog.run();
+            prog.run();
 
-        assert!(prog
-            .loop_abort_external_entry
-            .iter()
-            .any(|fact| fact == &(FUNC, HEADER, ABORT_ENTRY)));
-        assert!(prog
-            .loop_abort_unsafe_region
-            .iter()
-            .any(|fact| fact == &(FUNC, HEADER, ABORT_ENTRY)));
-        assert!(!prog
-            .loop_abort_region
-            .iter()
-            .any(|(func, header, _)| *func == FUNC && *header == HEADER));
+            assert!(prog
+                .loop_abort_external_entry
+                .iter()
+                .any(|fact| fact == &(FUNC, HEADER, ABORT_ENTRY)));
+            assert!(prog
+                .loop_abort_unsafe_region
+                .iter()
+                .any(|fact| fact == &(FUNC, HEADER, ABORT_ENTRY)));
+            assert!(!prog
+                .loop_abort_region
+                .iter()
+                .any(|(func, header, _)| *func == FUNC && *header == HEADER));
+        });
     }
 
     #[test]
     fn external_entry_into_descendant_rejects_whole_abort_region() {
-        let mut prog = abort_candidate();
-        prog.cminor_succ.push((OUTSIDE_PRED, ABORT_SINK));
+        on_large_stack(|| {
+            let mut prog = abort_candidate();
+            prog.cminor_succ.push((OUTSIDE_PRED, ABORT_SINK));
 
-        prog.run();
+            prog.run();
 
-        assert!(prog
-            .loop_abort_external_entry
-            .iter()
-            .any(|fact| fact == &(FUNC, HEADER, ABORT_SINK)));
-        assert!(prog
-            .loop_abort_unsafe_region
-            .iter()
-            .any(|fact| fact == &(FUNC, HEADER, ABORT_ENTRY)));
-        assert!(!prog
-            .loop_abort_region
-            .iter()
-            .any(|(func, header, _)| *func == FUNC && *header == HEADER));
+            assert!(prog
+                .loop_abort_external_entry
+                .iter()
+                .any(|fact| fact == &(FUNC, HEADER, ABORT_SINK)));
+            assert!(prog
+                .loop_abort_unsafe_region
+                .iter()
+                .any(|fact| fact == &(FUNC, HEADER, ABORT_ENTRY)));
+            assert!(!prog
+                .loop_abort_region
+                .iter()
+                .any(|(func, header, _)| *func == FUNC && *header == HEADER));
+        });
     }
 
     #[test]
     fn shared_component_does_not_reject_disconnected_owned_abort() {
-        let mut prog = abort_candidate();
-        prog.cminor_succ.push((OUTSIDE_PRED, ABORT_SINK));
-        prog.loop_abort_candidate.push((FUNC, HEADER, CLEAN_ENTRY));
-        prog.loop_abort_candidate.push((FUNC, HEADER, CLEAN_SINK));
-        prog.cminor_succ.push((CORE_EXIT, CLEAN_ENTRY));
-        prog.cminor_succ.push((CLEAN_ENTRY, CLEAN_SINK));
+        on_large_stack(|| {
+            let mut prog = abort_candidate();
+            prog.cminor_succ.push((OUTSIDE_PRED, ABORT_SINK));
+            prog.loop_abort_candidate.push((FUNC, HEADER, CLEAN_ENTRY));
+            prog.loop_abort_candidate.push((FUNC, HEADER, CLEAN_SINK));
+            prog.cminor_succ.push((CORE_EXIT, CLEAN_ENTRY));
+            prog.cminor_succ.push((CLEAN_ENTRY, CLEAN_SINK));
 
-        prog.run();
+            prog.run();
 
-        assert!(!prog
-            .loop_abort_region
-            .iter()
-            .any(|fact| fact == &(FUNC, HEADER, ABORT_ENTRY)));
-        assert!(prog
-            .loop_abort_region
-            .iter()
-            .any(|fact| fact == &(FUNC, HEADER, CLEAN_ENTRY)));
-        assert!(prog
-            .loop_abort_region
-            .iter()
-            .any(|fact| fact == &(FUNC, HEADER, CLEAN_SINK)));
+            assert!(!prog
+                .loop_abort_region
+                .iter()
+                .any(|fact| fact == &(FUNC, HEADER, ABORT_ENTRY)));
+            assert!(prog
+                .loop_abort_region
+                .iter()
+                .any(|fact| fact == &(FUNC, HEADER, CLEAN_ENTRY)));
+            assert!(prog
+                .loop_abort_region
+                .iter()
+                .any(|fact| fact == &(FUNC, HEADER, CLEAN_SINK)));
+        });
     }
 
     #[test]
     fn external_entry_taints_clean_sibling_through_shared_tail() {
-        let mut prog = abort_candidate();
-        prog.loop_abort_candidate
-            .push((FUNC, HEADER, SIBLING_ENTRY));
-        prog.cminor_succ.push((CORE_EXIT, SIBLING_ENTRY));
-        prog.cminor_succ.push((SIBLING_ENTRY, ABORT_SINK));
-        prog.cminor_succ.push((OUTSIDE_PRED, SIBLING_ENTRY));
+        on_large_stack(|| {
+            let mut prog = abort_candidate();
+            prog.loop_abort_candidate
+                .push((FUNC, HEADER, SIBLING_ENTRY));
+            prog.cminor_succ.push((CORE_EXIT, SIBLING_ENTRY));
+            prog.cminor_succ.push((SIBLING_ENTRY, ABORT_SINK));
+            prog.cminor_succ.push((OUTSIDE_PRED, SIBLING_ENTRY));
 
-        prog.run();
+            prog.run();
 
-        assert!(prog
-            .loop_abort_external_taint
-            .iter()
-            .any(|fact| fact == &(FUNC, HEADER, ABORT_SINK)));
-        assert!(prog
-            .loop_abort_unsafe_region
-            .iter()
-            .any(|fact| fact == &(FUNC, HEADER, ABORT_ENTRY)));
-        assert!(!prog
-            .loop_abort_region
-            .iter()
-            .any(|(func, header, _)| *func == FUNC && *header == HEADER));
+            assert!(prog
+                .loop_abort_external_taint
+                .iter()
+                .any(|fact| fact == &(FUNC, HEADER, ABORT_SINK)));
+            assert!(prog
+                .loop_abort_unsafe_region
+                .iter()
+                .any(|fact| fact == &(FUNC, HEADER, ABORT_ENTRY)));
+            assert!(!prog
+                .loop_abort_region
+                .iter()
+                .any(|(func, header, _)| *func == FUNC && *header == HEADER));
+        });
     }
 
     #[test]
