@@ -46,6 +46,10 @@ Useful focused modes:
 scripts/semantic_oracle.py --manifold target/debug/manifold \
   --compiler gcc --compiler clang
 
+# Compile recovered C with optimization enabled to expose UB-sensitive changes.
+scripts/semantic_oracle.py --manifold target/debug/manifold \
+  --compiler gcc --compiler clang --recompile-opt O2
+
 # One mechanism, production-like symbol stripping, or sanitizer attribution.
 scripts/semantic_oracle.py --manifold target/debug/manifold --case overflow_flags
 scripts/semantic_oracle.py --manifold target/debug/manifold --strip

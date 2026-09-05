@@ -417,7 +417,7 @@ def run_fixture(
         [
             recompiler["path"],
             "-std=gnu11",
-            "-O0",
+            "-" + args.recompile_opt,
             "-fno-pie",
             "-no-pie",
             "-fno-stack-protector",
@@ -697,6 +697,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--case", action="append", default=[], help="case name; repeatable")
     parser.add_argument("--compiler", action="append", default=[], help="reference compiler; repeatable (default: gcc)")
     parser.add_argument("--recompiler", default="gcc", help="compiler for recovered C (default: gcc)")
+    parser.add_argument("--recompile-opt", choices=["O0", "O1", "O2", "O3"], default="O0",
+                        help="optimization level for recovered C (default: O0)")
     parser.add_argument("--output", type=Path, help="new artifact directory (default: retained directory under /tmp)")
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--rayon-threads", type=int, default=2)
@@ -789,6 +791,7 @@ def main() -> int:
                 "rayon_threads": args.rayon_threads,
                 "strip": args.strip,
                 "sanitizers": args.sanitizers,
+                "recompile_opt": args.recompile_opt,
                 "compile_timeout_seconds": args.compile_timeout,
                 "decompile_timeout_seconds": args.decompile_timeout,
                 "run_timeout_seconds": args.run_timeout,

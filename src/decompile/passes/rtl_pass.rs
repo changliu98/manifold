@@ -2571,6 +2571,19 @@ ascent_par! {
     #[local] relation arith_indexed_load_materialized(
         Node, Addressing, Arc<Vec<RTLReg>>, RTLReg, RTLReg
     );
+    // Unknown origin at function entry is a legitimate runtime argument when
+    // the CFG proves that parameter MUST still be live here. It is not an
+    // absent value. A mixed/trimmed/undefined path without that proof remains
+    // unavailable. Keep this distinction at the consumer: other analyses use
+    // the Unknown lattice to ask for a known address/constant origin.
+    #[local] relation arith_indexed_load_missing_input(Node);
+    arith_indexed_load_missing_input(addr) <--
+        arith_indexed_load_op(addr, _, _, _, address_mregs, dst_mreg),
+        instr_in_function(addr, func),
+        for mreg in address_mregs.iter().chain(std::iter::once(dst_mreg)),
+        unknown_reg_value_reaches_use(func, addr, mreg),
+        !arg_reg_param_live_at(func, addr, mreg);
+
     arith_indexed_load_materialized(
         *addr, addressing.clone(), Arc::new(vec![*base, *index]), *input, *output
     ) <--
@@ -2579,9 +2592,7 @@ ascent_par! {
         instr_in_function(addr, func),
         let base_mreg = machine_args[0],
         let index_mreg = machine_args[1],
-        !unknown_reg_value_reaches_use(func, addr, base_mreg),
-        !unknown_reg_value_reaches_use(func, addr, index_mreg),
-        !unknown_reg_value_reaches_use(func, addr, dst_mreg),
+        !arith_indexed_load_missing_input(addr),
         arith_indexed_load_arg_exact(addr, 0, base),
         arith_indexed_load_arg_exact(addr, 1, index),
         arith_indexed_load_dst_input_exact(addr, input),
@@ -8933,6 +8944,22 @@ ascent_par! {
         if defaddr != useaddr,
         if def_id != use_id;
 
+    // A same-site reaching definition away from function entry is a real
+    // loop-carried value: the reaching-def lattice got it through the CFG
+    // back edge. Bind that iteration's indexed-arithmetic output to the next
+    // iteration's shadow input, just as the non-loop predecessors above do.
+    // The entry pseudo-definition shares a namespace with a first-instruction
+    // output and is deliberately excluded; identity is not reachability.
+    alias_edge(def_id, use_id) <--
+        arith_indexed_load_op(node, _, _, _, _, mreg),
+        reg_def_used(node, mreg, node),
+        instr_in_function(node, func),
+        if node != func,
+        is_def(node, def_id),
+        reg_xtl(node, mreg, def_id),
+        lop_overwrite_use_id(node, mreg, use_id),
+        if def_id != use_id;
+
     // Param case of the Osel preserve binding: bind the preserve use-id to the function's param reg when dst still holds the incoming caller value, since an entry pseudo-def carries no is_def.
     alias_edge(param_id, use_id) <--
         lop_overwrite_use_id(node, mreg, use_id),
@@ -11332,6 +11359,25 @@ ascent_par! {
         frame_read_escaped_owner_raw(func, read, _, right_ofs, right),
         if (*left_ofs, *left) != (*right_ofs, *right);
 
+    // A call invalidates a scalar's VALUE provenance, not the existence and
+    // byte coordinates of its frame storage. A unique containing frame cell
+    // still owns an interior read after that call. Do not publish a reaching
+    // writer here: the callee may have changed those bytes. The storage-owner
+    // handoff also keeps RTL DSE from erasing its addressable initializer.
+    #[local] relation frame_read_static_owner_candidate(Address, Address, i64, i64, RTLReg);
+    frame_read_static_owner_candidate(*func, *read, *read_ofs, *base_ofs, *owner) <--
+        frame_stack_read_bytes(func, read, read_ofs, read_width),
+        frame_stack_write_bytes(func, write, base_ofs, owner_width),
+        stack_var(func, write, base_ofs, owner),
+        if *read_ofs != *base_ofs,
+        if frame_interval_contains(*base_ofs, *owner_width, *read_ofs, *read_width);
+
+    #[local] relation frame_read_static_owner_conflict(Address, Address);
+    frame_read_static_owner_conflict(*func, *read) <--
+        frame_read_static_owner_candidate(func, read, _, left_base, left),
+        frame_read_static_owner_candidate(func, read, _, right_base, right),
+        if (*left_base, *left) != (*right_base, *right);
+
     relation frame_read_storage_owner(Address, Address, i64, i64, RTLReg);
     frame_read_storage_owner(*func, *read, *raw_ofs, *raw_base, *owner) <--
         known_out_param_read(func, read, raw_ofs, _, _, raw_base, normalized_base, _),
@@ -11345,6 +11391,13 @@ ascent_par! {
     frame_read_storage_owner(*func, *read, *read_ofs, *base_ofs, *owner) <--
         direct_frame_storage_owner(func, read, read_ofs, _, _, base_ofs, _, owner),
         !frame_read_escaped_owner_raw(func, read, _, _, _);
+
+    frame_read_storage_owner(*func, *read, *read_ofs, *base_ofs, *owner) <--
+        frame_read_static_owner_candidate(func, read, read_ofs, base_ofs, owner),
+        !frame_read_static_owner_conflict(func, read),
+        !frame_read_escaped_owner_raw(func, read, _, _, _),
+        !direct_frame_storage_owner(func, read, _, _, _, _, _, _),
+        !known_out_param_read(func, read, _, _, _, _, _, _);
 
     // Retain the exact writer behind a direct subcell owner.  Clight uses this
     // to rematerialize an initializer that SSA constant propagation is allowed
@@ -24414,6 +24467,67 @@ mod tests {
     }
 
     #[test]
+    fn indexed_arithmetic_loop_keeps_live_parameter_address_and_recurrent_value() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let (func, initial, access, next) = (0x3100, 0x3104, 0x3110, 0x3114);
+            let input = fresh_xtl_reg(initial, Mreg::AX);
+            let output = fresh_xtl_reg(access, Mreg::AX);
+            let (base, index) = (0x7101, 0x7102);
+            prog.arith_indexed_load_op.push((
+                access,
+                Operation::Omul,
+                MemoryChunk::MInt32,
+                Addressing::Aindexed2scaled(4, 0),
+                Arc::new(vec![Mreg::DI, Mreg::DX]),
+                Mreg::AX,
+            ));
+            prog.reg_rtl
+                .extend([(access, Mreg::DI, base), (access, Mreg::DX, index)]);
+            prog.reg_xtl.push((initial, Mreg::AX, input));
+            prog.is_def.push((initial, input));
+            prog.reg_def.push((access, Mreg::AX));
+            // Both reaching edges are necessary: first iteration and feedback.
+            prog.reg_def_used
+                .extend([(initial, Mreg::AX, access), (access, Mreg::AX, access)]);
+            prog.instr_in_function.extend([
+                (func, func),
+                (initial, func),
+                (access, func),
+                (next, func),
+            ]);
+            prog.next.push((access, next));
+            prog.ltl_inst
+                .push((access, LTLInst::Lbranch(Either::Right(next))));
+            prog.ltl_inst.push((next, LTLInst::Lreturn));
+            // The pointer is a caller-supplied runtime value, not a known
+            // constant origin; the established MUST-live parameter fact licenses it.
+            prog.unknown_reg_value_reaches_use
+                .push((func, access, Mreg::DI));
+            prog.arg_reg_param_live_at.push((func, access, Mreg::DI));
+            prog.run();
+
+            assert!(prog.xtl_canonical.iter().any(|row| row == &(output, input)));
+            let temp = fresh_xtl_reg(access, Mreg::x86("RTEMP"));
+            assert!(prog.rtl_inst_candidate.iter().any(|row| row
+                == &(
+                    access,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt32,
+                        Addressing::Aindexed2scaled(4, 0),
+                        Arc::new(vec![base, index]),
+                        temp
+                    )
+                )));
+            assert!(prog.rtl_inst_candidate.iter().any(|row| row
+                == &(
+                    access | (1u64 << 62),
+                    RTLInst::Iop(Operation::Omul, Arc::new(vec![input, temp]), input)
+                )));
+        });
+    }
+
+    #[test]
     fn indexed_imul_entry_parameter_flows_to_distinct_raw_output_and_continuation() {
         on_large_stack(|| {
             let mut prog = RTLPassProgram::default();
@@ -24921,6 +25035,29 @@ mod tests {
                 .frame_read_storage_access_owner
                 .iter()
                 .any(|fact| fact == &(func, read, -200, -208, owner)));
+        });
+    }
+
+    #[test]
+    fn frame_storage_survives_without_a_reaching_value_after_a_call() {
+        on_large_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let (func, write, read, owner) = (0x1000, 0x1010, 0x1030, 0x9000);
+            prog.frame_stack_write_bytes.push((func, write, 8, 8));
+            prog.frame_stack_read_bytes.push((func, read, 11, 1));
+            prog.stack_var.push((func, write, 8, owner));
+            // No settled_frame_storage_origin: an opaque call killed that
+            // value proof. The physical cell and interior address still exist.
+            prog.run();
+            assert!(prog
+                .frame_read_storage_owner
+                .iter()
+                .any(|row| row == &(func, read, 11, 8, owner)));
+            assert!(prog
+                .frame_read_storage_access_owner
+                .iter()
+                .any(|row| row == &(func, read, 11, 8, owner)));
+            assert!(prog.frame_read_reaching_storage.is_empty());
         });
     }
 

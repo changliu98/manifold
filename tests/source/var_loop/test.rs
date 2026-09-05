@@ -122,6 +122,40 @@ fn reduction_has_multiply() {
 }
 
 #[test]
+fn reduction_preserves_the_recurrent_product() {
+    let mut tu = TranslationUnit::new();
+    tu.add_function(func_def(&OUTPUT, "test_reduction").clone());
+    let recovered = manifold::decompile::passes::c_pass::print_translation_unit(&tu);
+    let source = format!(
+        "{recovered}\n{}",
+        r#"
+int main(void) {
+    int values[] = {3, 1, 4, 1, 5};
+    int expected[] = {1, 3, 3, 12, 12, 60};
+    if (test_reduction(values, -1) != 1) return 1;
+    for (int n = 0; n <= 5; ++n)
+        if (test_reduction(values, n) != expected[n]) return n + 2;
+    int negative[] = {2, -3, 4};
+    int zero[] = {2, 0, 4};
+    if (test_reduction(negative, 3) != -24) return 8;
+    if (test_reduction(zero, 3) != 0) return 9;
+    return 0;
+}
+"#
+    );
+    for compiler in ["gcc", "clang"] {
+        let name = format!("{}_reduction_behavior", module_path!().replace("::", "_"));
+        let executable = compile(&name, compiler, &source, "-O2");
+        let result = Command::new("timeout")
+            .arg("10s")
+            .arg(executable)
+            .status()
+            .unwrap();
+        assert!(result.success(), "recovered product differs: {recovered}");
+    }
+}
+
+#[test]
 fn inner_loop_var_reuse_has_loops() {
     let b = body(&OUTPUT, "test_inner_loop_var_reuse");
     let loop_count = b.matches("while").count() + b.matches("for").count() + b.matches("do").count();

@@ -1383,6 +1383,83 @@ mod tests {
     use super::*;
 
     #[test]
+    fn adjacent_byte_buffers_preserve_their_physical_frame_coordinates() {
+        let mut db = DecompileDB::default();
+        let (func, left, right) = (0x1000, 0x9000, 0x9100);
+        db.rel_push("stack_var", (func, 0x1010_u64, 0_i64, left));
+        db.rel_push("stack_var", (func, 0x1020_u64, 16_i64, right));
+        db.stack_struct_buffers
+            .insert(func, HashMap::from([(left, 16), (right, 16)]));
+        size_indexed_stack_arrays(&mut db);
+        assert_eq!(db.stack_struct_buffers[&func], HashMap::from([(left, 32)]));
+        assert!(db
+            .rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_alias")
+            .any(|row| row == &(func, right, left, 16)));
+        assert!(db
+            .rel_iter::<(Address, RTLReg)>("stack_buffer_address_root")
+            .any(|row| row == &(func, right)));
+    }
+
+    #[test]
+    fn image_pointer_comparisons_relocate_in_every_world_but_not_pie_or_ambiguous_constants() {
+        for (absolute, ambiguous) in [(true, false), (false, false), (true, true)] {
+            let mut db = DecompileDB::default();
+            db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
+            db.rel_push("raw_image_addresses_are_absolute", (absolute,));
+            db.rel_push("pointer_in_data", (0x4100_u64, 0x4208_u64));
+            db.rel_push("data_section_range", (0x4000_u64, 0x5000_u64));
+            db.rel_push("resolved_addr_to_symbol", (0x4208_u64, 0x4200_usize, 8_i64));
+            if ambiguous {
+                db.rel_push("resolved_addr_to_symbol", (0x4208_u64, 0x4208_usize, 0_i64));
+            }
+            let literal = ClightExpr::EconstLong(0x4208, default_long_type());
+            let comparison = ClightStmt::Sreturn(Some(ClightExpr::Ebinop(
+                ClightBinaryOp::Oeq,
+                Box::new(ClightExpr::Etempvar(7, default_long_type())),
+                Box::new(literal.clone()),
+                default_bool_type(),
+            )));
+            let arithmetic = ClightStmt::Sset(
+                8,
+                ClightExpr::Ebinop(
+                    ClightBinaryOp::Oadd,
+                    Box::new(ClightExpr::Etempvar(7, default_long_type())),
+                    Box::new(literal),
+                    default_long_type(),
+                ),
+            );
+            db.rel_push("clight_stmt", (0x1010_u64, comparison.clone()));
+            db.rel_push("clight_stmt", (0x1020_u64, arithmetic.clone()));
+            db.rel_push(
+                "emit_clight_stmt",
+                (0x1000_u64, 0x1010_u64, comparison.clone()),
+            );
+            for world in [0_u8, 1_u8] {
+                db.rel_push(
+                    "emit_clight_stmt_world",
+                    (0x1000_u64, world, 0x1010_u64, comparison.clone()),
+                );
+            }
+            relocate_image_address_comparisons(&mut db);
+            let changed = absolute && !ambiguous;
+            assert!(db
+                .rel_iter::<(Node, ClightStmt)>("clight_stmt")
+                .any(|row| row == &(0x1020, arithmetic.clone())));
+            for (_, stmt) in db
+                .rel_iter::<(Node, ClightStmt)>("clight_stmt")
+                .filter(|(node, _)| *node == 0x1010)
+            {
+                assert_eq!(*stmt != comparison, changed);
+            }
+            for (_, _, _, stmt) in
+                db.rel_iter::<(Address, u8, Node, ClightStmt)>("emit_clight_stmt_world")
+            {
+                assert_eq!(*stmt != comparison, changed);
+            }
+        }
+    }
+
+    #[test]
     fn one_argument_signed_condition_casts_an_unsigned_recovered_value() {
         let reg = 0x1234;
         let mut types = MultiVarTypeMap::new();
@@ -3922,6 +3999,7 @@ impl IRPass for ClightFieldPass {
     fn run(&self, db: &mut DecompileDB) {
         rewrite_clight_stmts_with_struct_fields(db);
         refresh_clight_structure_worlds(db);
+        relocate_image_address_comparisons(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
@@ -3964,6 +4042,10 @@ impl IRPass for ClightFieldPass {
             "op_indirect",
             "func_stacksz",
             "stack_base_move",
+            "raw_image_addresses_are_absolute",
+            "pointer_in_data",
+            "resolved_addr_to_symbol",
+            "data_section_range",
         ]
     }
 
@@ -3978,7 +4060,186 @@ impl IRPass for ClightFieldPass {
             "emit_struct_fields",
             "stack_buffer_alias",
             "stack_buffer_end_alias",
+            "stack_buffer_address_root",
         ]
+    }
+}
+
+// Linked non-PIE code can compare against a data address embedded as an
+// immediate. Recompilation relocates the object, so retaining the original
+// numeric address makes pointer equality depend on the new linker's layout.
+// Require positive image-pointer evidence, a data-section address and one
+// unambiguous symbol resolution. ET_DYN offsets and ordinary integer literals
+// are not address evidence. Normalize before statement/type selection, across
+// every structural world, using the same Oaddrsymbol lowering as initializers.
+fn relocate_image_address_comparisons(db: &mut DecompileDB) {
+    if !db
+        .rel_iter::<(bool,)>("raw_image_addresses_are_absolute")
+        .any(|(absolute,)| *absolute)
+    {
+        return;
+    }
+    let targets: HashSet<Address> = db
+        .rel_iter::<(Address, Address)>("pointer_in_data")
+        .map(|(_, target)| *target)
+        .collect();
+    let ranges: Vec<(Address, Address)> = db
+        .rel_iter::<(Address, Address)>("data_section_range")
+        .copied()
+        .collect();
+    let mut resolutions: BTreeMap<Address, BTreeSet<(Ident, i64)>> = BTreeMap::new();
+    for (address, ident, offset) in db.rel_iter::<(Address, Ident, i64)>("resolved_addr_to_symbol")
+    {
+        if *address != 0
+            && targets.contains(address)
+            && ranges
+                .iter()
+                .any(|(start, end)| start <= address && address < end)
+        {
+            resolutions
+                .entry(*address)
+                .or_default()
+                .insert((*ident, *offset));
+        }
+    }
+    let addresses: HashMap<Address, (Ident, i64)> = resolutions
+        .into_iter()
+        .filter_map(|(addr, targets)| {
+            (targets.len() == 1).then(|| (addr, *targets.first().unwrap()))
+        })
+        .collect();
+    if addresses.is_empty() {
+        return;
+    }
+    let ptr_size = db.abi().pointer_size as i64;
+    let mut count = 0usize;
+    let statements = db
+        .rel_iter::<(Node, ClightStmt)>("clight_stmt")
+        .map(|(node, stmt)| {
+            let mut stmt = stmt.clone();
+            relocate_comparison_stmt(&mut stmt, &addresses, ptr_size, &mut count);
+            (*node, stmt)
+        })
+        .collect::<ascent::boxcar::Vec<_>>();
+    db.rel_set("clight_stmt", statements);
+    let emitted = db
+        .rel_iter::<(Address, Node, ClightStmt)>("emit_clight_stmt")
+        .map(|(func, node, stmt)| {
+            let mut stmt = stmt.clone();
+            relocate_comparison_stmt(&mut stmt, &addresses, ptr_size, &mut count);
+            (*func, *node, stmt)
+        })
+        .collect::<ascent::boxcar::Vec<_>>();
+    db.rel_set("emit_clight_stmt", emitted);
+    let worlds = db
+        .rel_iter::<(Address, u8, Node, ClightStmt)>("emit_clight_stmt_world")
+        .map(|(func, world, node, stmt)| {
+            let mut stmt = stmt.clone();
+            relocate_comparison_stmt(&mut stmt, &addresses, ptr_size, &mut count);
+            (*func, *world, *node, stmt)
+        })
+        .collect::<ascent::boxcar::Vec<_>>();
+    db.rel_set("emit_clight_stmt_world", worlds);
+    if count > 0 {
+        eprintln!("[image-addresses] relocated-comparison-occurrences={count}");
+    }
+}
+
+fn relocate_comparison_expr(
+    expr: &mut ClightExpr,
+    addresses: &HashMap<Address, (Ident, i64)>,
+    ptr_size: i64,
+    count: &mut usize,
+) {
+    match expr {
+        ClightExpr::Ebinop(op, left, right, _) => {
+            relocate_comparison_expr(left, addresses, ptr_size, count);
+            relocate_comparison_expr(right, addresses, ptr_size, count);
+            if !matches!(op, ClightBinaryOp::Oeq | ClightBinaryOp::One) {
+                return;
+            }
+            for operand in [left, right] {
+                let (address, ty) = match operand.as_ref() {
+                    ClightExpr::EconstLong(value, ty) => (*value as u64, ty.clone()),
+                    ClightExpr::EconstInt(value, ty) if ptr_size == 4 => {
+                        (*value as u32 as u64, ty.clone())
+                    }
+                    _ => continue,
+                };
+                let Some(&(ident, offset)) = addresses.get(&address) else {
+                    continue;
+                };
+                let symbol = clight_expr_from_csharp(
+                    &CsharpminorExpr::Econst(Constant::Oaddrsymbol(ident, offset)),
+                    ptr_size,
+                );
+                **operand = ClightExpr::Ecast(Box::new(symbol), ty);
+                *count += 1;
+            }
+        }
+        ClightExpr::Ederef(inner, _)
+        | ClightExpr::Eaddrof(inner, _)
+        | ClightExpr::Eunop(_, inner, _)
+        | ClightExpr::Ecast(inner, _)
+        | ClightExpr::Efield(inner, _, _) => {
+            relocate_comparison_expr(inner, addresses, ptr_size, count)
+        }
+        ClightExpr::Econdition(cond, yes, no, _) => {
+            for inner in [cond, yes, no] {
+                relocate_comparison_expr(inner, addresses, ptr_size, count);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn relocate_comparison_stmt(
+    stmt: &mut ClightStmt,
+    addresses: &HashMap<Address, (Ident, i64)>,
+    ptr_size: i64,
+    count: &mut usize,
+) {
+    match stmt {
+        ClightStmt::Sassign(left, right) => {
+            relocate_comparison_expr(left, addresses, ptr_size, count);
+            relocate_comparison_expr(right, addresses, ptr_size, count);
+        }
+        ClightStmt::Sset(_, value) | ClightStmt::Sreturn(Some(value)) => {
+            relocate_comparison_expr(value, addresses, ptr_size, count)
+        }
+        ClightStmt::Scall(_, callee, args) => {
+            relocate_comparison_expr(callee, addresses, ptr_size, count);
+            for arg in args {
+                relocate_comparison_expr(arg, addresses, ptr_size, count);
+            }
+        }
+        ClightStmt::Sbuiltin(_, _, _, args) => {
+            for arg in args {
+                relocate_comparison_expr(arg, addresses, ptr_size, count);
+            }
+        }
+        ClightStmt::Ssequence(items) => {
+            for item in items {
+                relocate_comparison_stmt(item, addresses, ptr_size, count);
+            }
+        }
+        ClightStmt::Sifthenelse(cond, yes, no) => {
+            relocate_comparison_expr(cond, addresses, ptr_size, count);
+            relocate_comparison_stmt(yes, addresses, ptr_size, count);
+            relocate_comparison_stmt(no, addresses, ptr_size, count);
+        }
+        ClightStmt::Sloop(a, b) => {
+            relocate_comparison_stmt(a, addresses, ptr_size, count);
+            relocate_comparison_stmt(b, addresses, ptr_size, count);
+        }
+        ClightStmt::Sswitch(expr, cases) => {
+            relocate_comparison_expr(expr, addresses, ptr_size, count);
+            for (_, stmt) in cases {
+                relocate_comparison_stmt(stmt, addresses, ptr_size, count);
+            }
+        }
+        ClightStmt::Slabel(_, inner) => relocate_comparison_stmt(inner, addresses, ptr_size, count),
+        _ => {}
     }
 }
 
@@ -9105,7 +9366,15 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
                 && !matches!(ranges[right].kind, RangeKind::ExactWalk)
                 && (matches!(ranges[left].kind, RangeKind::IndexedFallback)
                     || matches!(ranges[right].kind, RangeKind::IndexedFallback));
-            if !overlaps && !fallback_abut {
+            // Two already materialized byte buffers in one physical frame
+            // must retain an observed adjacency. Separate C locals can be
+            // reordered by the compiler, changing one-past pointer equality.
+            // Logical exact-walk bounds remain exclusive; this only chooses
+            // shared backing storage for existing frame buffers.
+            let buffer_abut = abuts
+                && ranges[left].kind == RangeKind::ByteBuffer
+                && ranges[right].kind == RangeKind::ByteBuffer;
+            if !overlaps && !fallback_abut && !buffer_abut {
                 continue;
             }
             let left_root = find_root(&mut parents, left);
@@ -9124,6 +9393,7 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
 
     let mut coalesced_indexed = HashSet::new();
     let mut aliases = Vec::new();
+    let mut absorbed_address_roots = BTreeSet::new();
     for members in components.values() {
         let has_indexed = members
             .iter()
@@ -9138,7 +9408,9 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         // objects either. Exact boundaries do not merge merely by abutting,
         // but a real overlap uses one physical byte range just like an
         // overlapping address-taken buffer.
-        if !has_indexed || (!has_buffer && !(has_exact && members.len() > 1)) {
+        let multiple_buffers = members.iter()
+            .filter(|index| ranges[**index].kind == RangeKind::ByteBuffer).count() > 1;
+        if (!has_indexed && !multiple_buffers) || (!has_buffer && !(has_exact && members.len() > 1)) {
             continue;
         }
 
@@ -9201,7 +9473,12 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
                 }
                 RangeKind::ByteBuffer => {
                     if let Some(func_buffers) = db.stack_struct_buffers.get_mut(&func) {
-                        func_buffers.remove(&range.local);
+                        if func_buffers.remove(&range.local).is_some() {
+                            // Losing the declaration does not turn this array
+                            // name into a scalar value. Preserve its decay role
+                            // separately from the new physical storage owner.
+                            absorbed_address_roots.insert((func, range.local));
+                        }
                     }
                 }
             }
@@ -9238,6 +9515,9 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         .collect();
     for alias in &aliases {
         db.rel_push("stack_buffer_alias", *alias);
+    }
+    for root in absorbed_address_roots {
+        db.rel_push("stack_buffer_address_root", root);
     }
     for (func, endpoint, base, offset) in pending_end_aliases {
         if !coalesced_indexed.contains(&(func, base)) {

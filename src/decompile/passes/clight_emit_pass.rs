@@ -1815,6 +1815,7 @@ const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
     "slot_escaped_region_canonical",
     "stack_buffer_alias",
     "stack_buffer_end_alias",
+    "stack_buffer_address_root",
     "stack_var",
     "variadic_register_save_area_init",
     // Exact initialized bytes back designated initializers when a synthetic

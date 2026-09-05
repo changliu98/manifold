@@ -3263,6 +3263,10 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     let func_renames = &local_def_policy.renames;
     let mut escaped_stack_arrays = derive_escaped_stack_array_layouts(db);
     let stack_buffer_aliases = derive_stack_buffer_aliases(db);
+    let mut absorbed_buffer_roots: HashMap<Address, HashSet<RTLReg>> = HashMap::new();
+    for &(func, root) in db.rel_iter::<(Address, RTLReg)>("stack_buffer_address_root") {
+        absorbed_buffer_roots.entry(func).or_default().insert(root);
+    }
     let stack_buffer_end_aliases = derive_stack_buffer_end_aliases(db);
     let stack_address_regs: HashSet<RTLReg> = db
         .rel_iter::<(Node, RTLInst)>("rtl_inst")
@@ -3642,12 +3646,13 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 .iter()
                 .map(|(member, (_, _, chunk))| (*member, ctype_from_memchunk(chunk)))
                 .collect();
-            let backing_regs: HashSet<RTLReg> = escaped_stack_buffers
+            let mut backing_regs: HashSet<RTLReg> = escaped_stack_buffers
                 .buffers
                 .get(&func.address)
                 .into_iter()
                 .flat_map(|buffers| buffers.keys().copied())
                 .collect();
+            backing_regs.extend(absorbed_buffer_roots.get(&func.address).into_iter().flatten().copied());
             body = rewrite_stack_buffer_aliases_with_access_types(
                 &body,
                 &aliases,
@@ -3695,12 +3700,13 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                         .map(|ty| (*member, ty))
                 })
                 .collect();
-            let backing_regs: HashSet<RTLReg> = db
+            let mut backing_regs: HashSet<RTLReg> = db
                 .stack_struct_buffers
                 .get(&func.address)
                 .into_iter()
                 .flat_map(|buffers| buffers.keys().copied())
                 .collect();
+            backing_regs.extend(absorbed_buffer_roots.get(&func.address).into_iter().flatten().copied());
             body = rewrite_stack_buffer_aliases_with_access_types(
                 &body,
                 aliases,
@@ -7625,16 +7631,37 @@ fn unsigned_integer_clight_type(ty: &clight::ClightType) -> Option<clight::Cligh
 
 pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> CExpr {
     match expr {
-        clight::ClightExpr::EconstInt(val, _ty) => CExpr::IntLit(IntLiteral {
-            value: *val as i128,
-            suffix: IntLiteralSuffix::None,
-            base: IntLiteralBase::Decimal,
-        }),
-        clight::ClightExpr::EconstLong(val, _ty) => CExpr::IntLit(IntLiteral {
-            value: *val as i128,
-            suffix: IntLiteralSuffix::L,
-            base: IntLiteralBase::Decimal,
-        }),
+        clight::ClightExpr::EconstInt(val, ty) => {
+            let unsigned = matches!(ty, clight::ClightType::Tint(clight::ClightIntSize::I32, clight::ClightSignedness::Unsigned, _));
+            let literal = if !unsigned && *val == i32::MIN {
+                // C parses the minus separately; bare -2147483648 has a
+                // wider positive literal and therefore the wrong type.
+                CExpr::Binary(BinaryOp::Sub, Box::new(CExpr::int(i32::MIN as i64 + 1)), Box::new(CExpr::int(1)))
+            } else { CExpr::IntLit(IntLiteral {
+                value: if unsigned { *val as u32 as i128 } else { *val as i128 },
+                suffix: if unsigned { IntLiteralSuffix::U } else { IntLiteralSuffix::None },
+                base: IntLiteralBase::Decimal,
+            }) };
+            if matches!(ty, clight::ClightType::Tint(clight::ClightIntSize::I8 | clight::ClightIntSize::I16 | clight::ClightIntSize::IBool, _, _)) {
+                // Subword values undergo integer promotion at their use. An
+                // unsigned byte is not an unsigned-int literal.
+                CExpr::Cast(convert_clight_type(ty, ctx.data_model), Box::new(literal))
+            } else { literal }
+        }
+        clight::ClightExpr::EconstLong(val, ty) => {
+            let unsigned = matches!(ty, clight::ClightType::Tlong(clight::ClightSignedness::Unsigned, _));
+            let suffix = match (ctx.data_model.long_holds_64bit(), unsigned) {
+                (true, false) => IntLiteralSuffix::L,
+                (true, true) => IntLiteralSuffix::UL,
+                (false, false) => IntLiteralSuffix::LL,
+                (false, true) => IntLiteralSuffix::ULL,
+            };
+            let literal = |value| CExpr::IntLit(IntLiteral { value, suffix, base: IntLiteralBase::Decimal });
+            if !unsigned && *val == i64::MIN {
+                return CExpr::Binary(BinaryOp::Sub, Box::new(literal(i64::MIN as i128 + 1)), Box::new(literal(1)));
+            }
+            literal(if unsigned { *val as u64 as i128 } else { *val as i128 })
+        }
         clight::ClightExpr::EconstFloat(val, _ty) => CExpr::FloatLit(FloatLiteral {
             value: val.0,
             suffix: FloatLiteralSuffix::None,
@@ -9784,6 +9811,36 @@ mod escaped_stack_array_tests {
             rewritten,
             CStmt::Expr(stack_buffer_alias_value_expr(&base_name, 0, &CType::int())),
             "the backing array owns eight bytes, but a direct movl reload reads four",
+        );
+    }
+
+    #[test]
+    fn absorbed_buffer_root_keeps_address_semantics_after_its_declaration_is_removed() {
+        let (member, base) = (0x7001, 0x7002);
+        let member_name = param_name_for_reg(member);
+        let base_name = param_name_for_reg(base);
+        let pointer = CType::ptr(CType::char_unsigned());
+        let body = CStmt::Expr(CExpr::Cast(
+            pointer.clone(),
+            Box::new(CExpr::var(&member_name)),
+        ));
+        let rewritten = rewrite_stack_buffer_aliases_with_access_types(
+            &body,
+            &HashMap::from([(member, (base, 16))]),
+            &HashMap::from([(member_name, CType::long())]),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashSet::from([member]),
+        );
+        assert_eq!(
+            rewritten,
+            CStmt::Expr(CExpr::Cast(
+                pointer,
+                Box::new(CExpr::Unary(
+                    UnaryOp::AddrOf,
+                    Box::new(stack_buffer_alias_byte_expr(&base_name, 16))
+                ))
+            ))
         );
     }
 

@@ -95,11 +95,46 @@ fn phi_mixed_sources_has_multiply() {
 }
 
 #[test]
-fn phi_partially_dead_keeps_branch_dependent_arithmetic() {
-    let b = body(&OUTPUT, "test_phi_partially_dead");
-    assert!(has_if_stmt(&OUTPUT, "test_phi_partially_dead"),
-            "expected branch-dependent phi values:\n{b}");
-    assert!(has_binop(&OUTPUT, "test_phi_partially_dead", BinaryOp::Add)
-            || has_binop(&OUTPUT, "test_phi_partially_dead", BinaryOp::Sub),
-            "expected addition or equivalent 2-(x>0) arithmetic:\n{b}");
+fn phi_partially_dead_preserves_return_and_sink_values() {
+    // Clang can fold a+b into the constants 201 and 102 before decompilation.
+    // Check both observable values instead of requiring an arithmetic spelling
+    // absent from that binary. Keep the recovered function and global verbatim.
+    let mut tu = TranslationUnit::new();
+    tu.add_function(func_def(&OUTPUT, "test_phi_partially_dead").clone());
+    for declaration in &OUTPUT.tu.decls {
+        if let TopLevelDecl::VarDecl(global) = declaration {
+            if global.name == "sink" {
+                tu.add_global_var(global.clone());
+            }
+        }
+    }
+    let recovered = manifold::decompile::passes::c_pass::print_translation_unit(&tu);
+    let source = format!(
+        "#include <limits.h>\n{recovered}\n{}",
+        r#"
+int main(void) {
+    int inputs[] = {INT_MIN, -1, 0, 1, INT_MAX};
+    for (unsigned i = 0; i < sizeof(inputs) / sizeof(inputs[0]); ++i) {
+        sink = 77;
+        int result = test_phi_partially_dead(inputs[i]);
+        if (result != (inputs[i] > 0 ? 201 : 102)
+            || sink != (inputs[i] > 0 ? 1 : 2)) return i + 1;
+    }
+    return 0;
+}
+"#
+    );
+    for compiler in ["gcc", "clang"] {
+        let name = module_path!().replace("::", "_");
+        let executable = compile(&name, compiler, &source, "-O2");
+        let result = Command::new("timeout")
+            .arg("10s")
+            .arg(executable)
+            .status()
+            .unwrap();
+        assert!(
+            result.success(),
+            "recovered branch observations differ: {recovered}"
+        );
+    }
 }

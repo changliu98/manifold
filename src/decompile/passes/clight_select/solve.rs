@@ -1256,6 +1256,149 @@ struct BuiltFunction {
     recorded: HashMap<Node, Vec<Vec<RecordedCond>>>,
 }
 
+// The integer class has one deterministic concrete declaration per register.
+// Validate that profile, then guard every result by the classes of ALL input
+// and output declarations it used. A pointer/float model is never excluded by
+// an integer counterexample. Proven siblings must exist in the chosen world.
+fn integer_candidate_conditions(
+    t: &TypeDt,
+    tyvar: &HashMap<RTLReg, Dynamic>,
+    func: &FunctionData,
+    nodes: &[Node],
+    selections: &HashMap<Node, Vec<Bool>>,
+    worlds: &[u8],
+    world_vars: &HashMap<u8, Bool>,
+) -> (HashMap<(Node, usize), Bool>, Vec<Bool>) {
+    use crate::decompile::passes::c_pass::convert::from_relations::convert_param_type_from_param;
+    use crate::decompile::passes::c_pass::helpers::candtype_to_ctype;
+    use crate::decompile::passes::c_pass::types::CType;
+    use crate::decompile::passes::clight_select::integer_semantics::{Validator, Verdict};
+
+    if func.integer_anchors.is_empty() {
+        return (HashMap::new(), Vec::new());
+    }
+    let mut declarations = HashMap::new();
+    // Locals without an explicit declaration candidate are inferred later by
+    // emission. Their spelling is not committed here, so leave them unknown.
+    for (&reg, cands) in &func.var_type_candidates {
+        let rendered = CandType::I64(Sign::Signed);
+        let candidate = anchor_index(cands, rendered, false)
+            .map(|i| cands[i])
+            .unwrap_or(rendered);
+        declarations.insert(reg, candtype_to_ctype(candidate, func.data_model));
+    }
+    for (&reg, param) in func.param_regs.iter().zip(&func.param_types) {
+        let ty = convert_param_type_from_param(param, func.data_model);
+        // The emitter refines its default long parameters from local types;
+        // explicitly typed interface parameters keep their committed type.
+        if ty != CType::long() || !declarations.contains_key(&reg) {
+            declarations.insert(reg, ty);
+        }
+    }
+    let validator = Validator::new();
+    let mut out = HashMap::new();
+    let mut preferences = Vec::new();
+    let mut counts = [0usize; 4];
+    let mut gaps = 0usize;
+    for node in nodes {
+        let Some(inst) = func.integer_anchors.get(node) else {
+            continue;
+        };
+        let candidates = &func.node_statements[node];
+        let checks: Vec<_> = candidates
+            .iter()
+            .map(|stmt| {
+                let check = validator.check(inst, stmt, &declarations, func.data_model);
+                counts[match check.verdict {
+                    Verdict::Equivalent => 0,
+                    Verdict::Refuted => 1,
+                    Verdict::Unsupported => 2,
+                    Verdict::Unknown => 3,
+                }] += 1;
+                check
+            })
+            .collect();
+        if checks.iter().all(|check| check.verdict == Verdict::Refuted) {
+            gaps += 1;
+        }
+        let guard = |regs: &BTreeSet<RTLReg>| {
+            Bool::and(
+                &regs
+                    .iter()
+                    .filter_map(|reg| {
+                        tyvar.get(reg).map(|ty| {
+                            // render_type maps both int and bare struct models to the
+                            // integer carrier. Guard the emitted declaration, otherwise
+                            // Optimize can evade a veto with struct and still emit int.
+                            Bool::and(&[t.is_ptr(ty).not(), t.is_float(ty).not()])
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        // A hard veto is conditional on the declaration profile. Give an
+        // actually validated choice a small preference as well: otherwise a
+        // syntactic tie can move a declaration into an unchecked pointer
+        // profile solely to preserve the refuted statement's rank-0 prior.
+        // This is a coverage preference, not proof about an unchecked profile.
+        if checks.iter().any(|check| check.verdict == Verdict::Refuted) {
+            if let Some(vars) = selections.get(node) {
+                let proved: Vec<Bool> = checks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ci, check)| {
+                        (check.verdict == Verdict::Equivalent)
+                            .then(|| Bool::and(&[vars[ci].clone(), guard(&check.registers)]))
+                    })
+                    .collect();
+                if !proved.is_empty() {
+                    preferences.push(Bool::or(&proved));
+                }
+            }
+        }
+        for (ci, check) in checks.iter().enumerate() {
+            if check.verdict != Verdict::Refuted {
+                continue;
+            }
+            let witnesses: Vec<Bool> = checks
+                .iter()
+                .enumerate()
+                .filter_map(|(wi, witness)| {
+                    if witness.verdict != Verdict::Equivalent {
+                        return None;
+                    }
+                    let masks = func
+                        .candidate_structure_worlds
+                        .get(node)
+                        .and_then(|m| m.get(wi));
+                    let active: Vec<Bool> = worlds
+                        .iter()
+                        .filter(|world| masks.map_or(true, |m| m.contains(world)))
+                        .map(|world| {
+                            world_vars
+                                .get(world)
+                                .cloned()
+                                .unwrap_or_else(|| Bool::from_bool(true))
+                        })
+                        .collect();
+                    Some(Bool::and(&[guard(&witness.registers), Bool::or(&active)]))
+                })
+                .collect();
+            if !witnesses.is_empty() {
+                out.insert(
+                    (*node, ci),
+                    Bool::and(&[guard(&check.registers), Bool::or(&witnesses)]).not(),
+                );
+            }
+        }
+    }
+    if counts[0] + counts[1] > 0 {
+        eprintln!("[integer-semantics] fn={:#x} equivalent={} refuted={} unsupported={} unknown={} guarded-vetoes={} gaps={}",
+            func.address, counts[0], counts[1], counts[2], counts[3], out.len(), gaps);
+    }
+    (out, preferences)
+}
+
 // The single constraint build, engine-independent: identical hard constraints and identical soft families whichever backend consumes them.
 fn build_function_constraints(
     t: TypeDt,
@@ -1460,10 +1603,23 @@ fn build_function_constraints(
                 )
             })
             .count();
-        // Weight strata: priors 1 < SEL-AGREE 2 < cast nudges 8 < dominant
-        // compat_w.  Preserve the pre-world formula exactly.
-        let compat_w: u64 = (regs.len() + authoritative_refinable_nodes) as u64 + 1;
+        let (integer_conditions, integer_preferences) = integer_candidate_conditions(
+            &t,
+            &tyvar,
+            func,
+            &nodes,
+            &selvar,
+            &structure_worlds,
+            &structure_world_var,
+        );
+        // Include the new weight-1 coverage preferences in the prior bound.
+        // Functions without a semantic preference retain the original weight.
+        let compat_w: u64 =
+            (regs.len() + authoritative_refinable_nodes + integer_preferences.len()) as u64 + 1;
         let sink = ConstraintSink::new(backend, compat_w);
+        for preference in &integer_preferences {
+            sink.assert_soft_tagged(None, preference, 1, "integer_semantics");
+        }
 
         // Emit constraints for every candidate statement, guarded by its selection boolean when refinable; multi-candidate nodes also record their conditions for the post-solve re-pick.
         let mut recorded: HashMap<Node, Vec<Vec<RecordedCond>>> = HashMap::new();
@@ -1474,6 +1630,9 @@ fn build_function_constraints(
                     let mut per_cand = Vec::with_capacity(cands.len());
                     for (ci, stmt) in cands.iter().enumerate() {
                         sink.begin_candidate(true);
+                        if let Some(condition) = integer_conditions.get(&(node, ci)) {
+                            sink.assert_structural(Some(&vars[ci]), condition);
+                        }
                         constrain_stmt(
                             &t,
                             &tyvar,
@@ -1557,12 +1716,22 @@ fn build_function_constraints(
 }
 
 // Read one model into the per-function selection. Engine-independent: a pure function of the model plus the built terms.
+fn candidate_satisfies_hard_conditions(model: &dyn ModelView, conditions: &[RecordedCond]) -> bool {
+    conditions.iter().all(|(condition, weight)| {
+        *weight != u64::MAX
+            || condition
+                .as_ref()
+                .is_some_and(|c| model.truth(c) == Some(true))
+    })
+}
+
 #[allow(clippy::type_complexity)]
 fn extract_selection(
     m: &dyn ModelView,
     built: &BuiltFunction,
     func: &FunctionData,
     name_to_ident: &HashMap<String, Ident>,
+    allow_repick: bool,
 ) -> (
     HashMap<Node, Option<usize>>,
     HashMap<RTLReg, usize>,
@@ -1652,11 +1821,12 @@ fn extract_selection(
                     cand_out.insert(node, None);
                     continue;
                 };
-                // Exact-wt re-pick (P3): with the model fixed, score each candidate by fewest exact frontend errors, then structural conditions, then soft weight, then index, and take the minimum.
-                if let Some(per_cand) = recorded.get(&node) {
-                    let truth = |c: &Bool| m.truth(c).unwrap_or(true);
+                // Re-pick only among candidates satisfying all hard
+                // obligations under the fixed model and structural world.
+                if let Some(per_cand) = recorded.get(&node).filter(|_| allow_repick) {
+                    let truth = |c: &Bool| m.truth(c).unwrap_or(false);
                     let cands = &func.node_statements[&node];
-                    let mut best: Option<(u64, u64, u64, u64, usize)> = None;
+                    let mut best: Option<(u64, u64, u64, usize)> = None;
                     for (ci, conds) in per_cand.iter().enumerate() {
                         let allowed = func
                             .candidate_structure_worlds
@@ -1666,6 +1836,10 @@ fn extract_selection(
                         if !allowed {
                             continue;
                         }
+                        // Hard obligations are admission criteria, including
+                        // guarded semantic vetoes. Never trade one away for a
+                        // smaller frontend-error count. Unknown is not proof.
+                        if !candidate_satisfies_hard_conditions(m, conds) { continue; }
                         let wt = cands
                             .get(ci)
                             .map(|stmt| {
@@ -1679,7 +1853,6 @@ fn extract_selection(
                             .unwrap_or(0);
                         // Lossy 64->32 truncations: ranked above soft preferences, uniform when truncation is unavoidable.
                         let narrow = cands.get(ci).map(count_truncating_casts_stmt).unwrap_or(0);
-                        let mut sviol = 0u64;
                         let mut wviol = 0u64;
                         for (cond, w) in conds {
                             let ok = match cond {
@@ -1687,19 +1860,17 @@ fn extract_selection(
                                 None => false,
                             };
                             if !ok {
-                                if *w == u64::MAX {
-                                    sviol += 1;
-                                } else {
+                                if *w != u64::MAX {
                                     wviol = wviol.saturating_add(*w);
                                 }
                             }
                         }
-                        let key = (wt, sviol, narrow, wviol, ci);
+                        let key = (wt, narrow, wviol, ci);
                         if best.is_none_or(|b| key < b) {
                             best = Some(key);
                         }
                     }
-                    if let Some((_, _, _, _, ci)) = best {
+                    if let Some((_, _, _, ci)) = best {
                         chosen = ci;
                     }
                 }
@@ -1811,7 +1982,7 @@ fn solve_function_z3(
             Some(m) => {
                 report_cost("optimize", func, &m, &softs);
                 let (cand_out, ty_out, ty_override, structure_world) =
-                    extract_selection(&m, &built, func, name_to_ident);
+                    extract_selection(&m, &built, func, name_to_ident, true);
                 Ok((cand_out, ty_out, ty_override, structure_world, check_result))
             }
             None => Err(check_result),
@@ -2095,7 +2266,9 @@ fn solve_function_propagator_attempt(
             Some(m) => {
                 report_cost("propagator", func, &m, &clauses);
                 let (cand_out, ty_out, ty_override, structure_world) =
-                    extract_selection(&m, &built, func, name_to_ident);
+                    // The propagator learns constraints spanning candidates.
+                    // Independent re-picking cannot preserve those clauses.
+                    extract_selection(&m, &built, func, name_to_ident, false);
                 // Guess-surface proxy. When the flow theory named a node in a
                 // clause and that node's final pick is not candidate 0, the
                 // weight-1 syntactic prior lost to behavioral evidence: the
@@ -2860,6 +3033,92 @@ mod tests {
 
     fn synthetic_ids<const N: usize>() -> [u64; N] {
         std::array::from_fn(|index| index as u64 + 1)
+    }
+
+    #[test]
+    fn exact_repick_cannot_trade_a_hard_constraint_for_frontend_legality() {
+        let mut func = FunctionData::new(1, "hard_repick".into(), vec![], vec![], None, 0, 2, true);
+        func.return_type = ClightType::Tlong(ClightSignedness::Signed, a());
+        func.node_statements
+            .insert(2, vec![ClightStmt::Sskip, ClightStmt::Sreturn(None)]);
+        let opt = Optimize::new();
+        let backend = OptimizeBackend::new(&opt);
+        let mut built =
+            build_function_constraints(TypeDt::build(), &func, &HashMap::new(), &[], &backend);
+        opt.assert(&built.selvar[&2][0].not());
+        built.recorded.get_mut(&2).unwrap()[0].push((Some(Bool::from_bool(false)), u64::MAX));
+        assert_eq!(opt.check(&[]), SatResult::Sat);
+        let model = opt.get_model().unwrap();
+        let (choices, _, _, _) = extract_selection(&model, &built, &func, &HashMap::new(), true);
+        assert_eq!(choices[&2], Some(1));
+    }
+
+    #[test]
+    fn theory_models_are_not_independently_repicked() {
+        let mut func = FunctionData::new(1, "theory_pick".into(), vec![], vec![], None, 0, 2, true);
+        func.node_statements
+            .insert(2, vec![ClightStmt::Sskip, ClightStmt::Sskip]);
+        let opt = Optimize::new();
+        let backend = OptimizeBackend::new(&opt);
+        let built =
+            build_function_constraints(TypeDt::build(), &func, &HashMap::new(), &[], &backend);
+        opt.assert(&built.selvar[&2][1]);
+        assert_eq!(opt.check(&[]), SatResult::Sat);
+        let (choices, _, _, _) = extract_selection(
+            &opt.get_model().unwrap(),
+            &built,
+            &func,
+            &HashMap::new(),
+            false,
+        );
+        assert_eq!(choices[&2], Some(1));
+    }
+
+    #[test]
+    fn production_selects_defined_modular_arithmetic_over_its_signed_sibling() {
+        let mut func = FunctionData::new(
+            10,
+            "integer_semantics".into(),
+            vec![],
+            vec![],
+            None,
+            0,
+            20,
+            true,
+        );
+        for reg in [1, 2, 3] {
+            func.var_type_candidates
+                .insert(reg, vec![CandType::I64(Sign::Signed)]);
+        }
+        let expr = |sign| {
+            let ty = ClightType::Tlong(sign, a());
+            ClightStmt::Sset(
+                3,
+                ClightExpr::Ebinop(
+                    ClightBinaryOp::Oadd,
+                    Box::new(ClightExpr::Etempvar(1, ty.clone())),
+                    Box::new(ClightExpr::Etempvar(2, ty.clone())),
+                    ty,
+                ),
+            )
+        };
+        func.node_statements.insert(
+            20,
+            vec![
+                expr(ClightSignedness::Signed),
+                expr(ClightSignedness::Unsigned),
+            ],
+        );
+        func.integer_anchors.insert(
+            20,
+            crate::x86::types::RTLInst::Iop(
+                crate::x86::op::Operation::Oaddl,
+                Arc::new(vec![1, 2]),
+                3,
+            ),
+        );
+        let (choices, _, _, _) = solve_function(&func, &HashMap::new(), false);
+        assert_eq!(choices[&20], Some(1));
     }
 
     fn a() -> ClightAttr {

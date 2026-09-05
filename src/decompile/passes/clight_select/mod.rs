@@ -7,6 +7,7 @@ pub mod decl_solve;
 pub mod flow;
 pub mod flow_theory;
 pub mod interface_solve;
+pub mod integer_semantics;
 pub mod propagator;
 pub mod query;
 pub mod select;

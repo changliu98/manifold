@@ -65,30 +65,18 @@ pub fn node_address(node: Node) -> u64 {
     semantic_node_address(node)
 }
 
-fn type_class(ty: &ClightType) -> Option<CmpClass> {
-    match ty {
-        ClightType::Tint(_, ClightSignedness::Signed, _)
-        | ClightType::Tlong(ClightSignedness::Signed, _)
-        | ClightType::Tint128(ClightSignedness::Signed, _) => Some(CmpClass::Signed),
-        ClightType::Tint(_, ClightSignedness::Unsigned, _)
-        | ClightType::Tlong(ClightSignedness::Unsigned, _)
-        | ClightType::Tint128(ClightSignedness::Unsigned, _)
-        | ClightType::Tpointer(..)
-        | ClightType::Tarray(..) => Some(CmpClass::Unsigned),
-        _ => None,
-    }
-}
-
-// C's usual arithmetic conversions make a comparison unsigned as soon as one
-// side is; only a genuinely signed pair performs a signed compare. A side whose
-// class is unknown (float, struct, void) leaves the comparison unclassified.
+// Share C's integer promotions and usual arithmetic conversions with ctyping.
+// An unsigned subword promotes to int; signed long can represent uint32.
 fn compare_class(lhs: &ClightExpr, rhs: &ClightExpr) -> Option<CmpClass> {
-    let l = type_class(expr_type(lhs))?;
-    let r = type_class(expr_type(rhs))?;
-    if l == CmpClass::Unsigned || r == CmpClass::Unsigned {
-        Some(CmpClass::Unsigned)
-    } else {
-        Some(CmpClass::Signed)
+    use crate::decompile::passes::clight_select::ctyping::{classify_binarith, BinarithCase};
+    match classify_binarith(expr_type(lhs), expr_type(rhs)) {
+        BinarithCase::I(sign) | BinarithCase::L(sign) => Some(match sign {
+            ClightSignedness::Signed => CmpClass::Signed,
+            ClightSignedness::Unsigned => CmpClass::Unsigned,
+        }),
+        // Pointer comparisons need object/provenance semantics. The pilot
+        // cannot infer their behavior from an unsigned integer class.
+        _ => None,
     }
 }
 
@@ -333,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pointer_operand_makes_the_compare_unsigned() {
+    fn pointer_comparisons_need_provenance_not_integer_signedness() {
         let ptr = ClightType::Tpointer(
             std::sync::Arc::new(int_ty(ClightSignedness::Signed)),
             attr(),
@@ -344,7 +332,25 @@ mod tests {
             Box::new(ClightExpr::Etempvar(2, ptr)),
             int_ty(ClightSignedness::Signed),
         );
-        assert_eq!(expr_cmp_class(&e), Some(CmpClass::Unsigned));
+        assert_eq!(expr_cmp_class(&e), None);
+    }
+
+    #[test]
+    fn comparison_class_applies_promotions_and_mixed_width_conversions() {
+        let unsigned_byte = ClightType::Tint(ClightIntSize::I8, ClightSignedness::Unsigned, attr());
+        let signed_long = ClightType::Tlong(ClightSignedness::Signed, attr());
+        for (left, right) in [
+            (unsigned_byte.clone(), unsigned_byte),
+            (signed_long, int_ty(ClightSignedness::Unsigned)),
+        ] {
+            assert_eq!(
+                compare_class(
+                    &ClightExpr::Etempvar(1, left),
+                    &ClightExpr::Etempvar(2, right)
+                ),
+                Some(CmpClass::Signed)
+            );
+        }
     }
 
     // The veto only arms when a sibling already matches the machine class, so

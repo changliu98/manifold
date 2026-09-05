@@ -271,11 +271,9 @@ impl Printer {
         match lit.suffix {
             IntLiteralSuffix::None => {}
             IntLiteralSuffix::U => self.output.push('U'),
-            IntLiteralSuffix::L => {
-                if lit.value > i32::MAX as i128 || lit.value < i32::MIN as i128 {
-                    self.output.push('L');
-                }
-            }
+            // The suffix determines C's promotions and operation width even
+            // when the value fits int (for example 1L << 40). It is semantic.
+            IntLiteralSuffix::L => self.output.push('L'),
             IntLiteralSuffix::UL => self.output.push_str("UL"),
             IntLiteralSuffix::LL => self.output.push_str("LL"),
             IntLiteralSuffix::ULL => self.output.push_str("ULL"),

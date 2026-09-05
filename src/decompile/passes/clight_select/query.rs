@@ -310,6 +310,7 @@ pub struct FunctionData {
     pub name: String,
     /// Target pointer width (CompCert's Archi.ptr64), carried from the ABI so the per-function solve and wt audit can type-check against the right width.
     pub ptr64: bool,
+    pub data_model: crate::abi::DataModel,
     pub entry_node: Node,
     pub return_type: ClightType,
     #[allow(dead_code)]
@@ -383,6 +384,10 @@ pub struct FunctionData {
     /// against, and the straight-line blocks it folds.
     pub flow_anchors: crate::decompile::passes::clight_select::flow::FlowAnchors,
     pub flow_blocks: Vec<crate::decompile::passes::clight_select::flow::Block>,
+
+    /// Unique finalized RTL instructions for local integer validation. Exact
+    /// node identity is required; synthetic siblings are distinct effects.
+    pub integer_anchors: HashMap<Node, RTLInst>,
 
     // Known callee signatures indexed by function ident (address)
     pub callee_signatures: HashMap<Ident, CalleeSignature>,
@@ -787,6 +792,8 @@ impl FunctionData {
             class_evidence: std::sync::Arc::new(Default::default()),
             flow_anchors: Default::default(),
             flow_blocks: Vec::new(),
+            integer_anchors: HashMap::new(),
+            data_model: if ptr64 { crate::abi::DataModel::Lp64 } else { crate::abi::DataModel::Ilp32 },
         }
     }
 }
@@ -802,6 +809,18 @@ impl FunctionData {
 /// already consumed upstream, and per node it is unsound for bit-copies.
 fn build_flow_anchors(db: &DecompileDB, func_map: &mut HashMap<Address, FunctionData>) {
     use crate::decompile::passes::clight_select::flow;
+
+    let mut integer_anchors: HashMap<Node, Option<RTLInst>> = HashMap::new();
+    for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+        integer_anchors
+            .entry(*node)
+            .and_modify(|entry| {
+                if entry.as_ref() != Some(inst) {
+                    *entry = None;
+                }
+            })
+            .or_insert_with(|| Some(inst.clone()));
+    }
 
     // Chunk anchors: an Iload commits its destination, an Istore its source.
     let mut chunk_at: BTreeMap<Node, (RTLReg, flow::AVal)> = BTreeMap::new();
@@ -853,12 +872,18 @@ fn build_flow_anchors(db: &DecompileDB, func_map: &mut HashMap<Address, Function
         .collect();
 
     for func in func_map.values_mut() {
+        func.data_model = db.data_model();
         let ptr64 = func.ptr64;
         let mut anchors = flow::FlowAnchors::default();
 
         let mut nodes: Vec<Node> = func.node_statements.keys().copied().collect();
         nodes.sort_unstable();
         for node in &nodes {
+            if func.node_statements[node].len() > 1 {
+                if let Some(Some(inst @ (RTLInst::Iop(..) | RTLInst::Icond(..)))) = integer_anchors.get(node) {
+                    func.integer_anchors.insert(*node, inst.clone());
+                }
+            }
             if let Some(&(reg, aval)) = chunk_at.get(node) {
                 anchors.chunk.insert(*node, (reg, aval));
             }
