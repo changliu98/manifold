@@ -447,6 +447,7 @@ pub(super) fn discover(db: &DecompileDB, out: &mut Refinement) {
             problem,
             initial,
             unmapped: unmapped.get(&function).cloned().unwrap_or_default(),
+            candidate_writes: BTreeMap::new(),
         });
         out.records.push(RefinementRecord {
             function,

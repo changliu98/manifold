@@ -293,7 +293,7 @@ fn apply_clight_volatile(base: CType, attr: &crate::x86::types::ClightAttr) -> C
     }
 }
 
-fn convert_clight_type(ty: &crate::x86::types::ClightType, model: crate::abi::DataModel) -> CType {
+pub(crate) fn convert_clight_type(ty: &crate::x86::types::ClightType, model: crate::abi::DataModel) -> CType {
     use crate::x86::types::*;
     match ty {
         crate::x86::types::ClightType::Tvoid => CType::Void,

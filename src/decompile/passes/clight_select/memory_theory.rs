@@ -1,14 +1,25 @@
 //! Check actual typed Clight memory targets against decoded frame writes.
 //!
-//! This is a target/width correspondence theory, not a payload, dominance or
-//! control-flow equivalence certificate. Pointer addition is interpreted at
-//! the source pointee size; a matching byte count at the wrong offset fails.
+//! Target/width contracts and independent RTL anchors feed the selector's
+//! shared obligation interface. Pointer addition uses the source pointee size;
+//! a matching byte count at the wrong offset fails. This module does not
+//! establish initialization, dominance, or control-flow equivalence.
 
 use super::query::FunctionData;
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::semantic_counterexample::ledger::{self, ObjectId};
 use crate::x86::types::*;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Direct reads plus the storage discovery/decoder helpers used below. The
+/// selection registry unions these into the scheduler's declared dependencies.
+pub(crate) static INPUTS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+    let mut reads = crate::decompile::passes::semantic_counterexample::INPUTS.to_vec();
+    reads.extend_from_slice(&["semantic_storage_obligation", "frame_read_storage_access_owner", "rtl_inst"]);
+    reads.sort_unstable();
+    reads.dedup();
+    reads
+});
 
 #[derive(Clone, Debug)]
 pub(crate) struct WriteContract {
@@ -20,6 +31,19 @@ pub(crate) struct WriteContract {
     pub locals: BTreeSet<RTLReg>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ReadContract {
+    pub object: ObjectId,
+    pub node: Node,
+    pub root: RTLReg,
+    pub offset: i64,
+    pub width: usize,
+    pub chunk: MemoryChunk,
+    pub destination: RTLReg,
+    pub write_bits: Option<u32>,
+    pub signed_word_load: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Check {
     Matches,
@@ -29,8 +53,8 @@ pub(crate) enum Check {
 
 /// Bind the provisional model to storage that is ALREADY explicit in Clight.
 /// This is not a timeout shortcut: the full verifier still checks this model.
-/// A writer is shared only if every available candidate has the exact target
-/// and width, so subsequent statement selection cannot invalidate the binding.
+/// Each write view is conditional on its statement candidate. The layout
+/// verifier sees the selected view, and learns clauses over those same choices.
 pub(crate) fn bind_current_storage(
     db: &DecompileDB,
     functions: &[FunctionData],
@@ -90,18 +114,37 @@ pub(crate) fn bind_current_storage(
                 width: write.width,
                 locals: BTreeSet::from([write.local]),
             };
-            if candidates
+            let original = prepared.initial.writes.get(&write.node).copied();
+            let views: Vec<_> = candidates
                 .iter()
-                .all(|s| check(s, &contract, function) == Check::Matches)
+                .map(|stmt| match primitive(stmt) {
+                    ClightStmt::Sassign(lhs, _)
+                        if size(super::solve::clight_expr_type(lhs), function.ptr64)
+                            == Some(write.width as i64) =>
+                    {
+                        Some(View {
+                            object: StorageId::Frame(object),
+                            offset: lvalue(lhs, root, function)?,
+                            extent,
+                        })
+                    }
+                    ClightStmt::Sset(local, _) if contract.locals.contains(&(*local as RTLReg)) => {
+                        original
+                    }
+                    _ => None,
+                })
+                .collect();
+            if let Some(view) = views
+                .first()
+                .copied()
+                .flatten()
+                .filter(|view| views.iter().all(|other| *other == Some(*view)))
             {
-                prepared.initial.writes.insert(
-                    write.node,
-                    View {
-                        object: StorageId::Frame(object),
-                        offset: write.offset - p.base,
-                        extent,
-                    },
-                );
+                // Identical targets are independent of statement selection.
+                // Preserve ordinary re-picking of their payload alternatives.
+                prepared.initial.writes.insert(write.node, view);
+            } else {
+                prepared.candidate_writes.insert(write.node, views);
             }
         }
         // A repair may widen an existing allocation, never erase its other
@@ -187,11 +230,97 @@ pub(crate) fn collect(db: &DecompileDB, functions: &mut [FunctionData]) {
             }
         }
     }
+    let mut anchors: BTreeMap<Node, Option<RTLInst>> = BTreeMap::new();
+    for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+        anchors
+            .entry(*node)
+            .and_modify(|old| {
+                if old.as_ref() != Some(inst) {
+                    *old = None;
+                }
+            })
+            .or_insert_with(|| Some(inst.clone()));
+    }
+    let mut owners: BTreeMap<(Address, Node), BTreeSet<(i64, i64, RTLReg)>> = BTreeMap::new();
+    for &(f, n, offset, base, root) in
+        db.rel_iter::<(Address, Node, i64, i64, RTLReg)>("frame_read_storage_access_owner")
+    {
+        owners
+            .entry((f, n))
+            .or_default()
+            .insert((offset, base, root));
+    }
+    let mut reads: BTreeMap<(Address, Node), BTreeSet<(i64, usize)>> = BTreeMap::new();
+    for &(f, n, offset, width) in
+        db.rel_iter::<(Address, Node, i64, usize)>("frame_stack_read_bytes")
+    {
+        reads.entry((f, n)).or_default().insert((offset, width));
+    }
     for function in functions {
         function.storage_writes = writes.remove(&function.address).unwrap_or_default();
         function
             .storage_writes
             .sort_by_key(|w| (w.node, w.object, w.offset, w.width));
+        function.memory_anchors.clear();
+        for write in &function.storage_writes {
+            if let Some(Some(inst)) = anchors.get(&write.node) {
+                function.memory_anchors.insert(write.node, inst.clone());
+            }
+        }
+        function.storage_reads.clear();
+        for (&(f, node), ownership) in &owners {
+            if f != function.address || ownership.len() != 1 {
+                continue;
+            }
+            let &(offset, base, root) = ownership.first().unwrap();
+            let Some(footprint) = reads.get(&(f, node)).filter(|r| r.len() == 1) else {
+                continue;
+            };
+            let &(decoded_offset, width) = footprint.first().unwrap();
+            let Some(Some(RTLInst::Iload(
+                chunk,
+                crate::x86::op::Addressing::Ainstack(at),
+                args,
+                destination,
+            ))) = anchors.get(&node)
+            else {
+                continue;
+            };
+            let object = ObjectId { function: f, base };
+            // An exact scalar-cell read is an obligation even before an
+            // array representation exists. Requiring a recovered byte buffer
+            // here makes missing representation hide the machine observation.
+            // Interior views still require a known containing object; do not
+            // infer an aggregate's extent from the read we intend to check.
+            let contained = committed.get(&object).map_or(offset == base, |&extent| {
+                crate::decompile::passes::frame_write_pass::frame_interval_contains(
+                    base,
+                    extent as usize,
+                    offset,
+                    width,
+                )
+            });
+            if !args.is_empty()
+                || *at != offset
+                || decoded_offset != offset
+                || crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk) != width
+                || !contained
+                || roots.get(&object) != Some(&BTreeSet::from([root]))
+            {
+                continue;
+            }
+            function.storage_reads.push(ReadContract {
+                object,
+                node,
+                root,
+                offset: offset - base,
+                width,
+                chunk: *chunk,
+                destination: *destination,
+                write_bits: None,
+                signed_word_load: false,
+            });
+        }
     }
 }
 
@@ -274,8 +403,58 @@ fn lvalue(expr: &ClightExpr, root: RTLReg, function: &FunctionData) -> Option<i6
     }
 }
 
-pub(crate) fn check(stmt: &ClightStmt, contract: &WriteContract, function: &FunctionData) -> Check {
+/// Only a primitive (possibly provenance-wrapped) is one effect. Finding one
+/// matching write inside a sequence cannot establish the other effects agree.
+pub(crate) fn primitive(stmt: &ClightStmt) -> &ClightStmt {
     match stmt {
+        ClightStmt::Slabel(_, inner) => primitive(inner),
+        ClightStmt::Ssequence(items) if items.len() == 1 => primitive(&items[0]),
+        _ => stmt,
+    }
+}
+
+/// One explicit scalar read, with its byte target checked independently of
+/// the value expression. Calls, multiple reads and volatile accesses are not
+/// silently abstracted into an arbitrary integer.
+pub(crate) fn read_operand<'a>(
+    rhs: &'a ClightExpr,
+    contract: &ReadContract,
+    function: &FunctionData,
+) -> Option<&'a ClightExpr> {
+    fn visit<'a>(
+        expr: &'a ClightExpr,
+        found: &mut Vec<&'a ClightExpr>,
+        fuel: &mut usize,
+    ) -> Option<()> {
+        *fuel = fuel.checked_sub(1)?;
+        match expr {
+            ClightExpr::Ederef(..) | ClightExpr::Efield(..) => found.push(expr),
+            ClightExpr::Ecast(inner, _) | ClightExpr::Eunop(_, inner, _) => {
+                visit(inner, found, fuel)?
+            }
+            ClightExpr::Ebinop(_, lhs, rhs, _) => {
+                visit(lhs, found, fuel)?;
+                visit(rhs, found, fuel)?;
+            }
+            ClightExpr::EconstInt(..) | ClightExpr::EconstLong(..) | ClightExpr::Etempvar(..) => {}
+            _ => return None,
+        }
+        Some(())
+    }
+    let mut found = Vec::new();
+    visit(rhs, &mut found, &mut 96)?;
+    if found.len() != 1 {
+        return None;
+    }
+    let operand = found[0];
+    (lvalue(operand, contract.root, function) == Some(contract.offset)
+        && size(super::solve::clight_expr_type(operand), function.ptr64)
+            == Some(contract.width as i64))
+    .then_some(operand)
+}
+
+pub(crate) fn check(stmt: &ClightStmt, contract: &WriteContract, function: &FunctionData) -> Check {
+    match primitive(stmt) {
         ClightStmt::Sassign(lhs, _) => {
             let Some(offset) = lvalue(lhs, contract.root, function) else {
                 return Check::Unknown;
@@ -291,20 +470,6 @@ pub(crate) fn check(stmt: &ClightStmt, contract: &WriteContract, function: &Func
         }
         ClightStmt::Sset(local, _) if contract.locals.contains(&(*local as RTLReg)) => {
             Check::Mismatch
-        }
-        ClightStmt::Slabel(_, inner) => check(inner, contract, function),
-        ClightStmt::Ssequence(statements) => {
-            let checks: Vec<_> = statements
-                .iter()
-                .map(|s| check(s, contract, function))
-                .collect();
-            if checks.contains(&Check::Matches) {
-                Check::Matches
-            } else if checks.contains(&Check::Mismatch) {
-                Check::Mismatch
-            } else {
-                Check::Unknown
-            }
         }
         _ => Check::Unknown,
     }
@@ -371,6 +536,45 @@ mod tests {
         (f, w)
     }
 
+    #[test]
+    fn exact_scalar_cell_reads_do_not_require_a_preexisting_byte_array() {
+        let mut db = DecompileDB::default();
+        db.rel_push("slot_escaped_canonical", (1_u64, 12_i64, 10_u64));
+        db.rel_push(
+            "frame_read_storage_access_owner",
+            (1_u64, 40_u64, 12_i64, 12_i64, 10_u64),
+        );
+        db.rel_push("frame_stack_read_bytes", (1_u64, 40_u64, 12_i64, 4_usize));
+        db.rel_push(
+            "rtl_inst",
+            (
+                40_u64,
+                RTLInst::Iload(
+                    MemoryChunk::MAny32,
+                    crate::x86::op::Addressing::Ainstack(12),
+                    Arc::new(vec![]),
+                    13,
+                ),
+            ),
+        );
+        let (mut function, _) = fixture();
+        collect(&db, std::slice::from_mut(&mut function));
+        assert_eq!(function.storage_reads.len(), 1);
+        assert_eq!(function.storage_reads[0].offset, 0);
+        assert!(db.stack_struct_buffers.is_empty());
+        db.rel_set(
+            "frame_read_storage_access_owner",
+            [(1_u64, 40_u64, 12_i64, 8_i64, 10_u64)]
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        collect(&db, std::slice::from_mut(&mut function));
+        assert!(
+            function.storage_reads.is_empty(),
+            "an unknown interior extent is not a scalar cell"
+        );
+    }
+
     fn store(index: i64, element: ClightIntSize) -> ClightStmt {
         let attr = ClightAttr::default();
         let byte = ClightType::Tint(ClightIntSize::I8, ClightSignedness::Unsigned, attr.clone());
@@ -426,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_storage_binding_requires_every_candidate_to_preserve_the_write() {
+    fn existing_storage_binding_retains_each_candidates_distinct_write_view() {
         use crate::decompile::passes::semantic_counterexample::{
             self as storage, Access, Prepared, Problem, Representation, StorageId, View,
         };
@@ -491,14 +695,41 @@ mod tests {
                     )]),
                 },
                 unmapped: vec![],
+                candidate_writes: BTreeMap::new(),
             }];
-            bind_current_storage(&db, &[function], &mut pending);
+            bind_current_storage(&db, &[function.clone()], &mut pending);
             assert_eq!(pending[0].problem.minimum_extent, 16);
             let valid = matches!(
                 storage::validate_complete(&pending[0].problem, &pending[0].initial),
                 storage::Verdict::Validated
             );
             assert_eq!(valid, !has_unchecked);
+            if has_unchecked {
+                let views = &pending[0].candidate_writes[&30];
+                assert!(matches!(
+                    views[0],
+                    Some(View {
+                        object: StorageId::Frame(_),
+                        offset: 4,
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    views[1],
+                    Some(View {
+                        object: StorageId::Scalar(12),
+                        ..
+                    })
+                ));
+            }
+            super::super::analysis::storage::PROBLEMS.insert(&mut function.analysis_facts, pending);
+            let outcome =
+                super::super::solve::solve_function_z3(&function, &HashMap::new(), &[]).unwrap();
+            assert_eq!(outcome.0[&30], Some(0));
+            let decisions = super::super::analysis::storage::DECISIONS.get(&outcome.5).unwrap();
+            assert_eq!(decisions.len(), 1);
+            assert!(!decisions[0].requires_replay);
+            assert!(decisions[0].representation.is_some());
         }
     }
 }

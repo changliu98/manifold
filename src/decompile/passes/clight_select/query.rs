@@ -388,10 +388,19 @@ pub struct FunctionData {
     /// Unique finalized RTL instructions for local integer validation. Exact
     /// node identity is required; synthetic siblings are distinct effects.
     pub integer_anchors: HashMap<Node, RTLInst>,
-    /// Representation obligations share the final statement/type solve. A
-    /// successful latent layout requests re-derivation, not immediate C.
-    pub(crate) storage_problems: Vec<crate::decompile::passes::semantic_counterexample::Prepared>,
+    /// Immutable module-owned evidence, prepared before the per-function
+    /// solve. A new analysis need not add fields to this shared query record.
+    pub(crate) analysis_facts: super::analysis::Artifacts,
     pub(crate) storage_writes: Vec<super::memory_theory::WriteContract>,
+    pub(crate) storage_reads: Vec<super::memory_theory::ReadContract>,
+    /// Unique finalized operations at physical frame accesses. Unlike an
+    /// expression candidate, these are independent payload/extension anchors.
+    pub(crate) memory_anchors: HashMap<Node, RTLInst>,
+    pub(crate) value_producers: BTreeMap<(Node, RTLReg), super::producer_values::Producer>,
+    /// Supplemental hypotheses proposed by selection analyses. They retain
+    /// world provenance, but do not replace the ordinary no-model fallback.
+    pub(crate) analysis_candidates: HashMap<Node, HashSet<ClightStmt>>,
+    pub(crate) word_inputs: BTreeMap<Node, BTreeSet<RTLReg>>,
 
     // Known callee signatures indexed by function ident (address)
     pub callee_signatures: HashMap<Ident, CalleeSignature>,
@@ -797,8 +806,13 @@ impl FunctionData {
             flow_anchors: Default::default(),
             flow_blocks: Vec::new(),
             integer_anchors: HashMap::new(),
-            storage_problems: Vec::new(),
+            analysis_facts: super::analysis::Artifacts::default(),
             storage_writes: Vec::new(),
+            storage_reads: Vec::new(),
+            memory_anchors: HashMap::new(),
+            value_producers: BTreeMap::new(),
+            analysis_candidates: HashMap::new(),
+            word_inputs: BTreeMap::new(),
             data_model: if ptr64 { crate::abi::DataModel::Lp64 } else { crate::abi::DataModel::Ilp32 },
         }
     }

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "suite": "manifold-available-value-producers",
+  "cases": [
+    {
+      "name": "frame_load_word_view",
+      "source": "cases/frame_word.c",
+      "description": "Upper bits of a frame reload remain observable after 64-bit arithmetic; a signed C load must not replace machine zero extension.",
+      "cflags": ["-O2"],
+      "runs": [
+        {"name": "one", "args": [], "expected": {"returncode": 253, "stdout": "", "stderr": ""}},
+        {"name": "two", "args": ["x"], "expected": {"returncode": 252, "stdout": "", "stderr": ""}},
+        {"name": "four", "args": ["x", "x", "x"], "expected": {"returncode": 254, "stdout": "", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "producer_zero_extension",
+      "source": "cases/producer_word.c",
+      "description": "A 32-bit register definition is zero-extended before an eight-byte frame store; inlining must preserve its upper bytes.",
+      "cflags": ["-O2"],
+      "runs": [
+        {"name": "low_and_high_bytes", "args": [], "expected": {"returncode": 255, "stdout": "", "stderr": ""}}
+      ]
+    }
+  ]
+}

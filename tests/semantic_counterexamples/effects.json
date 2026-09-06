@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "suite": "manifold-frame-value-effects",
+  "cases": [
+    {
+      "name": "unsigned_linear_frame_read",
+      "source": "cases/frame_effects.c",
+      "description": "Straight-line unsigned frame reads preserve the loaded byte and integer payload.",
+      "cflags": ["-O2", "-DLINEAR_READ=1"],
+      "runs": [
+        {"name": "one", "args": [], "expected": {"returncode": 68, "stdout": "", "stderr": ""}},
+        {"name": "two", "args": ["x"], "expected": {"returncode": 73, "stdout": "", "stderr": ""}},
+        {"name": "four", "args": ["x", "x", "x"], "expected": {"returncode": 82, "stdout": "", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "signed_linear_frame_read",
+      "source": "cases/frame_effects.c",
+      "description": "Sign extension precedes conversion to unsigned and shifting; low-byte-only checks cannot establish this effect.",
+      "cflags": ["-O2", "-DLINEAR_READ=1", "-DSIGNED_READ=1"],
+      "runs": [
+        {"name": "one", "args": [], "expected": {"returncode": 196, "stdout": "", "stderr": ""}},
+        {"name": "two", "args": ["x"], "expected": {"returncode": 201, "stdout": "", "stderr": ""}},
+        {"name": "four", "args": ["x", "x", "x"], "expected": {"returncode": 210, "stdout": "", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "unsigned_frame_read",
+      "source": "cases/frame_effects.c",
+      "description": "Exact frame reads preserve unsigned extension and a separately stored integer payload.",
+      "cflags": ["-O2"],
+      "runs": [
+        {"name": "one", "args": [], "expected": {"returncode": 27, "stdout": "", "stderr": ""}},
+        {"name": "two", "args": ["x"], "expected": {"returncode": 31, "stdout": "", "stderr": ""}},
+        {"name": "four", "args": ["x", "x", "x"], "expected": {"returncode": 39, "stdout": "", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "signed_frame_read",
+      "source": "cases/frame_effects.c",
+      "description": "The same frame byte is interpreted through a signed load without losing its sign bit.",
+      "cflags": ["-O2", "-DSIGNED_READ=1"],
+      "runs": [
+        {"name": "one", "args": [], "expected": {"returncode": 27, "stdout": "", "stderr": ""}},
+        {"name": "two", "args": ["x"], "expected": {"returncode": 31, "stdout": "", "stderr": ""}},
+        {"name": "four", "args": ["x", "x", "x"], "expected": {"returncode": 39, "stdout": "", "stderr": ""}}
+      ]
+    }
+  ]
+}

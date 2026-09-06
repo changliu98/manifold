@@ -63,7 +63,7 @@ fn superset_provenance_priority(
 
 #[derive(Clone, Default)]
 pub(crate) struct ProgramSelectionState {
-    pub(crate) storage: Vec<super::storage_theory::Decision>,
+    pub(crate) analysis_results: BTreeMap<Address, super::analysis::Artifacts>,
     /// (func_addr, node) -> candidate index
     pub(crate) candidate_idx: HashMap<(Address, Node), Option<usize>>,
     /// One atomic CFG/structure interpretation per function.
@@ -123,15 +123,7 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
     let data_model = db.data_model();
     let (mut functions, id_to_name, mut committed_interfaces, interface_vars) =
         extract_functions(db)?;
-    let mut storage_obligations = if db.semantic_ablations.disable_storage_search {
-        Default::default()
-    } else { crate::decompile::passes::semantic_counterexample::prepare(db) };
-    super::memory_theory::bind_current_storage(db, &functions, &mut storage_obligations.pending);
-    for function in &mut functions {
-        function.storage_problems = storage_obligations.pending.iter()
-            .filter(|p| p.problem.function == function.address).cloned().collect();
-    }
-    super::memory_theory::collect(db, &mut functions);
+    let mut analyses = super::analysis::Stack::production().prepare(db, &mut functions);
     // Reversing Stacking turns a physical frame-cell write into `Sset` of the
     // cell's canonical local.  Retain that structural identity for the width
     // audit; an arbitrary SSA temporary at the same node is not memory-write
@@ -181,6 +173,7 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
         nodes.sort_unstable();
         for node in nodes {
             let authoritative_structure_world = func.authoritative_structure_world;
+            let hypotheses = func.analysis_candidates.get(&node);
             let candidates = func
                 .node_statements
                 .get_mut(&node)
@@ -228,6 +221,9 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
                     };
                     (
                         structure_priority,
+                        // Analysis-generated interpretations are hypotheses, not a
+                        // replacement for the ordinary no-model fallback.
+                        u8::from(hypotheses.is_some_and(|views| views.contains(s))),
                         provenance_priority,
                         priority,
                         stmt_deterministic_hash(s),
@@ -241,6 +237,11 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
             func.candidate_structure_worlds.insert(node, world_masks);
         }
     }
+
+    // Bind after the final priority ordering: candidate indices are solver
+    // identities, never positions in an unordered upstream relation. Binding
+    // earlier could apply a correct view to a different selected statement.
+    analyses.bind(db, &mut functions);
 
     // Dump candidate distribution stats when CANDIDATE_STATS_OUT is set
     if let Ok(out_path) = std::env::var("CANDIDATE_STATS_OUT") {
@@ -494,8 +495,7 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
     }
     db.committed_interfaces = committed_interfaces;
     db.interface_vars = interface_vars;
-    crate::decompile::passes::semantic_counterexample::publish_selection(db, storage_obligations, &best_state.storage);
-    super::memory_theory::record_selection(db, &functions, &best_state);
+    analyses.publish(db, &functions, &best_state);
 
     for func in &functions {
         let world = best_state
@@ -4357,7 +4357,7 @@ mod tests {
             structure_world: HashMap::new(),
             var_decl_idx: HashMap::new(),
             var_type_override: HashMap::new(),
-            storage: Vec::new(),
+            analysis_results: BTreeMap::new(),
         };
         let feedback = committed_global_flow_feedback(&[func], &state);
         assert_eq!(feedback.len(), 1, "{feedback:?}");

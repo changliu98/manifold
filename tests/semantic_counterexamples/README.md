@@ -11,6 +11,10 @@ stdout, stderr, and exit status for the inputs recorded in each manifest.
 - `selection_views.json`: sliding packet windows and overlapping byte lanes.
 - `abi_effects.json`: variadic forwarding through stdio and file descriptors.
 - `gp_variadic.json`: general-purpose-register variadic argument storage.
+- `effects.json`: integer payloads and signed/unsigned frame reads, with
+  straight-line and memory-comparison variants.
+- `producers.json`: available integer producers, register-word extension,
+  and frame values used by wider arithmetic.
 
 Run a manifest with a Debug build:
 
@@ -26,7 +30,8 @@ The harness accepts repeatable `--manifold-arg=--flag` arguments, including
 
 This corpus includes known failures: branch-merged and unsupported indexed
 views, narrow return values in packet windows, floating-point variadic argument
-recovery, and optimized direct reads from variadic register-save areas. The
+recovery, optimized direct reads from variadic register-save areas, and
+memory-comparison/conditional-move lifting in the branch-based access cases. The
 oracle reports these failures normally; they are not expected-failure passes.
 The mandatory GCC/Clang pipeline regression for committed storage refinement
 is `tests/source/semantic_selection_epoch`.

@@ -1547,6 +1547,7 @@ impl IRPass for RTLOptimizePass {
             "rtl_function_entry",
             "single_def_const",
             "emit_inline_temp",
+            "rtl_available_value",
             // Exact production optimizer kills, retained after nop collapse so
             // downstream audits can distinguish deliberate removal from loss.
             "dead_store",
@@ -2438,11 +2439,27 @@ impl PassContext {
         let mut live_regs: HashSet<RTLReg> = HashSet::new();
         let mut global_def_count: HashMap<RTLReg, usize> = HashMap::new();
         let mut global_use_nodes: HashMap<RTLReg, HashSet<Node>> = HashMap::new();
+        let mut pure_definition: HashMap<RTLReg, Node> = HashMap::new();
+        let mut owners: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+        for (&address, cfg) in &functions {
+            for &node in &cfg.nodes { owners.entry(node).or_default().insert(address); }
+        }
+        let conflicting_owners: HashSet<_> = conflicting_nodes.iter()
+            .flat_map(|node| owners.get(node).into_iter().flatten().copied()).collect();
         for (&node, inst) in &final_insts {
             collect_inst_regs(inst, &mut live_regs);
             let (defined, used) = inst_def_use(inst);
             if let Some(reg) = defined {
                 *global_def_count.entry(reg).or_default() += 1;
+            }
+            if let RTLInst::Iop(_, args, destination) = inst {
+                // Escaped slots are storage identities, not immutable scalar
+                // operands. A pure-value certificate must not ignore a call's
+                // possible writes through their addresses.
+                if !escaped_regs.contains(destination) && !multi_def_slot_regs.contains(destination)
+                    && args.iter().all(|r| !escaped_regs.contains(r) && !multi_def_slot_regs.contains(r)) {
+                    pure_definition.insert(*destination, node);
+                }
             }
             for reg in used {
                 global_use_nodes.entry(reg).or_default().insert(node);
@@ -2483,6 +2500,7 @@ impl PassContext {
         db.rel_set("rtl_function_entry", normalized_entries);
 
         let inline_vec = ascent::boxcar::Vec::<RTLReg>::new();
+        let value_equalities = ascent::boxcar::Vec::<(Address, Node, RTLReg, Node)>::new();
         // Sort and recheck the single-def/single-use contract globally: a
         // private owner view cannot certify a web shared by another entry.
         let mut inline_sorted: Vec<RTLReg> = inline_temps.iter().copied().collect();
@@ -2496,9 +2514,24 @@ impl PassContext {
                 && !parameter_regs.contains(&reg)
             {
                 inline_vec.push(reg);
+                if let (Some(&definition), Some(uses)) = (pure_definition.get(&reg), global_use_nodes.get(&reg)) {
+                    let usage = *uses.iter().next().unwrap(); // the unique queried use
+                    if let Some(owner) = owners.get(&definition).filter(|set| set.len() == 1)
+                        .filter(|set| owners.get(&usage) == Some(*set)).and_then(|set| set.first()) {
+                        if !conflicting_owners.contains(owner) {
+                            // This equality is justified by find_inline_temps'
+                            // point-keyed must-availability lattice: the pure
+                            // definition reaches this use with operands intact.
+                            // Export queried facts, never a pairwise reachability
+                            // closure or an instruction-order approximation.
+                            value_equalities.push((*owner, usage, reg, definition));
+                        }
+                    }
+                }
             }
         }
         db.rel_set("emit_inline_temp", inline_vec);
+        db.rel_set("rtl_available_value", value_equalities);
     }
 }
 
@@ -3414,6 +3447,39 @@ mod tests {
             escaped_slot_regs: HashSet::new(),
             multi_def_slot_regs: HashSet::new(),
             shared_nodes: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn exported_value_equations_require_cfg_availability_not_definition_order() {
+        for bypass in [false, true] {
+            // The definition's id is larger than its use. Only the CFG proves
+            // the positive case; the bypass invalidates the same single def.
+            let mut instructions = vec![
+                (90, RTLInst::Iop(Operation::Olongconst(7), Arc::new(vec![]), 7)),
+                (30, RTLInst::Istore(MemoryChunk::MInt64, Addressing::Ainstack(0), Arc::new(vec![]), 7)),
+                (10, RTLInst::Ireturn(2)),
+            ];
+            let mut edges = vec![(90, 30), (30, 10)];
+            let entry = if bypass {
+                instructions.push((1, RTLInst::Icond(Condition::Ccompimm(Comparison::Ceq, 0), Arc::new(vec![2]),
+                    Either::Right(90), Either::Right(30))));
+                edges.extend([(1, 90), (1, 30)]);
+                1
+            } else { 90 };
+            let function = synthetic_function(entry, instructions, &edges, &[2]);
+            let du = DefUseInfo::build(&function);
+            let liveness = LivenessInfo::build(&function, &du);
+            let inlines = find_inline_temps(&function, &du, &liveness);
+            assert_eq!(inlines.contains(&7), !bypass);
+            let context = PassContext {
+                original_insts: function.inst.clone(), original_succs: edges.into_iter().collect(),
+                functions: BTreeMap::from([(0x1000, function)]), var_types: HashMap::new(), inline_temps: inlines,
+            };
+            let mut db = DecompileDB::default();
+            context.write_back(&mut db);
+            let equalities: Vec<_> = db.rel_iter::<(u64, u64, u64, u64)>("rtl_available_value").copied().collect();
+            assert_eq!(equalities, if bypass { vec![] } else { vec![(0x1000, 30, 7, 90)] });
         }
     }
 

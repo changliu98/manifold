@@ -422,6 +422,9 @@ pub(crate) struct Prepared {
     pub problem: Problem,
     pub initial: Representation,
     pub unmapped: Vec<(i64, usize)>,
+    /// Final-selection candidate order, not relation iteration order. None
+    /// denotes an unmodeled effect and cannot authorize storage validation.
+    pub candidate_writes: BTreeMap<Node, Vec<Option<View>>>,
 }
 
 /// Verify the lowering's byte partition against the independent decoder
@@ -1028,6 +1031,7 @@ pub(crate) fn prepare(db: &DecompileDB) -> Refinement {
             problem,
             initial,
             unmapped: unmapped.get(&func).cloned().unwrap_or_default(),
+            candidate_writes: BTreeMap::new(),
         });
         record.reason = "pending final-selection storage theory";
         result.records.push(record);
@@ -1173,14 +1177,16 @@ mod tests {
                 p.lea,
                 true,
             );
-            function.storage_problems.push(prepared.clone());
+            crate::decompile::passes::clight_select::analysis::storage::PROBLEMS
+                .insert(&mut function.analysis_facts, vec![prepared.clone()]);
             let outcome = crate::decompile::passes::clight_select::solve::solve_function_z3(
                 &function,
                 &std::collections::HashMap::new(),
                 &[],
             )
             .unwrap();
-            for decision in outcome.5 {
+            for decision in crate::decompile::passes::clight_select::analysis::storage::DECISIONS
+                .get(&outcome.5).into_iter().flatten().cloned() {
                 if let Some(witness) = decision.steps.iter().find_map(|s| s.witness.clone()) {
                     result.counterexamples.push(witness);
                 }
@@ -1398,7 +1404,7 @@ mod tests {
         assert!(repair.objects.is_empty());
         assert_eq!(
             repair.records[0].reason,
-            "no layout satisfies the accumulated witnesses"
+            "no model satisfies the accumulated analysis witnesses"
         );
     }
 

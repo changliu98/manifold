@@ -1,329 +1,28 @@
 use rayon::prelude::*;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use z3::ast::{Bool, Dynamic, Int};
-use z3::{DatatypeAccessor, DatatypeBuilder, DatatypeSort, Optimize, SatResult, Sort};
+use super::analysis::c_types::*;
+use super::analysis::constraints::{
+    ConstraintSink, ModelView, RecordedCond, SolveBackend, SOFT_CLAUSES, SOFT_TAGS,
+};
+use super::analysis::{self, Artifacts, Candidate, DeclarationContext, FunctionContext, Stack};
+use z3::ast::{Bool, Dynamic};
+use z3::{Optimize, SatResult};
 
 use crate::decompile::elevator::config::CONFIG;
-use crate::decompile::passes::clight_select::candtype::{CandClass, CandType, Sign};
-use crate::decompile::passes::clight_select::propagator::{
-    RawModel, RawSolver, Theory, VetoTheory,
-};
+use crate::decompile::passes::clight_select::candtype::{CandType, Sign};
+use crate::decompile::passes::clight_select::propagator::{RawSolver, Theory, VetoTheory};
 use crate::decompile::passes::clight_select::query::{
-    CalleeSignature, CommittedInterfaces, FunctionData, InterfaceClass, KnownGlobalTypes,
+    CalleeSignature, CommittedInterfaces, FunctionData, InterfaceClass,
 };
-use crate::decompile::passes::clight_select::select::{
-    callee_ident_from_expr, ProgramSelectionState,
-};
+use crate::decompile::passes::clight_select::select::ProgramSelectionState;
 use crate::x86::types::{
     Address, ClightBinaryOp, ClightExpr, ClightIntSize, ClightStmt, ClightType, Ident, Node,
     ParamType, RTLReg, XType,
 };
-
-// Variant order in the Ty datatype; indices into DatatypeSort::variants.
-const V_VOID: usize = 0;
-const V_INT: usize = 1;
-const V_FLOAT: usize = 2;
-const V_STRUCT: usize = 3;
-const V_UNION: usize = 4;
-const V_FUNC: usize = 5;
-const V_PTR: usize = 6;
-
-// Per-Context handles to the recursive Ty datatype; the algebra models type CLASSES only, since width/signedness payloads carried no constraint information and exploded maxres.
-struct TypeDt {
-    dt: DatatypeSort,
-}
-
-impl TypeDt {
-    fn build() -> Self {
-        let dt = DatatypeBuilder::new("Ty")
-            .variant("void", vec![])
-            .variant("int", vec![])
-            .variant("float", vec![])
-            .variant("struct", vec![("sid", DatatypeAccessor::Sort(Sort::int()))])
-            .variant("union", vec![("uid", DatatypeAccessor::Sort(Sort::int()))])
-            .variant("func", vec![])
-            .variant("ptr", vec![("pointee", DatatypeAccessor::datatype("Ty"))])
-            .finish();
-        TypeDt { dt }
-    }
-
-    fn void(&self) -> Dynamic {
-        self.dt.variants[V_VOID].constructor.apply(&[])
-    }
-    fn int(&self) -> Dynamic {
-        self.dt.variants[V_INT].constructor.apply(&[])
-    }
-    fn float(&self) -> Dynamic {
-        self.dt.variants[V_FLOAT].constructor.apply(&[])
-    }
-    fn struct_(&self, sid: i64) -> Dynamic {
-        self.dt.variants[V_STRUCT]
-            .constructor
-            .apply(&[&Int::from_i64(sid)])
-    }
-    fn union_(&self, uid: i64) -> Dynamic {
-        self.dt.variants[V_UNION]
-            .constructor
-            .apply(&[&Int::from_i64(uid)])
-    }
-    fn func(&self) -> Dynamic {
-        self.dt.variants[V_FUNC].constructor.apply(&[])
-    }
-    fn ptr(&self, pointee: &Dynamic) -> Dynamic {
-        self.dt.variants[V_PTR].constructor.apply(&[pointee])
-    }
-
-    fn is_void(&self, x: &Dynamic) -> Bool {
-        self.dt.variants[V_VOID]
-            .tester
-            .apply(&[x])
-            .as_bool()
-            .unwrap()
-    }
-    fn is_int(&self, x: &Dynamic) -> Bool {
-        self.dt.variants[V_INT]
-            .tester
-            .apply(&[x])
-            .as_bool()
-            .unwrap()
-    }
-    fn is_float(&self, x: &Dynamic) -> Bool {
-        self.dt.variants[V_FLOAT]
-            .tester
-            .apply(&[x])
-            .as_bool()
-            .unwrap()
-    }
-    fn is_struct(&self, x: &Dynamic) -> Bool {
-        self.dt.variants[V_STRUCT]
-            .tester
-            .apply(&[x])
-            .as_bool()
-            .unwrap()
-    }
-    fn is_union(&self, x: &Dynamic) -> Bool {
-        self.dt.variants[V_UNION]
-            .tester
-            .apply(&[x])
-            .as_bool()
-            .unwrap()
-    }
-    fn is_func(&self, x: &Dynamic) -> Bool {
-        self.dt.variants[V_FUNC]
-            .tester
-            .apply(&[x])
-            .as_bool()
-            .unwrap()
-    }
-    fn is_ptr(&self, x: &Dynamic) -> Bool {
-        self.dt.variants[V_PTR]
-            .tester
-            .apply(&[x])
-            .as_bool()
-            .unwrap()
-    }
-    fn pointee(&self, x: &Dynamic) -> Dynamic {
-        self.dt.variants[V_PTR].accessors[0].apply(&[x])
-    }
-    fn struct_sid(&self, x: &Dynamic) -> Dynamic {
-        self.dt.variants[V_STRUCT].accessors[0].apply(&[x])
-    }
-
-    // The post-typeconv integer universe (one class on this algebra).
-    fn is_intish(&self, x: &Dynamic) -> Bool {
-        self.is_int(x)
-    }
-    // Arithmetic class: int/float -- what classify_binarith accepts.
-    fn is_arith(&self, x: &Dynamic) -> Bool {
-        Bool::or(&[self.is_int(x), self.is_float(x)])
-    }
-    // Pointer-shaped after decay: a pointer or a function (functions decay).
-    fn is_ptrish(&self, x: &Dynamic) -> Bool {
-        Bool::or(&[self.is_ptr(x), self.is_func(x)])
-    }
-    // classify_bool: int/float/ptr accept, struct/union/void reject.
-    fn is_boolish(&self, x: &Dynamic) -> Bool {
-        Bool::or(&[self.is_arith(x), self.is_ptrish(x)])
-    }
-
-    // A fresh free type variable.
-    fn fresh(&self) -> Dynamic {
-        Dynamic::from_ast(&z3::ast::Datatype::fresh_const("ty", &self.dt.sort))
-    }
-}
-
-// XType (signature types) -> a concrete Ty term.
-fn xtype_to_ty(t: &TypeDt, xt: &XType) -> Dynamic {
-    match xt {
-        XType::Xvoid => t.void(),
-        XType::Xfloat | XType::Xsingle => t.float(),
-        XType::XstructPtr(sid) => t.ptr(&t.struct_(*sid as i64)),
-        XType::Xfloatptr | XType::Xsingleptr => t.ptr(&t.float()),
-        XType::Xfuncptr => t.ptr(&t.func()),
-        XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr => t.ptr(&t.int()),
-        _ => t.int(),
-    }
-}
-
-// ClightType (expression annotations) -> a concrete Ty term at OPERATOR positions: typeconv applies (the whole integer family collapses to the int class, arrays decay, function decay is handled via classify_fun's ptrish acceptance).
-fn clight_to_ty(t: &TypeDt, ct: &ClightType) -> Dynamic {
-    match ct {
-        ClightType::Tvoid => t.void(),
-        ClightType::Tint(..) | ClightType::Tlong(..) | ClightType::Tint128(..) => t.int(),
-        ClightType::Tfloat(..) => t.float(),
-        ClightType::Tstruct(sid, _) => t.struct_(*sid as i64),
-        ClightType::Tunion(uid, _) => t.union_(*uid as i64),
-        ClightType::Tfunction(..) => t.func(),
-        ClightType::Tpointer(inner, _) => {
-            let pointee = clight_to_ty(t, inner);
-            t.ptr(&pointee)
-        }
-        ClightType::Tarray(inner, _, _) => {
-            // typeconv: arrays decay to element pointers.
-            let pointee = clight_to_ty(t, inner);
-            t.ptr(&pointee)
-        }
-    }
-}
-
-// Candidate type -> a concrete Ty term (the provenance prior); classes only -- width and signedness live in the candidate itself and are resolved at the anchor.
-fn cand_to_ty(t: &TypeDt, candidate: CandType) -> Dynamic {
-    match candidate {
-        CandType::PtrStruct(sid) => t.ptr(&t.struct_(sid as i64)),
-        CandType::PtrDouble | CandType::PtrFloat => t.ptr(&t.float()),
-        CandType::PtrVoid => t.ptr(&t.void()),
-        CandType::PtrFunc => t.ptr(&t.func()),
-        // ptr_ptr_char keeps an int pointee here: the class algebra only tests pointer-ness at
-        // this depth, and giving it a pointer pointee would change deref chains, not just decls.
-        CandType::PtrLong | CandType::PtrChar | CandType::PtrCharPtr | CandType::PtrInt => {
-            t.ptr(&t.int())
-        }
-        CandType::F32 | CandType::F64 => t.float(),
-        // The register domain excludes void (asserted hard below), so a void candidate stands in
-        // as int rather than becoming an unsatisfiable prior.
-        CandType::Void
-        | CandType::Bool
-        | CandType::I8(_)
-        | CandType::I16(_)
-        | CandType::I32(_)
-        | CandType::I64(_) => t.int(),
-    }
-}
-
-// wt_cast at the class level: float<->ptr, cross-kind composites, a void source and a function target are errors, while int<->ptr/width/float conversions are silent; composite IDs are deliberately not compared.
-fn wt_cast_term(t: &TypeDt, from: &Dynamic, to: &Dynamic) -> Bool {
-    let bad_f2p = Bool::and(&[t.is_float(from), t.is_ptrish(to)]);
-    let bad_p2f = Bool::and(&[t.is_ptrish(from), t.is_float(to)]);
-    let comp_ok = Bool::or(&[
-        Bool::and(&[t.is_struct(from), t.is_struct(to)]),
-        Bool::and(&[t.is_union(from), t.is_union(to)]),
-    ]);
-    let comp_involved = Bool::or(&[
-        t.is_struct(from),
-        t.is_union(from),
-        t.is_struct(to),
-        t.is_union(to),
-    ]);
-    let comp_bad = Bool::and(&[comp_involved, comp_ok.not()]);
-    let bad_void_src = t.is_void(from);
-    let bad_to_func = t.is_func(to);
-    let illegal = Bool::or(&[bad_f2p, bad_p2f, comp_bad, bad_void_src, bad_to_func]);
-    // cast_case_void: ANY source converts to void.
-    Bool::or(&[t.is_void(to), illegal.not()])
-}
-
-// wt_cast specialized for a pruned register variable TO-side, dropping the func/void/union arms to 8 testers instead of 14 on the hottest obligation family.
-fn wt_cast_to_reg(t: &TypeDt, from: &Dynamic, lv: &Dynamic) -> Bool {
-    let bad_f2p = Bool::and(&[t.is_float(from), t.is_ptr(lv)]);
-    let bad_p2f = Bool::and(&[t.is_ptrish(from), t.is_float(lv)]);
-    // lv can never be a union (domain pruning), so a union SOURCE is illegal for every register target; struct sources pair only with struct targets.
-    let bad_comp = Bool::or(&[
-        Bool::and(&[t.is_struct(from), t.is_struct(lv).not()]),
-        Bool::and(&[t.is_struct(from).not(), t.is_struct(lv)]),
-        t.is_union(from),
-    ]);
-    let bad_void_src = t.is_void(from);
-    Bool::or(&[bad_f2p, bad_p2f, bad_comp, bad_void_src]).not()
-}
-
-// "a and b agree on POINTERNESS", the axis the Sset-level SEL-AGREE preference operates on, demoting a crossing whose printed cast gcc rejects.
-fn ptr_class_eq(t: &TypeDt, a: &Dynamic, b: &Dynamic) -> Bool {
-    t.is_ptr(a)._eq(&t.is_ptr(b))
-}
-
-// type_binop legality at the class level, one clause per node; parity with ctyping::type_binop is test-enforced.
-fn binop_legal_term(t: &TypeDt, op: ClightBinaryOp, ltm: &Dynamic, rtm: &Dynamic) -> Bool {
-    use ClightBinaryOp::*;
-    match op {
-        Oadd => Bool::or(&[
-            Bool::and(&[t.is_ptrish(ltm), t.is_intish(rtm)]),
-            Bool::and(&[t.is_intish(ltm), t.is_ptrish(rtm)]),
-            Bool::and(&[t.is_arith(ltm), t.is_arith(rtm)]),
-        ]),
-        Osub => Bool::or(&[
-            Bool::and(&[t.is_ptrish(ltm), t.is_intish(rtm)]),
-            Bool::and(&[t.is_ptrish(ltm), t.is_ptrish(rtm)]),
-            Bool::and(&[t.is_arith(ltm), t.is_arith(rtm)]),
-        ]),
-        Omul | Odiv => Bool::and(&[t.is_arith(ltm), t.is_arith(rtm)]),
-        Omod | Oand | Oor | Oxor | Oshl | Oshr => Bool::and(&[t.is_intish(ltm), t.is_intish(rtm)]),
-        Oeq | One | Olt | Ogt | Ole | Oge => Bool::or(&[
-            Bool::and(&[t.is_ptrish(ltm), t.is_ptrish(rtm)]),
-            Bool::and(&[t.is_ptrish(ltm), t.is_intish(rtm)]),
-            Bool::and(&[t.is_intish(ltm), t.is_ptrish(rtm)]),
-            Bool::and(&[t.is_arith(ltm), t.is_arith(rtm)]),
-        ]),
-    }
-}
-
-// No C binary operator accepts one pointer-shaped operand together with one floating operand: classify_add/classify_sub/classify_cmp have no such case, and every fallback (binarith, binarith_int) rejects pointers outright. So this arm of binop legality holds for EVERY op, and unlike the rest of the rulebook it can be enforced HARD.
-//
-// Hard is safe here only in the float direction. The hard type set never REQUIRES a register to be float -- it only ever removes the float variant (the RC-1 pruning above asserts `!is_float` when upstream shows no float evidence) -- so forbidding float on an operand the solver still controls is always satisfiable. Forbidding the POINTER side instead can contradict a hard `is_ptr` coming from a deref of the same register; integer-register-to-float casts avoid that conflict with a generated integer-bridge candidate, while the arith/intish arms of binop_legal_term stay soft where no equivalent local rewrite is guaranteed.
-//
-// Each implication is emitted only when the operand being tested for float is symbolic. With a concretely-floating operand the clause would collapse to `!is_ptrish(other)`, re-introducing that same conflict, and no choice of types could fix the expression anyway -- the soft binop_legal clause prices it and a rival candidate wins.
-fn no_ptr_float_term(t: &TypeDt, ptr_side: &Dynamic, float_side: &Dynamic) -> Bool {
-    Bool::and(&[t.is_ptrish(ptr_side), t.is_float(float_side)]).not()
-}
-
-fn assert_no_ptr_float_mix(
-    t: &TypeDt,
-    sink: &ConstraintSink,
-    guard: Option<&Bool>,
-    lt: &TyTerm,
-    rt: &TyTerm,
-    ltm: &Dynamic,
-    rtm: &Dynamic,
-) {
-    if rt.is_sym() {
-        sink.assert_structural(guard, &no_ptr_float_term(t, ltm, rtm));
-    }
-    if lt.is_sym() {
-        sink.assert_structural(guard, &no_ptr_float_term(t, rtm, ltm));
-    }
-}
-
-// type_unop legality (Ctyping.v:52): ! accepts any scalar; ~ integers only; - and __builtin_fabs numerics only.
-fn unop_legal_term(t: &TypeDt, op: crate::x86::types::ClightUnaryOp, itm: &Dynamic) -> Bool {
-    use crate::x86::types::ClightUnaryOp::*;
-    match op {
-        Onotbool => t.is_boolish(itm),
-        Onotint => t.is_intish(itm),
-        Oneg | Oabsfloat => t.is_arith(itm),
-    }
-}
-
-/// One recorded condition for the post-solve per-node re-pick: the raw (unguarded) condition (None = an unconditional penalty for this candidate) and its weight; weight u64::MAX marks a structural requirement (validity, not preference).
-type RecordedCond = (Option<Bool>, u64);
-
-// Where a built constraint lands. Both engines build the SAME formula through this: the Optimize engine hands softs to MaxSMT, the propagator engine attaches a relaxation literal per soft and minimizes them itself.
-trait SolveBackend {
-    fn assert_hard(&self, cond: &Bool);
-    fn assert_soft(&self, cond: &Bool, weight: u64);
-}
 
 struct OptimizeBackend<'a> {
     opt: &'a Optimize,
@@ -421,779 +120,9 @@ fn report_cost(engine: &str, func: &FunctionData, model: &dyn ModelView, softs: 
     );
 }
 
-// The model reads the selection needs, over either engine's model representation.
-trait ModelView {
-    fn truth(&self, cond: &Bool) -> Option<bool>;
-    fn integer(&self, term: &Dynamic) -> Option<i64>;
-}
-
-impl ModelView for z3::Model {
-    fn truth(&self, cond: &Bool) -> Option<bool> {
-        self.eval(cond, true).and_then(|x| x.as_bool())
-    }
-    fn integer(&self, term: &Dynamic) -> Option<i64> {
-        self.eval(term, true)
-            .and_then(|x| x.as_int())
-            .and_then(|i| i.as_i64())
-    }
-}
-
-impl ModelView for RawModel {
-    fn truth(&self, cond: &Bool) -> Option<bool> {
-        self.eval_bool(cond)
-    }
-    fn integer(&self, term: &Dynamic) -> Option<i64> {
-        self.eval_i64(term)
-    }
-}
-
-// Z3 is the sole selector: structural requirements are always HARD; there is no relaxed retry and no non-Z3 fallback (a function whose constraints are UNSAT yields no selection and signals an upstream candidate-generation bug).
-struct ConstraintSink<'a> {
-    backend: &'a dyn SolveBackend,
-    // The per-function dominant soft weight (compat_w); carried here so the operator-typing rules in `type_of` can emit dominant-soft requirements without threading the weight through every recursive call.
-    compat_w: u64,
-    // Per-candidate dedup for the SEL-AGREE Etempvar class-match preference: a register read N times with the same annotation class in one candidate statement needs ONE preference, not N. Cleared by begin_candidate().
-    agree_seen: RefCell<HashSet<(RTLReg, u8)>>,
-    // Re-pick recording for multi-candidate nodes: every emitted condition is logged RAW and re-scored in Rust under the fixed model, since node selections are conditionally independent given it.
-    record: RefCell<Option<Vec<RecordedCond>>>,
-    // Per-function (guard, cond, weight) dedup for the OPTIMIZER side only: identical obligations carry the same MaxSMT meaning, and clause COUNT is the cost driver.
-    asserted: RefCell<HashSet<(Option<Bool>, Bool, u64)>>,
-}
-
-impl<'a> ConstraintSink<'a> {
-    fn new(backend: &'a dyn SolveBackend, compat_w: u64) -> Self {
-        ConstraintSink {
-            backend,
-            compat_w,
-            agree_seen: RefCell::new(HashSet::new()),
-            record: RefCell::new(None),
-            asserted: RefCell::new(HashSet::new()),
-        }
-    }
-
-    // True exactly once per distinct (guard, cond, w) within this function.
-    fn first_assert(&self, guard: Option<&Bool>, cond: &Bool, w: u64) -> bool {
-        self.asserted
-            .borrow_mut()
-            .insert((guard.cloned(), cond.clone(), w))
-    }
-
-    // Open a fresh per-candidate scope: resets the class-match preference dedup and (for multi-candidate nodes) starts recording conditions for the post-solve re-pick.
-    fn begin_candidate(&self, recording: bool) {
-        self.agree_seen.borrow_mut().clear();
-        *self.record.borrow_mut() = if recording { Some(Vec::new()) } else { None };
-    }
-
-    // Close the per-candidate scope, returning the recorded conditions.
-    fn take_recorded(&self) -> Vec<RecordedCond> {
-        self.record.borrow_mut().take().unwrap_or_default()
-    }
-
-    fn log(&self, cond: Option<&Bool>, w: u64) {
-        if let Some(buf) = self.record.borrow_mut().as_mut() {
-            buf.push((cond.cloned(), w));
-        }
-    }
-
-    // A selection preference: never asserted into the optimizer, only recorded for the post-solve re-pick (no-op outside a recording scope -- with a single candidate there is nothing to prefer).
-    fn prefer(&self, cond: &Bool, w: u64) {
-        self.log(Some(cond), w);
-    }
-
-    // An unconditional penalty against the current candidate (e.g. capturing a void callee's result); recorded for the re-pick alongside its z3 assertion.
-    fn penalize_candidate(&self, w: u64) {
-        self.log(None, w);
-    }
-
-    // A structural requirement: always hard.
-    fn assert_structural(&self, guard: Option<&Bool>, cond: &Bool) {
-        self.log(Some(cond), u64::MAX);
-        if !self.first_assert(guard, cond, u64::MAX) {
-            return;
-        }
-        let c = match guard {
-            Some(g) => g.implies(cond.clone()),
-            None => cond.clone(),
-        };
-        self.backend.assert_hard(&c);
-    }
-
-    fn assert_soft_tagged(&self, guard: Option<&Bool>, cond: &Bool, w: u64, tag: &'static str) {
-        self.log(Some(cond), w);
-        if !self.first_assert(guard, cond, w) {
-            return;
-        }
-        SOFT_CLAUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        soft_tag_count(tag);
-        match guard {
-            Some(g) => self.backend.assert_soft(&g.implies(cond.clone()), w),
-            None => self.backend.assert_soft(cond, w),
-        }
-    }
-
-    // Soft assertion on a raw Bool (the candidate-penalty `!guard` forms and the priors).
-    fn assert_soft_raw(&self, cond: &Bool, w: u64) {
-        SOFT_CLAUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.backend.assert_soft(cond, w);
-    }
-}
-
-// Run-wide asserted-soft-clause counter (P4 perf early-warning, CTYPING_PLAN D2: MaxSMT cost scales with conflicting soft-clause count -- the 15x lesson). Swap-reset and reported by infer_select_program.
-static SOFT_CLAUSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 // Construction-vs-solve attribution for the P4 perf gate.
 static BUILD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CHECK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-// Per-family soft-clause breakdown behind MANIFOLD_SOFT_BREAKDOWN (perf triage).
-static SOFT_TAGS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<&'static str, usize>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
-
-fn soft_tag_count(tag: &'static str) {
-    if std::env::var("MANIFOLD_SOFT_BREAKDOWN").is_ok() {
-        *SOFT_TAGS.lock().unwrap().entry(tag).or_default() += 1;
-    }
-}
-
-// True if a cast operand's type comes from an inferable register (a free Ty var the solver can drive) rather than a concrete annotation/constant; a hard structural constraint only helps on a free var, so concrete operands stay soft (else a single-candidate node can go UNSAT).
-fn cast_operand_is_inferable(e: &ClightExpr, tyvar: &HashMap<RTLReg, Dynamic>) -> bool {
-    match e {
-        ClightExpr::Etempvar(id, _) => tyvar.contains_key(&(*id as RTLReg)),
-        ClightExpr::Ecast(inner, _) => cast_operand_is_inferable(inner, tyvar),
-        _ => false,
-    }
-}
-
-// True when e's inferred type term carries a free register variable, so a structural constraint on it is satisfiable; fully concrete forms are skipped and left to the emitter.
-fn base_drives_free_var(e: &ClightExpr, tyvar: &HashMap<RTLReg, Dynamic>) -> bool {
-    match e {
-        ClightExpr::Etempvar(id, _) => tyvar.contains_key(&(*id as RTLReg)),
-        ClightExpr::Ederef(inner, _) => base_drives_free_var(inner, tyvar),
-        ClightExpr::Ebinop(ClightBinaryOp::Oadd | ClightBinaryOp::Osub, l, r, _) => {
-            base_drives_free_var(l, tyvar) || base_drives_free_var(r, tyvar)
-        }
-        _ => false,
-    }
-}
-
-fn direct_known_global_type<'a>(
-    known: &'a KnownGlobalTypes,
-    e: &ClightExpr,
-) -> Option<&'a ClightType> {
-    match e {
-        ClightExpr::Evar(id, _) => known.by_ident.get(id),
-        _ => None,
-    }
-}
-
-/// A typed term with freeness: Conc folds in Rust with no Z3 emission, Sym flows a free variable so obligations can steer a register type; freeness decides fold-vs-emit only.
-enum TyTerm {
-    Conc(ClightType),
-    Sym(Dynamic),
-}
-
-impl TyTerm {
-    fn is_sym(&self) -> bool {
-        matches!(self, TyTerm::Sym(_))
-    }
-    fn term(&self, t: &TypeDt) -> Dynamic {
-        match self {
-            TyTerm::Conc(ct) => clight_to_ty(t, ct),
-            TyTerm::Sym(d) => d.clone(),
-        }
-    }
-}
-
-// True when an obligation over these operands can steer the model (any free variable involved); concrete sites fold silently.
-fn any_sym(parts: &[&TyTerm]) -> bool {
-    parts.iter().any(|p| p.is_sym())
-}
-
-// The single operator-typing rule: returns the TyTerm of `e` and emits the classify-derived obligations its sub-expressions impose (Cop.v/Ctyping.v at the post-typeconv class level); `tyvar` holds each inferable register's free variable, non-inferable leaves fall back to their annotated type.
-fn type_of(
-    t: &TypeDt,
-    tyvar: &HashMap<RTLReg, Dynamic>,
-    sink: &ConstraintSink,
-    guard: Option<&Bool>,
-    func: &FunctionData,
-    e: &ClightExpr,
-) -> TyTerm {
-    match e {
-        ClightExpr::Etempvar(id, ct) => {
-            match tyvar.get(&(*id as RTLReg)) {
-                Some(tv) => {
-                    // SEL-AGREE (class match): prefer the candidate whose annotation CLASS matches the register's model class, weight 2, so it outranks the candidate-[0] prior but yields to every semantic constraint.
-                    {
-                        let class_id: u8 = match ct {
-                            ClightType::Tpointer(..) => 0,
-                            ClightType::Tfloat(..) => 1,
-                            ClightType::Tstruct(..) => 2,
-                            ClightType::Tint(..) | ClightType::Tlong(..) => 3,
-                            _ => u8::MAX,
-                        };
-                        if class_id != u8::MAX
-                            && sink
-                                .agree_seen
-                                .borrow_mut()
-                                .insert((*id as RTLReg, class_id))
-                        {
-                            let agree = match class_id {
-                                0 => t.is_ptr(tv),
-                                1 => t.is_float(tv),
-                                2 => t.is_struct(tv),
-                                _ => t.is_intish(tv),
-                            };
-                            sink.prefer(&agree, 2);
-                        }
-                    }
-                    TyTerm::Sym(tv.clone())
-                }
-                None => TyTerm::Conc(ct.clone()),
-            }
-        }
-        ClightExpr::EconstInt(_, ct)
-        | ClightExpr::EconstLong(_, ct)
-        | ClightExpr::EconstFloat(_, ct)
-        | ClightExpr::EconstSingle(_, ct) => TyTerm::Conc(ct.clone()),
-        ClightExpr::Evar(id, ct) => TyTerm::Conc(
-            func.known_global_types
-                .by_ident
-                .get(id)
-                .cloned()
-                .unwrap_or_else(|| ct.clone()),
-        ),
-        ClightExpr::EvarSymbol(_, ct) => TyTerm::Conc(ct.clone()),
-        ClightExpr::Ederef(inner, ct) => {
-            let it = type_of(t, tyvar, sink, guard, func, inner);
-            // deref requires a pointer and the result is the pointee; assert only when the base drives a free variable (on a concrete base it is redundant or forces whole-function UNSAT) -- the D1-frozen hard set.
-            if base_drives_free_var(inner, tyvar) {
-                sink.assert_structural(guard, &t.is_ptr(&it.term(t)));
-            }
-            match it {
-                TyTerm::Sym(d) => TyTerm::Sym(t.pointee(&d)),
-                TyTerm::Conc(c) => {
-                    // Fold: pointer/array yield the element; anything else is the re-pick's business -- recover with the annotation.
-                    match crate::decompile::passes::clight_select::ctyping::type_deref(&c) {
-                        Some(elem) => TyTerm::Conc(elem),
-                        None => TyTerm::Conc(ct.clone()),
-                    }
-                }
-            }
-        }
-        ClightExpr::Eaddrof(inner, _) => {
-            let it = type_of(t, tyvar, sink, guard, func, inner);
-            match it {
-                TyTerm::Sym(d) => TyTerm::Sym(t.ptr(&d)),
-                TyTerm::Conc(c) => TyTerm::Conc(ClightType::Tpointer(
-                    std::sync::Arc::new(c),
-                    crate::x86::types::ClightAttr::default(),
-                )),
-            }
-        }
-        ClightExpr::Efield(base, _, ct) => {
-            let bt = type_of(t, tyvar, sink, guard, func, base);
-            // the field base (for `e.f`, or the pointee for `e->f` = (*p).f) must be a struct; assert only when it drives a free variable, for the same reason as deref above.
-            if base_drives_free_var(base, tyvar) {
-                sink.assert_structural(guard, &t.is_struct(&bt.term(t)));
-            } else if matches!(
-                base.as_ref(),
-                ClightExpr::Evar(_, ClightType::Tstruct(..))
-                    | ClightExpr::Etempvar(_, ClightType::Tstruct(..))
-            ) {
-                // A struct-VALUE member access whose base folds only to a concrete Tstruct annotation is the member-of-non-struct error, priced here so a raw byte-offset alternative wins; p->f is untouched.
-                sink.penalize_candidate(8);
-            }
-            TyTerm::Conc(ct.clone())
-        }
-        ClightExpr::Ecast(inner, ct) => {
-            let it = type_of(t, tyvar, sink, guard, func, inner);
-            if it.is_sym() {
-                let itm = it.term(t);
-                // Casting a floating operand to a pointer is illegal C, enforced HARD for an inferable register but soft otherwise so a single-candidate node is not forced UNSAT.
-                if matches!(ct, ClightType::Tpointer(..)) {
-                    let not_float = t.is_float(&itm).not();
-                    if cast_operand_is_inferable(inner, tyvar) {
-                        sink.assert_structural(guard, &not_float);
-                    } else {
-                        sink.assert_soft_tagged(guard, &not_float, 8, "cast_to_ptr");
-                    }
-                }
-                // A direct pointer-to-float cast is invalid C. ClightPass adds
-                // an integer-bridge candidate for every machine
-                // integer-register-to-float conversion whose source variant
-                // is pointer-shaped, so rejecting the direct candidate HARD
-                // is satisfiable even when a dereference fixes the register
-                // as a pointer. Concrete/non-inferable operands remain soft:
-                // there is no type variable for this clause to drive, and an
-                // isolated single-candidate expression must report a
-                // generation gap rather than make the whole function UNSAT.
-                if matches!(ct, ClightType::Tfloat(..)) {
-                    let not_ptr = t.is_ptrish(&itm).not();
-                    if cast_operand_is_inferable(inner, tyvar) {
-                        sink.assert_structural(guard, &not_ptr);
-                    } else {
-                        sink.assert_soft_tagged(guard, &not_ptr, 8, "cast_to_float");
-                    }
-                }
-                // Remaining wt_cast mismatches (struct<->scalar, void source) are RECORDED-ONLY: the re-pick prices every cast exactly, and asserting these 16k+ clauses bought nothing.
-                let tgt = clight_to_ty(t, ct);
-                sink.prefer(&wt_cast_term(t, &itm, &tgt), 8);
-                // The weight-1 SEL-AGREE cast-level pointerness nudge was retired as subsumed; the Sset-level and Etempvar class-match preferences are not subsumed and stay.
-            } else if direct_known_global_type(func.known_global_types.as_ref(), inner).is_some() {
-                // Concrete known globals carry an authoritative declaration
-                // type. Unlike ordinary concrete annotations, a mismatch here
-                // is actionable: ClightPass supplies a definition-local,
-                // emitter-typed load alternative even when lifting began with
-                // only a machine-chunk cast.
-                let itm = it.term(t);
-                let tgt = clight_to_ty(t, ct);
-                sink.assert_soft_tagged(
-                    guard,
-                    &wt_cast_term(t, &itm, &tgt),
-                    sink.compat_w,
-                    "known_global_cast",
-                );
-            }
-            TyTerm::Conc(ct.clone())
-        }
-        ClightExpr::Ebinop(op, l, r, ct) => {
-            let lt = type_of(t, tyvar, sink, guard, func, l);
-            let rt = type_of(t, tyvar, sink, guard, func, r);
-            if any_sym(&[&lt, &rt]) {
-                let ltm = lt.term(t);
-                let rtm = rt.term(t);
-                // A float-typed arithmetic node requires non-pointer operands, since p + 0.1f is an invalid-operands error nothing silences; dominant-soft like the float-cast rule above.
-                if matches!(ct, ClightType::Tfloat(..)) {
-                    sink.assert_soft_tagged(
-                        guard,
-                        &t.is_ptrish(&ltm).not(),
-                        sink.compat_w,
-                        "float_binop",
-                    );
-                    sink.assert_soft_tagged(
-                        guard,
-                        &t.is_ptrish(&rtm).not(),
-                        sink.compat_w,
-                        "float_binop",
-                    );
-                }
-                // The integer mirror: an INT-annotated int-only op has integer operands by RTL construction, stronger than classify_binarith, which legally admits floats and let registers drift float.
-                if matches!(
-                    op,
-                    ClightBinaryOp::Omul
-                        | ClightBinaryOp::Odiv
-                        | ClightBinaryOp::Omod
-                        | ClightBinaryOp::Oand
-                        | ClightBinaryOp::Oor
-                        | ClightBinaryOp::Oxor
-                        | ClightBinaryOp::Oshl
-                        | ClightBinaryOp::Oshr
-                ) && matches!(ct, ClightType::Tint(..) | ClightType::Tlong(..))
-                {
-                    if lt.is_sym() {
-                        sink.assert_soft_tagged(
-                            guard,
-                            &t.is_intish(&ltm),
-                            sink.compat_w,
-                            "int_binop",
-                        );
-                    }
-                    if rt.is_sym() {
-                        sink.assert_soft_tagged(
-                            guard,
-                            &t.is_intish(&rtm),
-                            sink.compat_w,
-                            "int_binop",
-                        );
-                    }
-                }
-                // The pointer/float arm of binop legality is a hard requirement; the rest stays a dominant soft.
-                assert_no_ptr_float_mix(t, sink, guard, &lt, &rt, &ltm, &rtm);
-                sink.assert_soft_tagged(
-                    guard,
-                    &binop_legal_term(t, *op, &ltm, &rtm),
-                    sink.compat_w,
-                    "binop_legal",
-                );
-                // Pointer arithmetic carries the pointer operand's type so a deref of the result constrains the base's POINTEE; the pointer operand is itself inferred, so select it with ite.
-                match op {
-                    ClightBinaryOp::Oadd | ClightBinaryOp::Osub => {
-                        // The result is a pointer ONLY if an operand is, so force a non-pointer fallback or a deref could be satisfied by the annotation and the base register would escape is_ptr.
-                        let ann = match ct {
-                            ClightType::Tpointer(..) => t.int(),
-                            other => clight_to_ty(t, other),
-                        };
-                        let res = if matches!(op, ClightBinaryOp::Oadd) {
-                            let inner = t.is_ptr(&rtm).ite(&rtm, &ann);
-                            t.is_ptr(&ltm).ite(&ltm, &inner)
-                        } else {
-                            let both = Bool::and(&[t.is_ptr(&ltm), t.is_ptr(&rtm)]);
-                            let l_only = t.is_ptr(&ltm).ite(&ltm, &ann);
-                            both.ite(&t.int(), &l_only)
-                        };
-                        TyTerm::Sym(res)
-                    }
-                    _ => TyTerm::Conc(ct.clone()),
-                }
-            } else {
-                // Fully concrete: fold (the re-pick prices any error); annotation is the result.
-                TyTerm::Conc(ct.clone())
-            }
-        }
-        ClightExpr::Eunop(op, inner, ct) => {
-            let it = type_of(t, tyvar, sink, guard, func, inner);
-            // type_unop legality (Ctyping.v:52): ! accepts any scalar; ~ integers only; -/__builtin_fabs numerics only. New in P4 -- previously unops were entirely unconstrained.
-            if it.is_sym() {
-                sink.assert_soft_tagged(
-                    guard,
-                    &unop_legal_term(t, *op, &it.term(t)),
-                    sink.compat_w,
-                    "unop_legal",
-                );
-            }
-            TyTerm::Conc(ct.clone())
-        }
-        ClightExpr::Econdition(c, a, b, ct) => {
-            let tc = type_of(t, tyvar, sink, guard, func, c);
-            // wt_bool on the ?: condition (new in P4): struct/union/void-typed conditions are frontend errors.
-            if tc.is_sym() {
-                sink.assert_soft_tagged(
-                    guard,
-                    &t.is_boolish(&tc.term(t)),
-                    sink.compat_w,
-                    "cond_bool",
-                );
-            }
-            let _ = type_of(t, tyvar, sink, guard, func, a);
-            let _ = type_of(t, tyvar, sink, guard, func, b);
-            TyTerm::Conc(ct.clone())
-        }
-        ClightExpr::Esizeof(_, ct) | ClightExpr::Ealignof(_, ct) => TyTerm::Conc(ct.clone()),
-    }
-}
-
-// Walk a statement emitting operator-typing constraints, guarded so they bind only for the selected candidate; the old constrain_int_ops register scan is retired as subsumed.
-fn constrain_stmt(
-    t: &TypeDt,
-    tyvar: &HashMap<RTLReg, Dynamic>,
-    sink: &ConstraintSink,
-    guard: Option<&Bool>,
-    func: &FunctionData,
-    name_to_ident: &HashMap<String, Ident>,
-    func_ret: &Dynamic,
-    compat_w: u64,
-    stmt: &crate::x86::types::ClightStmt,
-) {
-    use crate::x86::types::ClightStmt;
-    match stmt {
-        ClightStmt::Sassign(lhs, rhs) => {
-            let lt = type_of(t, tyvar, sink, guard, func, lhs);
-            let rt = type_of(t, tyvar, sink, guard, func, rhs);
-            // `wt_cast` quite correctly accepts conversion *to* void for a
-            // discarded-value cast, but an assignment destination must name
-            // an object type.  Price a void pointee separately so both the
-            // MaxSMT model and the fixed-model exact re-pick prefer a real
-            // byte/word store whenever lifting supplied one.
-            if lt.is_sym() || matches!(&lt, TyTerm::Conc(ClightType::Tvoid)) {
-                sink.assert_soft_tagged(
-                    guard,
-                    &t.is_void(&lt.term(t)).not(),
-                    compat_w,
-                    "assign_lvalue_nonvoid",
-                );
-            }
-            if any_sym(&[&lt, &rt]) {
-                sink.assert_soft_tagged(
-                    guard,
-                    &wt_cast_term(t, &rt.term(t), &lt.term(t)),
-                    compat_w,
-                    "assign_compat",
-                );
-            }
-        }
-        ClightStmt::Sset(id, e) => {
-            let rt = type_of(t, tyvar, sink, guard, func, e);
-            if let Some(lv) = tyvar.get(&(*id as RTLReg)) {
-                sink.assert_soft_tagged(
-                    guard,
-                    &wt_cast_to_reg(t, &rt.term(t), lv),
-                    compat_w,
-                    "set_compat",
-                );
-                // SEL-AGREE (Sset level): prefer an rhs whose pointerness matches the destination, weight 2, which also demotes a float rhs into a pointer destination that the wt count cannot foresee.
-                sink.prefer(&ptr_class_eq(t, lv, &rt.term(t)), 2);
-            }
-        }
-        ClightStmt::Scall(ret, f, args) => {
-            let ft = type_of(t, tyvar, sink, guard, func, f);
-            // classify_fun (new in P4): a call through a non-function object is a frontend error; steer a register-typed callee toward pointer-ness (the model has no fnptr pointee discipline beyond ptrish).
-            if ft.is_sym() {
-                sink.assert_soft_tagged(guard, &t.is_ptrish(&ft.term(t)), compat_w, "callee_fun");
-            }
-            // Cross-function: bind each argument and the result to the callee's signature.
-            let sig = callee_ident_from_expr(f, name_to_ident)
-                .and_then(|id| func.callee_signatures.get(&id));
-            for (i, a) in args.iter().enumerate() {
-                let at = type_of(t, tyvar, sink, guard, func, a);
-                if at.is_sym() {
-                    if let Some(sig) = sig {
-                        if let Some(pt) = sig.param_types.get(i) {
-                            let want = xtype_to_ty(t, pt);
-                            sink.assert_soft_tagged(
-                                guard,
-                                &wt_cast_term(t, &at.term(t), &want),
-                                compat_w,
-                                "call_arg",
-                            );
-                        }
-                    }
-                }
-            }
-            if let (Some(rid), Some(sig)) = (ret, sig) {
-                if let Some(lv) = tyvar.get(&(*rid as RTLReg)) {
-                    let want = xtype_to_ty(t, &sig.return_type);
-                    sink.assert_soft_tagged(
-                        guard,
-                        &wt_cast_to_reg(t, &want, lv),
-                        compat_w,
-                        "call_ret",
-                    );
-                }
-            }
-            // return/void agreement (caller side): capturing the result of a void callee yields "void value not ignored as it ought to be", so when this call is a refinable candidate, penalize the result-capturing form so a non-capturing candidate is chosen.
-            if let (Some(_), Some(sig)) = (ret, sig) {
-                if matches!(sig.return_type, XType::Xvoid) {
-                    if let Some(g) = guard {
-                        sink.assert_soft_raw(&g.not(), compat_w);
-                        sink.penalize_candidate(compat_w);
-                    }
-                }
-            }
-        }
-        ClightStmt::Sreturn(ret) => {
-            // return/void agreement on the callee side: a value-return in a void function or a valueless return in a non-void one is a frontend error, so penalize the mismatching form.
-            let is_void_fn = matches!(func.return_type, ClightType::Tvoid);
-            match ret {
-                Some(e) => {
-                    let et = type_of(t, tyvar, sink, guard, func, e);
-                    if et.is_sym() {
-                        sink.assert_soft_tagged(
-                            guard,
-                            &wt_cast_term(t, &et.term(t), func_ret),
-                            compat_w,
-                            "ret_compat",
-                        );
-                    }
-                    if is_void_fn {
-                        if let Some(g) = guard {
-                            sink.assert_soft_raw(&g.not(), compat_w);
-                            sink.penalize_candidate(compat_w);
-                        }
-                    }
-                }
-                None => {
-                    if !is_void_fn {
-                        if let Some(g) = guard {
-                            sink.assert_soft_raw(&g.not(), compat_w);
-                            sink.penalize_candidate(compat_w);
-                        }
-                    }
-                }
-            }
-        }
-        ClightStmt::Sifthenelse(c, a, b) => {
-            let tc = type_of(t, tyvar, sink, guard, func, c);
-            // wt_bool on the branch condition (new in P4): struct/union/void conditions are frontend errors.
-            if tc.is_sym() {
-                sink.assert_soft_tagged(guard, &t.is_boolish(&tc.term(t)), compat_w, "if_bool");
-            }
-            constrain_stmt(
-                t,
-                tyvar,
-                sink,
-                guard,
-                func,
-                name_to_ident,
-                func_ret,
-                compat_w,
-                a,
-            );
-            constrain_stmt(
-                t,
-                tyvar,
-                sink,
-                guard,
-                func,
-                name_to_ident,
-                func_ret,
-                compat_w,
-                b,
-            );
-        }
-        ClightStmt::Ssequence(ss) => {
-            for s in ss {
-                constrain_stmt(
-                    t,
-                    tyvar,
-                    sink,
-                    guard,
-                    func,
-                    name_to_ident,
-                    func_ret,
-                    compat_w,
-                    s,
-                );
-            }
-        }
-        ClightStmt::Sloop(a, b) => {
-            constrain_stmt(
-                t,
-                tyvar,
-                sink,
-                guard,
-                func,
-                name_to_ident,
-                func_ret,
-                compat_w,
-                a,
-            );
-            constrain_stmt(
-                t,
-                tyvar,
-                sink,
-                guard,
-                func,
-                name_to_ident,
-                func_ret,
-                compat_w,
-                b,
-            );
-        }
-        ClightStmt::Slabel(_, inner) => {
-            constrain_stmt(
-                t,
-                tyvar,
-                sink,
-                guard,
-                func,
-                name_to_ident,
-                func_ret,
-                compat_w,
-                inner,
-            );
-        }
-        ClightStmt::Sswitch(e, cases) => {
-            let te = type_of(t, tyvar, sink, guard, func, e);
-            // classify_switch (new in P4): the scrutinee must be an integer.
-            if te.is_sym() {
-                sink.assert_soft_tagged(guard, &t.is_intish(&te.term(t)), compat_w, "switch_int");
-            }
-            for (_, s) in cases {
-                constrain_stmt(
-                    t,
-                    tyvar,
-                    sink,
-                    guard,
-                    func,
-                    name_to_ident,
-                    func_ret,
-                    compat_w,
-                    s,
-                );
-            }
-        }
-        _ => {}
-    }
-}
-
-// Render a model's inferred Ty for reg as a candidate type; allow_void permits ptr_void only when the register is never a deref/field base. CLASS-level renders only, widths chosen at anchor_index.
-fn render_type(
-    t: &TypeDt,
-    model: &dyn ModelView,
-    tv: &Dynamic,
-    reg: RTLReg,
-    func: &FunctionData,
-    allow_void: bool,
-) -> CandType {
-    let truth = |b: Bool| model.truth(&b).unwrap_or(false);
-    if truth(t.is_ptr(tv)) {
-        let p = t.pointee(tv);
-        if truth(t.is_struct(&p)) {
-            if let Some(&sid) = func.reg_struct_ids.get(&reg) {
-                return CandType::PtrStruct(sid);
-            }
-            // sid from the model if upstream didn't record one. The Z3 Int is the `as i64` image
-            // of a usize sid, so map it back the same way rather than dropping the high bit.
-            if let Some(sid) = model.integer(&t.struct_sid(&p)) {
-                return CandType::PtrStruct(sid as usize);
-            }
-            return CandType::PtrLong;
-        }
-        if truth(t.is_float(&p)) {
-            return CandType::PtrDouble;
-        }
-        if truth(t.is_func(&p)) {
-            return CandType::PtrFunc;
-        }
-        if allow_void && truth(t.is_void(&p)) {
-            return CandType::PtrVoid;
-        }
-        return CandType::PtrLong;
-    }
-    if truth(t.is_float(tv)) {
-        return CandType::F64;
-    }
-    CandType::I64(Sign::Signed)
-}
-
-// Pick the candidate index best matching the rendered inferred type; None means genuinely-new type (carry as override). `allow_void` mirrors render_type's license: ptr_void anchoring requires the register is never deref/field-based.
-fn anchor_index(cands: &[CandType], rendered: CandType, allow_void: bool) -> Option<usize> {
-    // The Ty algebra carries classes only, so render_type spells EVERY integer `int_I64`. Matching
-    // that literally makes the spelling beat an equally wide candidate that differs from it only in
-    // signedness -- a dimension the model cannot represent and the render therefore cannot mean.
-    // Within the integer class, match on width instead and let the priority-sorted candidate order
-    // (which does carry the upstream sign evidence) pick. Width still binds, so a narrow candidate
-    // is never widened onto or narrowed into.
-    if rendered.is_integer() {
-        if let Some(i) = cands
-            .iter()
-            .position(|c| c.is_integer() && c.width() == rendered.width())
-        {
-            return Some(i);
-        }
-    }
-    // ptr_void without the license emits an incomplete pointee that can't be deref-assigned; fall through to prefer a complete scalar pointer.
-    if rendered != CandType::PtrVoid || allow_void {
-        if let Some(i) = cands.iter().position(|c| *c == rendered) {
-            return Some(i);
-        }
-    }
-    // Classes: struct-pointer is distinct from scalar/generic pointer, so a scalar-pointer inference never anchors back onto a `ptr_struct` candidate (which would reintroduce the struct mismatch).
-    let rc = rendered.class();
-    if rc == CandClass::Ptr {
-        // A scalar/generic pointer: prefer a COMPLETE pointee (int*/long*/char*) over void* (incomplete, not assignable through); only fall back to ptr_void if nothing complete is available.
-        for pref in [CandType::PtrLong, CandType::PtrInt, CandType::PtrChar] {
-            if let Some(i) = cands.iter().position(|c| *c == pref) {
-                return Some(i);
-            }
-        }
-        if let Some(i) = cands
-            .iter()
-            .position(|c| c.class() == CandClass::Ptr && *c != CandType::PtrVoid)
-        {
-            return Some(i);
-        }
-        // ptr_void is still a pointer-class anchor when nothing with a complete pointee is available.
-        return cands.iter().position(|c| *c == CandType::PtrVoid);
-    }
-    // Same class, no exact width: take nearest-width candidate; ties break to the earlier (higher-priority) index.
-    let rw = rendered.width();
-    cands
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.class() == rc)
-        .min_by_key(|(i, c)| (c.width().abs_diff(rw), *i))
-        .map(|(i, _)| i)
-}
 
 // Z3-only solve: a Sat model IS the selection, and UNSAT gives no selection so the consumer keeps upstream defaults; there is deliberately no relaxed retry, since UNSAT is an upstream bug.
 fn solve_function(
@@ -1205,10 +134,10 @@ fn solve_function(
     HashMap<RTLReg, usize>,
     HashMap<RTLReg, CandType>,
     u8,
-    Vec<super::storage_theory::Decision>,
+    Artifacts,
 ) {
     match solve_function_engine(func, name_to_ident, &[], maximal_flow_certification) {
-        Ok((c, ty, ov, structure_world, grade, storage)) => {
+        Ok((c, ty, ov, structure_world, grade, artifacts)) => {
             if matches!(grade, SatResult::Unknown) {
                 TYPE_SOLVE_PARTIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 eprintln!(
@@ -1219,7 +148,7 @@ fn solve_function(
                     func.var_type_candidates.len()
                 );
             }
-            (c, ty, ov, structure_world, storage)
+            (c, ty, ov, structure_world, artifacts)
         }
         Err(first) => {
             TYPE_SOLVE_NO_MODEL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1240,7 +169,7 @@ fn solve_function(
                 HashMap::new(),
                 HashMap::new(),
                 func.authoritative_structure_world,
-                Vec::new(),
+                Artifacts::default(),
             )
         }
     }
@@ -1256,187 +185,28 @@ struct BuiltFunction {
     nodes: Vec<Node>,
     selvar: HashMap<Node, Vec<Bool>>,
     recorded: HashMap<Node, Vec<Vec<RecordedCond>>>,
+    func_ret: Dynamic,
 }
 
-// The integer class has one deterministic concrete declaration per register.
-// Validate that profile, then guard every result by the classes of ALL input
-// and output declarations it used. A pointer/float model is never excluded by
-// an integer counterexample. Proven siblings must exist in the chosen world.
-fn integer_candidate_conditions(
-    t: &TypeDt,
-    tyvar: &HashMap<RTLReg, Dynamic>,
-    func: &FunctionData,
-    nodes: &[Node],
-    selections: &HashMap<Node, Vec<Bool>>,
-    worlds: &[u8],
-    world_vars: &HashMap<u8, Bool>,
-) -> (HashMap<(Node, usize), Bool>, Vec<Bool>) {
-    use crate::decompile::passes::c_pass::convert::from_relations::convert_param_type_from_param;
-    use crate::decompile::passes::c_pass::helpers::candtype_to_ctype;
-    use crate::decompile::passes::c_pass::types::CType;
-    use crate::decompile::passes::clight_select::integer_semantics::{Validator, Verdict};
-
-    if func.integer_anchors.is_empty() {
-        return (HashMap::new(), Vec::new());
-    }
-    let mut declarations = HashMap::new();
-    // Locals without an explicit declaration candidate are inferred later by
-    // emission. Their spelling is not committed here, so leave them unknown.
-    for (&reg, cands) in &func.var_type_candidates {
-        let rendered = CandType::I64(Sign::Signed);
-        let candidate = anchor_index(cands, rendered, false)
-            .map(|i| cands[i])
-            .unwrap_or(rendered);
-        declarations.insert(reg, candtype_to_ctype(candidate, func.data_model));
-    }
-    for (&reg, param) in func.param_regs.iter().zip(&func.param_types) {
-        let ty = convert_param_type_from_param(param, func.data_model);
-        // The emitter refines its default long parameters from local types;
-        // explicitly typed interface parameters keep their committed type.
-        if ty != CType::long() || !declarations.contains_key(&reg) {
-            declarations.insert(reg, ty);
+impl BuiltFunction {
+    fn context<'a>(
+        &'a self,
+        func: &'a FunctionData,
+        names: &'a HashMap<String, Ident>,
+    ) -> FunctionContext<'a> {
+        FunctionContext {
+            types: &self.t,
+            function: func,
+            names,
+            registers: &self.regs,
+            declarations: &self.tyvar,
+            nodes: &self.nodes,
+            selections: &self.selvar,
+            worlds: &self.structure_worlds,
+            world_variables: &self.structure_world_var,
+            return_type: &self.func_ret,
         }
     }
-    let validator = Validator::new();
-    let mut out = HashMap::new();
-    let mut preferences = Vec::new();
-    let mut counts = [0usize; 4];
-    let mut gaps = 0usize;
-    for node in nodes {
-        let Some(inst) = func.integer_anchors.get(node) else {
-            continue;
-        };
-        let candidates = &func.node_statements[node];
-        let checks: Vec<_> = candidates
-            .iter()
-            .map(|stmt| {
-                let check = validator.check(inst, stmt, &declarations, func.data_model);
-                counts[match check.verdict {
-                    Verdict::Equivalent => 0,
-                    Verdict::Refuted => 1,
-                    Verdict::Unsupported => 2,
-                    Verdict::Unknown => 3,
-                }] += 1;
-                check
-            })
-            .collect();
-        if checks.iter().all(|check| check.verdict == Verdict::Refuted) {
-            gaps += 1;
-        }
-        let guard = |regs: &BTreeSet<RTLReg>| {
-            Bool::and(
-                &regs
-                    .iter()
-                    .filter_map(|reg| {
-                        tyvar.get(reg).map(|ty| {
-                            // render_type maps both int and bare struct models to the
-                            // integer carrier. Guard the emitted declaration, otherwise
-                            // Optimize can evade a veto with struct and still emit int.
-                            Bool::and(&[t.is_ptr(ty).not(), t.is_float(ty).not()])
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        };
-        // A hard veto is conditional on the declaration profile. Give an
-        // actually validated choice a small preference as well: otherwise a
-        // syntactic tie can move a declaration into an unchecked pointer
-        // profile solely to preserve the refuted statement's rank-0 prior.
-        // This is a coverage preference, not proof about an unchecked profile.
-        if checks.iter().any(|check| check.verdict == Verdict::Refuted) {
-            if let Some(vars) = selections.get(node) {
-                let proved: Vec<Bool> = checks
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(ci, check)| {
-                        (check.verdict == Verdict::Equivalent)
-                            .then(|| Bool::and(&[vars[ci].clone(), guard(&check.registers)]))
-                    })
-                    .collect();
-                if !proved.is_empty() {
-                    preferences.push(Bool::or(&proved));
-                }
-            }
-        }
-        for (ci, check) in checks.iter().enumerate() {
-            if check.verdict != Verdict::Refuted {
-                continue;
-            }
-            let witnesses: Vec<Bool> = checks
-                .iter()
-                .enumerate()
-                .filter_map(|(wi, witness)| {
-                    if witness.verdict != Verdict::Equivalent {
-                        return None;
-                    }
-                    let masks = func
-                        .candidate_structure_worlds
-                        .get(node)
-                        .and_then(|m| m.get(wi));
-                    let active: Vec<Bool> = worlds
-                        .iter()
-                        .filter(|world| masks.map_or(true, |m| m.contains(world)))
-                        .map(|world| {
-                            world_vars
-                                .get(world)
-                                .cloned()
-                                .unwrap_or_else(|| Bool::from_bool(true))
-                        })
-                        .collect();
-                    Some(Bool::and(&[guard(&witness.registers), Bool::or(&active)]))
-                })
-                .collect();
-            if !witnesses.is_empty() {
-                out.insert(
-                    (*node, ci),
-                    Bool::and(&[guard(&check.registers), Bool::or(&witnesses)]).not(),
-                );
-            }
-        }
-    }
-    if counts[0] + counts[1] > 0 {
-        eprintln!("[integer-semantics] fn={:#x} equivalent={} refuted={} unsupported={} unknown={} guarded-vetoes={} gaps={}",
-            func.address, counts[0], counts[1], counts[2], counts[3], out.len(), gaps);
-    }
-    (out, preferences)
-}
-
-fn memory_candidate_conditions(
-    func: &FunctionData,
-    selections: &HashMap<Node, Vec<Bool>>,
-    worlds: &HashMap<u8, Bool>,
-) -> (HashMap<(Node, usize), Bool>, Vec<Bool>) {
-    use super::memory_theory::{check, Check};
-    let mut conditions = HashMap::new();
-    let mut preferences = Vec::new();
-    for contract in &func.storage_writes {
-        let Some(candidates) = func.node_statements.get(&contract.node) else { continue; };
-        let checks: Vec<_> = candidates.iter().map(|stmt| check(stmt, contract, func)).collect();
-        if !checks.contains(&Check::Mismatch) { continue; }
-        let proving_worlds: Vec<Bool> = checks.iter().enumerate().filter(|(_, c)| **c == Check::Matches)
-            .flat_map(|(i, _)| {
-                let mask = func.candidate_structure_worlds.get(&contract.node).and_then(|m| m.get(i));
-                func.structure_worlds.iter().filter(move |w| mask.is_none_or(|m| m.contains(w)))
-                    .map(|w| worlds.get(w).cloned().unwrap_or_else(|| Bool::from_bool(true)))
-            }).collect();
-        if proving_worlds.is_empty() { continue; } // Explicit candidate-domain gap, not a false proof.
-        let allowed = Bool::or(&proving_worlds).not();
-        for (index, verdict) in checks.iter().enumerate() {
-            if *verdict == Check::Mismatch {
-                conditions.entry((contract.node, index))
-                    .and_modify(|old: &mut Bool| *old = Bool::and(&[old.clone(), allowed.clone()]))
-                    .or_insert_with(|| allowed.clone());
-            }
-        }
-        if let Some(vars) = selections.get(&contract.node) {
-            let proved: Vec<_> = checks.iter().enumerate().filter(|(_, c)| **c == Check::Matches).map(|(i, _)| vars[i].clone()).collect();
-            preferences.push(Bool::or(&proved));
-        }
-    }
-    if !func.storage_writes.is_empty() {
-        eprintln!("[storage-selection] function={:#x} machine-writes={} guarded-vetoes={}", func.address, func.storage_writes.len(), conditions.len());
-    }
-    (conditions, preferences)
 }
 
 // The single constraint build, engine-independent: identical hard constraints and identical soft families whichever backend consumes them.
@@ -1447,54 +217,43 @@ fn build_function_constraints(
     interface_pins: &[(RTLReg, XType)],
     backend: &dyn SolveBackend,
 ) -> BuiltFunction {
+    build_function_constraints_with_stack(
+        t,
+        func,
+        name_to_ident,
+        interface_pins,
+        backend,
+        &Stack::production(),
+    )
+}
+
+fn build_function_constraints_with_stack(
+    t: TypeDt,
+    func: &FunctionData,
+    name_to_ident: &HashMap<String, Ident>,
+    interface_pins: &[(RTLReg, XType)],
+    backend: &dyn SolveBackend,
+    stack: &Stack<'_>,
+) -> BuiltFunction {
     {
         // Free type variable per inferable register (deterministic order).
         let mut regs: Vec<RTLReg> = func.var_type_candidates.keys().copied().collect();
         regs.sort();
         let mut tyvar: HashMap<RTLReg, Dynamic> = HashMap::new();
+        let declarations = DeclarationContext {
+            types: &t,
+            function: func,
+            pins: interface_pins,
+        };
         for &reg in &regs {
             let tv = t.fresh();
-            // Domain pruning: a register decl never renders as bare func/void/union (render_type falls back to int_I64), so excluding those variants HARD shrinks every clause's search space at zero MaxSMT cost and lets the Sset compat formula drop their arms (wt_cast_to_reg).
-            backend.assert_hard(&t.is_func(&tv).not());
-            backend.assert_hard(&t.is_void(&tv).not());
-            backend.assert_hard(&t.is_union(&tv).not());
-            // Stage C receives an interface commitment selected only after
-            // full legality pricing.  Let an explicit non-pointer commitment
-            // supersede Stage A's pointer-only pruning; otherwise the old
-            // heuristic and the new hard pin contradict each other before
-            // any statement candidate is considered, making every corrected
-            // wrapper interface UNSAT.  Pointer pins retain the pruning.
-            let pinned_non_pointer = interface_pins.iter().any(|(pinned_reg, xtype)| {
-                *pinned_reg == reg && !InterfaceClass::from_xtype(xtype).is_pointer()
-            });
-            if func.must_pointer_regs.contains(&reg) && !pinned_non_pointer {
-                backend.assert_hard(&t.is_ptr(&tv));
-            }
-            // Float-class pruning (RC-1): the is_float axis is otherwise free, so require positive upstream float evidence; excluding the float variant HARD cannot cause UNSAT since nothing forces is_float.
-            let cands = func.var_type_candidates.get(&reg);
-            let has_float_cand = cands
-                .map(|cs| cs.iter().any(|c| c.is_float() || c.is_float_pointee()))
-                .unwrap_or(false);
-            // RC-1: a register carrying a concrete non-float pointer candidate is a pointer, so close the is_float axis to stop MaxSMT fabricating double; ptr_double/ptr_float excluded.
-            let has_concrete_ptr = cands
-                .map(|cs| cs.iter().any(|c| c.is_pointer() && !c.is_float_pointee()))
-                .unwrap_or(false);
-            let pinned_float = interface_pins.iter().any(|(pinned_reg, xtype)| {
-                *pinned_reg == reg && matches!(xtype, XType::Xfloat | XType::Xsingle)
-            });
-            let has_float_evidence = pinned_float || (has_float_cand && !has_concrete_ptr);
-            if !has_float_evidence {
-                backend.assert_hard(&t.is_float(&tv).not());
+            for module in stack.modules() {
+                module.constrain_declaration(&declarations, reg, &tv, backend);
             }
             tyvar.insert(reg, tv);
         }
-        // Stage-C only: the committed own-interface class is a hard input to
-        // the dirty re-solve.  Stage A passes an empty slice and remains
-        // byte-identical, including compat_w and variable counts.
-        for (reg, xtype) in interface_pins {
-            if let Some(variable) = tyvar.get(reg) {
-                backend.assert_hard(&variable._eq(xtype_to_ty(&t, xtype)));
-            }
+        for module in stack.modules() {
+            module.constrain_interfaces(&declarations, &tyvar, backend);
         }
 
         // Diagnostic: dump the candidates the lifting pass produced for a target function (by name substring), to distinguish "correct candidate absent (lifting bug)" from "present but not selected (selector bug)".
@@ -1643,30 +402,25 @@ fn build_function_constraints(
                 )
             })
             .count();
-        let (mut semantic_conditions, integer_preferences) = integer_candidate_conditions(
-            &t,
-            &tyvar,
-            func,
-            &nodes,
-            &selvar,
-            &structure_worlds,
-            &structure_world_var,
-        );
-        // The same guarded structural constraints and recorded conditions
-        // protect both the Z3 model and deterministic post-model re-picking.
-        let (memory_conditions, memory_preferences) = memory_candidate_conditions(func, &selvar, &structure_world_var);
-        for (key, condition) in memory_conditions {
-            semantic_conditions.entry(key).and_modify(|old| *old = Bool::and(&[old.clone(), condition.clone()])).or_insert(condition);
-        }
-        // Include the new weight-1 coverage preferences in the prior bound.
-        // Functions without a semantic preference retain the original weight.
-        let compat_w: u64 =
-            (regs.len() + authoritative_refinable_nodes + integer_preferences.len() + memory_preferences.len()) as u64 + 1;
+        let cx = FunctionContext {
+            types: &t,
+            function: func,
+            names: name_to_ident,
+            registers: &regs,
+            declarations: &tyvar,
+            nodes: &nodes,
+            selections: &selvar,
+            worlds: &structure_worlds,
+            world_variables: &structure_world_var,
+            return_type: &func_ret,
+        };
+        let analyses = stack.build(&cx);
+        let extra_priors: usize = analyses.iter().map(|a| a.prior_count()).sum();
+        let compat_w = (regs.len() + authoritative_refinable_nodes + extra_priors) as u64 + 1;
         let sink = ConstraintSink::new(backend, compat_w);
-        for preference in &integer_preferences {
-            sink.assert_soft_tagged(None, preference, 1, "integer_semantics");
+        for analysis in &analyses {
+            analysis.constrain_function(&cx, &sink);
         }
-        for preference in &memory_preferences { sink.assert_soft_tagged(None, preference, 1, "storage_semantics"); }
 
         // Emit constraints for every candidate statement, guarded by its selection boolean when refinable; multi-candidate nodes also record their conditions for the post-solve re-pick.
         let mut recorded: HashMap<Node, Vec<Vec<RecordedCond>>> = HashMap::new();
@@ -1677,37 +431,38 @@ fn build_function_constraints(
                     let mut per_cand = Vec::with_capacity(cands.len());
                     for (ci, stmt) in cands.iter().enumerate() {
                         sink.begin_candidate(true);
-                        if let Some(condition) = semantic_conditions.get(&(node, ci)) {
-                            sink.assert_structural(Some(&vars[ci]), condition);
+                        let candidate = Candidate {
+                            node,
+                            index: ci,
+                            statement: stmt,
+                            selected: Some(&vars[ci]),
+                        };
+                        for analysis in &analyses {
+                            analysis.constrain_candidate(&cx, &candidate, &sink);
                         }
-                        constrain_stmt(
-                            &t,
-                            &tyvar,
-                            &sink,
-                            Some(&vars[ci]),
-                            func,
-                            name_to_ident,
-                            &func_ret,
-                            compat_w,
-                            stmt,
-                        );
                         per_cand.push(sink.take_recorded());
                     }
                     recorded.insert(node, per_cand);
                 }
                 None => {
                     sink.begin_candidate(false);
-                    constrain_stmt(
-                        &t,
-                        &tyvar,
-                        &sink,
-                        None,
-                        func,
-                        name_to_ident,
-                        &func_ret,
-                        compat_w,
-                        &cands[0],
-                    );
+                    let candidate = Candidate {
+                        node,
+                        index: 0,
+                        statement: &cands[0],
+                        selected: None,
+                    };
+                    for analysis in &analyses {
+                        analysis.constrain_candidate(&cx, &candidate, &sink);
+                    }
+                }
+            }
+        }
+
+        for node in sink.joint_nodes(&selvar) {
+            if let Some(per_candidate) = recorded.get_mut(&node) {
+                for (guard, conditions) in selvar[&node].iter().zip(per_candidate) {
+                    conditions.push((Some(guard.clone()), u64::MAX));
                 }
             }
         }
@@ -1758,6 +513,7 @@ fn build_function_constraints(
             nodes,
             selvar,
             recorded,
+            func_ret,
         }
     }
 }
@@ -1794,6 +550,7 @@ fn extract_selection(
         nodes,
         selvar,
         recorded,
+        ..
     } = built;
     let selected_structure_world = structure_worlds
         .iter()
@@ -1886,7 +643,9 @@ fn extract_selection(
                         // Hard obligations are admission criteria, including
                         // guarded semantic vetoes. Never trade one away for a
                         // smaller frontend-error count. Unknown is not proof.
-                        if !candidate_satisfies_hard_conditions(m, conds) { continue; }
+                        if !candidate_satisfies_hard_conditions(m, conds) {
+                            continue;
+                        }
                         let wt = cands
                             .get(ci)
                             .map(|stmt| {
@@ -1970,7 +729,7 @@ type SolveOutcome = (
     HashMap<RTLReg, CandType>,
     u8,
     SatResult,
-    Vec<super::storage_theory::Decision>,
+    Artifacts,
 );
 
 // The single Z3 solve. Returns the selection + the SatResult that yielded the model, or the failing SatResult when no model is available.
@@ -1978,6 +737,15 @@ pub(crate) fn solve_function_z3(
     func: &FunctionData,
     name_to_ident: &HashMap<String, Ident>,
     interface_pins: &[(RTLReg, XType)],
+) -> Result<SolveOutcome, SatResult> {
+    solve_function_z3_with_stack(func, name_to_ident, interface_pins, &Stack::production())
+}
+
+pub(crate) fn solve_function_z3_with_stack(
+    func: &FunctionData,
+    name_to_ident: &HashMap<String, Ident>,
+    interface_pins: &[(RTLReg, XType)],
+    stack: &Stack<'_>,
 ) -> Result<SolveOutcome, SatResult> {
     // Fresh Z3 context per function: reusing one leaks MaxSMT state across functions and makes tie-breaking depend on rayon order. Do not set random_seed -- z3 rejects it and warns to stderr.
     let cfg = z3::Config::new();
@@ -1992,10 +760,16 @@ pub(crate) fn solve_function_z3(
         params.set_u32("random_seed", 0);
         opt.set_params(&params);
 
-        let (built, softs) = {
+        let (mut built, softs) = {
             let backend = OptimizeBackend::new(&opt);
-            let built =
-                build_function_constraints(t, func, name_to_ident, interface_pins, &backend);
+            let built = build_function_constraints_with_stack(
+                t,
+                func,
+                name_to_ident,
+                interface_pins,
+                &backend,
+                stack,
+            );
             (built, backend.into_softs())
         };
 
@@ -2003,73 +777,55 @@ pub(crate) fn solve_function_z3(
             build_t0.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
-        // One per-function MaxSMT owns both statement/type choices and latent
-        // storage choices. The verifier contributes witness clauses to THIS
-        // instance; it does not run an independent representation optimizer.
-        opt.push();
-        let mut layouts: Vec<_> = func.storage_problems.iter()
-            .map(|p| super::storage_theory::Encoding::build(p, &opt)).collect();
-        let mut storage_decisions = Vec::new();
-        let mut rounds = 0;
+        let mut refinements =
+            analysis::refinement::Session::start(stack, &built.context(func, name_to_ident), &opt);
         loop {
             let check_t0 = std::time::Instant::now();
             let check_result = opt.check(&[]);
-            CHECK_NS.fetch_add(check_t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            CHECK_NS.fetch_add(
+                check_t0.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let model = match check_result {
-            SatResult::Sat => opt.get_model(),
-            // Partial-solve reuse (TR-1): on unknown, reuse the best-so-far model only when the deterministic rlimit was exhausted, since a wall-clock unknown would be timing-dependent.
-            SatResult::Unknown if layouts.is_empty() => {
-                let resource_budget = opt
-                    .get_reason_unknown()
-                    .map(|r| r.contains("resource"))
-                    .unwrap_or(false);
-                if resource_budget {
-                    opt.get_model()
-                } else {
-                    None
-                }
-            }
-            SatResult::Unknown | SatResult::Unsat => None,
-            };
-            if !layouts.is_empty() {
-                let mut failure = None;
-                let mut refined = false;
-                if let Some(model) = model.as_ref() {
-                    for layout in &mut layouts {
-                        match layout.refine(model, &opt) {
-                            Ok(changed) => refined |= changed,
-                            Err(reason) => { failure = Some(reason); break; }
-                        }
+                SatResult::Sat => opt.get_model(),
+                // Only reuse deterministic resource-limited partial models,
+                // and only outside an uncertified analysis extension.
+                SatResult::Unknown if !refinements.active() => {
+                    let resource_budget = opt
+                        .get_reason_unknown()
+                        .is_some_and(|r| r.contains("resource"));
+                    if resource_budget {
+                        opt.get_model()
+                    } else {
+                        None
                     }
-                } else {
-                    failure = Some(if check_result == SatResult::Unsat {
-                        "no layout satisfies the accumulated witnesses"
-                    } else { "storage solve resource limit or unavailable model" });
                 }
-                if refined && rounds >= super::storage_theory::MAX_REFINEMENTS {
-                    failure = Some("storage refinement budget exhausted");
-                }
-                if let Some(reason) = failure {
-                    storage_decisions = layouts.drain(..).map(|l| l.finish(None, reason)).collect();
-                    // Unsupported storage does not relax any semantic clause
-                    // and pretend success. Discard the latent extension and
-                    // preserve the ordinary, explicitly uncertified selection.
-                    opt.pop();
-                    continue;
-                }
-                if refined { rounds += 1; continue; }
-                storage_decisions = layouts.drain(..)
-                    .map(|l| l.finish(model.as_ref(), "all storage witnesses and universal obligations discharged"))
-                    .collect();
+                SatResult::Unknown | SatResult::Unsat => None,
+            };
+            if refinements.advance(
+                model.as_ref(),
+                check_result,
+                &opt,
+                &built.selvar,
+                &mut built.recorded,
+            ) {
+                continue;
             }
             match model {
-            Some(m) => {
-                report_cost("optimize", func, &m, &softs);
-                let (cand_out, ty_out, ty_override, structure_world) =
-                    extract_selection(&m, &built, func, name_to_ident, true);
-                return Ok((cand_out, ty_out, ty_override, structure_world, check_result, storage_decisions));
-            }
-            None => return Err(check_result),
+                Some(m) => {
+                    report_cost("optimize", func, &m, &softs);
+                    let (cand_out, ty_out, ty_override, structure_world) =
+                        extract_selection(&m, &built, func, name_to_ident, true);
+                    return Ok((
+                        cand_out,
+                        ty_out,
+                        ty_override,
+                        structure_world,
+                        check_result,
+                        refinements.into_results(),
+                    ));
+                }
+                None => return Err(check_result),
             }
         }
     })
@@ -2368,7 +1124,14 @@ fn solve_function_propagator_attempt(
                     let mut g = FLOW_STATS.lock().unwrap();
                     g.ties_determined_by_flow += ties;
                 }
-                Ok((cand_out, ty_out, ty_override, structure_world, check_result, Vec::new()))
+                Ok((
+                    cand_out,
+                    ty_out,
+                    ty_override,
+                    structure_world,
+                    check_result,
+                    Artifacts::default(),
+                ))
             }
             None => Err(check_result),
         };
@@ -2507,7 +1270,9 @@ fn solve_function_engine(
     interface_pins: &[(RTLReg, XType)],
     maximal_flow_certification: bool,
 ) -> Result<SolveOutcome, SatResult> {
-    if selected_solve_engine(maximal_flow_certification) == SolveEngine::Optimize || !func.storage_problems.is_empty() {
+    if selected_solve_engine(maximal_flow_certification) == SolveEngine::Optimize
+        || Stack::production().needs_refinement(func)
+    {
         let started = std::time::Instant::now();
         let out = solve_function_z3(func, name_to_ident, interface_pins);
         ENGINE_OPTIMIZE_NS.fetch_add(
@@ -2822,12 +1587,13 @@ pub(crate) fn infer_select_program(
         HashMap<RTLReg, usize>,
         HashMap<RTLReg, CandType>,
         u8,
-        Vec<super::storage_theory::Decision>,
+        Artifacts,
     )> = functions
         .par_iter()
         .map(|f| {
-            let (c, t, o, world, storage) = solve_function(f, name_to_ident, maximal_flow_certification);
-            (f.address, c, t, o, world, storage)
+            let (c, t, o, world, artifacts) =
+                solve_function(f, name_to_ident, maximal_flow_certification);
+            (f.address, c, t, o, world, artifacts)
         })
         .collect();
 
@@ -2869,9 +1635,9 @@ pub(crate) fn infer_select_program(
     let mut structure_world = HashMap::new();
     let mut var_decl_idx = HashMap::new();
     let mut var_type_override = HashMap::new();
-    let mut storage = Vec::new();
+    let mut analysis_results = BTreeMap::new();
     for (addr, cmap, tmap, omap, world, decisions) in per_func {
-        storage.extend(decisions);
+        analysis_results.insert(addr, decisions);
         structure_world.insert(addr, world);
         for (node, idx) in cmap {
             candidate_idx.insert((addr, node), idx);
@@ -2885,7 +1651,7 @@ pub(crate) fn infer_select_program(
     }
 
     let state = ProgramSelectionState {
-        storage,
+        analysis_results,
         candidate_idx,
         structure_world,
         var_decl_idx,
@@ -3051,9 +1817,15 @@ pub(crate) fn resolve_dirty_functions(
             &pins,
             maximal_flow_certification,
         ) {
-            Ok((candidates, declarations, overrides, structure_world, SatResult::Sat, decisions)) => {
-                state.storage.retain(|d| d.prepared.problem.function != func.address);
-                state.storage.extend(decisions);
+            Ok((
+                candidates,
+                declarations,
+                overrides,
+                structure_world,
+                SatResult::Sat,
+                decisions,
+            )) => {
+                state.analysis_results.insert(func.address, decisions);
                 *func = resolve_func;
                 state.structure_world.insert(func.address, structure_world);
                 state
@@ -3110,754 +1882,5 @@ pub(crate) fn resolve_dirty_functions(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::decompile::passes::clight_select::ctyping;
-    use crate::decompile::passes::clight_select::query::{
-        CommittedFunctionInterface, InterfaceAuthority,
-    };
-    use crate::x86::types::{
-        ClightAttr, ClightFloatSize, ClightIntSize, ClightSignedness, ClightUnaryOp,
-    };
-    use std::sync::Arc;
-    use z3::ast::Ast; // for `.simplify()` on Bool, used in tests below
-
-    fn synthetic_ids<const N: usize>() -> [u64; N] {
-        std::array::from_fn(|index| index as u64 + 1)
-    }
-
-    #[test]
-    fn exact_repick_cannot_trade_a_hard_constraint_for_frontend_legality() {
-        let mut func = FunctionData::new(1, "hard_repick".into(), vec![], vec![], None, 0, 2, true);
-        func.return_type = ClightType::Tlong(ClightSignedness::Signed, a());
-        func.node_statements
-            .insert(2, vec![ClightStmt::Sskip, ClightStmt::Sreturn(None)]);
-        let opt = Optimize::new();
-        let backend = OptimizeBackend::new(&opt);
-        let mut built =
-            build_function_constraints(TypeDt::build(), &func, &HashMap::new(), &[], &backend);
-        opt.assert(&built.selvar[&2][0].not());
-        built.recorded.get_mut(&2).unwrap()[0].push((Some(Bool::from_bool(false)), u64::MAX));
-        assert_eq!(opt.check(&[]), SatResult::Sat);
-        let model = opt.get_model().unwrap();
-        let (choices, _, _, _) = extract_selection(&model, &built, &func, &HashMap::new(), true);
-        assert_eq!(choices[&2], Some(1));
-    }
-
-    #[test]
-    fn theory_models_are_not_independently_repicked() {
-        let mut func = FunctionData::new(1, "theory_pick".into(), vec![], vec![], None, 0, 2, true);
-        func.node_statements
-            .insert(2, vec![ClightStmt::Sskip, ClightStmt::Sskip]);
-        let opt = Optimize::new();
-        let backend = OptimizeBackend::new(&opt);
-        let built =
-            build_function_constraints(TypeDt::build(), &func, &HashMap::new(), &[], &backend);
-        opt.assert(&built.selvar[&2][1]);
-        assert_eq!(opt.check(&[]), SatResult::Sat);
-        let (choices, _, _, _) = extract_selection(
-            &opt.get_model().unwrap(),
-            &built,
-            &func,
-            &HashMap::new(),
-            false,
-        );
-        assert_eq!(choices[&2], Some(1));
-    }
-
-    #[test]
-    fn production_selects_defined_modular_arithmetic_over_its_signed_sibling() {
-        let mut func = FunctionData::new(
-            10,
-            "integer_semantics".into(),
-            vec![],
-            vec![],
-            None,
-            0,
-            20,
-            true,
-        );
-        for reg in [1, 2, 3] {
-            func.var_type_candidates
-                .insert(reg, vec![CandType::I64(Sign::Signed)]);
-        }
-        let expr = |sign| {
-            let ty = ClightType::Tlong(sign, a());
-            ClightStmt::Sset(
-                3,
-                ClightExpr::Ebinop(
-                    ClightBinaryOp::Oadd,
-                    Box::new(ClightExpr::Etempvar(1, ty.clone())),
-                    Box::new(ClightExpr::Etempvar(2, ty.clone())),
-                    ty,
-                ),
-            )
-        };
-        func.node_statements.insert(
-            20,
-            vec![
-                expr(ClightSignedness::Signed),
-                expr(ClightSignedness::Unsigned),
-            ],
-        );
-        func.integer_anchors.insert(
-            20,
-            crate::x86::types::RTLInst::Iop(
-                crate::x86::op::Operation::Oaddl,
-                Arc::new(vec![1, 2]),
-                3,
-            ),
-        );
-        let (choices, _, _, _, _) = solve_function(&func, &HashMap::new(), false);
-        assert_eq!(choices[&20], Some(1));
-    }
-
-    fn a() -> ClightAttr {
-        ClightAttr::default()
-    }
-
-    fn committed_param(address: Address, xtype: XType) -> CommittedInterfaces {
-        let mut committed = CommittedInterfaces::default();
-        committed.functions.insert(
-            address as Ident,
-            CommittedFunctionInterface {
-                signature: CalleeSignature {
-                    param_count: 1,
-                    return_type: XType::Xvoid,
-                    param_types: vec![xtype],
-                    is_varargs: false,
-                },
-                authority: InterfaceAuthority::Reconciled,
-            },
-        );
-        committed
-    }
-
-    #[test]
-    fn structure_world_selection_never_mixes_correlated_node_candidates() {
-        let func_addr = 0x1000;
-        let first = 0x1010;
-        let second = 0x1020;
-        let structured = crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_STRUCTURED;
-        let flat = crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_FLAT;
-        let mut func = FunctionData::new(
-            func_addr,
-            "world_atomicity".into(),
-            Vec::new(),
-            Vec::new(),
-            None,
-            0,
-            first,
-            true,
-        );
-        func.structure_worlds = vec![structured, flat];
-        func.authoritative_structure_world = structured;
-        // Opposite local candidate orders make an independent node selector
-        // prefer the unsound mixed pair.  World masks must force (0, 1) or
-        // (1, 0), never (0, 0) or (1, 1).
-        func.node_statements
-            .insert(first, vec![ClightStmt::Sgoto(1), ClightStmt::Sgoto(2)]);
-        func.candidate_structure_worlds.insert(
-            first,
-            vec![BTreeSet::from([structured]), BTreeSet::from([flat])],
-        );
-        func.node_statements
-            .insert(second, vec![ClightStmt::Sgoto(3), ClightStmt::Sgoto(4)]);
-        func.candidate_structure_worlds.insert(
-            second,
-            vec![BTreeSet::from([flat]), BTreeSet::from([structured])],
-        );
-
-        let (choices, _, _, selected_world, _) = solve_function(&func, &HashMap::new(), false);
-        let first_choice = choices[&first].expect("first node is active");
-        let second_choice = choices[&second].expect("second node is active");
-        assert!(func.candidate_structure_worlds[&first][first_choice].contains(&selected_world));
-        assert!(func.candidate_structure_worlds[&second][second_choice].contains(&selected_world));
-        assert!(matches!((first_choice, second_choice), (0, 1) | (1, 0)));
-    }
-
-    #[test]
-    fn dirty_unsat_preserves_stage_a_candidate_indices() {
-        let [address] = synthetic_ids();
-        let reg = 11;
-        let mut func = FunctionData::new(
-            address,
-            "unsat_dirty".into(),
-            vec![reg],
-            vec![ParamType::Integer],
-            None,
-            0,
-            1,
-            true,
-        );
-        func.var_type_candidates
-            .insert(reg, vec![CandType::I64(Sign::Signed), CandType::PtrVoid]);
-        let before = func.var_type_candidates.clone();
-        let stage_a = ProgramSelectionState {
-            candidate_idx: HashMap::new(),
-            structure_world: HashMap::new(),
-            var_decl_idx: [((address, reg), 1)].into_iter().collect(),
-            var_type_override: HashMap::new(),
-            storage: Vec::new(),
-        };
-        let (state, stats) = resolve_dirty_functions(
-            std::slice::from_mut(&mut func),
-            &HashMap::new(),
-            &stage_a,
-            &[address].into_iter().collect(),
-            &committed_param(address, XType::Xvoid),
-            &BTreeMap::new(),
-            false,
-        );
-        assert_eq!(stats.fallback_count, 1);
-        assert_eq!(func.var_type_candidates, before);
-        assert_eq!(state.var_decl_idx, stage_a.var_decl_idx);
-        assert_eq!(state.candidate_idx, stage_a.candidate_idx);
-    }
-
-    #[test]
-    fn dirty_float_pin_overrides_stage_a_float_pruning() {
-        let [address] = synthetic_ids();
-        let reg = 12;
-        let mut func = FunctionData::new(
-            address,
-            "float_dirty".into(),
-            vec![reg],
-            vec![ParamType::Pointer],
-            None,
-            0,
-            1,
-            true,
-        );
-        func.var_type_candidates
-            .insert(reg, vec![CandType::PtrVoid, CandType::F64]);
-        let stage_a = ProgramSelectionState {
-            candidate_idx: HashMap::new(),
-            structure_world: HashMap::new(),
-            var_decl_idx: [((address, reg), 0)].into_iter().collect(),
-            var_type_override: HashMap::new(),
-            storage: Vec::new(),
-        };
-        let (state, stats) = resolve_dirty_functions(
-            std::slice::from_mut(&mut func),
-            &HashMap::new(),
-            &stage_a,
-            &[address].into_iter().collect(),
-            &committed_param(address, XType::Xfloat),
-            &BTreeMap::new(),
-            false,
-        );
-        assert_eq!(stats.resolved_count, 1);
-        assert_eq!(stats.fallback_count, 0);
-        let chosen = state.var_decl_idx[&(address, reg)];
-        assert!(func.var_type_candidates[&reg][chosen].is_float());
-    }
-
-    #[test]
-    fn dirty_scalar_pin_overrides_stage_a_pointer_pruning() {
-        let [address] = synthetic_ids();
-        let reg = 13;
-        let mut func = FunctionData::new(
-            address,
-            "scalar_dirty".into(),
-            vec![reg],
-            vec![ParamType::Pointer],
-            None,
-            0,
-            1,
-            true,
-        );
-        func.var_type_candidates
-            .insert(reg, vec![CandType::PtrVoid, CandType::I64(Sign::Signed)]);
-        func.must_pointer_regs.insert(reg);
-        let stage_a = ProgramSelectionState {
-            candidate_idx: HashMap::new(),
-            structure_world: HashMap::new(),
-            var_decl_idx: [((address, reg), 0)].into_iter().collect(),
-            var_type_override: HashMap::new(),
-            storage: Vec::new(),
-        };
-        let (state, stats) = resolve_dirty_functions(
-            std::slice::from_mut(&mut func),
-            &HashMap::new(),
-            &stage_a,
-            &[address].into_iter().collect(),
-            &committed_param(address, XType::Xlong),
-            &BTreeMap::new(),
-            false,
-        );
-
-        assert_eq!(stats.resolved_count, 1);
-        assert_eq!(stats.fallback_count, 0);
-        let chosen = state.var_decl_idx[&(address, reg)];
-        assert_eq!(
-            func.var_type_candidates[&reg][chosen],
-            CandType::I64(Sign::Signed)
-        );
-    }
-
-    #[test]
-    fn stage_c_refreshes_flow_global_anchors_even_when_body_is_clean() {
-        let [address] = synthetic_ids();
-        let symbol = 0x9000usize;
-        let mut func = FunctionData::new(
-            address,
-            "global_anchor".into(),
-            Vec::new(),
-            Vec::new(),
-            None,
-            0,
-            1,
-            true,
-        );
-        func.flow_anchors.global.insert(
-            symbol,
-            crate::decompile::passes::clight_select::flow::anchor_of_xtype(&XType::Xint, true),
-        );
-        let mut committed = CommittedInterfaces::default();
-        committed.globals.insert(symbol, XType::Xfloat);
-        let stage_a = ProgramSelectionState {
-            candidate_idx: HashMap::new(),
-            structure_world: HashMap::new(),
-            var_decl_idx: HashMap::new(),
-            var_type_override: HashMap::new(),
-            storage: Vec::new(),
-        };
-        let (_, stats) = resolve_dirty_functions(
-            std::slice::from_mut(&mut func),
-            &HashMap::new(),
-            &stage_a,
-            &BTreeSet::new(),
-            &committed,
-            &BTreeMap::new(),
-            false,
-        );
-        assert_eq!(stats.dirty_count, 0);
-        assert_eq!(
-            func.flow_anchors.global[&symbol],
-            crate::decompile::passes::clight_select::flow::anchor_of_xtype(&XType::Xfloat, true,)
-        );
-    }
-
-    #[test]
-    fn maximal_certification_plans_one_deterministic_new_site_per_retry() {
-        let injected: BTreeSet<Node> = [0x30, 0x10, 0x20].into_iter().collect();
-        let mut exempt: BTreeSet<Node> = [0x10].into_iter().collect();
-        assert_eq!(first_new_flow_exemption(&injected, &exempt), Some(0x20));
-        exempt.insert(0x20);
-        assert_eq!(first_new_flow_exemption(&injected, &exempt), Some(0x30));
-        exempt.insert(0x30);
-        assert_eq!(first_new_flow_exemption(&injected, &exempt), None);
-    }
-
-    #[test]
-    fn maximal_certification_selects_propagator_without_environment_gate() {
-        assert_eq!(selected_solve_engine(true), SolveEngine::Propagator);
-        assert_eq!(selected_solve_engine(false), SolveEngine::Optimize);
-    }
-
-    // Class-level representatives: every Ty variant, both composite-id cases.
-    fn type_set() -> Vec<ClightType> {
-        use ClightFloatSize::*;
-        use ClightIntSize::*;
-        use ClightSignedness::*;
-        vec![
-            ClightType::Tvoid,
-            ClightType::Tint(I32, Signed, a()),
-            ClightType::Tint(I32, Unsigned, a()),
-            ClightType::Tlong(Signed, a()),
-            ClightType::Tlong(Unsigned, a()),
-            ClightType::Tfloat(F32, a()),
-            ClightType::Tfloat(F64, a()),
-            ClightType::Tpointer(Arc::new(ClightType::Tlong(Signed, a())), a()),
-            ClightType::Tpointer(Arc::new(ClightType::Tvoid), a()),
-            ClightType::Tpointer(Arc::new(ClightType::Tfloat(F64, a())), a()),
-            ClightType::Tpointer(Arc::new(ClightType::Tstruct(1, a())), a()),
-            ClightType::Tstruct(1, a()),
-            ClightType::Tstruct(2, a()),
-            ClightType::Tunion(7, a()),
-            ClightType::Tunion(8, a()),
-            ClightType::Tfunction(
-                Arc::new(vec![]),
-                Arc::new(ClightType::Tvoid),
-                Default::default(),
-            ),
-        ]
-    }
-
-    // A closed (variable-free) Bool term is valid iff it is true; the solver check is the robust ground-truth evaluator (simplify alone can leave datatype tester applications unreduced).
-    fn eval_closed(b: &Bool) -> bool {
-        if let Some(v) = b.clone().simplify().as_bool() {
-            return v;
-        }
-        let s = z3::Solver::new();
-        s.assert(&b.not());
-        matches!(s.check(), SatResult::Unsat)
-    }
-
-    /// The Z3 relaxation and the executable checker must agree on every concrete class-level pair except the composite-id relaxation, where the test asserts soundness only.
-    #[test]
-    fn wt_cast_term_matches_ctyping() {
-        z3::with_z3_config(&z3::Config::new(), || {
-            let t = TypeDt::build();
-            for from in type_set() {
-                for to in type_set() {
-                    let term = wt_cast_term(&t, &clight_to_ty(&t, &from), &clight_to_ty(&t, &to));
-                    let z3_legal = eval_closed(&term);
-                    let same_kind_composites = matches!(
-                        (&from, &to),
-                        (ClightType::Tstruct(..), ClightType::Tstruct(..))
-                            | (ClightType::Tunion(..), ClightType::Tunion(..))
-                    );
-                    // Pointer width moves a cast between non-Default cases only (Pointer/I2I/L2L/I2L/L2I/...), never in or out of Default, so LEGALITY is width-independent and parity must hold at both.
-                    for ptr64 in [true, false] {
-                        let ct_legal = ctyping::wt_cast(ptr64, &from, &to);
-                        if same_kind_composites {
-                            assert!(
-                                z3_legal || !ct_legal,
-                                "wt_cast soundness (ptr64={}): {} -> {}",
-                                ptr64,
-                                ctyping::ty_str(&from),
-                                ctyping::ty_str(&to)
-                            );
-                        } else {
-                            assert_eq!(
-                                z3_legal,
-                                ct_legal,
-                                "wt_cast parity (ptr64={}): {} -> {} (z3 {}, ctyping {})",
-                                ptr64,
-                                ctyping::ty_str(&from),
-                                ctyping::ty_str(&to),
-                                z3_legal,
-                                ct_legal
-                            );
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    /// wt_cast_to_reg is wt_cast_term specialized to the pruned register domain (no bare func/void/union targets) -- they must agree there.
-    #[test]
-    fn wt_cast_to_reg_matches_full_on_pruned_domain() {
-        use ClightFloatSize::*;
-        use ClightSignedness::*;
-        let reg_targets = vec![
-            ClightType::Tint(ClightIntSize::I32, Signed, a()),
-            ClightType::Tlong(Unsigned, a()),
-            ClightType::Tfloat(F64, a()),
-            ClightType::Tpointer(Arc::new(ClightType::Tlong(Signed, a())), a()),
-            ClightType::Tstruct(1, a()),
-        ];
-        z3::with_z3_config(&z3::Config::new(), || {
-            let t = TypeDt::build();
-            for from in type_set() {
-                for to in &reg_targets {
-                    let full = eval_closed(&wt_cast_term(
-                        &t,
-                        &clight_to_ty(&t, &from),
-                        &clight_to_ty(&t, to),
-                    ));
-                    let spec = eval_closed(&wt_cast_to_reg(
-                        &t,
-                        &clight_to_ty(&t, &from),
-                        &clight_to_ty(&t, to),
-                    ));
-                    assert_eq!(
-                        full,
-                        spec,
-                        "to-reg specialization: {} -> {}",
-                        ctyping::ty_str(&from),
-                        ctyping::ty_str(to)
-                    );
-                }
-            }
-        });
-    }
-
-    #[test]
-    fn binop_legality_matches_ctyping() {
-        use ClightBinaryOp::*;
-        let ops = [
-            Oadd, Osub, Omul, Odiv, Omod, Oand, Oor, Oxor, Oshl, Oshr, Oeq, One, Olt, Ogt, Ole, Oge,
-        ];
-        z3::with_z3_config(&z3::Config::new(), || {
-            let t = TypeDt::build();
-            for op in ops {
-                for l in type_set() {
-                    for r in type_set() {
-                        let term =
-                            binop_legal_term(&t, op, &clight_to_ty(&t, &l), &clight_to_ty(&t, &r));
-                        let z3_legal = eval_closed(&term);
-                        // The z3 encoding classifies with width-agnostic is_ptrish/is_intish, so legality must agree at BOTH pointer widths; only the ptr-minus-ptr RESULT type moves with the width.
-                        for ptr64 in [true, false] {
-                            let ct_legal = ctyping::type_binop(ptr64, op, &l, &r).is_some();
-                            assert_eq!(
-                                z3_legal,
-                                ct_legal,
-                                "binop parity (ptr64={}): {:?} on ({}, {})",
-                                ptr64,
-                                op,
-                                ctyping::ty_str(&l),
-                                ctyping::ty_str(&r)
-                            );
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    // Soundness of hardening the pointer/float arm: whenever the hard clause is violated, EVERY binop is
-    // ill-typed under ctyping, so the clause can never cut off a selection that would have printed valid C.
-    // A pair the clause rejects but some op accepts would be a silent loss of a legal program.
-    #[test]
-    fn ptr_float_mix_is_illegal_for_every_binop() {
-        use ClightBinaryOp::*;
-        let ops = [
-            Oadd, Osub, Omul, Odiv, Omod, Oand, Oor, Oxor, Oshl, Oshr, Oeq, One, Olt, Ogt, Ole, Oge,
-        ];
-        z3::with_z3_config(&z3::Config::new(), || {
-            let t = TypeDt::build();
-            let mut violations = 0usize;
-            for l in type_set() {
-                for r in type_set() {
-                    let (ltm, rtm) = (clight_to_ty(&t, &l), clight_to_ty(&t, &r));
-                    for (ptr_side, float_side, lhs_is_ptr) in
-                        [(&ltm, &rtm, true), (&rtm, &ltm, false)]
-                    {
-                        if eval_closed(&no_ptr_float_term(&t, ptr_side, float_side)) {
-                            continue;
-                        }
-                        violations += 1;
-                        for op in ops {
-                            for ptr64 in [true, false] {
-                                assert!(
-                                    ctyping::type_binop(ptr64, op, &l, &r).is_none(),
-                                    "hard ptr/float clause rejects a pair ctyping accepts (ptr64={}, lhs_is_ptr={}): {:?} on ({}, {})",
-                                    ptr64,
-                                    lhs_is_ptr,
-                                    op,
-                                    ctyping::ty_str(&l),
-                                    ctyping::ty_str(&r)
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            // Guard against the clause silently becoming vacuous (e.g. if is_ptrish or is_float lost a variant).
-            assert!(
-                violations > 0,
-                "the ptr/float clause never fired over type_set(); it is no longer constraining anything"
-            );
-        });
-    }
-
-    #[test]
-    fn unop_legality_matches_ctyping() {
-        use ClightUnaryOp::*;
-        z3::with_z3_config(&z3::Config::new(), || {
-            let t = TypeDt::build();
-            for op in [Onotbool, Onotint, Oneg, Oabsfloat] {
-                for x in type_set() {
-                    let term = unop_legal_term(&t, op, &clight_to_ty(&t, &x));
-                    let z3_legal = eval_closed(&term);
-                    // Width-agnostic on the z3 side, so parity must hold at both widths.
-                    for ptr64 in [true, false] {
-                        let ct_legal = ctyping::type_unop(ptr64, op, &x).is_some();
-                        assert_eq!(
-                            z3_legal,
-                            ct_legal,
-                            "unop parity (ptr64={}): {:?} on {}",
-                            ptr64,
-                            op,
-                            ctyping::ty_str(&x)
-                        );
-                    }
-                }
-            }
-        });
-    }
-
-    /// D8 lockstep: both declaration consumers agree, for EVERY candidate variant, on whether it
-    /// is a pointer and whether it is a float. Both are total matches now, so this catches a new
-    /// variant being classified inconsistently rather than a string falling to a `long` default.
-    #[test]
-    fn candidate_vocabulary_lockstep() {
-        use crate::decompile::passes::c_pass::types::CType;
-        use crate::decompile::passes::clight_select::candtype::all_variants;
-        use crate::decompile::passes::clight_select::wt_audit::candtype_to_clight;
-        for candidate in all_variants() {
-            let ctype = crate::decompile::passes::c_pass::helpers::candtype_to_ctype(
-                candidate,
-                crate::abi::DataModel::Lp64,
-            );
-            let clight = candtype_to_clight(candidate);
-            assert_eq!(
-                matches!(ctype, CType::Pointer(..)),
-                candidate.is_pointer(),
-                "emitter disagrees on pointerness of {:?}",
-                candidate
-            );
-            assert_eq!(
-                matches!(clight, ClightType::Tpointer(..)),
-                candidate.is_pointer(),
-                "checker disagrees on pointerness of {:?}",
-                candidate
-            );
-            assert_eq!(
-                matches!(ctype, CType::Float(_)),
-                candidate.is_float(),
-                "emitter disagrees on floatness of {:?}",
-                candidate
-            );
-            assert_eq!(
-                matches!(clight, ClightType::Tfloat(..)),
-                candidate.is_float(),
-                "checker disagrees on floatness of {:?}",
-                candidate
-            );
-        }
-    }
-
-    #[test]
-    fn authoritative_global_type_drives_exact_statement_repick() {
-        use crate::decompile::passes::clight_select::query::KnownGlobalTypes;
-
-        let attr = ClightAttr::default();
-        let tlong = ClightType::Tlong(ClightSignedness::Signed, attr.clone());
-        let tdouble = ClightType::Tfloat(ClightFloatSize::F64, attr.clone());
-        let tchar_ptr = ClightType::Tpointer(
-            Arc::new(ClightType::Tint(
-                ClightIntSize::I8,
-                ClightSignedness::Signed,
-                attr,
-            )),
-            ClightAttr::default(),
-        );
-
-        // The machine load is annotated `long`, while the authoritative emitted
-        // declaration is a character pointer. Synthetic identifiers keep this
-        // regression independent of any particular binary layout.
-        let [global_raw, reg, func_addr, load_node, other_use] = synthetic_ids();
-        let global = global_raw as Ident;
-        let mut func = FunctionData::new(
-            func_addr,
-            "authoritative-global-repick".to_string(),
-            Vec::new(),
-            Vec::new(),
-            None,
-            0,
-            func_addr,
-            true,
-        );
-        func.used_regs.insert(reg);
-        func.var_types.insert(reg, CandType::F64);
-        func.var_type_candidates
-            .insert(reg, vec![CandType::F64, CandType::I64(Sign::Signed)]);
-        func.known_global_types = Arc::new(KnownGlobalTypes {
-            by_ident: [(global, tchar_ptr)].into_iter().collect(),
-            ..KnownGlobalTypes::default()
-        });
-        func.node_statements.insert(
-            load_node,
-            vec![
-                ClightStmt::Sset(
-                    reg as Ident,
-                    ClightExpr::Ecast(Box::new(ClightExpr::Evar(global, tlong.clone())), tdouble),
-                ),
-                ClightStmt::Sset(reg as Ident, ClightExpr::Evar(global, tlong.clone())),
-            ],
-        );
-        // Keep the model on the integer declaration, as the real function's
-        // other uses did, so this specifically tests post-model re-picking.
-        func.node_statements.insert(
-            other_use,
-            vec![ClightStmt::Sswitch(
-                ClightExpr::Etempvar(reg as Ident, tlong),
-                Vec::new(),
-            )],
-        );
-
-        let (statement_idx, declaration_idx, _, _, _) = solve_function(&func, &HashMap::new(), false);
-        assert_eq!(declaration_idx.get(&reg), Some(&1));
-        assert_eq!(statement_idx.get(&load_node), Some(&Some(1)));
-    }
-
-    #[test]
-    fn exact_statement_repick_rejects_a_void_lvalue_store() {
-        let attr = ClightAttr::default();
-        let tlong = ClightType::Tlong(ClightSignedness::Signed, attr.clone());
-        let tint = ClightType::Tint(ClightIntSize::I32, ClightSignedness::Signed, attr.clone());
-        let tchar = ClightType::Tint(ClightIntSize::I8, ClightSignedness::Unsigned, attr.clone());
-        let ptr_void = ClightType::Tpointer(Arc::new(ClightType::Tvoid), attr.clone());
-        let ptr_char = ClightType::Tpointer(Arc::new(tchar.clone()), attr);
-
-        let [reg, func_addr, store_node] = synthetic_ids();
-        let mut func = FunctionData::new(
-            func_addr,
-            "void-lvalue-repick".to_string(),
-            Vec::new(),
-            Vec::new(),
-            None,
-            0,
-            func_addr,
-            true,
-        );
-        func.used_regs.insert(reg);
-        func.var_types.insert(reg, CandType::PtrVoid);
-        func.var_type_candidates
-            .insert(reg, vec![CandType::PtrVoid, CandType::PtrChar]);
-
-        let base = ClightExpr::Etempvar(reg as Ident, tlong);
-        let rhs = ClightExpr::EconstInt(0, tint);
-        func.node_statements.insert(
-            store_node,
-            vec![
-                ClightStmt::Sassign(
-                    ClightExpr::Ederef(
-                        Box::new(ClightExpr::Ecast(Box::new(base.clone()), ptr_void)),
-                        ClightType::Tvoid,
-                    ),
-                    rhs.clone(),
-                ),
-                ClightStmt::Sassign(
-                    ClightExpr::Ederef(
-                        Box::new(ClightExpr::Ecast(Box::new(base), ptr_char)),
-                        tchar,
-                    ),
-                    rhs,
-                ),
-            ],
-        );
-
-        let (statement_idx, _, _, _, _) = solve_function(&func, &HashMap::new(), false);
-        assert_eq!(statement_idx.get(&store_node), Some(&Some(1)));
-    }
-
-    #[test]
-    fn must_pointer_fact_overrides_an_integer_declaration_prior() {
-        let [reg, func_addr] = synthetic_ids();
-        let mut func = FunctionData::new(
-            func_addr,
-            "must-pointer".to_string(),
-            Vec::new(),
-            Vec::new(),
-            None,
-            0,
-            func_addr,
-            true,
-        );
-        func.used_regs.insert(reg);
-        func.must_pointer_regs.insert(reg);
-        func.var_types.insert(reg, CandType::I32(Sign::Signed));
-        func.var_type_candidates
-            .insert(reg, vec![CandType::I32(Sign::Signed), CandType::PtrChar]);
-
-        let (_, declarations, _, _, _) = solve_function(&func, &HashMap::new(), false);
-
-        assert_eq!(declarations.get(&reg), Some(&1));
-    }
-}
+#[path = "solve_tests.rs"]
+mod tests;

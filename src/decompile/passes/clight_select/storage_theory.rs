@@ -41,6 +41,7 @@ pub(crate) struct Encoding {
     shared: Bool,
     extent: Int,
     members: BTreeMap<Node, Bool>,
+    candidate_writes: BTreeMap<Node, Vec<(Bool, Option<View>)>>,
     steps: Vec<Step>,
 }
 
@@ -108,22 +109,68 @@ impl Encoding {
             shared,
             extent,
             members,
+            candidate_writes: BTreeMap::new(),
             steps: Vec::new(),
         }
+    }
+
+    /// Couple each provisional write embedding to the actual statement
+    /// variable. A witness can now select another expression without first
+    /// replacing an already adequate allocation.
+    pub(crate) fn bind_candidates(
+        &mut self,
+        selections: &std::collections::HashMap<Node, Vec<Bool>>,
+    ) {
+        for (&node, views) in &self.prepared.candidate_writes {
+            let guards = selections
+                .get(&node)
+                .cloned()
+                .unwrap_or_else(|| vec![Bool::from_bool(true); views.len()]);
+            if guards.len() == views.len() && (selections.contains_key(&node) || views.len() == 1) {
+                self.candidate_writes.insert(
+                    node,
+                    guards.into_iter().zip(views.iter().copied()).collect(),
+                );
+            }
+        }
+    }
+
+    pub(crate) fn coupled_nodes(&self) -> impl Iterator<Item = Node> + '_ {
+        self.candidate_writes.keys().copied()
+    }
+
+    fn original_writes(&self, model: &Model) -> Option<BTreeMap<Node, View>> {
+        let mut writes = self.prepared.initial.writes.clone();
+        for (&node, choices) in &self.candidate_writes {
+            let selected: Vec<_> = choices
+                .iter()
+                .filter(|(guard, _)| {
+                    model.eval(guard, true).and_then(|v| v.as_bool()) == Some(true)
+                })
+                .collect();
+            if selected.len() != 1 {
+                return None;
+            }
+            writes.insert(node, selected[0].1?);
+        }
+        Some(writes)
     }
 
     fn representation(&self, model: &Model) -> Option<Representation> {
         let shared = model.eval(&self.shared, true)?.as_bool()?;
         let extent = model.eval(&self.extent, true)?.as_i64()?;
+        let mut writes = self.original_writes(model)?;
         if !shared {
-            return Some(self.prepared.initial.clone());
+            return Some(Representation {
+                writes,
+                ..self.prepared.initial.clone()
+            });
         }
         let p = &self.prepared.problem;
         let object = StorageId::Frame(storage::ledger::ObjectId {
             function: p.function,
             base: p.base,
         });
-        let mut writes = self.prepared.initial.writes.clone();
         for write in &p.writes {
             if model.eval(&self.members[&write.node], true)?.as_bool()? {
                 writes.insert(
@@ -169,7 +216,6 @@ impl Encoding {
                 let p = &self.prepared.problem;
                 let node = witness.writer?;
                 let write = p.writes.iter().find(|w| w.node == node)?;
-                let view = self.prepared.initial.writes.get(&node)?;
                 let machine_read = p.base.checked_add(witness.observed_byte)?;
                 let source_read = self
                     .prepared
@@ -177,36 +223,55 @@ impl Encoding {
                     .argument
                     .offset
                     .checked_add(witness.observed_byte)?;
-                let mut original_agrees = true;
-                let mut physically_aliases = false;
-                for byte in 0..write.width {
-                    let machine_alias = write.offset.checked_add(byte as i64)? == machine_read;
-                    let source_alias = view.object == self.prepared.initial.argument.object
-                        && view.offset.checked_add(byte as i64)? == source_read;
-                    original_agrees &= machine_alias == source_alias;
-                    physically_aliases |= machine_alias;
-                }
+                let agrees = |view: &View| -> Option<bool> {
+                    let mut same = true;
+                    for byte in 0..write.width {
+                        let machine_alias = write.offset.checked_add(byte as i64)? == machine_read;
+                        let source_alias = view.object == self.prepared.initial.argument.object
+                            && view.offset.checked_add(byte as i64)? == source_read;
+                        same &= machine_alias == source_alias;
+                    }
+                    Some(same)
+                };
+                let original_agrees = if let Some(choices) = self.candidate_writes.get(&node) {
+                    Bool::or(
+                        &choices
+                            .iter()
+                            .filter_map(|(guard, view)| {
+                                // Unsupported embeddings are not generalized from a
+                                // different candidate's counterexample.
+                                view.as_ref()
+                                    .and_then(agrees)
+                                    .unwrap_or(true)
+                                    .then(|| guard.clone())
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    Bool::from_bool(agrees(self.prepared.initial.writes.get(&node)?)?)
+                };
+                let physically_aliases = (write.offset..storage::end(write.offset, write.width)?)
+                    .contains(&machine_read);
                 let joined_agrees = if physically_aliases {
                     self.members.get(&node)?.clone()
                 } else {
                     Bool::from_bool(true)
                 };
-                Some(
-                    self.shared
-                        .ite(&joined_agrees, &Bool::from_bool(original_agrees)),
-                )
+                Some(self.shared.ite(&joined_agrees, &original_agrees))
             }
         }
     }
 
-    pub(crate) fn refine(&mut self, model: &Model, opt: &Optimize) -> Result<bool, &'static str> {
+    pub(crate) fn refine(&mut self, model: &Model) -> Result<Option<Bool>, &'static str> {
         let representation = self
             .representation(model)
             .ok_or("layout model unavailable")?;
-        let witness = match storage::validate_complete(&self.prepared.problem, &representation) {
-            Verdict::Validated => None,
-            Verdict::Refuted(witness) => Some(witness),
-            Verdict::Unknown => return Err("storage verifier unknown or unsupported"),
+        use super::obligations::{Verdict as Outcome, Witness};
+        let check = super::obligations::check_layout(&self.prepared.problem, &representation);
+        let witness = match (check.verdict, check.witness) {
+            (Outcome::Equivalent, _) => None,
+            (Outcome::Refuted, Some(Witness::Storage(witness))) => Some(witness),
+            _ => return Err("storage verifier unknown or unsupported"),
         };
         self.steps.push(Step {
             extent: representation.argument.extent,
@@ -221,16 +286,13 @@ impl Encoding {
             witness: witness.clone(),
         });
         let Some(witness) = witness else {
-            return Ok(false);
+            return Ok(None);
         };
         let clause = self
             .learn(&witness)
             .ok_or("witness is outside the layout grammar")?;
-        if model.eval(&clause, true).and_then(|b| b.as_bool()) != Some(false) {
-            return Err("witness did not exclude its generating layout");
-        }
-        opt.assert(&clause);
-        Ok(true)
+        // The shared refinement driver checks progress and asserts the clause.
+        Ok(Some(clause))
     }
 
     pub(crate) fn finish(self, model: Option<&Model>, reason: &'static str) -> Decision {
@@ -335,6 +397,7 @@ mod tests {
             },
             initial,
             unmapped: vec![],
+            candidate_writes: BTreeMap::new(),
         }
     }
 
@@ -349,11 +412,9 @@ mod tests {
             80,
             true,
         );
-        f.storage_problems.push(p);
-        super::super::solve::solve_function_z3(&f, &HashMap::new(), &[])
-            .unwrap()
-            .5
-            .remove(0)
+        super::super::analysis::storage::PROBLEMS.insert(&mut f.analysis_facts, vec![p]);
+        let result = super::super::solve::solve_function_z3(&f, &HashMap::new(), &[]).unwrap().5;
+        super::super::analysis::storage::DECISIONS.get(&result).unwrap()[0].clone()
     }
 
     #[test]
@@ -413,8 +474,67 @@ mod tests {
         assert!(decision.representation.is_none());
         assert_eq!(
             decision.reason,
-            "no layout satisfies the accumulated witnesses"
+            "no model satisfies the accumulated analysis witnesses"
         );
+    }
+
+    #[test]
+    fn a_storage_witness_can_change_the_statement_without_rebuilding_the_object() {
+        let mut p = prepared();
+        p.problem.writes.retain(|w| w.node == 30);
+        p.problem.observations = vec![(4, 4)];
+        let object = StorageId::Frame(storage::ledger::ObjectId {
+            function: 1,
+            base: 16,
+        });
+        p.initial.argument = View {
+            object,
+            offset: 0,
+            extent: 16,
+        };
+        p.candidate_writes.insert(
+            30,
+            vec![
+                Some(View {
+                    object,
+                    offset: 0,
+                    extent: 16,
+                }),
+                Some(View {
+                    object,
+                    offset: 4,
+                    extent: 16,
+                }),
+            ],
+        );
+        let opt = Optimize::new();
+        let bad = Bool::new_const("wrong_target");
+        let good = Bool::new_const("correct_target");
+        opt.assert(&Bool::pb_eq(&[(&bad, 1), (&good, 1)], 1));
+        opt.assert_soft(&bad, 1, None);
+        let mut encoding = Encoding::build(&p, &opt);
+        encoding.bind_candidates(&HashMap::from([(30, vec![bad.clone(), good.clone()])]));
+        // Check the retain-existing branch of the grammar. The only repair
+        // available here is statement reselection, not object construction.
+        opt.assert(&encoding.shared.not());
+        assert_eq!(opt.check(&[]), z3::SatResult::Sat);
+        let model = opt.get_model().unwrap();
+        assert_eq!(model.eval(&bad, true).unwrap().as_bool(), Some(true));
+        let clause = encoding.refine(&model).unwrap().unwrap();
+        assert_eq!(model.eval(&clause, true).unwrap().as_bool(), Some(false));
+        opt.assert(&clause);
+        assert_eq!(opt.check(&[]), z3::SatResult::Sat);
+        let model = opt.get_model().unwrap();
+        assert_eq!(model.eval(&good, true).unwrap().as_bool(), Some(true));
+        assert!(encoding.refine(&model).unwrap().is_none());
+        let decision = encoding.finish(Some(&model), "checked");
+        assert!(!decision.requires_replay);
+        assert_eq!(decision.steps.len(), 2);
+        assert!(decision.steps[0]
+            .witness
+            .as_ref()
+            .is_some_and(|w| w.writer == Some(30)));
+        assert_eq!(decision.representation.unwrap().writes[&30].offset, 4);
     }
 
     #[test]

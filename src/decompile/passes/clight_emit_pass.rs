@@ -1839,6 +1839,7 @@ const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
     "semantic_storage_obligation",
     "semantic_storage_projection",
     "semantic_storage_selected_target",
+    "frame_read_storage_access_owner",
     "stack_var",
     "variadic_register_save_area_init",
     // Exact initialized bytes back designated initializers when a synthetic
@@ -1870,7 +1871,7 @@ impl IRPass for ClightSelectPass {
                 db.clight_selected_functions = Vec::new();
             }
         }
-        crate::decompile::passes::semantic_counterexample::ledger::check_selection(db);
+        crate::decompile::passes::clight_select::analysis::Stack::production().audit_selection(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
@@ -1878,21 +1879,20 @@ impl IRPass for ClightSelectPass {
     }
 
     fn outputs(&self) -> &'static [&'static str] {
-        &[
-            "clight_selected_functions",
-            "committed_interfaces",
-            "interface_vars",
-            "semantic_storage_obligation",
-            "semantic_storage_counterexample", "semantic_storage_refinement", "semantic_storage_search",
-            "selection_storage_request", "selection_storage_field_request",
-            "semantic_storage_selected_target",
-        ]
+        static OUTPUTS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+            let mut outputs = vec!["clight_selected_functions", "committed_interfaces", "interface_vars"];
+            outputs.extend(crate::decompile::passes::clight_select::analysis::Stack::production().writes());
+            outputs.sort_unstable();
+            outputs.dedup();
+            outputs
+        });
+        &OUTPUTS
     }
 
     fn extra_reads(&self) -> &'static [&'static str] {
         static READS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
             let mut reads = CLIGHT_EMIT_EXTRA_READS.to_vec();
-            reads.extend_from_slice(crate::decompile::passes::semantic_counterexample::INPUTS);
+            reads.extend(crate::decompile::passes::clight_select::analysis::Stack::production().reads());
             reads.sort_unstable();
             reads.dedup();
             reads

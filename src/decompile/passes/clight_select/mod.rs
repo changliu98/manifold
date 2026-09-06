@@ -1,4 +1,5 @@
 pub mod adequacy;
+pub(crate) mod analysis;
 pub mod branch_theory;
 pub mod candtype;
 pub mod class_theory;
@@ -14,6 +15,10 @@ pub mod select;
 pub mod solve;
 pub(crate) mod storage_theory;
 pub(crate) mod memory_theory;
+pub(crate) mod obligations;
+pub(crate) mod producer_values;
+pub(crate) mod word_views;
+pub(crate) mod word_inputs;
 pub mod wt_audit;
 
 pub fn derive_canonical_path(path_str: &str) -> String {
