@@ -98,6 +98,13 @@ impl RelationEntry {
     }
 }
 use crate::decompile::analysis::coverage_pass::PostEmitAuditTrail;
+
+/// Transaction boundary for an IR epoch. Missing relations are part of the
+/// snapshot too: restoring must erase facts first produced by the old epoch.
+pub(crate) struct RelationCheckpoint {
+    names: Vec<&'static str>,
+    saved: StdHashMap<&'static str, RelationEntry>,
+}
 use crate::decompile::passes::c_pass::types::{CType, TranslationUnit};
 use crate::decompile::passes::clight_select::query::{
     CommittedInterfaces, GlobalData, InterfaceVars,
@@ -369,6 +376,14 @@ mod xtype_parser_tests {
 }
 
 // Central storage for all Datalog relations and pipeline state; hand-written (not macro-generated) for fast compilation.
+/// Experimental controls; production is the all-false fixed policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SemanticAblations {
+    pub disable_storage_search: bool,
+    pub disable_existing_views: bool,
+    pub global_call_observer: bool,
+}
+
 pub struct DecompileDB {
     pub relations: StdHashMap<&'static str, RelationEntry>,
 
@@ -421,6 +436,7 @@ pub struct DecompileDB {
     /// Experimental paper ablation: retain the propagator after a flow-induced
     /// UNSAT by exempting only the audited contradiction sites.
     pub ablate_flow_max_certification: bool,
+    pub semantic_ablations: SemanticAblations,
     /// Diagnostic CLI output; never changes decompilation behavior.
     pub dump_interface_vars: bool,
     pub dump_interface_instance: bool,
@@ -462,6 +478,7 @@ impl Default for DecompileDB {
             ablate_scope_function: false,
             ablate_flow_anchor_reopen: false,
             ablate_flow_max_certification: false,
+            semantic_ablations: SemanticAblations::default(),
             dump_interface_vars: false,
             dump_interface_instance: false,
             skip_function_names: HashSet::new(),
@@ -602,6 +619,42 @@ impl DecompileDB {
             }
         }
         Some(result)
+    }
+
+    pub(crate) fn checkpoint_relations(
+        &self,
+        names: &[&'static str],
+    ) -> Option<RelationCheckpoint> {
+        Some(RelationCheckpoint {
+            names: names.to_vec(),
+            saved: self.try_clone_relations(names)?,
+        })
+    }
+
+    /// Exchange only the checkpoint's declared relations. The returned epoch
+    /// can be restored on validation failure without cloning its large outputs.
+    pub(crate) fn exchange_checkpoint(
+        &mut self,
+        checkpoint: RelationCheckpoint,
+    ) -> RelationCheckpoint {
+        let previous = checkpoint.names.iter().filter_map(|name| {
+            self.relations.remove(name).map(|entry| (*name, entry))
+        }).collect();
+        self.relations.extend(checkpoint.saved);
+        RelationCheckpoint { names: checkpoint.names, saved: previous }
+    }
+
+    /// Non-relational outputs are transactional too. Input configuration,
+    /// immutable analyses and diagnostic timing do not belong to this swap.
+    fn exchange_inference_outputs(&mut self, mut other: Box<Self>) -> Box<Self> {
+        macro_rules! exchange { ($($field:ident),* $(,)?) => { $(std::mem::swap(&mut self.$field, &mut other.$field);)* }; }
+        exchange!(clight_selected_functions, committed_interfaces, interface_vars,
+            interface_instance_dump, cast_selected_functions, cast_globals,
+            cast_id_to_name, cast_struct_layouts, cast_var_types_for_emission,
+            cast_raw_translation_unit, cast_post_emit_audit_trail, cast_optimized_translation_unit,
+            decl_solve_field_force_long, decl_solve_field_ptr_selection, decl_solve_fnptr_globals,
+            decl_solve_force_long_regs, decl_solve_force_ptr_regs, stack_struct_buffers, stack_array_buffers);
+        other
     }
 }
 
@@ -867,7 +920,29 @@ impl DecompileDB {
         let schedule = PassScheduler::build_schedule(&passes);
         schedule.print();
 
-        for stage in schedule.stages.iter() {
+        let rtl_stage = schedule.stages.iter().position(|stage|
+            stage.passes.iter().any(|&idx| passes[idx].name() == "rtl"));
+        let mut initial_epoch = None;
+        let mut initial_buffers = None;
+        let mut rollback: Option<(RelationCheckpoint, Box<DecompileDB>, usize)> = None;
+        let mut epoch = 0_usize;
+        let mut stage_index = 0_usize;
+        while stage_index < schedule.stages.len() {
+            let stage = &schedule.stages[stage_index];
+            if Some(stage_index) == rtl_stage && epoch == 0 && !self.semantic_ablations.disable_storage_search {
+                // Immutable opaque lattices need not be cloned: the scheduler
+                // proves that replayed passes only read them. Checkpoint the
+                // union of replay outputs, including read/write overlaps.
+                let mut outputs: Vec<_> = schedule.stages[stage_index..].iter()
+                    .flat_map(|s| s.passes.iter().flat_map(|&i| passes[i].outputs().iter().copied())).collect();
+                outputs.sort_unstable(); outputs.dedup();
+                initial_epoch = self.checkpoint_relations(&outputs);
+                initial_buffers = Some((self.stack_struct_buffers.clone(), self.stack_array_buffers.clone()));
+                if initial_epoch.is_none() {
+                    let opaque: Vec<_> = outputs.iter().filter(|name| self.relations.get(**name).is_some_and(|r| r.cloner.is_none())).collect();
+                    eprintln!("[selection-feedback] mutable inputs lack checkpoint support: {opaque:?}");
+                }
+            }
             if stage.passes.len() == 1 {
                 let idx = stage.passes[0];
                 let pass = &passes[idx];
@@ -925,6 +1000,7 @@ impl DecompileDB {
                         sub_db.ablate_scope_function = self.ablate_scope_function;
                         sub_db.ablate_flow_anchor_reopen = self.ablate_flow_anchor_reopen;
                         sub_db.ablate_flow_max_certification = self.ablate_flow_max_certification;
+                        sub_db.semantic_ablations = self.semantic_ablations;
                         sub_db.dump_interface_vars = self.dump_interface_vars;
                         sub_db.dump_interface_instance = self.dump_interface_instance;
                         sub_db.relations = cloned;
@@ -1008,8 +1084,64 @@ impl DecompileDB {
                     }
                 }
             }
+            if Some(stage_index) == rtl_stage && rollback.is_some()
+                && !crate::decompile::passes::semantic_counterexample::record_materialization(self)
+            {
+                let (previous, typed, next) = rollback.take().unwrap();
+                self.exchange_checkpoint(previous);
+                self.exchange_inference_outputs(typed);
+                eprintln!("[selection-feedback] epoch={epoch} rolled back: incomplete RTL materialization");
+                stage_index = next;
+                continue;
+            }
+            if stage.passes.iter().any(|&idx| passes[idx].name() == "clight_select") {
+                if rollback.take().is_some() {
+                    eprintln!("[selection-feedback] epoch={epoch} reached final selection on regenerated facts");
+                }
+                let requests: Vec<_> = self.rel_iter::<(Address, Node, i64, i64)>("selection_storage_request").copied().collect();
+                if !requests.is_empty() {
+                    let next = if epoch < 4 {
+                        initial_epoch.as_ref().and_then(|snapshot| {
+                            let saved: Option<StdHashMap<_, _>> = snapshot.saved.iter()
+                                .map(|(name, value)| Some((*name, value.try_clone()?))).collect();
+                            Some(RelationCheckpoint { names: snapshot.names.clone(), saved: saved? })
+                        })
+                    } else { None };
+                    if let (Some(mut next), Some(restart)) = (next, rtl_stage) {
+                        // Keep only explicit hypotheses and proof history from
+                        // the rejected epoch. Every other downstream relation
+                        // and typed selection is recomputed from original input.
+                        let history = ["semantic_storage_obligation", "semantic_storage_counterexample", "semantic_storage_refinement", "semantic_storage_search"];
+                        let history = self.try_clone_relations(&history);
+                        let mut objects: Vec<_> = self.rel_iter::<(Address, Node, i64, i64)>("semantic_frame_object").copied().chain(requests).collect();
+                        objects.sort_unstable(); objects.dedup();
+                        let mut fields: Vec<_> = self.rel_iter::<(Address, i64, i64, MemoryChunk)>("semantic_frame_object_field").copied()
+                            .chain(self.rel_iter::<(Address, i64, i64, MemoryChunk)>("selection_storage_field_request").copied()).collect();
+                        fields.sort_unstable(); fields.dedup();
+                        eprintln!("[selection-feedback] epoch={} requested-objects={}", epoch + 1, objects.len());
+                        let previous = self.exchange_checkpoint(next);
+                        let typed = self.exchange_inference_outputs(Box::new(Self::default()));
+                        if let Some((buffers, arrays)) = &initial_buffers {
+                            self.stack_struct_buffers = buffers.clone();
+                            self.stack_array_buffers = arrays.clone();
+                        }
+                        if let Some(history) = history { self.relations.extend(history); }
+                        self.rel_set("semantic_frame_object", objects.into_iter().collect::<ascent::boxcar::Vec<_>>());
+                        self.rel_set("semantic_frame_object_field", fields.into_iter().collect::<ascent::boxcar::Vec<_>>());
+                        rollback = Some((previous, typed, stage_index + 1));
+                        epoch += 1;
+                        stage_index = restart;
+                        continue;
+                    }
+                    eprintln!("[selection-feedback] requests={} unresolved: epoch budget or input checkpoint unavailable", requests.len());
+                }
+            }
+            stage_index += 1;
         }
 
+        // The final storage discharge sees the actual post-selection C tree,
+        // not a proposed type or an earlier epoch's declaration names.
+        crate::decompile::passes::semantic_counterexample::ledger::check_emission(self);
         log::info!("Decompilation pipeline completed.");
 
         // Comma-separated so one run can follow a whole slot web or branch
@@ -1895,6 +2027,7 @@ pub fn pipeline_passes() -> Vec<Box<dyn crate::decompile::passes::pass::IRPass>>
         Box::new(rtl_dominator_pass::RTLDominatorPass),
         Box::new(frame_coordinate_pass::FrameCoordinatePass),
         Box::new(frame_write_pass::FrameWritePass),
+        Box::new(machine_storage_pass::MachineStoragePass),
         Box::new(rtl_pass::RTLPass),
         Box::new(stack_ptr_canonical_pass::StackPtrCanonicalPass),
         Box::new(rtl_optimize_pass::RTLOptimizePass),
@@ -1911,7 +2044,7 @@ pub fn pipeline_passes() -> Vec<Box<dyn crate::decompile::passes::pass::IRPass>>
         Box::new(cminor_pass::CminorPass),
         Box::new(csh_pass::CshPass),
         Box::new(cshminor_pass::CshminorPass),
-        Box::new(structuring_pass::StructuringPass),
+        Box::new(structuring_pass::StructuringPass::default()),
         Box::new(closed_form_switch_pass::ClosedFormSwitchPass),
         Box::new(clight_pass::ClightPass),
         Box::new(clight_pass::ClightFieldPass),
@@ -1926,4 +2059,50 @@ pub fn pipeline_passes() -> Vec<Box<dyn crate::decompile::passes::pass::IRPass>>
         Box::new(coverage_pass::CoverageAuditPass),
     ];
     passes
+}
+
+#[cfg(test)]
+mod epoch_checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn replay_keeps_opaque_immutable_inputs_and_restores_typed_outputs() {
+        let mut db = DecompileDB::default();
+        db.relations.insert("immutable_analysis", RelationEntry::new_opaque(std::sync::RwLock::new(42_u64)));
+        db.rel_push("shared", (1_u64,));
+        let original = db.checkpoint_relations(&["shared", "derived"]).unwrap();
+        db.rel_push("shared", (2_u64,));
+        db.rel_push("derived", (3_u64,));
+        db.stack_struct_buffers.insert(1, HashMap::from([(10, 16)]));
+        db.cast_id_to_name.insert(10, "original".into());
+        let old = db.exchange_checkpoint(original);
+        let typed = db.exchange_inference_outputs(Box::new(DecompileDB::default()));
+        assert!(db.stack_struct_buffers.is_empty() && db.cast_id_to_name.is_empty());
+        assert_eq!(*db.relations["immutable_analysis"].data.downcast_ref::<std::sync::RwLock<u64>>().unwrap().read().unwrap(), 42);
+        db.stack_struct_buffers.insert(1, HashMap::from([(10, 99)]));
+        db.rel_push("derived", (99_u64,));
+        db.exchange_checkpoint(old);
+        db.exchange_inference_outputs(typed);
+        assert_eq!(db.stack_struct_buffers[&1][&10], 16);
+        assert_eq!(db.cast_id_to_name[&10], "original");
+        assert_eq!(db.rel_iter::<(u64,)>("derived").copied().collect::<Vec<_>>(), vec![(3,)]);
+    }
+
+    #[test]
+    fn fresh_epoch_restores_shared_inputs_and_removes_old_derived_facts() {
+        let mut db = DecompileDB::default();
+        db.rel_push("shared_input_output", (1_u64,));
+        db.rel_push("unrelated_input", (42_u64,));
+        let original = db.checkpoint_relations(&["shared_input_output", "derived_output"]).unwrap();
+        db.rel_push("shared_input_output", (2_u64,));
+        db.rel_push("derived_output", (3_u64,));
+        let first_epoch = db.exchange_checkpoint(original);
+        assert_eq!(db.rel_iter::<(u64,)>("shared_input_output").copied().collect::<Vec<_>>(), vec![(1,)]);
+        assert_eq!(db.rel_iter::<(u64,)>("derived_output").count(), 0);
+        db.rel_push("derived_output", (99_u64,));
+        db.exchange_checkpoint(first_epoch);
+        assert_eq!(db.rel_iter::<(u64,)>("shared_input_output").copied().collect::<Vec<_>>(), vec![(1,), (2,)]);
+        assert_eq!(db.rel_iter::<(u64,)>("derived_output").copied().collect::<Vec<_>>(), vec![(3,)]);
+        assert_eq!(db.rel_iter::<(u64,)>("unrelated_input").copied().collect::<Vec<_>>(), vec![(42,)]);
+    }
 }

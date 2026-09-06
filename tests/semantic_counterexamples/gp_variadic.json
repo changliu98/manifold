@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "suite": "manifold-gp-variadic-storage",
+  "cases": [
+    {
+      "name": "gp_variadic",
+      "source": "cases/gp_variadic.c",
+      "description": "A GP-only variadic protocol must preserve incoming values across register-save-area and va_list reconstruction.",
+      "cflags": ["-O2"],
+      "runs": [
+        {"name": "two_values", "args": [], "expected": {"returncode": 8, "stdout": "", "stderr": ""}},
+        {"name": "three_values", "args": ["x"], "expected": {"returncode": 15, "stdout": "", "stderr": ""}},
+        {"name": "one_value", "args": ["x", "x"], "expected": {"returncode": 3, "stdout": "", "stderr": ""}},
+        {"name": "two_values_again", "args": ["x", "x", "x"], "expected": {"returncode": 8, "stdout": "", "stderr": ""}}
+      ]
+    }
+  ]
+}

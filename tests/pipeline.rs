@@ -563,6 +563,7 @@ dual_compiler_test!(var_lifetime, "-O1");
 dual_compiler_test!(var_copy_prop, "-O1");
 dual_compiler_test!(var_register, "-O1");
 dual_compiler_test!(var_stack, "-O0");
+dual_compiler_test!(semantic_selection_epoch, "-O2");
 dual_compiler_test!(var_loop, "-O1");
 dual_compiler_test!(var_cross_block, "-O1");
 dual_compiler_test!(var_params, "-O1");

@@ -398,7 +398,7 @@ def run_fixture(
 
     decompiled = work / "decompiled.c"
     decompile_run = run_command(
-        [str(manifold), str(reference), str(decompiled)],
+        [str(manifold), str(reference), str(decompiled), *getattr(args, "manifold_arg", [])],
         work,
         "decompile",
         args.decompile_timeout,
@@ -497,7 +497,10 @@ def run_sanitizers(
     reference = work / "reference.sanitized.bin"
     recovered = work / "recovered.sanitized.bin"
     ref_compile = run_command(
-        [*common, str(source), "-o", str(reference)],
+        # The sanitizer must compile the same fixture variant. Put the
+        # instrumentation/optimization policy last, but retain its -D/-I and
+        # other semantic source flags. Recovered C is already preprocessed.
+        [common[0], *case.get("cflags", []), *common[1:], str(source), "-o", str(reference)],
         work,
         "sanitizer_reference_compile",
         args.compile_timeout,
@@ -694,6 +697,7 @@ def parse_args() -> argparse.Namespace:
         help="incrementally cargo-build --checkout in Debug mode before the gate",
     )
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument("--manifold-arg", action="append", default=[], help="recorded decompiler argument; repeatable (use --manifold-arg=--flag)")
     parser.add_argument("--case", action="append", default=[], help="case name; repeatable")
     parser.add_argument("--compiler", action="append", default=[], help="reference compiler; repeatable (default: gcc)")
     parser.add_argument("--recompiler", default="gcc", help="compiler for recovered C (default: gcc)")

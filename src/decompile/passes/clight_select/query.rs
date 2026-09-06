@@ -388,6 +388,10 @@ pub struct FunctionData {
     /// Unique finalized RTL instructions for local integer validation. Exact
     /// node identity is required; synthetic siblings are distinct effects.
     pub integer_anchors: HashMap<Node, RTLInst>,
+    /// Representation obligations share the final statement/type solve. A
+    /// successful latent layout requests re-derivation, not immediate C.
+    pub(crate) storage_problems: Vec<crate::decompile::passes::semantic_counterexample::Prepared>,
+    pub(crate) storage_writes: Vec<super::memory_theory::WriteContract>,
 
     // Known callee signatures indexed by function ident (address)
     pub callee_signatures: HashMap<Ident, CalleeSignature>,
@@ -793,6 +797,8 @@ impl FunctionData {
             flow_anchors: Default::default(),
             flow_blocks: Vec::new(),
             integer_anchors: HashMap::new(),
+            storage_problems: Vec::new(),
+            storage_writes: Vec::new(),
             data_model: if ptr64 { crate::abi::DataModel::Lp64 } else { crate::abi::DataModel::Ilp32 },
         }
     }

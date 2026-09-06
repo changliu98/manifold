@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "suite": "manifold-semantic-counterexamples-v1",
+  "cases": [
+    {
+      "name": "escaped_float_options",
+      "source": "cases/escaped_options.c",
+      "description": "Opaque floating payloads in an escaped frame object must preserve their bytes, not be converted to integers.",
+      "cflags": ["-O2", "-DGETOPT_OPTIONS=1", "-DFLOAT_OPTIONS=1"],
+      "runs": [
+        {"name": "defaults", "args": [], "expected": {"returncode": 73, "stdout": "", "stderr": ""}},
+        {"name": "mode", "args": ["-m"], "expected": {"returncode": 83, "stdout": "", "stderr": ""}},
+        {"name": "two_flags", "args": ["-i", "-v"], "expected": {"returncode": 98, "stdout": "", "stderr": ""}},
+        {"name": "limit_and_recursive", "args": ["-l", "-r"], "expected": {"returncode": 99, "stdout": "", "stderr": ""}},
+        {"name": "large_mode", "args": ["-b"], "expected": {"returncode": 132, "stdout": "", "stderr": ""}},
+        {"name": "all_updates", "args": ["-i", "-m", "-r", "-v", "-l"], "expected": {"returncode": 147, "stdout": "", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "escaped_getopt_options",
+      "source": "cases/escaped_options.c",
+      "description": "A mixed-width options object initialized and updated around library calls, then inspected by a direct internal callee.",
+      "cflags": ["-O2", "-DGETOPT_OPTIONS=1"],
+      "runs": [
+        {"name": "defaults", "args": [], "expected": {"returncode": 61, "stdout": "", "stderr": ""}},
+        {"name": "mode", "args": ["-m"], "expected": {"returncode": 63, "stdout": "", "stderr": ""}},
+        {"name": "two_flags", "args": ["-i", "-v"], "expected": {"returncode": 70, "stdout": "", "stderr": ""}},
+        {"name": "limit_and_recursive", "args": ["-l", "-r"], "expected": {"returncode": 71, "stdout": "", "stderr": ""}},
+        {"name": "large_mode", "args": ["-b"], "expected": {"returncode": 112, "stdout": "", "stderr": ""}},
+        {"name": "all_updates", "args": ["-i", "-m", "-r", "-v", "-l"], "expected": {"returncode": 95, "stdout": "", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "escaped_options",
+      "source": "cases/escaped_options.c",
+      "description": "Mixed-width initialized frame fields observed through one pointer by a direct internal callee.",
+      "cflags": ["-O2"],
+      "runs": [
+        {"name": "odd", "args": [], "expected": {"returncode": 61, "stdout": "", "stderr": ""}},
+        {"name": "even", "args": ["x"], "expected": {"returncode": 49, "stdout": "", "stderr": ""}},
+        {"name": "odd_again", "args": ["x", "x"], "expected": {"returncode": 63, "stdout": "", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "escaped_switch_options",
+      "source": "cases/escaped_options.c",
+      "description": "An escaped mixed-width object updated along switch branches before a direct internal read-only call.",
+      "cflags": ["-O2", "-DSWITCH_OPTIONS=1"],
+      "runs": [
+        {"name": "ignore", "args": [], "expected": {"returncode": 62, "stdout": "", "stderr": ""}},
+        {"name": "recursive", "args": ["x"], "expected": {"returncode": 62, "stdout": "", "stderr": ""}},
+        {"name": "limit", "args": ["x", "x"], "expected": {"returncode": 71, "stdout": "", "stderr": ""}},
+        {"name": "verbose", "args": ["x", "x", "x"], "expected": {"returncode": 54, "stdout": "", "stderr": ""}},
+        {"name": "mode", "args": ["x", "x", "x", "x"], "expected": {"returncode": 79, "stdout": "", "stderr": ""}},
+        {"name": "two_fields", "args": ["x", "x", "x", "x", "x"], "expected": {"returncode": 60, "stdout": "", "stderr": ""}},
+        {"name": "default", "args": ["x", "x", "x", "x", "x", "x"], "expected": {"returncode": 46, "stdout": "", "stderr": ""}},
+        {"name": "case_zero", "args": ["x", "x", "x", "x", "x", "x", "x"], "expected": {"returncode": 118, "stdout": "", "stderr": ""}}
+      ]
+    }
+  ]
+}

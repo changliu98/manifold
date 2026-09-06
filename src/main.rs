@@ -33,6 +33,7 @@ fn print_usage_and_exit() -> ! {
         	--measure-rule-times  dump per-pass Ascent rule timing to debug/rule_times/\n\
         	--dump-deps          dump pipeline dependency graph as Graphviz DOT to pipeline.dot"
     );
+    eprintln!("Experiment controls: --ablate-storage-search, --ablate-existing-storage-views, --ablate-call-observer-isolation");
     std::process::exit(1);
 }
 
@@ -64,6 +65,7 @@ fn main() {
     let mut ablate_scope_function = false;
     let mut ablate_flow_anchor_reopen = false;
     let mut ablate_flow_max_certification = false;
+    let mut semantic_ablations = decompile::elevator::SemanticAblations::default();
 
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -77,6 +79,9 @@ fn main() {
             "--ablate-scope=function" => ablate_scope_function = true,
             "--ablate-flow-anchor-reopen" => ablate_flow_anchor_reopen = true,
             "--ablate-flow-max-certification" => ablate_flow_max_certification = true,
+            "--ablate-storage-search" => semantic_ablations.disable_storage_search = true,
+            "--ablate-existing-storage-views" => semantic_ablations.disable_existing_views = true,
+            "--ablate-call-observer-isolation" => semantic_ablations.global_call_observer = true,
             "--dump-deps" => dump_deps = true,
             "--dump-dead-rels" => dump_dead_rels = true,
             s if s.starts_with('-') => {
@@ -137,6 +142,8 @@ fn main() {
     prog.ablate_scope_function = ablate_scope_function;
     prog.ablate_flow_anchor_reopen = ablate_flow_anchor_reopen;
     prog.ablate_flow_max_certification = ablate_flow_max_certification;
+    prog.semantic_ablations = semantic_ablations;
+    if semantic_ablations != Default::default() { eprintln!("[semantic-ablations] {semantic_ablations:?}"); }
 
     if !input_path.is_file() {
         eprintln!("Error: input path must be a binary file.");

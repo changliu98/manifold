@@ -445,6 +445,7 @@ impl Printer {
                                 } else {
                                     self.write(&decl.name);
                                 }
+                                self.print_var_alignment(decl);
                                 if let Some(ref init) = decl.init {
                                     self.write(" = ");
                                     self.print_initializer(init);
@@ -576,6 +577,7 @@ impl Printer {
         }
 
         self.print_type_with_name(&decl.ty, &decl.name);
+        self.print_var_alignment(decl);
 
         if let Some(ref init) = decl.init {
             self.write(" = ");
@@ -583,6 +585,12 @@ impl Printer {
         }
 
         self.writeln(";");
+    }
+
+    fn print_var_alignment(&mut self, decl: &VarDecl) {
+        if let Some(alignment) = decl.alignment {
+            self.write(&format!(" __attribute__((aligned({alignment})))"));
+        }
     }
 
     pub fn print_func_decl(&mut self, decl: &FuncDecl) {
@@ -1293,6 +1301,18 @@ fn collect_needed_protos(tu: &TranslationUnit) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_backing_alignment_is_explicit_and_survives_ast_rewrites() {
+        let mut declaration = VarDecl::new("backing", CType::Array(Box::new(CType::char_unsigned()), Some(28)));
+        declaration.alignment = Some(8);
+        let statement = CStmt::Decl(vec![declaration.clone()]);
+        let rewritten = crate::decompile::passes::c_pass::helpers::map_stmt_exprs_total(&statement, &|expr| expr.clone());
+        assert_eq!(rewritten, statement);
+        let mut printer = Printer::with_default_config();
+        printer.print_var_decl(&declaration);
+        assert_eq!(printer.into_string(), "unsigned char backing[28] __attribute__((aligned(8)));\n");
+    }
 
     #[test]
     fn function_pointer_return_wraps_the_function_declarator() {

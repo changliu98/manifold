@@ -12,6 +12,8 @@ pub mod propagator;
 pub mod query;
 pub mod select;
 pub mod solve;
+pub(crate) mod storage_theory;
+pub(crate) mod memory_theory;
 pub mod wt_audit;
 
 pub fn derive_canonical_path(path_str: &str) -> String {

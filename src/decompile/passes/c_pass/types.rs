@@ -650,6 +650,10 @@ pub struct VarDecl {
     pub ty: CType,
     pub storage_class: StorageClass,
     pub qualifiers: TypeQualifiers,
+    /// Minimum object alignment, independent of its element/access type.
+    pub alignment: Option<usize>,
+    /// Proof-carrying machine storage views; not part of the printed C syntax.
+    pub storage_views: Vec<crate::decompile::passes::semantic_counterexample::ledger::ObjectView>,
     pub init: Option<Initializer>,
     pub loc: SourceLoc,
 }
@@ -662,6 +666,8 @@ impl VarDecl {
             ty,
             storage_class: StorageClass::Auto,
             qualifiers: TypeQualifiers::none(),
+            alignment: None,
+            storage_views: Vec::new(),
             init: None,
             loc: SourceLoc::unknown(),
         }

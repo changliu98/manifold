@@ -3906,6 +3906,27 @@ mod tests {
     }
 
     #[test]
+    fn field_recovery_preserves_object_address_and_pointer_value_as_distinct_bases() {
+        let local = 900;
+        let byte = clight_type_from_chunk(&MemoryChunk::MInt8Unsigned);
+        let byte_ptr = pointer_to(byte.clone());
+        let address = ClightExpr::Ecast(Box::new(ClightExpr::Eaddrof(
+            Box::new(ClightExpr::Evar(local, default_long_type())),
+            pointer_to(default_long_type()))), byte_ptr.clone());
+        let pointer = ClightExpr::Etempvar(local, byte_ptr.clone());
+        let fields = HashMap::from([((local as i64, 4), (4, MemoryChunk::MInt8Unsigned))]);
+        for (base, is_address) in [(address, true), (pointer, false)] {
+            let original = ClightExpr::Ederef(Box::new(ClightExpr::Ebinop(
+                ClightBinaryOp::Oadd, Box::new(base),
+                Box::new(ClightExpr::EconstLong(4, default_long_type())), byte_ptr.clone())), byte.clone());
+            let rewritten = rewrite_clight_expr_fields(&original, &fields, &HashMap::new(), 8);
+            let ClightExpr::Efield(parent, _, _) = rewritten else { panic!("field was not recovered"); };
+            let ClightExpr::Ederef(base, _) = parent.as_ref() else { panic!("field needs an object lvalue"); };
+            assert_eq!(clight_addrof_target(base), is_address.then_some(local));
+        }
+    }
+
+    #[test]
     fn negative_pointer_displacement_is_not_rewritten_as_a_positive_field() {
         let base = 0x7100;
         let char_ptr = pointer_to(ClightType::Tint(
@@ -3997,7 +4018,18 @@ impl IRPass for ClightFieldPass {
     }
 
     fn run(&self, db: &mut DecompileDB) {
+        // Derive the byte-view candidates from the unmodified Clight epoch.
+        // Field synthesis can split a write into several assignments; using
+        // those fragments as the value of the original full-width store
+        // would duplicate/corrupt effects. Keep the source alternatives intact.
+        let source_writes = frame_projection_sources(db);
         rewrite_clight_stmts_with_struct_fields(db);
+        // Storage allocation and access views are different decisions. Once
+        // an allocation is known, every physical write gets an explicit
+        // exact-width Clight target before selection. The backend must not
+        // infer that width later from a field's narrowest observed read.
+        let semantic_projection = semantic_frame_projection_from(db, &source_writes);
+        apply_semantic_frame_projection(db, semantic_projection);
         refresh_clight_structure_worlds(db);
         relocate_image_address_comparisons(db);
     }
@@ -4027,6 +4059,13 @@ impl IRPass for ClightFieldPass {
             "stack_pointer_walk_region",
             "stack_var",
             "stack_var_chunk",
+            "semantic_frame_object",
+            "semantic_frame_member",
+            "semantic_frame_write_piece",
+            "semantic_storage_obligation",
+            "frame_stack_write_bytes",
+            "rtl_inst_candidate",
+            "xtl_canonical",
             "frame_read_reaching_storage",
             "slot_escaped_canonical",
             "escaped_stack_region_field",
@@ -4061,7 +4100,308 @@ impl IRPass for ClightFieldPass {
             "stack_buffer_alias",
             "stack_buffer_end_alias",
             "stack_buffer_address_root",
+            "semantic_storage_projection",
+            "semantic_frame_storage",
+            "semantic_storage_obligation",
         ]
+    }
+}
+
+#[derive(Default)]
+struct SemanticFrameProjection {
+    replacements: BTreeMap<(Address, Node), Vec<ClightStmt>>,
+    buffers: BTreeMap<(Address, RTLReg), i64>,
+    accesses: Vec<(Address, Node, RTLReg, i64, usize)>,
+    constructed: BTreeSet<(Address, RTLReg)>,
+}
+
+fn semantic_store_chunk(width: usize, value: &ClightExpr, pointer_bytes: usize) -> Option<MemoryChunk> {
+    // A wider store cannot recover bits absent from a narrower C value.
+    // Truncating to a smaller integer view is bit-preserving; widening an
+    // unknown signed carrier is not. Nonnegative integer literals are exact.
+    let source_bytes = match clight_expr_type(value) {
+        ClightType::Tint(ClightIntSize::I8 | ClightIntSize::IBool,_,_) => 1,
+        ClightType::Tint(ClightIntSize::I16,_,_) => 2,
+        ClightType::Tint(ClightIntSize::I32,_,_) | ClightType::Tfloat(ClightFloatSize::F32,_) => 4,
+        ClightType::Tlong(..) | ClightType::Tfloat(ClightFloatSize::F64,_) => 8,
+        ClightType::Tpointer(..) => pointer_bytes,
+        _ => return None,
+    };
+    let exact_literal = matches!(value, ClightExpr::EconstInt(n,_) if *n >= 0);
+    if width > source_bytes && !exact_literal { return None; }
+    match (clight_expr_type(value), width) {
+        (ClightType::Tfloat(ClightFloatSize::F32, _), 4) => Some(MemoryChunk::MFloat32),
+        (ClightType::Tfloat(ClightFloatSize::F64, _), 8) => Some(MemoryChunk::MFloat64),
+        // An access-width change on a floating value needs a bit-level value
+        // correspondence. A numeric cast is not a representation-preserving
+        // way to copy the low bytes of an FP register.
+        (ClightType::Tfloat(..) | ClightType::Tint128(..), _) => None,
+        _ => unsigned_chunk_for_byte_width(width),
+    }
+}
+
+/// Project the storage representation accepted by the counterexample driver.
+/// The decoded byte width, not a scalar carrier type or guessed struct field,
+/// determines the write. Padding and overlapping field views need no tiling:
+/// they are bytes of the same validated backing object.
+fn semantic_frame_projection(db: &DecompileDB) -> SemanticFrameProjection {
+    semantic_frame_projection_from(db, &frame_projection_sources(db))
+}
+
+fn frame_projection_sources(db: &DecompileDB) -> BTreeMap<Node, Vec<ClightStmt>> {
+    let (pieces, _) = crate::decompile::passes::semantic_counterexample::write_pieces(db);
+    let nodes: BTreeSet<_> = pieces.values().flatten().map(|p| p.node).collect();
+    let mut statements: BTreeMap<Node, Vec<ClightStmt>> = BTreeMap::new();
+    // Generic clight_stmt also contains flat-world alternatives. A primitive
+    // from that world must not replace an authoritative Sloop/Sif container
+    // sharing its header node. Preserve authoritative candidate provenance.
+    for (_, node, stmt) in db.rel_iter::<(Address,Node,ClightStmt)>("emit_clight_stmt") {
+        if nodes.contains(node) { statements.entry(*node).or_default().push(stmt.clone()); }
+    }
+    statements
+}
+
+fn project_frame_write_candidate(
+    stmt: &ClightStmt, node: Node, locals: &BTreeSet<RTLReg>, root: RTLReg,
+    extent: i64, offset: i64, width: usize, pointer_bytes: usize,
+) -> Option<ClightStmt> {
+    match stmt {
+        ClightStmt::Slabel(label,inner) if *label == crate::decompile::passes::csh_pass::ident_from_node(node) =>
+            Some(ClightStmt::Slabel(*label,Box::new(project_frame_write_candidate(inner,node,locals,root,extent,offset,width,pointer_bytes)?))),
+        ClightStmt::Ssequence(items) if items.len()==1 =>
+            Some(ClightStmt::Ssequence(vec![project_frame_write_candidate(&items[0],node,locals,root,extent,offset,width,pointer_bytes)?])),
+        ClightStmt::Sset(local,value) if locals.contains(&(*local as RTLReg)) => {
+            let chunk=semantic_store_chunk(width,value,pointer_bytes)?;
+            Some(raw_stack_buffer_store_expr(root as Ident,extent,offset,value.clone(),&chunk))
+        }
+        ClightStmt::Sassign(_,value) => {
+            let chunk=semantic_store_chunk(width,value,pointer_bytes)?;
+            Some(raw_stack_buffer_store_expr(root as Ident,extent,offset,value.clone(),&chunk))
+        }
+        // A primitive's machine footprint does not license replacement of
+        // its enclosing loop/branch/sequence or a differently labeled node.
+        _ => None,
+    }
+}
+
+fn semantic_frame_projection_from(db: &DecompileDB, statements: &BTreeMap<Node,Vec<ClightStmt>>) -> SemanticFrameProjection {
+    let mut projection = SemanticFrameProjection::default();
+    let committed: BTreeSet<_> = crate::decompile::passes::semantic_counterexample::ledger::committed(db)
+        .into_iter().map(|e| (e.object.function, e.object.base)).collect();
+    let roots: BTreeMap<_, _> = db.rel_iter::<(Address, i64, RTLReg)>("slot_escaped_canonical")
+        .map(|&(func, base, root)| ((func, base), root)).collect();
+    let mut objects: BTreeMap<Address, Vec<(i64, i64, RTLReg)>> = BTreeMap::new();
+    for &(func, _, base, extent) in db.rel_iter::<(Address, Node, i64, i64)>("semantic_frame_object") {
+        if !committed.contains(&(func, base)) { continue; }
+        if let Some(&root) = roots.get(&(func, base)) {
+            objects.entry(func).or_default().push((base, extent, root));
+            projection.buffers.insert((func, root), extent);
+            projection.constructed.insert((func, root));
+        }
+    }
+    for (object,root,extent) in crate::decompile::passes::semantic_counterexample::existing_byte_objects(db)
+        .into_iter().filter(|_| !db.semantic_ablations.disable_existing_views) {
+        let row = (object.base,extent,root);
+        let rows = objects.entry(object.function).or_default();
+        if !rows.contains(&row) { rows.push(row); }
+        projection.buffers.entry((object.function,root)).or_insert(extent);
+    }
+    if objects.is_empty() { return projection; }
+    let mut members: BTreeMap<(Address, Node, i64, usize), BTreeSet<RTLReg>> = BTreeMap::new();
+    for &(func, node, offset, local, width) in db.rel_iter::<(Address, Node, i64, RTLReg, usize)>("semantic_frame_member") {
+        members.entry((func, node, offset, width)).or_default().insert(local);
+    }
+    let mut claims: BTreeMap<(Address, Node), BTreeSet<(i64, usize, i64, i64, RTLReg)>> = BTreeMap::new();
+    let (write_pieces, _) = crate::decompile::passes::semantic_counterexample::write_pieces(db);
+    for (&func, pieces) in &write_pieces { for piece in pieces {
+        let (node, offset, width) = (piece.node, piece.offset, piece.width);
+        members.entry((func,node,offset,width)).or_default().insert(piece.local);
+        for &(base, extent, root) in objects.get(&func).into_iter().flatten() {
+            if crate::decompile::passes::frame_write_pass::frame_interval_contains(base, extent as usize, offset, width) {
+                claims.entry((func, node)).or_default().insert((offset, width, base, extent, root));
+            }
+        }
+    }}
+    for ((func, node), choices) in claims {
+        if choices.len() != 1 { continue; }
+        let &(offset, width, base, extent, root) = choices.first().unwrap();
+        let Some(locals) = members.get(&(func, node, offset, width)) else { continue; };
+        let mut replacements = Vec::new();
+        let mut unsupported = false;
+        for stmt in statements.get(&node).into_iter().flatten() {
+            let Some(stmt) = project_frame_write_candidate(stmt,node,locals,root,extent,offset-base,width,db.abi().pointer_size) else {
+                unsupported = true;
+                break;
+            };
+            if !replacements.contains(&stmt) { replacements.push(stmt); }
+        }
+        if !unsupported && !replacements.is_empty() {
+            projection.replacements.insert((func, node), replacements);
+            projection.accesses.push((func, node, root, offset - base, width));
+        }
+    }
+    projection
+}
+
+fn apply_semantic_frame_projection(db: &mut DecompileDB, projection: SemanticFrameProjection) {
+    if projection.buffers.is_empty() { return; }
+    for (&(func, root), &extent) in &projection.buffers {
+        db.stack_struct_buffers.entry(func).or_default().entry(root)
+            .and_modify(|size| *size = (*size).max(extent)).or_insert(extent);
+        db.rel_push("semantic_frame_storage", (func, root));
+    }
+    let mut by_node: BTreeMap<Node, Vec<ClightStmt>> = BTreeMap::new();
+    let mut node_functions: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for &(node, func) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        node_functions.entry(node).or_default().insert(func);
+    }
+    for (&(func, node), statements) in &projection.replacements {
+        // Never rewrite a statement shared by superposed functions according
+        // to one caller's frame. The synthesis eligibility check is similarly
+        // conservative, but retain this consumer-side boundary as well.
+        if node_functions.get(&node) == Some(&BTreeSet::from([func])) {
+            by_node.insert(node, statements.clone());
+        }
+    }
+    let clight = db.rel_iter::<(Node, ClightStmt)>("clight_stmt")
+        .filter(|(node, _)| !by_node.contains_key(node)).cloned()
+        .chain(by_node.iter().flat_map(|(&node, statements)| statements.iter().cloned().map(move |s| (node, s))))
+        .collect::<ascent::boxcar::Vec<_>>();
+    let emit = db.rel_iter::<(Address, Node, ClightStmt)>("emit_clight_stmt")
+        .filter(|(_, node, _)| !by_node.contains_key(node)).cloned()
+        .chain(projection.replacements.iter().filter(|((_, node), _)| by_node.contains_key(node))
+            .flat_map(|(&(func, node), statements)| statements.iter().cloned().map(move |s| (func, node, s))))
+        .collect::<ascent::boxcar::Vec<_>>();
+    db.rel_set("clight_stmt", clight);
+    db.rel_set("emit_clight_stmt", emit);
+    eprintln!("[semantic-counterexample] byte-object-projection objects={} constructed={} existing={} writes={}",
+        projection.buffers.len(), projection.constructed.len(), projection.buffers.len().saturating_sub(projection.constructed.len()), by_node.len());
+    let applied: Vec<_> = projection.accesses.into_iter().filter(|r| by_node.contains_key(&r.1)).collect();
+    use crate::decompile::passes::semantic_counterexample::ledger::{self, Outcome, Stage};
+    let (pieces, unknown) = crate::decompile::passes::semantic_counterexample::write_pieces(db);
+    let events: Vec<_> = ledger::committed(db).into_iter().map(|event| {
+        let complete = !unknown.get(&event.object.function).into_iter().flatten()
+            .any(|&(o,w)| o < event.object.base + event.extent && o.checked_add(w as i64).is_some_and(|end| end > event.object.base))
+            && pieces.get(&event.object.function).into_iter().flatten()
+            .filter(|r| crate::decompile::passes::frame_write_pass::frame_interval_contains(event.object.base, event.extent as usize, r.offset, r.width))
+            .all(|r| applied.iter().any(|a| a.0 == event.object.function && a.1 == r.node && a.3 == r.offset - event.object.base && a.4 == r.width));
+        event.at(Stage::Projection, if complete { Outcome::Proven } else { Outcome::Unknown },
+            if complete { "every physical write has an exact-width byte-view candidate" } else { "a physical write lacks a supported byte-view candidate" })
+    }).collect();
+    ledger::append(db, events);
+    db.rel_set("semantic_storage_projection", applied.into_iter().collect::<ascent::boxcar::Vec<_>>());
+}
+
+#[cfg(test)]
+mod semantic_frame_projection_tests {
+    use super::*;
+
+    #[test]
+    fn byte_projection_preserves_physical_width_and_every_value_candidate() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
+        let (func, lea, write, root, local) = (1_u64, 80_u64, 20_u64, 10_u64, 11_u64);
+        db.rel_push("semantic_frame_object", (func, lea, 16_i64, 12_i64));
+        db.rel_push("semantic_storage_obligation", crate::decompile::passes::semantic_counterexample::ledger::Event {
+            object: crate::decompile::passes::semantic_counterexample::ledger::ObjectId { function: func, base: 16 },
+            anchor: lea, call: 90, extent: 12,
+            stage: crate::decompile::passes::semantic_counterexample::ledger::Stage::Rtl,
+            outcome: crate::decompile::passes::semantic_counterexample::ledger::Outcome::Proven,
+            reason: "unit-test committed representation",
+        });
+        db.rel_push("slot_escaped_canonical", (func, 16_i64, root));
+        db.rel_push("semantic_frame_member", (func, write, 20_i64, local, 2_usize));
+        db.rel_push("frame_stack_write_bytes", (func, write, 20_i64, 2_usize));
+        db.rel_push("semantic_frame_write_piece", (func, write, write, 20_i64, 2_usize, local));
+        db.rel_push("instr_in_function", (write, func));
+        for value in [0x1234, 0x5678] {
+            let statement = ClightStmt::Sset(local as Ident, ClightExpr::EconstInt(value, default_int_type()));
+            db.rel_push("clight_stmt", (write, statement.clone()));
+            db.rel_push("emit_clight_stmt", (func, write, statement));
+        }
+        let projection = semantic_frame_projection(&db);
+        assert_eq!(projection.replacements[&(func, write)].len(), 2);
+        assert_eq!(projection.accesses, vec![(func, write, root, 4, 2)]);
+        for statement in &projection.replacements[&(func, write)] {
+            let ClightStmt::Sassign(ClightExpr::Ederef(_, ty), _) = statement else { panic!("not a byte-view store"); };
+            assert!(matches!(ty, ClightType::Tint(ClightIntSize::I16, _, _)));
+        }
+        apply_semantic_frame_projection(&mut db, projection);
+        assert_eq!(db.stack_struct_buffers[&func][&root], 12);
+        assert_eq!(db.rel_iter::<(Node, ClightStmt)>("clight_stmt").count(), 2);
+        assert!(db.rel_iter::<(Node, ClightStmt)>("clight_stmt").all(|(_, s)| matches!(s, ClightStmt::Sassign(..))));
+    }
+
+    #[test]
+    fn floating_storage_keeps_its_encoding_instead_of_numeric_integer_conversion() {
+        let single = ClightExpr::Etempvar(1, ClightType::Tfloat(ClightFloatSize::F32, default_attr()));
+        let double = ClightExpr::Etempvar(2, ClightType::Tfloat(ClightFloatSize::F64, default_attr()));
+        assert_eq!(semantic_store_chunk(4, &single, 8), Some(MemoryChunk::MFloat32));
+        assert_eq!(semantic_store_chunk(8, &double, 8), Some(MemoryChunk::MFloat64));
+        assert_eq!(semantic_store_chunk(8, &single, 8), None);
+        assert_eq!(semantic_store_chunk(4, &double, 8), None);
+        let statement = raw_stack_buffer_store_expr(10, 16, 4, single, &MemoryChunk::MFloat32);
+        let ClightStmt::Sassign(ClightExpr::Ederef(_, ty), value) = statement else { panic!("not a store"); };
+        assert_eq!(ty, clight_expr_type(&value));
+    }
+
+    #[test]
+    fn existing_buffers_get_explicit_word_views_before_final_selection() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
+        db.rel_push("func_stacksz", (1_u64,90_u64,"test",32_u64));
+        db.stack_struct_buffers.insert(1, HashMap::from([(10,16)]));
+        db.rel_push("stack_var", (1_u64,20_u64,0_i64,10_u64));
+        db.rel_push("stack_var", (1_u64,20_u64,8_i64,11_u64));
+        db.rel_push("frame_stack_write_bytes", (1_u64,20_u64,0_i64,16_usize));
+        for (node,offset,local) in [(20_u64,0_i64,10_u64),(30,8,11)] {
+            db.rel_push("semantic_frame_write_piece", (1_u64,20_u64,node,offset,8_usize,local));
+            db.rel_push("rtl_inst_candidate", (node, RTLInst::Iop(Operation::Olongconst(1), Arc::new(vec![]), local)));
+            db.rel_push("clight_stmt", (node,ClightStmt::Sset(local as Ident,ClightExpr::EconstLong(1,default_long_type()))));
+            db.rel_push("emit_clight_stmt", (1_u64,node,ClightStmt::Sset(local as Ident,ClightExpr::EconstLong(1,default_long_type()))));
+        }
+        let projection = semantic_frame_projection(&db);
+        assert!(projection.constructed.is_empty(), "ordinary buffers are not counted as synthesized objects");
+        assert_eq!(projection.accesses, vec![(1,20,10,0,8),(1,30,10,8,8)]);
+        db.semantic_ablations.disable_existing_views = true;
+        assert!(semantic_frame_projection(&db).accesses.is_empty());
+    }
+
+    #[test]
+    fn a_narrow_signed_carrier_cannot_supply_unproved_upper_store_bits() {
+        let value = ClightExpr::Etempvar(1, default_int_type());
+        assert!(semantic_store_chunk(8,&value,8).is_none());
+        assert!(semantic_store_chunk(2,&value,8).is_some());
+        assert!(semantic_store_chunk(8,&ClightExpr::EconstInt(0,default_int_type()),8).is_some());
+    }
+
+    #[test]
+    fn flat_write_candidates_cannot_replace_an_authoritative_loop() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
+        db.rel_push("func_stacksz", (1_u64,90_u64,"test",32_u64));
+        db.stack_struct_buffers.insert(1,HashMap::from([(10,8)]));
+        db.rel_push("stack_var",(1_u64,20_u64,0_i64,10_u64));
+        db.rel_push("frame_stack_write_bytes",(1_u64,20_u64,0_i64,4_usize));
+        db.rel_push("instr_in_function",(20_u64,1_u64));
+        let leaf = ClightStmt::Sset(10,ClightExpr::EconstInt(1,default_int_type()));
+        let whole_loop = ClightStmt::Sloop(Box::new(leaf.clone()),Box::new(ClightStmt::Sskip));
+        db.rel_push("clight_stmt",(20_u64,leaf));
+        db.rel_push("clight_stmt",(20_u64,whole_loop.clone()));
+        db.rel_push("emit_clight_stmt",(1_u64,20_u64,whole_loop.clone()));
+        let projection = semantic_frame_projection(&db);
+        assert!(projection.replacements.is_empty());
+        apply_semantic_frame_projection(&mut db,projection);
+        assert!(db.rel_iter::<(Address,Node,ClightStmt)>("emit_clight_stmt").any(|r| r.2==whole_loop));
+    }
+
+    #[test]
+    fn write_projection_preserves_exact_node_labels_but_not_foreign_origins() {
+        let value=ClightExpr::EconstLong(1,default_long_type());
+        let stmt=ClightStmt::Slabel(20,Box::new(ClightStmt::Sset(10,value)));
+        let result=project_frame_write_candidate(&stmt,20,&BTreeSet::from([10]),10,16,8,8,8).unwrap();
+        assert!(matches!(result,ClightStmt::Slabel(20,inner) if matches!(inner.as_ref(),ClightStmt::Sassign(..))));
+        assert!(project_frame_write_candidate(&stmt,30,&BTreeSet::from([10]),10,16,8,8,8).is_none());
     }
 }
 
@@ -7330,7 +7670,6 @@ fn clight_base_ptr_elem_size(expr: &ClightExpr, ptr_size: i64) -> i64 {
 /// Build the pointer-to-struct for a recovered field access, preserving any array index so base[idx] is not mis-rendered as base->ofs_0; the trailing constant addend is stripped as the field offset.
 fn struct_base_ptr_expr(
     inner: &ClightExpr,
-    base_ident: Ident,
     struct_ptr_ty: &ClightType,
 ) -> ClightExpr {
     let stripped = match inner {
@@ -7340,9 +7679,12 @@ fn struct_base_ptr_expr(
     if let ClightExpr::Ebinop(ClightBinaryOp::Oadd, lhs, rhs, _) = stripped {
         let lhs_is_pure_base = extract_base_ident_clight(lhs).is_some();
         let rhs_is_const = extract_const_offset_clight(rhs).is_some();
-        // `base + const`: no index term, keep the clean base-register form.
+        // A field key identifies an object, not whether the operand is its
+        // address or a pointer VALUE stored in it. Preserve the actual base
+        // expression: rebuilding Etempvar(id) here turned &cell + k into
+        // cell + k, loading a pointer from the first byte of a frame object.
         if lhs_is_pure_base && rhs_is_const {
-            return ClightExpr::Etempvar(base_ident, struct_ptr_ty.clone());
+            return cast_expr_to_type(lhs.as_ref().clone(), struct_ptr_ty.clone());
         }
         // Indexed: the struct pointer is the address minus the trailing constant field offset, or the whole sum when there is none.
         let base_sum = if rhs_is_const {
@@ -7352,8 +7694,7 @@ fn struct_base_ptr_expr(
         };
         return cast_expr_to_type(base_sum, struct_ptr_ty.clone());
     }
-    // Bare base register (Etempvar) or any non-additive form: clean base.
-    ClightExpr::Etempvar(base_ident, struct_ptr_ty.clone())
+    cast_expr_to_type(stripped.clone(), struct_ptr_ty.clone())
 }
 
 fn extract_deref_field_pattern(inner: &ClightExpr, ptr_size: i64) -> Option<(Ident, i64)> {
@@ -7481,7 +7822,7 @@ fn rewrite_clight_expr_fields(
                             .unwrap_or_else(|| base_key.unsigned_abs() as Ident);
                         let struct_ty = ClightType::Tstruct(struct_id, default_attr());
                         let struct_ptr_ty = pointer_to(struct_ty.clone());
-                        let ptr_expr = struct_base_ptr_expr(inner, base_ident, &struct_ptr_ty);
+                        let ptr_expr = struct_base_ptr_expr(inner, &struct_ptr_ty);
                         let proper_field_id = make_field_ident(field_offset, chunk.clone());
                         let deref_expr = ClightExpr::Ederef(Box::new(ptr_expr), struct_ty);
                         return ClightExpr::Efield(Box::new(deref_expr), proper_field_id, field_ty);

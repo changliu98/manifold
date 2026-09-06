@@ -1,0 +1,264 @@
+{
+  "schema_version": 1,
+  "suite": "manifold-selection-storage-search",
+  "cases": [
+    {
+      "name": "packet_windows",
+      "source": "cases/packet_windows.c",
+      "description": "Independent byte-window workload for final-selection storage refinement.",
+      "cflags": [
+        "-O2"
+      ],
+      "runs": [
+        {
+          "name": "argc_1",
+          "args": [],
+          "expected": {
+            "returncode": 194,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_2",
+          "args": [
+            "x"
+          ],
+          "expected": {
+            "returncode": 48,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_3",
+          "args": [
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 99,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_4",
+          "args": [
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 143,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_5",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 194,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_8",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 143,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_9",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 194,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_16",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 143,
+            "stdout": "",
+            "stderr": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "overlapping_lanes",
+      "source": "cases/overlapping_lanes.c",
+      "description": "Independent byte-window workload for final-selection storage refinement.",
+      "cflags": [
+        "-O2"
+      ],
+      "runs": [
+        {
+          "name": "argc_1",
+          "args": [],
+          "expected": {
+            "returncode": 250,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_2",
+          "args": [
+            "x"
+          ],
+          "expected": {
+            "returncode": 42,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_3",
+          "args": [
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 27,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_4",
+          "args": [
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 75,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_5",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 187,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_8",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 234,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_9",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 250,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_16",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 234,
+            "stdout": "",
+            "stderr": ""
+          }
+        }
+      ]
+    }
+  ]
+}

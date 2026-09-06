@@ -1729,6 +1729,7 @@ mod tests {
             ..InterfaceVars::default()
         };
         let state = ProgramSelectionState {
+            storage: Vec::new(),
             candidate_idx: [((callee_addr, 1), Some(0)), ((caller_addr, 2), Some(0))]
                 .into_iter()
                 .collect(),
@@ -1864,6 +1865,7 @@ mod tests {
             ..InterfaceVars::default()
         };
         let state = ProgramSelectionState {
+            storage: Vec::new(),
             candidate_idx: [((wrapper_addr, call), Some(0))].into_iter().collect(),
             structure_world: HashMap::new(),
             var_decl_idx: [((wrapper_addr, param), 0)].into_iter().collect(),
@@ -1929,6 +1931,7 @@ mod tests {
         solve_with_global_feedback(
             &[],
             &ProgramSelectionState {
+                storage: Vec::new(),
                 candidate_idx: HashMap::new(),
                 structure_world: HashMap::new(),
                 var_decl_idx: HashMap::new(),
@@ -2017,6 +2020,7 @@ mod tests {
         let outcome = solve_with_global_feedback(
             &[],
             &ProgramSelectionState {
+                storage: Vec::new(),
                 candidate_idx: HashMap::new(),
                 structure_world: HashMap::new(),
                 var_decl_idx: HashMap::new(),
@@ -2069,6 +2073,7 @@ mod tests {
             )],
         );
         let state = ProgramSelectionState {
+            storage: Vec::new(),
             candidate_idx: [((address, 3), Some(0))].into_iter().collect(),
             structure_world: HashMap::new(),
             var_decl_idx: [((address, reg), 0)].into_iter().collect(),
@@ -2117,6 +2122,7 @@ mod tests {
             )],
         );
         let state = ProgramSelectionState {
+            storage: Vec::new(),
             candidate_idx: [((address, node), Some(0))].into_iter().collect(),
             structure_world: HashMap::new(),
             var_decl_idx: [((address, reg), 0)].into_iter().collect(),

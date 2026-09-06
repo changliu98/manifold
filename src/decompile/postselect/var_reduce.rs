@@ -732,6 +732,7 @@ fn is_scalar(ty: &CType) -> bool {
 /// Coalescing may change an object's declaration and storage. Restrict it to ordinary automatic scalar locals: storage duration and every object-level qualifier are semantically significant and must remain untouched.
 fn is_plain_auto_scalar(d: &VarDecl) -> bool {
     d.storage_class == StorageClass::Auto
+        && d.storage_views.is_empty()
         && !d.qualifiers.is_const
         && !d.qualifiers.is_volatile
         && !d.qualifiers.is_restrict
@@ -1564,6 +1565,7 @@ fn demote_pointer_counters(func: &mut FuncDef) -> usize {
     let mut demoted = 0usize;
     for d in func.local_vars.iter_mut() {
         if d.ty.is_pointer()
+            && d.storage_views.is_empty()
             && self_add.contains(&d.name)
             && null_cmp.contains(&d.name)
             && !bare_deref.contains(&d.name)
@@ -1686,6 +1688,23 @@ mod tests {
 
     fn lv(n: &str) -> VarDecl {
         VarDecl::new(n, CType::long())
+    }
+
+    #[test]
+    fn storage_declarations_are_excluded_without_losing_other_coalescing() {
+        let mut storage = lv("storage");
+        storage.storage_views.push(crate::decompile::passes::semantic_counterexample::ledger::ObjectView {
+            object: crate::decompile::passes::semantic_counterexample::ledger::ObjectId { function: 1, base: 0 },
+            offset: 0, extent: 8,
+        });
+        assert!(!is_plain_auto_scalar(&storage));
+        let mut function = fd(vec![storage,lv("a"),lv("b")], vec![
+            assign("a",CExpr::int(1)), callstmt("consume",CExpr::var("a")),
+            assign("b",CExpr::int(2)), callstmt("consume",CExpr::var("b")),
+            assign("storage",CExpr::int(3)), CStmt::Return(Some(CExpr::var("storage"))),
+        ]);
+        assert_eq!(run_coalesce(&mut function),1);
+        assert!(function.local_vars.iter().any(|v| v.name=="storage" && !v.storage_views.is_empty()));
     }
 
     fn assign(v: &str, e: CExpr) -> CStmt {

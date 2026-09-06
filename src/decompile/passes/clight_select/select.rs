@@ -63,6 +63,7 @@ fn superset_provenance_priority(
 
 #[derive(Clone, Default)]
 pub(crate) struct ProgramSelectionState {
+    pub(crate) storage: Vec<super::storage_theory::Decision>,
     /// (func_addr, node) -> candidate index
     pub(crate) candidate_idx: HashMap<(Address, Node), Option<usize>>,
     /// One atomic CFG/structure interpretation per function.
@@ -122,6 +123,15 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
     let data_model = db.data_model();
     let (mut functions, id_to_name, mut committed_interfaces, interface_vars) =
         extract_functions(db)?;
+    let mut storage_obligations = if db.semantic_ablations.disable_storage_search {
+        Default::default()
+    } else { crate::decompile::passes::semantic_counterexample::prepare(db) };
+    super::memory_theory::bind_current_storage(db, &functions, &mut storage_obligations.pending);
+    for function in &mut functions {
+        function.storage_problems = storage_obligations.pending.iter()
+            .filter(|p| p.problem.function == function.address).cloned().collect();
+    }
+    super::memory_theory::collect(db, &mut functions);
     // Reversing Stacking turns a physical frame-cell write into `Sset` of the
     // cell's canonical local.  Retain that structural identity for the width
     // audit; an arbitrary SSA temporary at the same node is not memory-write
@@ -484,6 +494,8 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
     }
     db.committed_interfaces = committed_interfaces;
     db.interface_vars = interface_vars;
+    crate::decompile::passes::semantic_counterexample::publish_selection(db, storage_obligations, &best_state.storage);
+    super::memory_theory::record_selection(db, &functions, &best_state);
 
     for func in &functions {
         let world = best_state
@@ -1839,7 +1851,7 @@ fn assemble_loops(
                 .collect();
             targets.sort_unstable();
             targets.dedup();
-            (targets.len() == 1).then_some(targets[0])
+            (targets.len() == 1).then(|| targets[0])
         });
         let body_top_label: Option<Ident> = header_continue_frontier
             .or(primary_continue_frontier)
@@ -4345,6 +4357,7 @@ mod tests {
             structure_world: HashMap::new(),
             var_decl_idx: HashMap::new(),
             var_type_override: HashMap::new(),
+            storage: Vec::new(),
         };
         let feedback = committed_global_flow_feedback(&[func], &state);
         assert_eq!(feedback.len(), 1, "{feedback:?}");
@@ -4627,6 +4640,41 @@ mod tests {
             !has_break(assembled),
             "non-primary exits collapsed to break: {assembled:#?}"
         );
+    }
+
+    #[test]
+    fn a_selected_primary_exit_without_an_inside_target_has_no_continue_frontier() {
+        use crate::decompile::passes::clight_select::query::PrimaryExitData;
+        fn has_return(stmt: &ClightStmt) -> bool {
+            match stmt {
+                ClightStmt::Sreturn(_) => true,
+                ClightStmt::Slabel(_,inner) => has_return(inner),
+                ClightStmt::Ssequence(items) => items.iter().any(has_return),
+                ClightStmt::Sloop(body,step) => has_return(body) || has_return(step),
+                ClightStmt::Sifthenelse(_,yes,no) => has_return(yes) || has_return(no),
+                ClightStmt::Sswitch(_,cases) => cases.iter().any(|(_,stmt)| has_return(stmt)),
+                _ => false,
+            }
+        }
+        for exits_by_return in [false,true] {
+            let (header,exit,outside) = (0x100_u64,0x110_u64,0x200_u64);
+            let exit_stmt = if exits_by_return { ClightStmt::Sreturn(None) }
+                else { ClightStmt::Sgoto(ident_from_node(outside)) };
+            let mut statements = HashMap::from([
+                (header,ClightStmt::Sset(1,test_expr())),
+                (exit,exit_stmt), (outside,ClightStmt::Sreturn(None)),
+            ]);
+            let info = LoopInfo { body_nodes: vec![exit],
+                primary_exit: Some(PrimaryExitData { exit_node: exit,
+                    exit_target: (!exits_by_return).then_some(outside) }),
+                ..LoopInfo::default()
+            };
+            let successors = HashMap::from([(header,vec![exit]),
+                (exit,if exits_by_return { vec![] } else { vec![outside] })]);
+            assemble_loops(&mut statements,&HashMap::from([(header,info)]),&successors);
+            assert!(!statements.is_empty());
+            assert!(statements.values().any(has_return),"selected return was lost: {statements:?}");
+        }
     }
 
     #[test]

@@ -1205,9 +1205,10 @@ fn solve_function(
     HashMap<RTLReg, usize>,
     HashMap<RTLReg, CandType>,
     u8,
+    Vec<super::storage_theory::Decision>,
 ) {
     match solve_function_engine(func, name_to_ident, &[], maximal_flow_certification) {
-        Ok((c, ty, ov, structure_world, grade)) => {
+        Ok((c, ty, ov, structure_world, grade, storage)) => {
             if matches!(grade, SatResult::Unknown) {
                 TYPE_SOLVE_PARTIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 eprintln!(
@@ -1218,7 +1219,7 @@ fn solve_function(
                     func.var_type_candidates.len()
                 );
             }
-            (c, ty, ov, structure_world)
+            (c, ty, ov, structure_world, storage)
         }
         Err(first) => {
             TYPE_SOLVE_NO_MODEL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1239,6 +1240,7 @@ fn solve_function(
                 HashMap::new(),
                 HashMap::new(),
                 func.authoritative_structure_world,
+                Vec::new(),
             )
         }
     }
@@ -1397,6 +1399,44 @@ fn integer_candidate_conditions(
             func.address, counts[0], counts[1], counts[2], counts[3], out.len(), gaps);
     }
     (out, preferences)
+}
+
+fn memory_candidate_conditions(
+    func: &FunctionData,
+    selections: &HashMap<Node, Vec<Bool>>,
+    worlds: &HashMap<u8, Bool>,
+) -> (HashMap<(Node, usize), Bool>, Vec<Bool>) {
+    use super::memory_theory::{check, Check};
+    let mut conditions = HashMap::new();
+    let mut preferences = Vec::new();
+    for contract in &func.storage_writes {
+        let Some(candidates) = func.node_statements.get(&contract.node) else { continue; };
+        let checks: Vec<_> = candidates.iter().map(|stmt| check(stmt, contract, func)).collect();
+        if !checks.contains(&Check::Mismatch) { continue; }
+        let proving_worlds: Vec<Bool> = checks.iter().enumerate().filter(|(_, c)| **c == Check::Matches)
+            .flat_map(|(i, _)| {
+                let mask = func.candidate_structure_worlds.get(&contract.node).and_then(|m| m.get(i));
+                func.structure_worlds.iter().filter(move |w| mask.is_none_or(|m| m.contains(w)))
+                    .map(|w| worlds.get(w).cloned().unwrap_or_else(|| Bool::from_bool(true)))
+            }).collect();
+        if proving_worlds.is_empty() { continue; } // Explicit candidate-domain gap, not a false proof.
+        let allowed = Bool::or(&proving_worlds).not();
+        for (index, verdict) in checks.iter().enumerate() {
+            if *verdict == Check::Mismatch {
+                conditions.entry((contract.node, index))
+                    .and_modify(|old: &mut Bool| *old = Bool::and(&[old.clone(), allowed.clone()]))
+                    .or_insert_with(|| allowed.clone());
+            }
+        }
+        if let Some(vars) = selections.get(&contract.node) {
+            let proved: Vec<_> = checks.iter().enumerate().filter(|(_, c)| **c == Check::Matches).map(|(i, _)| vars[i].clone()).collect();
+            preferences.push(Bool::or(&proved));
+        }
+    }
+    if !func.storage_writes.is_empty() {
+        eprintln!("[storage-selection] function={:#x} machine-writes={} guarded-vetoes={}", func.address, func.storage_writes.len(), conditions.len());
+    }
+    (conditions, preferences)
 }
 
 // The single constraint build, engine-independent: identical hard constraints and identical soft families whichever backend consumes them.
@@ -1603,7 +1643,7 @@ fn build_function_constraints(
                 )
             })
             .count();
-        let (integer_conditions, integer_preferences) = integer_candidate_conditions(
+        let (mut semantic_conditions, integer_preferences) = integer_candidate_conditions(
             &t,
             &tyvar,
             func,
@@ -1612,14 +1652,21 @@ fn build_function_constraints(
             &structure_worlds,
             &structure_world_var,
         );
+        // The same guarded structural constraints and recorded conditions
+        // protect both the Z3 model and deterministic post-model re-picking.
+        let (memory_conditions, memory_preferences) = memory_candidate_conditions(func, &selvar, &structure_world_var);
+        for (key, condition) in memory_conditions {
+            semantic_conditions.entry(key).and_modify(|old| *old = Bool::and(&[old.clone(), condition.clone()])).or_insert(condition);
+        }
         // Include the new weight-1 coverage preferences in the prior bound.
         // Functions without a semantic preference retain the original weight.
         let compat_w: u64 =
-            (regs.len() + authoritative_refinable_nodes + integer_preferences.len()) as u64 + 1;
+            (regs.len() + authoritative_refinable_nodes + integer_preferences.len() + memory_preferences.len()) as u64 + 1;
         let sink = ConstraintSink::new(backend, compat_w);
         for preference in &integer_preferences {
             sink.assert_soft_tagged(None, preference, 1, "integer_semantics");
         }
+        for preference in &memory_preferences { sink.assert_soft_tagged(None, preference, 1, "storage_semantics"); }
 
         // Emit constraints for every candidate statement, guarded by its selection boolean when refinable; multi-candidate nodes also record their conditions for the post-solve re-pick.
         let mut recorded: HashMap<Node, Vec<Vec<RecordedCond>>> = HashMap::new();
@@ -1630,7 +1677,7 @@ fn build_function_constraints(
                     let mut per_cand = Vec::with_capacity(cands.len());
                     for (ci, stmt) in cands.iter().enumerate() {
                         sink.begin_candidate(true);
-                        if let Some(condition) = integer_conditions.get(&(node, ci)) {
+                        if let Some(condition) = semantic_conditions.get(&(node, ci)) {
                             sink.assert_structural(Some(&vars[ci]), condition);
                         }
                         constrain_stmt(
@@ -1923,10 +1970,11 @@ type SolveOutcome = (
     HashMap<RTLReg, CandType>,
     u8,
     SatResult,
+    Vec<super::storage_theory::Decision>,
 );
 
 // The single Z3 solve. Returns the selection + the SatResult that yielded the model, or the failing SatResult when no model is available.
-fn solve_function_z3(
+pub(crate) fn solve_function_z3(
     func: &FunctionData,
     name_to_ident: &HashMap<String, Ident>,
     interface_pins: &[(RTLReg, XType)],
@@ -1955,16 +2003,22 @@ fn solve_function_z3(
             build_t0.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
-        let check_t0 = std::time::Instant::now();
-        let check_result = opt.check(&[]);
-        CHECK_NS.fetch_add(
-            check_t0.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        let model = match check_result {
+        // One per-function MaxSMT owns both statement/type choices and latent
+        // storage choices. The verifier contributes witness clauses to THIS
+        // instance; it does not run an independent representation optimizer.
+        opt.push();
+        let mut layouts: Vec<_> = func.storage_problems.iter()
+            .map(|p| super::storage_theory::Encoding::build(p, &opt)).collect();
+        let mut storage_decisions = Vec::new();
+        let mut rounds = 0;
+        loop {
+            let check_t0 = std::time::Instant::now();
+            let check_result = opt.check(&[]);
+            CHECK_NS.fetch_add(check_t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            let model = match check_result {
             SatResult::Sat => opt.get_model(),
             // Partial-solve reuse (TR-1): on unknown, reuse the best-so-far model only when the deterministic rlimit was exhausted, since a wall-clock unknown would be timing-dependent.
-            SatResult::Unknown => {
+            SatResult::Unknown if layouts.is_empty() => {
                 let resource_budget = opt
                     .get_reason_unknown()
                     .map(|r| r.contains("resource"))
@@ -1975,17 +2029,48 @@ fn solve_function_z3(
                     None
                 }
             }
-            SatResult::Unsat => None,
-        };
-
-        match model {
+            SatResult::Unknown | SatResult::Unsat => None,
+            };
+            if !layouts.is_empty() {
+                let mut failure = None;
+                let mut refined = false;
+                if let Some(model) = model.as_ref() {
+                    for layout in &mut layouts {
+                        match layout.refine(model, &opt) {
+                            Ok(changed) => refined |= changed,
+                            Err(reason) => { failure = Some(reason); break; }
+                        }
+                    }
+                } else {
+                    failure = Some(if check_result == SatResult::Unsat {
+                        "no layout satisfies the accumulated witnesses"
+                    } else { "storage solve resource limit or unavailable model" });
+                }
+                if refined && rounds >= super::storage_theory::MAX_REFINEMENTS {
+                    failure = Some("storage refinement budget exhausted");
+                }
+                if let Some(reason) = failure {
+                    storage_decisions = layouts.drain(..).map(|l| l.finish(None, reason)).collect();
+                    // Unsupported storage does not relax any semantic clause
+                    // and pretend success. Discard the latent extension and
+                    // preserve the ordinary, explicitly uncertified selection.
+                    opt.pop();
+                    continue;
+                }
+                if refined { rounds += 1; continue; }
+                storage_decisions = layouts.drain(..)
+                    .map(|l| l.finish(model.as_ref(), "all storage witnesses and universal obligations discharged"))
+                    .collect();
+            }
+            match model {
             Some(m) => {
                 report_cost("optimize", func, &m, &softs);
                 let (cand_out, ty_out, ty_override, structure_world) =
                     extract_selection(&m, &built, func, name_to_ident, true);
-                Ok((cand_out, ty_out, ty_override, structure_world, check_result))
+                return Ok((cand_out, ty_out, ty_override, structure_world, check_result, storage_decisions));
             }
-            None => Err(check_result),
+            None => return Err(check_result),
+            }
         }
     })
 }
@@ -2283,7 +2368,7 @@ fn solve_function_propagator_attempt(
                     let mut g = FLOW_STATS.lock().unwrap();
                     g.ties_determined_by_flow += ties;
                 }
-                Ok((cand_out, ty_out, ty_override, structure_world, check_result))
+                Ok((cand_out, ty_out, ty_override, structure_world, check_result, Vec::new()))
             }
             None => Err(check_result),
         };
@@ -2422,7 +2507,7 @@ fn solve_function_engine(
     interface_pins: &[(RTLReg, XType)],
     maximal_flow_certification: bool,
 ) -> Result<SolveOutcome, SatResult> {
-    if selected_solve_engine(maximal_flow_certification) == SolveEngine::Optimize {
+    if selected_solve_engine(maximal_flow_certification) == SolveEngine::Optimize || !func.storage_problems.is_empty() {
         let started = std::time::Instant::now();
         let out = solve_function_z3(func, name_to_ident, interface_pins);
         ENGINE_OPTIMIZE_NS.fetch_add(
@@ -2737,11 +2822,12 @@ pub(crate) fn infer_select_program(
         HashMap<RTLReg, usize>,
         HashMap<RTLReg, CandType>,
         u8,
+        Vec<super::storage_theory::Decision>,
     )> = functions
         .par_iter()
         .map(|f| {
-            let (c, t, o, world) = solve_function(f, name_to_ident, maximal_flow_certification);
-            (f.address, c, t, o, world)
+            let (c, t, o, world, storage) = solve_function(f, name_to_ident, maximal_flow_certification);
+            (f.address, c, t, o, world, storage)
         })
         .collect();
 
@@ -2783,7 +2869,9 @@ pub(crate) fn infer_select_program(
     let mut structure_world = HashMap::new();
     let mut var_decl_idx = HashMap::new();
     let mut var_type_override = HashMap::new();
-    for (addr, cmap, tmap, omap, world) in per_func {
+    let mut storage = Vec::new();
+    for (addr, cmap, tmap, omap, world, decisions) in per_func {
+        storage.extend(decisions);
         structure_world.insert(addr, world);
         for (node, idx) in cmap {
             candidate_idx.insert((addr, node), idx);
@@ -2797,6 +2885,7 @@ pub(crate) fn infer_select_program(
     }
 
     let state = ProgramSelectionState {
+        storage,
         candidate_idx,
         structure_world,
         var_decl_idx,
@@ -2962,7 +3051,9 @@ pub(crate) fn resolve_dirty_functions(
             &pins,
             maximal_flow_certification,
         ) {
-            Ok((candidates, declarations, overrides, structure_world, SatResult::Sat)) => {
+            Ok((candidates, declarations, overrides, structure_world, SatResult::Sat, decisions)) => {
+                state.storage.retain(|d| d.prepared.problem.function != func.address);
+                state.storage.extend(decisions);
                 *func = resolve_func;
                 state.structure_world.insert(func.address, structure_world);
                 state
@@ -2987,7 +3078,7 @@ pub(crate) fn resolve_dirty_functions(
                 }
                 resolved_count += 1;
             }
-            Ok((_, _, _, _, grade)) => {
+            Ok((_, _, _, _, grade, _)) => {
                 fallback_count += 1;
                 eprintln!(
                     "[interface-solve] WARN: dirty re-solve for {} ({:#x}) returned {:?}; retaining Stage-A selection",
@@ -3117,7 +3208,7 @@ mod tests {
                 3,
             ),
         );
-        let (choices, _, _, _) = solve_function(&func, &HashMap::new(), false);
+        let (choices, _, _, _, _) = solve_function(&func, &HashMap::new(), false);
         assert_eq!(choices[&20], Some(1));
     }
 
@@ -3177,7 +3268,7 @@ mod tests {
             vec![BTreeSet::from([flat]), BTreeSet::from([structured])],
         );
 
-        let (choices, _, _, selected_world) = solve_function(&func, &HashMap::new(), false);
+        let (choices, _, _, selected_world, _) = solve_function(&func, &HashMap::new(), false);
         let first_choice = choices[&first].expect("first node is active");
         let second_choice = choices[&second].expect("second node is active");
         assert!(func.candidate_structure_worlds[&first][first_choice].contains(&selected_world));
@@ -3207,6 +3298,7 @@ mod tests {
             structure_world: HashMap::new(),
             var_decl_idx: [((address, reg), 1)].into_iter().collect(),
             var_type_override: HashMap::new(),
+            storage: Vec::new(),
         };
         let (state, stats) = resolve_dirty_functions(
             std::slice::from_mut(&mut func),
@@ -3244,6 +3336,7 @@ mod tests {
             structure_world: HashMap::new(),
             var_decl_idx: [((address, reg), 0)].into_iter().collect(),
             var_type_override: HashMap::new(),
+            storage: Vec::new(),
         };
         let (state, stats) = resolve_dirty_functions(
             std::slice::from_mut(&mut func),
@@ -3282,6 +3375,7 @@ mod tests {
             structure_world: HashMap::new(),
             var_decl_idx: [((address, reg), 0)].into_iter().collect(),
             var_type_override: HashMap::new(),
+            storage: Vec::new(),
         };
         let (state, stats) = resolve_dirty_functions(
             std::slice::from_mut(&mut func),
@@ -3327,6 +3421,7 @@ mod tests {
             structure_world: HashMap::new(),
             var_decl_idx: HashMap::new(),
             var_type_override: HashMap::new(),
+            storage: Vec::new(),
         };
         let (_, stats) = resolve_dirty_functions(
             std::slice::from_mut(&mut func),
@@ -3686,7 +3781,7 @@ mod tests {
             )],
         );
 
-        let (statement_idx, declaration_idx, _, _) = solve_function(&func, &HashMap::new(), false);
+        let (statement_idx, declaration_idx, _, _, _) = solve_function(&func, &HashMap::new(), false);
         assert_eq!(declaration_idx.get(&reg), Some(&1));
         assert_eq!(statement_idx.get(&load_node), Some(&Some(1)));
     }
@@ -3738,7 +3833,7 @@ mod tests {
             ],
         );
 
-        let (statement_idx, _, _, _) = solve_function(&func, &HashMap::new(), false);
+        let (statement_idx, _, _, _, _) = solve_function(&func, &HashMap::new(), false);
         assert_eq!(statement_idx.get(&store_node), Some(&Some(1)));
     }
 
@@ -3761,7 +3856,7 @@ mod tests {
         func.var_type_candidates
             .insert(reg, vec![CandType::I32(Sign::Signed), CandType::PtrChar]);
 
-        let (_, declarations, _, _) = solve_function(&func, &HashMap::new(), false);
+        let (_, declarations, _, _, _) = solve_function(&func, &HashMap::new(), false);
 
         assert_eq!(declarations.get(&reg), Some(&1));
     }

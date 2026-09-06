@@ -1,0 +1,1800 @@
+{
+  "schema_version": 1,
+  "suite": "manifold-machine-storage-demands",
+  "cases": [
+    {
+      "name": "constant_views",
+      "source": "cases/machine_offset_views.c",
+      "description": "Diagnostic offset family; no hand-edited generated C.",
+      "cflags": [
+        "-O2",
+        "-DCONSTANT_VIEWS=1"
+      ],
+      "runs": [
+        {
+          "name": "argc_1",
+          "args": [],
+          "expected": {
+            "returncode": 111,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_2",
+          "args": [
+            "x"
+          ],
+          "expected": {
+            "returncode": 133,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_3",
+          "args": [
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 113,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_4",
+          "args": [
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 135,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_7",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 117,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_8",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 139,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_15",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 125,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_16",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 131,
+            "stdout": "",
+            "stderr": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "mask1",
+      "source": "cases/machine_offset_views.c",
+      "description": "Diagnostic offset family; no hand-edited generated C.",
+      "cflags": [
+        "-O2",
+        "-DINDEX_EXPR=((unsigned)argc&1u)"
+      ],
+      "runs": [
+        {
+          "name": "argc_1",
+          "args": [],
+          "expected": {
+            "returncode": 111,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_2",
+          "args": [
+            "x"
+          ],
+          "expected": {
+            "returncode": 133,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_3",
+          "args": [
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 113,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_4",
+          "args": [
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 135,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_7",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 117,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_8",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 139,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_15",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 125,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_16",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 131,
+            "stdout": "",
+            "stderr": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "mask7",
+      "source": "cases/machine_offset_views.c",
+      "description": "Diagnostic offset family; no hand-edited generated C.",
+      "cflags": [
+        "-O2",
+        "-DINDEX_EXPR=((unsigned)argc&7u)"
+      ],
+      "runs": [
+        {
+          "name": "argc_1",
+          "args": [],
+          "expected": {
+            "returncode": 111,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_2",
+          "args": [
+            "x"
+          ],
+          "expected": {
+            "returncode": 133,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_3",
+          "args": [
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 113,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_4",
+          "args": [
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 135,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_7",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 117,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_8",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 139,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_15",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 125,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_16",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 131,
+            "stdout": "",
+            "stderr": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "affine_mask",
+      "source": "cases/machine_offset_views.c",
+      "description": "Diagnostic offset family; no hand-edited generated C.",
+      "cflags": [
+        "-O2",
+        "-DINDEX_EXPR=(((unsigned)argc*3u+1u)&7u)"
+      ],
+      "runs": [
+        {
+          "name": "argc_1",
+          "args": [],
+          "expected": {
+            "returncode": 111,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_2",
+          "args": [
+            "x"
+          ],
+          "expected": {
+            "returncode": 133,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_3",
+          "args": [
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 113,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_4",
+          "args": [
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 135,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_7",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 117,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_8",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 139,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_15",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 125,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_16",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 131,
+            "stdout": "",
+            "stderr": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "shift",
+      "source": "cases/machine_offset_views.c",
+      "description": "Diagnostic offset family; no hand-edited generated C.",
+      "cflags": [
+        "-O2",
+        "-DINDEX_EXPR=((unsigned)argc>>30)"
+      ],
+      "runs": [
+        {
+          "name": "argc_1",
+          "args": [],
+          "expected": {
+            "returncode": 111,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_2",
+          "args": [
+            "x"
+          ],
+          "expected": {
+            "returncode": 133,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_3",
+          "args": [
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 113,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_4",
+          "args": [
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 135,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_7",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 117,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_8",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 139,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_15",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 125,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_16",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 131,
+            "stdout": "",
+            "stderr": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "remainder",
+      "source": "cases/machine_offset_views.c",
+      "description": "Diagnostic offset family; no hand-edited generated C.",
+      "cflags": [
+        "-O2",
+        "-DINDEX_EXPR=((unsigned)argc%3u)"
+      ],
+      "runs": [
+        {
+          "name": "argc_1",
+          "args": [],
+          "expected": {
+            "returncode": 111,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_2",
+          "args": [
+            "x"
+          ],
+          "expected": {
+            "returncode": 133,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_3",
+          "args": [
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 113,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_4",
+          "args": [
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 135,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_7",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 117,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_8",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 139,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_15",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 125,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_16",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 131,
+            "stdout": "",
+            "stderr": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "scaled_mask",
+      "source": "cases/machine_offset_views.c",
+      "description": "Diagnostic offset family; no hand-edited generated C.",
+      "cflags": [
+        "-O2",
+        "-DINDEX_EXPR=(4u*((unsigned)argc&7u))"
+      ],
+      "runs": [
+        {
+          "name": "argc_1",
+          "args": [],
+          "expected": {
+            "returncode": 111,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_2",
+          "args": [
+            "x"
+          ],
+          "expected": {
+            "returncode": 133,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_3",
+          "args": [
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 113,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_4",
+          "args": [
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 135,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_7",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 117,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_8",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 139,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_15",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 125,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_16",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 131,
+            "stdout": "",
+            "stderr": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "wrap_mask",
+      "source": "cases/machine_offset_views.c",
+      "description": "Diagnostic offset family; no hand-edited generated C.",
+      "cflags": [
+        "-O2",
+        "-DINDEX_EXPR=(((unsigned)argc+0xffffffffu)&7u)"
+      ],
+      "runs": [
+        {
+          "name": "argc_1",
+          "args": [],
+          "expected": {
+            "returncode": 111,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_2",
+          "args": [
+            "x"
+          ],
+          "expected": {
+            "returncode": 133,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_3",
+          "args": [
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 113,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_4",
+          "args": [
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 135,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_7",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 117,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_8",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 139,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_15",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 125,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_16",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 131,
+            "stdout": "",
+            "stderr": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "two_sources",
+      "source": "cases/machine_offset_views.c",
+      "description": "Diagnostic offset family; no hand-edited generated C.",
+      "cflags": [
+        "-O2",
+        "-DINDEX_EXPR=((((unsigned)argc>>1)^(unsigned)argc)&7u)"
+      ],
+      "runs": [
+        {
+          "name": "argc_1",
+          "args": [],
+          "expected": {
+            "returncode": 111,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_2",
+          "args": [
+            "x"
+          ],
+          "expected": {
+            "returncode": 133,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_3",
+          "args": [
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 113,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_4",
+          "args": [
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 135,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_7",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 117,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_8",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 139,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_15",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 125,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_16",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 131,
+            "stdout": "",
+            "stderr": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "branch_merge",
+      "source": "cases/machine_offset_views.c",
+      "description": "Diagnostic offset family; no hand-edited generated C.",
+      "cflags": [
+        "-O2",
+        "-DINDEX_EXPR=((argc&1)?1u:3u)"
+      ],
+      "runs": [
+        {
+          "name": "argc_1",
+          "args": [],
+          "expected": {
+            "returncode": 111,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_2",
+          "args": [
+            "x"
+          ],
+          "expected": {
+            "returncode": 133,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_3",
+          "args": [
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 113,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_4",
+          "args": [
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 135,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_7",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 117,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_8",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 139,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_15",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 125,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_16",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 131,
+            "stdout": "",
+            "stderr": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "guarded_unmodeled",
+      "source": "cases/machine_offset_views.c",
+      "description": "Diagnostic offset family; no hand-edited generated C.",
+      "cflags": [
+        "-O2",
+        "-DINDEX_EXPR=((unsigned)argc)",
+        "-DGUARDED_INDEX=1"
+      ],
+      "runs": [
+        {
+          "name": "argc_1",
+          "args": [],
+          "expected": {
+            "returncode": 111,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_2",
+          "args": [
+            "x"
+          ],
+          "expected": {
+            "returncode": 133,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_3",
+          "args": [
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 113,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_4",
+          "args": [
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 135,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_7",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 117,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_8",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 139,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_15",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 125,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_16",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 131,
+            "stdout": "",
+            "stderr": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "cross_view_observer",
+      "source": "cases/machine_cross_views.c",
+      "description": "An interior callee write must be visible through another view of initialized frame storage.",
+      "cflags": [
+        "-O2"
+      ],
+      "runs": [
+        {
+          "name": "argc_1",
+          "args": [],
+          "expected": {
+            "returncode": 14,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_2",
+          "args": [
+            "x"
+          ],
+          "expected": {
+            "returncode": 76,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_3",
+          "args": [
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 145,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_4",
+          "args": [
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 14,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_7",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 149,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_8",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 14,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_15",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 157,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_16",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 14,
+            "stdout": "",
+            "stderr": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "cross_view_direct_read",
+      "source": "cases/machine_cross_views.c",
+      "description": "An interior callee write must be visible through another view of initialized frame storage.",
+      "cflags": [
+        "-O2",
+        "-DDIRECT_READ=1"
+      ],
+      "runs": [
+        {
+          "name": "argc_1",
+          "args": [],
+          "expected": {
+            "returncode": 14,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_2",
+          "args": [
+            "x"
+          ],
+          "expected": {
+            "returncode": 76,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_3",
+          "args": [
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 145,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_4",
+          "args": [
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 14,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_7",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 149,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_8",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 14,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_15",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 157,
+            "stdout": "",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "argc_16",
+          "args": [
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x",
+            "x"
+          ],
+          "expected": {
+            "returncode": 14,
+            "stdout": "",
+            "stderr": ""
+          }
+        }
+      ]
+    }
+  ]
+}

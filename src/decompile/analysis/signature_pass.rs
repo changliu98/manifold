@@ -166,6 +166,7 @@ ascent_par! {
     relation emit_function_float_param_count(Address, usize);
     relation emit_function_stack_param_count(Address, usize);
     relation variadic_fixed_stack_prefix_count(Address, usize);
+    relation variadic_fixed_gp_prefix_count(Address, usize);
     relation known_varargs_function(Symbol, usize);
     // Functions inferred variadic by their XMM register save area prologue (test %al,%al; je; movaps xmm0..7 to stack).
     relation func_has_variadic_xmm_prologue(Address);
@@ -470,6 +471,7 @@ ascent_par! {
         known_varargs_function(name, _);
     is_varargs_fn(addr) <--
         func_has_variadic_xmm_prologue(addr);
+    is_varargs_fn(addr) <-- variadic_fixed_gp_prefix_count(addr, _);
 
     #[local] relation abi_max_int_arg_position(usize);
     abi_max_int_arg_position(max_position) <--
@@ -486,7 +488,10 @@ ascent_par! {
 
     relation signature_variadic_fixed_gp_count(Address, usize);
     signature_variadic_fixed_gp_count(func, fixed_count) <--
+        variadic_fixed_gp_prefix_count(func, fixed_count);
+    signature_variadic_fixed_gp_count(func, fixed_count) <--
         variadic_spilled_gp_position(func, _, _),
+        !variadic_fixed_gp_prefix_count(func, _),
         agg fixed_count = variadic_fixed_gp_count_aggregate(position, max_position)
             in variadic_spilled_gp_position(func, position, max_position);
 
@@ -935,6 +940,7 @@ impl IRPass for SignatureReconciliationPass {
             "emit_function_stack_param_count",
             "variadic_next_arg_site",
             "variadic_fixed_stack_prefix_count",
+            "variadic_fixed_gp_prefix_count",
             "func_has_variadic_xmm_prologue",
             "arg_reg_spilled_to_stack",
             "rtl_inst",
@@ -1048,6 +1054,19 @@ mod tests {
             variadic_fixed_gp_count_from_spills(&HashSet::from([0, 1, 2, 3, 4, 5]), 5),
             None
         );
+    }
+
+    #[test]
+    fn gp_only_protocol_pins_the_named_prefix_without_an_xmm_block() {
+        let mut program = SignatureReconciliationProgram::default();
+        program.emit_function.push((100, "gp_only", 100));
+        program.variadic_fixed_gp_prefix_count.push((100, 2));
+        program.variadic_fixed_stack_prefix_count.push((100, 0));
+        program.reconciled_int_count.push((100, 6));
+        program.run();
+        assert!(program.is_varargs_fn.iter().any(|r| *r == (100,)));
+        assert!(program.signature_effective_int_count.iter().any(|r| *r == (100, 2)));
+        assert!(!program.signature_effective_int_count.iter().any(|r| *r == (100, 6)));
     }
 
     #[test]

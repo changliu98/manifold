@@ -64,7 +64,7 @@ fn uses_storage_alias(stmt: &ClightStmt, storage_aliases: &HashMap<Ident, Ident>
 /// machine-derived accesses retain their exact offsets; casting its address to
 /// __builtin_va_list lets GCC populate the unnamed GP/FP arguments that cannot
 /// be named as ordinary C parameters.
-fn append_source_va_start(stmt: CStmt, va_list_local: Ident, last_named: RTLReg) -> CStmt {
+fn source_va_start(va_list_local: Ident, last_named: RTLReg) -> CStmt {
     let va_list_ptr = CType::Pointer(
         Box::new(CType::TypedefName("__builtin_va_list".to_string())),
         TypeQualifiers::none(),
@@ -73,16 +73,35 @@ fn append_source_va_start(stmt: CStmt, va_list_local: Ident, last_named: RTLReg)
         va_list_ptr,
         CExpr::var(format!("var_{va_list_local}")),
     ));
-    let start = CStmt::Expr(CExpr::call(
+    CStmt::Expr(CExpr::call(
         CExpr::var("__builtin_va_start"),
         vec![va_list, CExpr::var(param_name_for_reg(last_named))],
-    ));
+    ))
+}
+
+fn append_source_va_start(stmt: CStmt, va_list_local: Ident, last_named: RTLReg) -> CStmt {
+    let start = source_va_start(va_list_local, last_named);
     match stmt {
         CStmt::Sequence(mut statements) => {
             statements.push(start);
             CStmt::Sequence(statements)
         }
         other => CStmt::Sequence(vec![other, start]),
+    }
+}
+
+/// Count selected primitive writes with this exact source-event origin.
+/// Compound headers do not confer their origin on unlabeled child statements.
+fn count_selected_store_origins(stmt: &ClightStmt, origin: Option<Node>, target: Node) -> usize {
+    match stmt {
+        ClightStmt::Sassign(..) => usize::from(origin == Some(target)),
+        ClightStmt::Slabel(label, inner) => count_selected_store_origins(inner, Some(*label as Node), target),
+        ClightStmt::Ssequence(stmts) if stmts.len() == 1 => count_selected_store_origins(&stmts[0], origin, target),
+        ClightStmt::Ssequence(stmts) => stmts.iter().map(|s| count_selected_store_origins(s, None, target)).sum(),
+        ClightStmt::Sifthenelse(_, a, b) | ClightStmt::Sloop(a, b) =>
+            count_selected_store_origins(a, None, target) + count_selected_store_origins(b, None, target),
+        ClightStmt::Sswitch(_, cases) => cases.iter().map(|(_, s)| count_selected_store_origins(s, None, target)).sum(),
+        _ => 0,
     }
 }
 
@@ -1816,6 +1835,10 @@ const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
     "stack_buffer_alias",
     "stack_buffer_end_alias",
     "stack_buffer_address_root",
+    "semantic_frame_storage",
+    "semantic_storage_obligation",
+    "semantic_storage_projection",
+    "semantic_storage_selected_target",
     "stack_var",
     "variadic_register_save_area_init",
     // Exact initialized bytes back designated initializers when a synthetic
@@ -1847,6 +1870,7 @@ impl IRPass for ClightSelectPass {
                 db.clight_selected_functions = Vec::new();
             }
         }
+        crate::decompile::passes::semantic_counterexample::ledger::check_selection(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
@@ -1858,11 +1882,22 @@ impl IRPass for ClightSelectPass {
             "clight_selected_functions",
             "committed_interfaces",
             "interface_vars",
+            "semantic_storage_obligation",
+            "semantic_storage_counterexample", "semantic_storage_refinement", "semantic_storage_search",
+            "selection_storage_request", "selection_storage_field_request",
+            "semantic_storage_selected_target",
         ]
     }
 
     fn extra_reads(&self) -> &'static [&'static str] {
-        CLIGHT_EMIT_EXTRA_READS
+        static READS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+            let mut reads = CLIGHT_EMIT_EXTRA_READS.to_vec();
+            reads.extend_from_slice(crate::decompile::passes::semantic_counterexample::INPUTS);
+            reads.sort_unstable();
+            reads.dedup();
+            reads
+        });
+        &READS
     }
 }
 
@@ -2512,7 +2547,7 @@ impl IRPass for ClightEmitPass {
                 _ => None,
             })
             .collect();
-        let mut variadic_va_start_specs: HashMap<Address, HashSet<(RTLReg, Ident)>> =
+        let mut variadic_va_start_specs: HashMap<Address, HashSet<(Node, RTLReg, Ident)>> =
             HashMap::new();
         for (func, _save_slot, store_node) in
             db.rel_iter::<(Address, i64, Node)>("variadic_register_save_area_init")
@@ -2529,11 +2564,16 @@ impl IRPass for ClightEmitPass {
                     variadic_va_start_specs
                         .entry(*func)
                         .or_default()
-                        .insert((*destination, base));
+                        .insert((*store_node, *destination, base));
                 }
             }
         }
         let empty_storage_aliases = HashMap::new();
+        let selected_exact_pointer_stores: HashSet<_> = db
+            .rel_iter::<(Address, Node, crate::decompile::passes::semantic_counterexample::ledger::ObjectId, i64, usize)>("semantic_storage_selected_target")
+            .filter(|r| r.4 == 8)
+            .map(|r| (r.0, r.1))
+            .collect();
         let mut ctx =
             crate::decompile::passes::c_pass::convert::from_relations::ConversionContext::new(
                 id_to_name.clone(),
@@ -2548,6 +2588,20 @@ impl IRPass for ClightEmitPass {
         for func in &internal_functions {
             let mut statements = Vec::new();
             let mut func_edges = Vec::new();
+            ctx.source_post_effects.clear();
+            ctx.applied_source_effects.clear();
+            if let (Some(specs), Some(&last_named)) = (
+                variadic_va_start_specs.get(&func.address), func.param_regs.last(),
+            ) {
+                for &(node, _, va_list_local) in specs {
+                    if selected_exact_pointer_stores.contains(&(func.address, node))
+                        && func.statements.iter().map(|(&origin, stmt)|
+                            count_selected_store_origins(stmt, Some(origin), node)).sum::<usize>() == 1
+                    {
+                        ctx.source_post_effects.insert(node, source_va_start(va_list_local, last_named));
+                    }
+                }
+            }
 
             for (reg, pty) in func.param_regs.iter().zip(func.param_types.iter()) {
                 let name = param_name_for_reg(*reg);
@@ -2599,9 +2653,10 @@ impl IRPass for ClightEmitPass {
                         continue;
                     }
                     let cstmt =
-                        crate::decompile::passes::c_pass::convert::from_relations::convert_stmt(
+                        crate::decompile::passes::c_pass::convert::from_relations::convert_stmt_at(
                             clight_stmt,
                             &mut ctx,
+                            node,
                         );
                     // A finalized exact scalar load is stronger than the
                     // high-recall string_data byte-shape hint.  Fold proven
@@ -2629,9 +2684,10 @@ impl IRPass for ClightEmitPass {
                 variadic_va_start_specs.get(&func.address),
                 func.param_regs.last(),
             ) {
-                let mut specs: Vec<(RTLReg, Ident)> = specs.iter().copied().collect();
+                let mut specs: Vec<(Node, RTLReg, Ident)> = specs.iter().copied().collect();
                 specs.sort_unstable();
-                for (destination, va_list_local) in specs {
+                for (node, destination, va_list_local) in specs {
+                    if ctx.applied_source_effects.contains(&node) { continue; }
                     let destination = param_name_for_reg(destination);
                     let matches: usize = statements
                         .iter()
@@ -2653,6 +2709,9 @@ impl IRPass for ClightEmitPass {
                         .sum();
                     debug_assert_eq!(inserted, 1);
                 }
+            }
+            if !ctx.applied_source_effects.is_empty() {
+                eprintln!("[source-abi] function={:#x} origin-bound-va-start={}", func.address, ctx.applied_source_effects.len());
             }
 
             // func.successors is a HashMap, so iterating it leaks non-deterministic ordering into the edge sets; the pair set is the same, but sort by source for stable diagnostics anyway.
@@ -3111,6 +3170,41 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     #[test]
+    fn selected_abi_event_survives_explicit_memory_view_lowering() {
+        use crate::decompile::passes::c_pass::convert::from_relations::{convert_stmt_at, ConversionContext};
+        use crate::x86::types::{ClightAttr, ClightSignedness};
+        let word = ClightType::Tlong(ClightSignedness::Unsigned, ClightAttr::default());
+        let store = ClightStmt::Sassign(
+            ClightExpr::Ederef(Box::new(ClightExpr::Etempvar(7,
+                ClightType::Tpointer(std::sync::Arc::new(word.clone()), ClightAttr::default()))), word.clone()),
+            ClightExpr::EconstLong(123, word),
+        );
+        let nested = ClightStmt::Ssequence(vec![
+            ClightStmt::Slabel(42, Box::new(store.clone())),
+            ClightStmt::Scall(None, ClightExpr::Etempvar(99, ClightType::Tvoid), vec![]),
+        ]);
+        assert_eq!(super::count_selected_store_origins(&nested, Some(10), 42), 1);
+        assert_eq!(super::count_selected_store_origins(&nested, Some(42), 10), 0);
+        let mut ctx = ConversionContext::new(HashMap::new(), crate::abi::DataModel::Lp64);
+        ctx.source_post_effects.insert(42, super::source_va_start(20, 1));
+        let converted = convert_stmt_at(&nested, &mut ctx, 10);
+        let printed = crate::decompile::passes::c_pass::print::print_stmt(&converted);
+        assert_eq!(printed.matches("__builtin_va_start").count(), 1, "{printed}");
+        assert!(printed.find("__builtin_memcpy").unwrap() < printed.find("__builtin_va_start").unwrap());
+        assert!(printed.find("__builtin_va_start").unwrap() < printed.find("var_99(").unwrap());
+        assert_eq!(ctx.applied_source_effects, HashSet::from([42]));
+
+        // A compound header does not license moving the initialization after
+        // an entire loop, or attaching it to a different unlabelled store.
+        let compound = ClightStmt::Sloop(Box::new(store), Box::new(ClightStmt::Sskip));
+        assert_eq!(super::count_selected_store_origins(&compound, Some(42), 42), 0);
+        ctx.applied_source_effects.clear();
+        let converted = convert_stmt_at(&compound, &mut ctx, 42);
+        assert!(!crate::decompile::passes::c_pass::print::print_stmt(&converted).contains("__builtin_va_start"));
+        assert!(ctx.applied_source_effects.is_empty());
+    }
+
+    #[test]
     fn proven_variadic_save_store_appends_source_va_start() {
         let original = CStmt::Expr(CExpr::assign(CExpr::var("slot"), CExpr::var("save_area")));
         let va_list_local = 0x1234;
@@ -3417,6 +3511,7 @@ mod tests {
         assert!(emit
             .extra_reads()
             .contains(&"variadic_register_save_area_init"));
+        assert!(emit.extra_reads().contains(&"semantic_storage_selected_target"));
     }
 
     #[test]

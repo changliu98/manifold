@@ -134,7 +134,15 @@ fn affine_pointer_base(expr: &CsharpminorExpr) -> Option<RTLReg> {
     }
 }
 
-pub struct StructuringPass;
+#[derive(Default)]
+pub struct StructuringPass {
+    // This pure-analysis cache belongs to one pipeline invocation. It is not
+    // inferred state: replay/rollback still restores every blackboard output.
+    fixpoints: structuring_memo::Fixpoints,
+}
+
+#[path = "structuring_memo.rs"]
+mod structuring_memo;
 
 impl IRPass for StructuringPass {
     fn name(&self) -> &'static str {
@@ -350,7 +358,7 @@ impl IRPass for StructuringPass {
                 }
 
                 let declared_entry = func_entry.get(func_addr).copied();
-                let structured = structure(
+                let structured = structure_with_memo(
                     stmts,
                     &next_map,
                     &cminor_succs,
@@ -360,6 +368,7 @@ impl IRPass for StructuringPass {
                     &packed_alu_nodes,
                     &optimized_gap_nodes,
                     &pointer_regs,
+                    Some(&self.fixpoints),
                 );
                 (*func_addr, stmts.clone(), structured)
             })
@@ -582,6 +591,7 @@ impl IRPass for StructuringPass {
     fn inputs(&self) -> &'static [&'static str] {
         &[
             "csharp_stmt_candidate",
+            "csharp_stmt",
             "instr_in_function",
             "single_def_const",
             "slot_escaped_canonical",
@@ -616,6 +626,7 @@ impl IRPass for StructuringPass {
         &[
             "csharp_stmt",
             "switch_chain_member",
+            "switch_chain_default",
             "valid_switch_chain",
             "emit_switch_chain",
             "emit_ifbody_true",
@@ -677,6 +688,7 @@ fn sseq_terminal_targets(stmt: &CsharpminorStmt) -> Vec<Node> {
 
 // CFG analysis, reachability, if-then-else body, loop, and switch detection
 ascent_par! {
+    #[swap_db]
     pub struct StructuringProgram;
 
     relation stmt(Node, CsharpminorStmt);
@@ -2100,6 +2112,32 @@ pub fn structure(
     optimized_gap_nodes: &HashSet<Node>,
     pointer_regs: &HashSet<RTLReg>,
 ) -> StructuringResult {
+    structure_with_memo(
+        stmts,
+        next_map,
+        cminor_succs,
+        expansion_sources,
+        declared_entry,
+        cminor_preds,
+        packed_alu_nodes,
+        optimized_gap_nodes,
+        pointer_regs,
+        None,
+    )
+}
+
+fn structure_with_memo(
+    stmts: &[(Node, CsharpminorStmt)],
+    next_map: &HashMap<Node, Node>,
+    cminor_succs: &HashMap<Node, Vec<Node>>,
+    expansion_sources: &HashSet<Node>,
+    declared_entry: Option<Node>,
+    cminor_preds: &HashMap<Node, Vec<Node>>,
+    packed_alu_nodes: &HashSet<Node>,
+    optimized_gap_nodes: &HashSet<Node>,
+    pointer_regs: &HashSet<RTLReg>,
+    memo: Option<&structuring_memo::Fixpoints>,
+) -> StructuringResult {
     if stmts.is_empty() {
         return StructuringResult {
             stmts: vec![],
@@ -2163,8 +2201,15 @@ pub fn structure(
             prog.optimized_gap_node.push((*node,));
         }
     }
+    // pointer_reg is only consumed at a variable use in stmt. This exact
+    // semijoin removes unrelated functions' pointer facts from the pure
+    // analysis input, without approximating any CFG or dataflow relation.
+    let used_regs: HashSet<_> = current_stmts
+        .iter()
+        .flat_map(|(_, stmt)| stmt_uses_set(stmt))
+        .collect();
     prog.pointer_reg
-        .extend(pointer_regs.iter().map(|reg| (*reg,)));
+        .extend(used_regs.intersection(pointer_regs).map(|reg| (*reg,)));
 
     let seq_edges =
         compute_sequential_edges(&current_stmts, next_map, cminor_succs, expansion_sources);
@@ -2195,7 +2240,10 @@ pub fn structure(
         });
     prog.entry_node.push((entry_node,));
 
-    prog.run();
+    // Cache only the Ascent fixpoint's exported facts. Target resolution,
+    // tail expansion, and all later imperative consumers run on fresh epoch
+    // inputs, including cross-function predecessors and candidate payloads.
+    let prog = structuring_memo::run(&mut prog, memo);
 
     let stmt_map: HashMap<Node, CsharpminorStmt> = current_stmts.iter().cloned().collect();
 
@@ -5010,7 +5058,7 @@ mod candidate_handoff_tests {
         db.rel_push("instr_in_function", (node, func));
         db.rel_push("emit_function", (func, "candidate_order", node));
 
-        StructuringPass.run(&mut db);
+        StructuringPass::default().run(&mut db);
 
         let mut result: Vec<CsharpminorStmt> = db
             .rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt")
@@ -5042,7 +5090,7 @@ mod candidate_handoff_tests {
         // when this one-node fixture leaves the statement value unchanged.
         db.rel_push("emit_loop_body", (func, node, node));
 
-        StructuringPass.run(&mut db);
+        StructuringPass::default().run(&mut db);
 
         let mut worlds: Vec<_> = db
             .rel_iter::<(u64, u8, bool)>("structure_world")
@@ -5112,7 +5160,7 @@ mod candidate_handoff_tests {
         db.rel_push("next", (writer, read));
         db.rel_push("cminor_succ", (writer, read));
 
-        StructuringPass.run(&mut db);
+        StructuringPass::default().run(&mut db);
 
         let writer_stmts: Vec<_> = db
             .rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt")

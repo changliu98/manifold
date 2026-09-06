@@ -1494,6 +1494,7 @@ impl IRPass for RTLOptimizePass {
     }
 
     fn run(&self, db: &mut DecompileDB) {
+        super::frame_reload_views::normalize(db);
         trim_direct_call_args_to_callee_arity(db);
         if let Some(stats) = optimize_rtl_candidates(db) {
             if stats.has_changes() {
@@ -1537,6 +1538,7 @@ impl IRPass for RTLOptimizePass {
             // cannot race the patched argument inventory.
             "rtl_inst_candidate",
             "rtl_inst",
+            "frame_read_storage_access_owner",
             "rtl_succ",
             "rtl_next",
             // Per-function entry after semantic-node normalization, static
@@ -1571,6 +1573,10 @@ impl IRPass for RTLOptimizePass {
             "slot_escaped_canonical",
             "slot_escaped_region_canonical",
             "frame_read_storage_owner",
+            "frame_read_storage_access_owner",
+            "frame_stack_read_bytes",
+            "ltl_inst",
+            "instruction",
             "indexed_stack_base_offset",
             "exact_stack_addr_ptr_result",
             "stack_var",

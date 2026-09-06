@@ -2099,6 +2099,14 @@ impl CshminorPass {
         let mut jmp_nodes: Vec<Node> = tables.keys().copied().collect();
         jmp_nodes.sort();
         for jmp_node in jmp_nodes {
+            // RTL already preserved the actual dispatch use and its reaching
+            // index computation. Reconstructing it from an earlier comparison
+            // would replace that value with its pre-mask/pre-adjustment input.
+            if db.rel_iter::<(Node, CminorStmt)>("cminor_stmt")
+                .any(|(node, stmt)| *node == jmp_node && matches!(stmt, CminorStmt::Sjumptable(..)))
+            {
+                continue;
+            }
             let targets = &tables[&jmp_node];
             let impl_nodes = match impls.get(&jmp_node) {
                 Some(v) => v,
@@ -3375,6 +3383,25 @@ mod tests {
                         if *value == dst && *stale == stale_exact_local
                 )
         }));
+    }
+
+    #[test]
+    fn full_width_owned_base_reload_keeps_the_memory_read_operation() {
+        let [node, dst, owner] = synthetic_ids();
+        let mut prog = CshminorPassProgram::default();
+        prog.cminor_stmt.push((node, CminorStmt::Sassign(dst,
+            CminorExpr::Eload(MemoryChunk::MAny64, Addressing::Ainstack(8), Arc::new(vec![])))));
+        prog.instr_in_function.push((node, FUNC));
+        prog.stack_var.push((FUNC, node, 8, owner));
+        prog.frame_read_storage_access_owner.push((FUNC, node, 8, 8, owner));
+        prog.run();
+        let reads: Vec<_> = prog.csharp_stmt_candidate.iter()
+            .filter(|(candidate, _)| *candidate == node).collect();
+        assert_eq!(reads.len(), 1);
+        assert!(matches!(&reads[0].1,
+            CsharpminorStmt::Sset(value, CsharpminorExpr::Eload(MemoryChunk::MAny64, address))
+                if *value == dst && matches!(address.as_ref(), CsharpminorExpr::Eaddrof(id)
+                    if *id == ident_from_reg(owner))));
     }
 
     #[test]

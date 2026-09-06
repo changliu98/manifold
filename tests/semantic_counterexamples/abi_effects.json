@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "suite": "manifold-storage-abi-effects",
+  "cases": [
+    {
+      "name": "variadic_observer",
+      "source": "cases/variadic_observer.c",
+      "description": "The decoded va_list initialization keeps its source ABI effect when stores become explicit memory views.",
+      "cflags": ["-O2"],
+      "runs": [
+        {"name": "one", "args": [], "expected": {"returncode": 0, "stdout": "entry=payload count=1 value=7.25\n", "stderr": ""}},
+        {"name": "two", "args": ["x"], "expected": {"returncode": 0, "stdout": "entry=payload count=2 value=7.25\n", "stderr": ""}},
+        {"name": "four", "args": ["x", "x", "x"], "expected": {"returncode": 0, "stdout": "entry=payload count=4 value=7.25\n", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "variadic_descriptor",
+      "source": "cases/variadic_observer.c",
+      "description": "The same variadic forwarding law through a descriptor-based consumer, without a caller-side FILE global.",
+      "cflags": ["-O2", "-DUSE_DESCRIPTOR=1"],
+      "runs": [
+        {"name": "one", "args": [], "expected": {"returncode": 0, "stdout": "entry=payload count=1 value=7.25\n", "stderr": ""}},
+        {"name": "two", "args": ["x"], "expected": {"returncode": 0, "stdout": "entry=payload count=2 value=7.25\n", "stderr": ""}},
+        {"name": "four", "args": ["x", "x", "x"], "expected": {"returncode": 0, "stdout": "entry=payload count=4 value=7.25\n", "stderr": ""}}
+      ]
+    }
+  ]
+}

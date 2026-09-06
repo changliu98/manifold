@@ -475,7 +475,7 @@ pub(crate) fn typ_is_pointer_width(typ: &Typ, pointer_width: i64) -> bool {
 }
 
 // ABI-1 (3.2e): MOVSX/MOVSXD/MOVZX -> MemoryChunk; returns None for non-extending mnemonics so plain MOV (which also covers callee-save reloads) never fires; (unsigned, 4) rejected because 32-bit writes zero-extend implicitly.
-fn extending_load_chunk(mnem: &str, size: usize) -> Option<MemoryChunk> {
+pub(super) fn extending_load_chunk(mnem: &str, size: usize) -> Option<MemoryChunk> {
     let m = mnem.to_ascii_uppercase();
     let signed = if m == "MOVZX" {
         false
@@ -797,6 +797,7 @@ ascent_par! {
     relation ddisasm_cfg_edge(Address, Address, Symbol);
     relation decoded_stack_read_bytes(Address, Symbol, i64, usize);
     relation jump_table_target(Node, usize, Node);
+    relation jump_table_index_reg(Node, Symbol);
     relation emit_var_type_candidate(RTLReg, XType);
     relation instr_in_function(Node, Address);
     relation instruction(Address, usize, &'static str, &'static str, Symbol, Symbol, Symbol, Symbol, usize, usize);
@@ -1083,6 +1084,9 @@ ascent_par! {
     #[local] relation variadic_overflow_arg_area_init(Address, Node, Mreg, i64);
     #[local] relation variadic_next_arg_prefix_candidate(Address, Node, Mreg, usize);
     relation variadic_fixed_stack_prefix_count(Address, usize);
+    // A complete GP-only SysV va_list protocol supplies the fixed GP prefix
+    // directly, without requiring an XMM save block or a known function name.
+    relation variadic_fixed_gp_prefix_count(Address, usize);
 
     // sp_synth_skip_to_ltl(start, func, dst): start has no ltl_inst; walking next within func reaches dst with one. Function-bounded; used ONLY to give a synth chain its exit edge when the raw fallthrough lifted to nothing, so it doesn't affect ltl_fallthrough.
     #[local] relation sp_synth_skip_to_ltl(Address, Address, Node);
@@ -7337,6 +7341,24 @@ ascent_par! {
         reg_rtl(addr, *arg_reg, arg_rtl),
         let inst = RTLInst::Ijumptable(*arg_rtl, Arc::new(targets.clone()));
 
+    // A direct indexed memory JMP consumes the index *at the dispatch*, not
+    // the value before the earlier bound/mask instruction. Materialize this
+    // use before DSE: reconstructing it only in Csharpminor makes the mask
+    // appear dead and can turn switch(x & mask) into switch(x).
+    #[local] relation direct_indexed_jump_targets(Node, Arc<Vec<Node>>);
+    direct_indexed_jump_targets(jump, targets) <--
+        jump_table_target(jump, _, _),
+        agg targets = collect_dense_jump_targets(index, target) in jump_table_target(jump, index, target);
+
+    rtl_inst_candidate(*jump, RTLInst::Ijumptable(*value, targets.clone())) <--
+        instruction(jump, _, _, "JMP", operand, _, _, _, _, _),
+        op_indirect(operand, _, _, index_name, scale, _, _),
+        if !index_name.is_empty() && *index_name != "NONE" && *scale > 0,
+        jump_table_index_reg(jump, recorded_index),
+        if Mreg::x86(index_name) == Mreg::x86(recorded_index),
+        reg_rtl(jump, Mreg::x86(index_name), value),
+        direct_indexed_jump_targets(jump, targets);
+
 
     // Direct def-use: the return value's defining instruction reaches the return.
     relation ax_value_direct(Address, Address);
@@ -8733,9 +8755,20 @@ ascent_par! {
     function_reg_observer(*func, *use_node, *reg) <--
         reg_def_used(_, reg, use_node),
         instr_in_function(use_node, func);
+    // ABI arguments are implicit machine uses. Observing them independently
+    // of successful argument recovery preserves unknown incoming arms at a
+    // call rather than allowing a surviving setup candidate to look like MUST.
+    #[local] relation semantic_call_reg_observer(Address, Node, Mreg);
+    semantic_call_reg_observer(*func, *call, *reg) <--
+        instruction(call, _, _, "CALL", _, _, _, _, _, _),
+        abi_int_arg_position(reg, _), instr_in_function(call, func);
+    relation semantic_global_call_observer(());
+    function_reg_observer(func, node, reg) <--
+        semantic_global_call_observer(()), semantic_call_reg_observer(func, node, reg);
 
     #[local] relation function_observed_reg(Address, Mreg);
     function_observed_reg(func, reg) <-- function_reg_observer(func, _, reg);
+    function_observed_reg(func, reg) <-- semantic_call_reg_observer(func, _, reg);
 
     #[local] lattice unknown_reg_value_in(Address, Address, Mreg, Set<()>);
     unknown_reg_value_in(*func, *entry_block, *reg, Set::singleton(())) <--
@@ -8758,6 +8791,43 @@ ascent_par! {
     // has a concrete origin.  Reconstructing this after RTL lowering loses
     // entry/live-in and trimmed-definition arms.
     relation unknown_reg_value_reaches_use(Address, Address, Mreg);
+    // A theory-local observer retains implicit call arms without publishing
+    // them as ordinary uses to the corpus-wide pointer/origin analyses.
+    relation semantic_unknown_reg_value_reaches_use(Address, Node, Mreg);
+    semantic_unknown_reg_value_reaches_use(func, node, reg) <--
+        unknown_reg_value_reaches_use(func, node, reg);
+    semantic_unknown_reg_value_reaches_use(*func, *node, *reg) <--
+        semantic_call_reg_observer(func, node, reg),
+        block_last_def(node, def, reg), trim_instruction(def), !asm_effective_def(def, reg);
+    semantic_unknown_reg_value_reaches_use(*func, *node, *reg) <--
+        semantic_call_reg_observer(func, node, reg), code_in_block(node, block),
+        !block_last_def(node, _, reg), unknown_reg_value_in(func, block, reg, _);
+    // A point-keyed proof handoff to representation validation. This is the
+    // existing structural def/use information, including unknown incoming
+    // arms, retained as a lattice rather than a new transitive pair relation.
+    lattice semantic_value_sources(Address, Node, Mreg, Set<Option<Node>>);
+    semantic_value_sources(*func, *use_node, *reg, Set::singleton(Some(*def))) <--
+        reg_def_used(def, reg, use_node), instr_in_function(use_node, func);
+    semantic_value_sources(*func, *use_node, *reg, Set::singleton(None)) <--
+        semantic_unknown_reg_value_reaches_use(func, use_node, reg);
+    semantic_value_sources(*func, *call, *reg, Set::singleton(Some(*def))) <--
+        def_reaches_call(call, def, reg), instr_in_function(call, func);
+    semantic_value_sources(*func, *call, *reg, Set::singleton(Some(*def))) <--
+        arg_setup_candidate(def, reg, call), instr_in_function(call, func);
+
+    // MAY dependencies identify which machine address anchors can contribute
+    // to a value. They do not establish a pointer origin: the symbolic affine
+    // check must still reject non-frame/unknown arms. State remains keyed per
+    // definition, never as a pairwise transitive reachability relation.
+    lattice semantic_frame_dependencies(Address, Node, Mreg, Set<Node>);
+    semantic_frame_dependencies(*func, *node, *dst, Set::singleton(*node)) <--
+        machine_frame_anchor(func, node, _, _, _, dst, _);
+    semantic_frame_dependencies(*func, *node, *dst, roots.clone()) <--
+        ltl_inst(node, ?LTLInst::Lop(_, args, dst)),
+        instr_in_function(node, func), for arg in args.iter(),
+        semantic_value_sources(func, node, arg, sources),
+        for maybe_source in sources.0.iter(), if let Some(source) = maybe_source,
+        semantic_frame_dependencies(func, source, arg, roots);
     unknown_reg_value_reaches_use(*func, *use_node, *reg) <--
         function_reg_observer(func, use_node, reg),
         instr_in_function(use_node, func),
@@ -9710,6 +9780,21 @@ ascent_par! {
     param_base_field_access(func, base, field_ofs, chunk) <--
         param_base_field_store(func, base, field_ofs, chunk);
 
+    // Candidate callee observations retain the machine access witness. They
+    // are a conditional footprint contract, not a claim that the summary is
+    // complete or that every MAY-origin is an actual executed dereference.
+    relation semantic_parameter_field(Address, usize, Node, i64, MemoryChunk);
+    semantic_parameter_field(*origin, *pos, *access, *offset, *chunk) <--
+        rtl_inst_candidate(access, ?RTLInst::Iload(chunk, Addressing::Aindexed(offset), args, _)),
+        if args.len() == 1 && *offset >= 0,
+        let base = args[0], instr_in_function(access, current),
+        param_origin_carrier(origin, pos, current, base);
+    semantic_parameter_field(*origin, *pos, *access, *offset, *chunk) <--
+        rtl_inst_candidate(access, ?RTLInst::Istore(chunk, Addressing::Aindexed(offset), args, _)),
+        if args.len() == 1 && *offset >= 0,
+        let base = args[0], instr_in_function(access, current),
+        param_origin_carrier(origin, pos, current, base);
+
     // A direct internal callee is not a license to unify the caller's whole
     // slot: many internal helpers merely inspect an address, and broad escape
     // there can absorb unrelated frame values.  Project only fields that a
@@ -9902,6 +9987,65 @@ ascent_par! {
         if direct_pointer_interval_within_local_frame(*base, high, frame_size);
 
     relation escaped_stack_region_field(Address, i64, i64, MemoryChunk);
+    // Explicit hypotheses produced only after the initial storage model was
+    // refuted. These are fresh-epoch inputs, not optimistic reaching facts.
+    relation semantic_frame_object(Address, Node, i64, i64);
+    relation machine_frame_anchor(Address, Node, i64, i64, Option<Mreg>, Mreg, u32);
+    relation semantic_frame_object_field(Address, i64, i64, MemoryChunk);
+    escaped_stack_region_field(func, base, offset, chunk) <--
+        semantic_frame_object_field(func, base, offset, chunk);
+
+    slot_addr_escaped(func, lea, base) <--
+        semantic_frame_object(func, lea, base, _),
+        renderable_frame_stack_addr_lea_def(func, lea, _, base, width),
+        abi_pointer_size(width);
+
+    // A constructed object may be demanded by an indexed machine view that
+    // ordinary escape inference could not represent. Only the decoder anchor
+    // and its exact RTL stack base can license this fresh-epoch hypothesis.
+    slot_addr_escaped(func, lea, base) <--
+        semantic_frame_object(func, lea, base, _),
+        machine_frame_anchor(func, lea, base, _, _, _, bits),
+        abi_pointer_size(width), if *bits as i64 == *width * 8,
+        indexed_synth_stack_base(func, lea, base, _);
+
+    relation semantic_frame_member(Address, Node, i64, RTLReg, usize);
+    // Exact write-piece provenance. A physical SIMD write is one machine
+    // event but its trusted RTL lowering has two word definitions. Retain
+    // that partition so all later theories check bytes, not carrier guesses.
+    relation semantic_frame_write_piece(Address, Node, Node, i64, usize, RTLReg);
+    semantic_frame_write_piece(*func, *node, *node, *offset, *width, *local) <--
+        frame_stack_write_bytes(func, node, offset, width), if *width <= 8,
+        stack_var(func, node, offset, local);
+    semantic_frame_write_piece(*func, *node, *node, *offset, 8, *local) <--
+        frame_stack_write_bytes(func, node, offset, 16),
+        xmm_hi_frame_store(node, high, _, _, _, _), if *high == *offset + 8,
+        stack_var(func, node, offset, local);
+    semantic_frame_write_piece(*func, *node, high_node, *high, 8, *local) <--
+        frame_stack_write_bytes(func, node, offset, 16),
+        xmm_hi_frame_store(node, high, _, _, _, _), if *high == *offset + 8,
+        stack_var(func, node, high, local), let high_node = xmm_hi_lane_node(*node);
+    semantic_frame_member(*func, *node, *offset, *local, *width) <--
+        semantic_frame_object(func, _, base, extent),
+        semantic_frame_write_piece(func, _, node, offset, width, local),
+        if frame_interval_contains(*base, *extent as usize, *offset, *width);
+    semantic_frame_member(*func, *node, *offset, *local, *width) <--
+        semantic_frame_object(func, _, base, extent),
+        frame_stack_read_bytes(func, node, offset, width),
+        stack_var(func, node, offset, local),
+        if frame_interval_contains(*base, *extent as usize, *offset, *width);
+
+    slot_escaped_region_canonical_raw(func, offset, local) <--
+        semantic_frame_member(func, _, offset, local, _);
+
+    // Storage ownership is a byte-coordinate fact, not a claim that a
+    // particular initializer reaches the use. Preserve caller views across
+    // opaque calls and include their entire physical access width.
+    escaped_stack_region_caller_field(*func, *base, *offset - *base, chunk) <--
+        semantic_frame_object(func, _, base, extent),
+        semantic_frame_member(func, _, offset, _, width),
+        if frame_interval_contains(*base, *extent as usize, *offset, *width),
+        if let Some(chunk) = crate::decompile::passes::semantic_counterexample::storage_chunk(*width);
     escaped_stack_region_field(caller, *base, projected, *chunk) <--
         bounded_indexed_stack_call_access(caller, base, scale, count, callee_field, chunk, _),
         for index in 0..*count,
@@ -11273,6 +11417,8 @@ ascent_par! {
         let limit = size_i64;
 
     relation escaped_stack_region_extent(Address, i64, i64);
+    escaped_stack_region_extent(func, base, extent) <--
+        semantic_frame_object(func, _, base, extent);
     escaped_stack_region_extent(caller, base, extent) <--
         direct_renderable_internal_written_field(caller, base, field_ofs, chunk),
         let width = crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk) as i64,
@@ -13153,6 +13299,69 @@ ascent_par! {
         let base = *xmm_base - 48,
         stack_var(func, _, base, canonical);
 
+    // GP-only va_start is still an ABI record, not a bag of independent
+    // scalar spills. Require a complete incoming-register suffix in the SysV
+    // eight-byte slots, plus gp_offset and the two adjacent proven pointers
+    // in one CFG block. Neither instruction distance nor function names are
+    // evidence. Partial suffixes and zero-GP-fixed-prefix cases stay unknown.
+    #[local] relation sysv_gp_save_position(Address, Address, i64, usize);
+    sysv_gp_save_position(*func, *block, base, *position) <--
+        abi_int_arg_position(Mreg::DI, 0usize),
+        !abi_shared_arg_slots(true), abi_pointer_size(8i64),
+        ltl_inst(node, ?LTLInst::Lsetstack(reg, Slot::Local, offset, typ)),
+        if typ_is_pointer_width(typ, 8),
+        abi_int_arg_position(reg, position), if *position < 6,
+        arg_reg_param_live_at(func, node, reg), code_in_block(node, block),
+        frame_stack_write_bytes(func, node, offset, 8usize),
+        if let Some(base) = offset.checked_sub((*position as i64) * 8);
+
+    #[local] relation sysv_gp_save_first(Address, Address, i64, usize);
+    sysv_gp_save_first(*func, *block, *base, first) <--
+        sysv_gp_save_position(func, block, base, _),
+        agg first = ascent::aggregators::min(position) in sysv_gp_save_position(func, block, base, position);
+    #[local] relation sysv_gp_save_incomplete(Address, Address, i64);
+    sysv_gp_save_incomplete(*func, *block, *base) <--
+        sysv_gp_save_first(func, block, base, first),
+        abi_int_arg_position(_, position), if *position >= *first && *position < 6,
+        !sysv_gp_save_position(func, block, base, position);
+
+    // (function, header base, save-area base, save LEA, save-pointer store,
+    //  gp_offset initializer, number of fixed GP arguments).
+    #[local] relation sysv_gp_va_record(Address, i64, i64, Node, Node, Node, usize);
+    sysv_gp_va_record(*func, *header, *save_base, *save_lea, *save_store, *gp_init, *first) <--
+        sysv_gp_save_first(func, block, save_base, first), if *first > 0 && *first < 6,
+        !sysv_gp_save_incomplete(func, block, save_base),
+        mach_imm_stack_init(gp_init, header, gp_offset, Typ::Tint),
+        frame_stack_write_bytes(func, gp_init, header, 4usize),
+        if *gp_offset == (*first as i64) * 8,
+        code_in_block(gp_init, block),
+        incoming_stack_tail_base(func, overflow_lea, _, overflow_reg),
+        reg_def_used(overflow_lea, overflow_reg, overflow_store),
+        ltl_inst(overflow_store, ?LTLInst::Lsetstack(overflow_src, Slot::Local, overflow_slot, overflow_typ)),
+        if overflow_src == overflow_reg && typ_is_pointer_width(overflow_typ, 8),
+        if header.checked_add(8) == Some(*overflow_slot), code_in_block(overflow_store, block),
+        exact_stack_addr_lea_def(func, save_lea, save_reg, save_base, 8i64),
+        reg_def_used(save_lea, save_reg, save_store),
+        ltl_inst(save_store, ?LTLInst::Lsetstack(save_src, Slot::Local, save_slot, save_typ)),
+        if save_src == save_reg && typ_is_pointer_width(save_typ, 8),
+        if header.checked_add(16) == Some(*save_slot), code_in_block(save_store, block);
+
+    variadic_fixed_gp_prefix_count(*func, *first) <-- sysv_gp_va_record(func, _, _, _, _, _, first);
+    variadic_register_save_area_init(*func, save_slot, *store) <--
+        sysv_gp_va_record(func, header, _, _, store, _, _),
+        if let Some(save_slot) = header.checked_add(16);
+    escaped_stack_region_caller_field(*func, *base, offset, MemoryChunk::MAny64) <--
+        sysv_gp_va_record(func, _, base, _, _, _, first),
+        for position in *first..6usize, let offset = (position as i64) * 8;
+    escaped_stack_region_caller_field(*func, *header, 0i64, MemoryChunk::MInt32) <--
+        sysv_gp_va_record(func, header, _, _, _, _, _);
+    escaped_stack_region_caller_field(*func, *header, offset, MemoryChunk::MAny64) <--
+        sysv_gp_va_record(func, header, _, _, _, _, _), for offset in [8i64, 16i64];
+    slot_escaped_canonical_raw(*func, *base, *root) <--
+        sysv_gp_va_record(func, _, base, lea, _, _, _), stack_var(func, lea, base, root);
+    slot_escaped_canonical_raw(*func, *header, *root) <--
+        sysv_gp_va_record(func, header, _, _, _, init, _), stack_var(func, init, header, root);
+
     relation func_float_param_used(Address, Mreg);
 
     // (Dead helper xmm_arg_use_has_internal_def removed: func_float_param_used now uses arg_reg_param_live_at, which already excludes an XMM register with an internal def.)
@@ -13323,7 +13532,6 @@ ascent_par! {
         !func_sets_frame_pointer(func_start);
 
     variadic_overflow_arg_area_init(*func_start, *addr, *dst_mreg, *overflow_slot) <--
-        func_has_variadic_xmm_prologue(func_start),
         !abi_shared_arg_slots(true),
         abi_pointer_size(pointer_size),
         incoming_stack_tail_base(func_start, addr, _, dst_mreg),
@@ -16358,6 +16566,16 @@ fn remove_absorbed_bsr_xors(db: &mut DecompileDB) -> usize {
 
 pub struct RTLPass;
 
+fn collect_dense_jump_targets<'a>(
+    input: impl Iterator<Item = (&'a usize, &'a Node)>,
+) -> impl Iterator<Item = Arc<Vec<Node>>> {
+    let mut targets: Vec<_> = input.map(|(index, target)| (*index, *target)).collect();
+    targets.sort_unstable();
+    targets.dedup();
+    let dense = !targets.is_empty() && targets.iter().enumerate().all(|(i, (index, _))| i == *index);
+    dense.then(|| Arc::new(targets.into_iter().map(|(_, target)| target).collect())).into_iter()
+}
+
 impl IRPass for RTLPass {
     fn name(&self) -> &'static str {
         "rtl"
@@ -16379,6 +16597,41 @@ impl IRPass for RTLPass {
                 .into_iter()
                 .collect::<ascent::boxcar::Vec<_>>(),
         );
+        db.rel_set("semantic_global_call_observer", if db.semantic_ablations.global_call_observer {
+            std::iter::once(((),)).collect::<ascent::boxcar::Vec<_>>()
+        } else { ascent::boxcar::Vec::<((),)>::new() });
+        run_rtl_epoch(db);
+        // Final selection owns storage search. RTL is only the declarative
+        // re-derivation boundary for explicit hypotheses from that selector.
+        crate::decompile::passes::semantic_counterexample::record_materialization(db);
+    }
+
+    fn inputs(&self) -> &'static [&'static str] {
+        RTLPassProgram::inputs_only()
+    }
+
+    fn extra_reads(&self) -> &'static [&'static str] {
+        &["unnormalized_frame_stack_write", "machine_register_write_view", "settled_sp_frame_shift"]
+    }
+
+    fn outputs(&self) -> &'static [&'static str] {
+        static OUTPUTS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+            let mut outputs = RTLPassProgram::rule_outputs().to_vec();
+            outputs.extend([
+                "semantic_frame_object", "semantic_frame_object_field",
+                "semantic_storage_counterexample", "semantic_storage_refinement",
+                "semantic_storage_obligation",
+                "semantic_global_call_observer",
+            ]);
+            outputs.sort_unstable();
+            outputs.dedup();
+            outputs
+        });
+        &OUTPUTS
+    }
+}
+
+fn run_rtl_epoch(db: &mut DecompileDB) {
         run_pass!(db, RTLPassProgram);
         remove_absorbed_bsr_xors(db);
         materialize_one_operand_multiply_low_halves(db);
@@ -16394,15 +16647,6 @@ impl IRPass for RTLPass {
             }
             db.rel_push("escaped_stack_region_field", field);
         }
-    }
-
-    fn inputs(&self) -> &'static [&'static str] {
-        RTLPassProgram::inputs_only()
-    }
-
-    fn outputs(&self) -> &'static [&'static str] {
-        RTLPassProgram::rule_outputs()
-    }
 }
 
 #[cfg(test)]
@@ -16435,6 +16679,79 @@ mod tests {
 
     fn synthetic_ids<const N: usize>() -> [u64; N] {
         std::array::from_fn(|index| index as u64 + 1)
+    }
+
+    #[test]
+    fn gp_only_variadic_protocol_requires_a_complete_suffix_and_adjacent_fields() {
+        on_large_stack(|| {
+            for (missing, save_slot, expected) in [(None, 32, true), (Some(4), 32, false), (None, 40, false)] {
+                let mut p = RTLPassProgram::default();
+                let function = 1;
+                p.abi_pointer_size.push((8,));
+                for (position, reg) in [Mreg::DI, Mreg::SI, Mreg::DX, Mreg::CX, Mreg::R8, Mreg::R9].into_iter().enumerate() {
+                    p.abi_int_arg_position.push((reg, position));
+                    if position < 2 || Some(position) == missing { continue; }
+                    let node = 100 + position as u64;
+                    let offset = 48 + position as i64 * 8;
+                    p.ltl_inst.push((node, LTLInst::Lsetstack(reg, Slot::Local, offset, Typ::Tany64)));
+                    p.arg_reg_param_live_at.push((function, node, reg));
+                    p.frame_stack_write_bytes.push((function, node, offset, 8));
+                    p.code_in_block.push((node, function));
+                }
+                p.mach_imm_stack_init.push((40, 16, 16, Typ::Tint));
+                p.frame_stack_write_bytes.push((function, 40, 16, 4));
+                p.incoming_stack_tail_base.push((function, 50, 128, Mreg::AX));
+                p.reg_def_used.push((50, Mreg::AX, 51));
+                p.ltl_inst.push((51, LTLInst::Lsetstack(Mreg::AX, Slot::Local, 24, Typ::Tany64)));
+                p.exact_stack_addr_lea_def.push((function, 60, Mreg::AX, 48, 8));
+                p.reg_def_used.push((60, Mreg::AX, 61));
+                p.ltl_inst.push((61, LTLInst::Lsetstack(Mreg::AX, Slot::Local, save_slot, Typ::Tany64)));
+                for node in [40, 51, 61] { p.code_in_block.push((node, function)); }
+                p.stack_var.extend([(function, 40, 16, 300), (function, 60, 48, 200)]);
+                p.run();
+                assert_eq!(p.variadic_fixed_gp_prefix_count.iter().any(|r| *r == (function, 2)), expected);
+                assert_eq!(p.variadic_register_save_area_init.iter().any(|r| *r == (function, 32, 61)), expected);
+                if expected {
+                    assert!(p.slot_escaped_canonical.iter().any(|r| *r == (function, 16, 300)));
+                    assert!(p.slot_escaped_canonical.iter().any(|r| *r == (function, 48, 200)));
+                    assert!(p.escaped_stack_region_caller_field.iter().any(|r| *r == (function, 48, 40, MemoryChunk::MAny64)));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn indexed_dispatch_uses_the_post_mask_value_before_optimization() {
+        on_large_stack(|| {
+            let mut program = RTLPassProgram::default();
+            let (mask, jump, incoming, masked) = (10_u64, 20_u64, 90_u64, 91_u64);
+            program.instruction.push((jump, 4, "", "JMP", "table", "", "", "", 0, 0));
+            program.op_indirect.push(("table", "NONE", "NONE", "RDI", 8, 1000, 8));
+            program.jump_table_index_reg.push((jump, "EDI"));
+            program.jump_table_target.extend([(jump, 0, 100), (jump, 1, 200)]);
+            program.reg_rtl.extend([(mask, Mreg::DI, incoming), (jump, Mreg::DI, masked)]);
+            program.run();
+            assert!(program.rtl_inst_candidate.iter().any(|r| r == &(jump, RTLInst::Ijumptable(masked, Arc::new(vec![100, 200])))));
+            assert!(!program.rtl_inst_candidate.iter().any(|r| r == &(jump, RTLInst::Ijumptable(incoming, Arc::new(vec![100, 200])))));
+        });
+    }
+
+    #[test]
+    fn implicit_call_unknown_arms_do_not_leak_into_global_origins() {
+        on_large_stack(|| {
+            for global in [false,true] {
+                let mut p = RTLPassProgram::default();
+                p.instruction.push((20,5,"","CALL","callee","","","",0,0));
+                p.instr_in_function.push((20,1));
+                p.abi_int_arg_position.push((Mreg::DI,0));
+                p.code_in_block.push((20,10));
+                p.func_entry_block.push((1,10));
+                if global { p.semantic_global_call_observer.push(((),)); }
+                p.run();
+                assert!(p.semantic_unknown_reg_value_reaches_use.iter().any(|r| r == &(1,20,Mreg::DI)));
+                assert_eq!(p.unknown_reg_value_reaches_use.iter().any(|r| r == &(1,20,Mreg::DI)),global);
+            }
+        });
     }
 
     #[test]

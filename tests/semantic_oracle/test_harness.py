@@ -11,6 +11,31 @@ HARNESS = ROOT / "scripts" / "semantic_oracle.py"
 
 
 class SemanticOracleHarnessTest(unittest.TestCase):
+    def test_sanitizer_reference_preserves_compile_time_variant(self):
+        import importlib.util
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        spec = importlib.util.spec_from_file_location("semantic_oracle", HARNESS)
+        harness = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(harness)
+        commands = []
+
+        def record(command, *args, **kwargs):
+            commands.append(command)
+            return {"status": "completed", "returncode": 1}
+
+        with patch.object(harness, "run_command", side_effect=record):
+            harness.run_sanitizers(
+                {"cflags": ["-O3", "-DVARIANT=7", "-Iinclude"], "runs": []},
+                self.work / "source.c", self.work / "recovered.c", self.work,
+                {"path": "cc"}, SimpleNamespace(compile_timeout=30),
+            )
+        self.assertIn("-DVARIANT=7", commands[0])
+        self.assertIn("-Iinclude", commands[0])
+        self.assertLess(commands[0].index("-O3"), commands[0].index("-O1"))
+        self.assertNotIn("-DVARIANT=7", commands[1])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="semantic_oracle_test_")
         self.work = Path(self.temp.name)
@@ -50,7 +75,7 @@ class SemanticOracleHarnessTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_gate(self, recovered_source):
+    def run_gate(self, recovered_source, manifold_args=()):
         candidate = self.work / "candidate.c"
         candidate.write_text(recovered_source)
         output = self.work / ("output_" + str(len(list(self.work.glob("output_*")))))
@@ -67,6 +92,7 @@ class SemanticOracleHarnessTest(unittest.TestCase):
                 str(output),
                 "--jobs",
                 "1",
+                *["--manifold-arg=" + arg for arg in manifold_args],
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -75,6 +101,15 @@ class SemanticOracleHarnessTest(unittest.TestCase):
             timeout=30,
         )
         return proc, json.loads((output / "summary.json").read_text())
+
+    def test_decompiler_ablation_arguments_are_executed_and_recorded(self):
+        source = (self.work / "source.c").read_text()
+        proc, summary = self.run_gate(source, ("--ablate-storage-search",))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = summary["results"][0]
+        command_path = Path(summary["artifact_dir"]) / result["artifact_dir"] / result["decompile"]["command_path"]
+        command = json.loads(command_path.read_text())
+        self.assertEqual(command["argv"][-1], "--ablate-storage-search")
 
     def test_pass_mismatch_and_recompile_error_are_distinct(self):
         passing = (

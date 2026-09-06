@@ -8924,6 +8924,18 @@ ascent_par! {
         let args = vec![*res, *a2],
         let op = if *r_is_64 { Operation::Oaddl } else { Operation::Oadd };
 
+    // SP is not an allocatable Ireg, so the ordinary two-register rule cannot
+    // lift ADD dst,RSP. Its full-width value is exactly the existing indexed
+    // address primitive. Preserve the old destination as the index; RTL's
+    // structural overwrite-use split then materializes the frame address.
+    mach_inst(address, MachInst::Mop(Operation::Oleal(Addressing::Aindexed2(0)), Arc::new(vec![Mreg::SP, *res]), *res)) <--
+        padd(address, destination, source),
+        !div_consumed(address),
+        op_register(destination, destination_name), reg_64(destination_name),
+        op_register(source, source_name), if *source_name == "RSP",
+        ireg_of(preg, Ireg::from(destination_name)), preg_of(res, preg),
+        if *res != Mreg::SP;
+
     // Divergence: ADD reg,reg can also be Olea(Aindexed2(0)); CompCert has no Oadd for x86, register addition is Olea(Aindexed2 0) compiling to LEA r,[r1+r2].
     mach_inst(address, MachInst::Mop(op, Arc::new(args), *res)) <--
         padd(address, r, r2),

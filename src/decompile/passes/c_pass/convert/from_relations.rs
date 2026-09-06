@@ -1299,6 +1299,37 @@ fn derive_stack_buffer_aliases(db: &DecompileDB) -> StackBufferAliases {
     result
 }
 
+fn semantic_declaration_views(
+    db: &DecompileDB,
+    function: Address,
+    aliases: Option<&HashMap<RTLReg, (RTLReg, usize)>>,
+) -> HashMap<String, Vec<crate::decompile::passes::semantic_counterexample::ledger::ObjectView>> {
+    use crate::decompile::passes::semantic_counterexample::ledger::{self, ObjectView};
+    let mut result: HashMap<String, Vec<ObjectView>> = HashMap::new();
+    for contract in ledger::committed(db).into_iter().filter(|e| e.object.function == function) {
+        let roots: BTreeSet<_> = db.rel_iter::<(Address, i64, RTLReg)>("slot_escaped_canonical")
+            .filter(|r| (r.0, r.1) == (function, contract.object.base)).map(|r| r.2).collect();
+        if roots.len() != 1 || contract.extent <= 0 { continue; }
+        let mut root = *roots.first().unwrap();
+        let mut offset = 0_usize;
+        let mut seen = BTreeSet::new();
+        let mut valid = true;
+        while let Some(&(parent, delta)) = aliases.and_then(|a| a.get(&root)) {
+            if parent == root { valid &= delta == 0; break; }
+            if !seen.insert(root) { valid = false; break; }
+            let Some(next) = offset.checked_add(delta) else { valid = false; break; };
+            root = parent; offset = next;
+        }
+        if !valid { continue; }
+        let view = ObjectView { object: contract.object, offset, extent: contract.extent as usize };
+        let name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(root);
+        let views = result.entry(name).or_default();
+        if !views.contains(&view) { views.push(view); }
+    }
+    for views in result.values_mut() { views.sort_by_key(|v| (v.object, v.offset, v.extent)); }
+    result
+}
+
 fn derive_stack_buffer_end_aliases(db: &DecompileDB) -> StackBufferEndAliases {
     let mut candidates: BTreeMap<(Address, RTLReg), BTreeSet<(RTLReg, usize)>> = BTreeMap::new();
     for &(func, endpoint, base, offset) in
@@ -2822,6 +2853,8 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                     is_const: true,
                     ..TypeQualifiers::none()
                 },
+                alignment: None,
+                storage_views: Vec::new(),
                 init: Some(Initializer::Expr(CExpr::FloatLit(FloatLiteral {
                     value,
                     suffix,
@@ -3239,6 +3272,8 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             ty,
             storage_class,
             qualifiers: TypeQualifiers::none(),
+            alignment: None,
+            storage_views: Vec::new(),
             init,
             loc: SourceLoc::unknown(),
         });
@@ -3889,6 +3924,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             !param_name_set.contains(n) && !global_names.contains(n) && !n.starts_with("__builtin_")
         });
 
+        let semantic_views = semantic_declaration_views(db, func.address, stack_buffer_aliases.get(&func.address));
         let mut local_vars: Vec<VarDecl> = local_names
             .into_iter()
             .map(|name| {
@@ -3896,11 +3932,14 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                     .get(&name)
                     .cloned()
                     .unwrap_or_else(CType::int);
+                let storage_views = semantic_views.get(&name).cloned().unwrap_or_default();
                 VarDecl {
                     name,
                     ty,
                     storage_class: StorageClass::default(),
                     qualifiers: TypeQualifiers::none(),
+                    alignment: None,
+                    storage_views,
                     init: None,
                     loc: SourceLoc::unknown(),
                 }
@@ -3976,9 +4015,27 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             }
         }
         collect_var_origins_stmt(&body, &mut local_origin_names);
+        let mut semantic_storage_names = HashSet::new();
+        // The counterexample engine constructs storage, not an invented
+        // initial value. Its explicit machine stores initialize the observed
+        // bytes; do not satisfy a missing-value heuristic by adding {0} to
+        // this new representation. Padding/unknown bytes remain uninitialized.
+        for declaration in &local_vars {
+            if !declaration.storage_views.is_empty() {
+                local_origin_names.insert(declaration.name.clone());
+                semantic_storage_names.insert(declaration.name.clone());
+            }
+        }
         let local_vars: Vec<VarDecl> = local_vars
             .into_iter()
             .map(|mut v| {
+                if semantic_storage_names.contains(&v.name) {
+                    // The initial representation grammar admits at most
+                    // eight-byte scalar views. A char array alone would only
+                    // promise byte alignment, insufficient when a callee
+                    // accesses this storage through an inferred struct pointer.
+                    v.alignment = Some(8);
+                }
                 if v.init.is_none() && !local_origin_names.contains(&v.name) {
                     v.init = zero_initializer_for_var(&v.ty);
                 }
@@ -4390,6 +4447,8 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 ty: var_ty,
                 storage_class,
                 qualifiers: TypeQualifiers::none(),
+                alignment: None,
+                storage_views: Vec::new(),
                 init: None,
                 loc: SourceLoc::unknown(),
             }));
@@ -4407,6 +4466,8 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                     is_volatile: true,
                     ..TypeQualifiers::none()
                 },
+                alignment: None,
+                storage_views: Vec::new(),
                 init: None,
                 loc: SourceLoc::unknown(),
             }));
@@ -5866,6 +5927,10 @@ pub struct ConversionContext {
     pub global_lvalue_aliases: HashMap<usize, CExpr>,
     /// The target's C data model, so a 64-bit value gets a 64-bit spelling.
     pub data_model: crate::abi::DataModel,
+    /// Source ABI effects licensed by a unique, selected machine event. They
+    /// follow statement provenance, not the printable spelling of its lvalue.
+    pub source_post_effects: HashMap<Node, CStmt>,
+    pub applied_source_effects: HashSet<Node>,
     #[allow(dead_code)]
     pub global_names: HashSet<String>,
     pub string_globals: HashSet<usize>,
@@ -5890,6 +5955,8 @@ impl ConversionContext {
             id_to_name,
             global_lvalue_aliases: HashMap::new(),
             data_model,
+            source_post_effects: HashMap::new(),
+            applied_source_effects: HashSet::new(),
             global_names,
             string_globals: HashSet::new(),
             name_counter: 0,
@@ -7244,7 +7311,13 @@ fn should_lower_scalar_field(
     aggregate_ty: &clight::ClightType,
     field_ty: &clight::ClightType,
 ) -> bool {
-    scalar_access_needs_alignment(field_ty)
+    // An inferred aggregate is not evidence that a C object of that effective
+    // type exists. Even character MEMBERS can acquire aggregate TBAA during
+    // optimization. Use the same bytewise access contract as wider fields;
+    // the character-alias exception applies to a character lvalue, not to an
+    // arbitrary guessed aggregate view. Proven exact owners remain readable.
+    (scalar_access_needs_alignment(field_ty)
+        || matches!(field_ty, clight::ClightType::Tint(clight::ClightIntSize::I8, _, _)))
         && !clight_access_is_volatile(aggregate_ty)
         && !clight_access_is_volatile(field_ty)
         && !scalar_deref_alignment_proven(address, aggregate_ty)
@@ -8300,6 +8373,28 @@ fn contains_named_label(stmt: &CStmt) -> bool {
     }
 }
 
+pub fn convert_stmt_at(stmt: &clight::ClightStmt, ctx: &mut ConversionContext, node: Node) -> CStmt {
+    let converted = convert_stmt(stmt, ctx);
+    fn primitive(stmt: &clight::ClightStmt) -> bool {
+        match stmt {
+            clight::ClightStmt::Sassign(..) | clight::ClightStmt::Sset(..) => true,
+            clight::ClightStmt::Ssequence(stmts) if stmts.len() == 1 => primitive(&stmts[0]),
+            _ => false,
+        }
+    }
+    // A node may name a structured container. Its provenance does not place
+    // an effect after the entire loop/branch. Explicit inner labels rebind
+    // origins during recursive conversion instead.
+    if primitive(stmt) {
+        if let Some(effect) = ctx.source_post_effects.get(&node).cloned() {
+            if ctx.applied_source_effects.insert(node) {
+                return CStmt::Sequence(vec![converted, effect]);
+            }
+        }
+    }
+    converted
+}
+
 pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> CStmt {
     match stmt {
         clight::ClightStmt::Sskip => CStmt::Empty,
@@ -8484,7 +8579,7 @@ pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> C
 
         clight::ClightStmt::Slabel(label_id, inner) => {
             let label_name = ctx.label_name(*label_id);
-            let inner_stmt = convert_stmt(inner, ctx);
+            let inner_stmt = convert_stmt_at(inner, ctx, *label_id as Node);
             CStmt::Labeled(Label::Named(label_name), Box::new(inner_stmt))
         }
 
