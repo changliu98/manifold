@@ -1,5 +1,9 @@
 # Manifold
 
+<p align="center">
+  <img src="assets/manifold-logo-circle.svg" alt="Manifold logo" width="128">
+</p>
+
 An experimental x86-64 ELF and native AMD64 PE32+ binary decompiler using [Ascent](https://github.com/s-arash/ascent).
 
 The end-to-end behavioral evaluation and quality claims are currently scoped to
