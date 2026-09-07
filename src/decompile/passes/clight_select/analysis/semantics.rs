@@ -15,20 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use z3::ast::{Bool, Dynamic};
 
 // The integer class has one deterministic concrete declaration per register.
-// Validate that profile, then guard every result by the classes of ALL input
-// and output declarations it used. A pointer/float model is never excluded by
-// an integer counterexample. Proven siblings must exist in the chosen world.
-fn semantic_candidate_conditions(
-    t: &TypeDt,
-    tyvar: &HashMap<RTLReg, Dynamic>,
-    func: &FunctionData,
-    nodes: &[Node],
-    selections: &HashMap<Node, Vec<Bool>>,
-    worlds: &[u8],
-    world_vars: &HashMap<u8, Bool>,
-    by_node: super::super::obligations::Obligations<'_>,
-) -> (HashMap<(Node, usize), Bool>, Vec<Bool>) {
-    use super::super::obligations::{Validator, Verdict};
+pub(super) fn integer_declarations(func: &FunctionData) -> HashMap<RTLReg, crate::decompile::passes::c_pass::types::CType> {
     use crate::decompile::passes::c_pass::convert::from_relations::convert_param_type_from_param;
     use crate::decompile::passes::c_pass::helpers::candtype_to_ctype;
     use crate::decompile::passes::c_pass::types::CType;
@@ -51,6 +38,24 @@ fn semantic_candidate_conditions(
             declarations.insert(reg, ty);
         }
     }
+    declarations
+}
+
+// Validate that profile, then guard every result by the classes of ALL input
+// and output declarations it used. A pointer/float model is never excluded by
+// an integer counterexample. Proven siblings must exist in the chosen world.
+fn semantic_candidate_conditions(
+    t: &TypeDt,
+    tyvar: &HashMap<RTLReg, Dynamic>,
+    func: &FunctionData,
+    nodes: &[Node],
+    selections: &HashMap<Node, Vec<Bool>>,
+    worlds: &[u8],
+    world_vars: &HashMap<u8, Bool>,
+    by_node: super::super::obligations::Obligations<'_>,
+) -> (HashMap<(Node, usize), Bool>, Vec<Bool>) {
+    use super::super::obligations::{Validator, Verdict};
+    let declarations = integer_declarations(func);
     let validator = Validator::new();
     let mut out = HashMap::new();
     let mut preferences = Vec::new();

@@ -445,7 +445,7 @@ fn callee_symbol(stmt: &ClightStmt) -> Option<String> {
             },
             _ => None,
         },
-        ClightStmt::Slabel(_, inner) => callee_symbol(inner),
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => callee_symbol(inner),
         ClightStmt::Ssequence(items) => items.iter().find_map(callee_symbol),
         _ => None,
     }
@@ -574,7 +574,7 @@ impl<'a> Eval<'a> {
                     out.push(LocKey::Reg(*d as RTLReg));
                 }
             }
-            ClightStmt::Slabel(_, i) => self.collect_defs(i, out, kills_memory),
+            (ClightStmt::Slabel(_, i) | ClightStmt::Seffect(_, i)) => self.collect_defs(i, out, kills_memory),
             ClightStmt::Ssequence(items) => {
                 for i in items {
                     self.collect_defs(i, out, kills_memory);
@@ -895,7 +895,7 @@ impl<'a> Eval<'a> {
 
     fn stmt(&mut self, node: Node, s: &ClightStmt) {
         match s {
-            ClightStmt::Slabel(_, inner) => {
+            (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => {
                 self.stmt(node, inner);
                 return;
             }
@@ -1256,7 +1256,7 @@ pub fn claim_on(stmt: &ClightStmt, loc: LocKey, ptr64: bool) -> Option<AVal> {
                 }
             }
             ClightStmt::Ssequence(items) => stack.extend(items.iter()),
-            ClightStmt::Slabel(_, i) | ClightStmt::Sloop(i, _) => stack.push(i),
+            (ClightStmt::Slabel(_, i) | ClightStmt::Seffect(_, i)) | ClightStmt::Sloop(i, _) => stack.push(i),
             _ => {}
         }
     }

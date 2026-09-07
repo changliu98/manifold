@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "suite": "manifold-effect-capture-contracts",
+  "cases": [
+    {
+      "name": "captured_flags_before_overwrite",
+      "source": "cases/effect_capture.c",
+      "description": "The flags describe the original byte, not the zero stored before CMOV; SF alone differs from SF xor OF on overflow.",
+      "cflags": ["-O2", "-mno-red-zone"],
+      "runs": [
+        {"name":"overflow", "args":[], "expected":{"returncode":253,"stdout":"","stderr":""}},
+        {"name":"negative", "args":["x"], "expected":{"returncode":102,"stdout":"","stderr":""}}
+      ]
+    },
+    {
+      "name": "conditional_word_write_clears_upper_bits",
+      "source": "cases/effect_capture.c",
+      "description": "Both taken and untaken 32-bit CMOV results clear the high register word.",
+      "cflags": ["-O2", "-mno-red-zone", "-DWORD_RESULT=1"],
+      "runs": [
+        {"name":"taken", "args":[], "expected":{"returncode":83,"stdout":"","stderr":""}},
+        {"name":"untaken", "args":["x"], "expected":{"returncode":17,"stdout":"","stderr":""}}
+      ]
+    }
+  ]
+}

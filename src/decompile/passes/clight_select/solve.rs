@@ -1478,7 +1478,7 @@ fn collect_reg_ptr_evidence_stmt(stmt: &ClightStmt, out: &mut BTreeMap<RTLReg, R
             collect_reg_ptr_evidence_stmt(a, out);
             collect_reg_ptr_evidence_stmt(b, out);
         }
-        ClightStmt::Slabel(_, inner) => collect_reg_ptr_evidence_stmt(inner, out),
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => collect_reg_ptr_evidence_stmt(inner, out),
         ClightStmt::Sswitch(e, cases) => {
             collect_reg_ptr_evidence_expr(e, out);
             for (_, s) in cases {
@@ -1570,7 +1570,7 @@ fn count_truncating_casts_stmt(stmt: &ClightStmt) -> u64 {
         ClightStmt::Sreturn(Some(e)) => count_truncating_casts_expr(e),
         ClightStmt::Sifthenelse(c, _, _) => count_truncating_casts_expr(c),
         ClightStmt::Sswitch(e, _) => count_truncating_casts_expr(e),
-        ClightStmt::Slabel(_, inner) => count_truncating_casts_stmt(inner),
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => count_truncating_casts_stmt(inner),
         _ => 0,
     }
 }

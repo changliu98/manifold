@@ -281,6 +281,11 @@ fn main() {
         }
     }
 
+    let unresolved_effects = prog.unresolved_effect_count();
+    if unresolved_effects > 0 {
+        eprintln!("Refusing executable C: {unresolved_effects} scoped machine effects remain unresolved; use --dump-ir for diagnostics.");
+        std::process::exit(1);
+    }
     let raw_tu = prog
         .cast_raw_translation_unit
         .as_ref()

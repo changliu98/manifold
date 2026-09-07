@@ -345,7 +345,7 @@ fn collect_edges_stmt(
                 collect_edges_stmt(func, state, name_to_ident, node, stmt, out);
             }
         }
-        ClightStmt::Slabel(_, stmt) => {
+        (ClightStmt::Slabel(_, stmt) | ClightStmt::Seffect(_, stmt)) => {
             collect_edges_stmt(func, state, name_to_ident, node, stmt, out)
         }
         _ => {}
@@ -537,7 +537,7 @@ fn stmt_matches(
                     .iter()
                     .any(|(_, stmt)| stmt_matches(stmt, temp, global, returns))
         }
-        ClightStmt::Slabel(_, stmt) => stmt_matches(stmt, temp, global, returns),
+        (ClightStmt::Slabel(_, stmt) | ClightStmt::Seffect(_, stmt)) => stmt_matches(stmt, temp, global, returns),
         _ => false,
     }
 }

@@ -716,9 +716,13 @@ ascent_par! {
         copy_subst_resolved_v2(src, resolved);
 
     // Dead store: def not in live_out, is Iop or Iload, not param.
+    #[local] relation effect_contract_point(Node);
+    effect_contract_point(*node), effect_contract_point(spec.capture) <--
+        rtl_opt_inst(node, ?RTLInst::Iop(Operation::Oflagselect(spec), _, _));
     relation dead_store_v2(Node);
     dead_store_v2(*node) <--
         rtl_def(func, node, reg),
+        !effect_contract_point(node),
         !rtl_opt_shared(node),
         !rtl_opt_param(func, reg),
         !live_out(node, reg),
@@ -869,6 +873,7 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
     // DB cannot retain kills from an earlier run.
     db.rel_set("dead_store", ascent::boxcar::Vec::<(Node,)>::new());
     db.rel_set("copy_eliminated", ascent::boxcar::Vec::<(Node,)>::new());
+    db.rel_set("rtl_effect_value_alias", ascent::boxcar::Vec::<(Address,Node,RTLReg,RTLReg)>::new());
     // The optimizer owns the semantic function-entry contract.  Clear it even
     // for an empty/reused DB so downstream passes can never observe entries
     // left by an earlier optimization run.
@@ -956,6 +961,18 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
                 .remove(&func_addr)
                 .unwrap_or_default();
 
+            // Retain the optimizer's actual, CFG-proven renamings at effect
+            // inputs. These are value equations at queried points, not a
+            // program-wide alias relation or a reconstructed name heuristic.
+            let effect_points: HashSet<Node> = func.inst.iter().flat_map(|(&node,inst)| match inst {
+                RTLInst::Iop(Operation::Oflagselect(spec),_,_) => vec![node,spec.capture],
+                _ => Vec::new(),
+            }).collect();
+            let mut effect_aliases: BTreeMap<(Node,RTLReg),RTLReg> = effect_points.into_iter()
+                .filter(|node| !func.shared_nodes.contains(node))
+                .flat_map(|node| func.inst.get(&node).into_iter().flat_map(move |inst|
+                    inst_def_use(inst).1.into_iter().map(move |r|((node,r),r)))).collect();
+
             // Track iteration-1 imperative outputs for diffing against Ascent.
             let imp_self_zero: HashSet<Node> = func
                 .inst
@@ -997,6 +1014,9 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
                 let liveness = LivenessInfo::build(func, &du);
 
                 let (c, copy_subst, copy_kills) = copy_propagation(func, &du, &liveness);
+                for value in effect_aliases.values_mut() {
+                    if let Some(&replacement) = copy_subst.get(value) { *value = replacement; }
+                }
                 if first_iter {
                     iter1_copy_subst = copy_subst.clone();
                     iter1_copy_eliminated_nodes = copy_kills.clone();
@@ -1057,6 +1077,7 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
                 copy_eliminated_nodes,
                 dead_store_nodes,
                 became_void,
+                effect_aliases,
             )
         })
         .collect();
@@ -1072,6 +1093,7 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
     let mut copy_eliminated_all: HashSet<Node> = HashSet::new();
     let mut dead_store_all: HashSet<Node> = HashSet::new();
     let mut newly_void: HashSet<Address> = HashSet::new();
+    let mut effect_aliases_all = Vec::new();
 
     for (
         func_stats,
@@ -1086,6 +1108,7 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
         copy_kills,
         dead_store_kills,
         became_void,
+        effect_aliases,
     ) in results
     {
         stats.accumulate(func_stats);
@@ -1100,6 +1123,8 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
         imp_dead_call_all.extend(idcl);
         copy_eliminated_all.extend(copy_kills);
         dead_store_all.extend(dead_store_kills);
+        effect_aliases_all.extend(effect_aliases.into_iter().filter_map(|((node,original),current)|
+            (original!=current).then_some((fa,node,original,current))));
         if became_void {
             newly_void.insert(fa);
         }
@@ -1229,6 +1254,9 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
 
     ctx.var_types = merged_var_types;
     ctx.write_back(db);
+    effect_aliases_all.sort_unstable();
+    effect_aliases_all.dedup();
+    db.rel_set("rtl_effect_value_alias",effect_aliases_all.into_iter().collect::<ascent::boxcar::Vec<_>>());
 
     let mut dead_store_nodes: Vec<Node> = dead_store_all.into_iter().collect();
     dead_store_nodes.sort_unstable();
@@ -1548,6 +1576,7 @@ impl IRPass for RTLOptimizePass {
             "single_def_const",
             "emit_inline_temp",
             "rtl_available_value",
+            "rtl_effect_value_alias",
             // Exact production optimizer kills, retained after nop collapse so
             // downstream audits can distinguish deliberate removal from loss.
             "dead_store",
@@ -3122,11 +3151,20 @@ pub(crate) fn dead_store_elimination(
     du: &DefUseInfo,
     liveness: &LivenessInfo,
 ) -> (usize, HashSet<Node>, HashSet<Node>) {
+    // A memory/flag bundle can only be removed by a checked whole-bundle
+    // elimination. Register liveness alone is not a memory-read certificate.
+    let contract_points: HashSet<Node> = func.inst.iter().flat_map(|(&node, inst)| {
+        match inst {
+            RTLInst::Iop(Operation::Oflagselect(spec), _, _) => vec![node, spec.capture],
+            _ => Vec::new(),
+        }
+    }).collect();
     let mut count = 0;
     let dead_nodes: Vec<Node> = func
         .inst
         .iter()
         .filter_map(|(&node, inst)| {
+            if contract_points.contains(&node) { return None; }
             if func.shared_nodes.contains(&node) {
                 return None;
             }
@@ -3364,10 +3402,17 @@ pub(crate) fn find_inline_temps(
             continue;
         }
 
+        if matches!(func.inst.get(&use_node), Some(RTLInst::Iop(Operation::Oflagselect(_), _, _))) {
+            continue;
+        }
+
         let inst = match func.inst.get(&def_node) {
             Some(i) => i,
             None => continue,
         };
+        // Keep effect boundaries until an inlining schema can transfer their
+        // occurrence and capture obligations to the receiving expression.
+        if matches!(inst, RTLInst::Iop(Operation::Oflagselect(_), _, _)) { continue; }
         // Only inline Iop temps; Iload is unsafe without aliasing/intervening store checks.
         let def_args: Vec<RTLReg> = match inst {
             RTLInst::Iop(_, args, _) => args.iter().copied().collect(),
@@ -4189,6 +4234,39 @@ mod tests {
         assert!(!db
             .rel_iter::<(u64,)>("dead_store")
             .any(|&(node,)| node == entry));
+    }
+
+    #[test]
+    fn effect_operand_renaming_exports_only_cfg_proven_point_equalities() {
+        use crate::decompile::effects::flags::{FlagSelect,Predicate,Producer};
+        use crate::x86::types::{Address,Node,RTLReg};
+        for bypass in [false,true] {
+            let function = 0x1000_u64;
+            let spec = FlagSelect {capture:30,producer:Producer::Compare,predicate:Predicate::Equal,
+                width:1,immediate:0,result_bits:64};
+            let mut db = DecompileDB::default();
+            let mut instructions: Vec<(Node,RTLInst)> = vec![
+                (90,RTLInst::Iop(Operation::Omove,Arc::new(vec![1]),3)),
+                (30,RTLInst::Iload(MemoryChunk::MInt8Unsigned,Addressing::Aindexed(0),Arc::new(vec![3]),4)),
+                (20,RTLInst::Iop(Operation::Oflagselect(spec),Arc::new(vec![1,2,4]),5)),
+                (10,RTLInst::Ireturn(5)),
+            ];
+            let mut edges: Vec<(Node,Node)> = vec![(90,30),(30,20),(20,10)];
+            let entry: Node = if bypass {
+                instructions.push((100,RTLInst::Icond(Condition::Ccompimm(Comparison::Ceq,0),Arc::new(vec![2]),Either::Right(90),Either::Right(30))));
+                edges.extend([(100,90),(100,30)]); 100
+            } else {90};
+            for (node,inst) in instructions {
+                db.rel_push("rtl_inst_candidate",(node,inst));
+                db.rel_push("instr_in_function",(node,function));
+            }
+            for edge in edges {db.rel_push("rtl_succ_candidate",edge);}
+            db.rel_push("emit_function",(function,"effect_copy",entry));
+            for reg in [1_u64,2] {db.rel_push("emit_function_param_candidate",(function,reg));}
+            optimize_rtl_candidates(&mut db).unwrap();
+            let aliases: Vec<_> = db.rel_iter::<(Address,Node,RTLReg,RTLReg)>("rtl_effect_value_alias").copied().collect();
+            assert_eq!(aliases,if bypass {vec![]} else {vec![(function,30,3,1)]});
+        }
     }
 
     #[test]

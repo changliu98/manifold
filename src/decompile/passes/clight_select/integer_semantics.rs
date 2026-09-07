@@ -270,6 +270,16 @@ impl Eval<'_> {
                 let right = self.expr(right)?;
                 c_binary(*op, left, right)
             }
+            CExpr::Ternary(condition, yes, no) => {
+                let c = self.expr(condition)?;
+                let a = self.expr(yes)?;
+                let b = self.expr(no)?;
+                let ty = a.ty.common(b.ty);
+                let a = a.cast(ty);
+                let b = b.cast(ty);
+                Some(Value { bits: c.truth().ite(&a.bits, &b.bits), ty,
+                    defined: Bool::and(&[c.defined.clone(), c.truth().ite(&a.defined, &b.defined)]) })
+            }
             _ => None,
         }
     }
@@ -417,6 +427,15 @@ fn c_binary(op: BinaryOp, left: Value, right: Value) -> Option<Value> {
 }
 
 fn machine_op(eval: &mut Eval<'_>, op: &Operation, args: &[RTLReg]) -> Option<Value> {
+    if let Operation::Oflagselect(spec) = op {
+        if args.len() != 3 || !spec.valid() { return None; }
+        let old = eval.machine_reg(args[0], spec.result_bits)?;
+        let taken = eval.machine_reg(args[1], spec.result_bits)?;
+        let memory = eval.machine_reg(args[2], (spec.width * 8) as u32)?;
+        let predicate = crate::decompile::effects::flags::machine_predicate(*spec, &memory.bits)?;
+        let selected = predicate.ite(&taken.bits, &old.bits);
+        return Some(Value::raw(if spec.result_bits == 32 { selected.zero_ext(32) } else { selected }, false));
+    }
     use Operation::*;
     let (width, binary, immediate) = match op {
         Olea(addressing) | Oleal(addressing) => {
@@ -542,7 +561,7 @@ fn machine_condition(eval: &mut Eval<'_>, cond: &Condition, args: &[RTLReg]) -> 
 
 fn unlabel(stmt: &ClightStmt) -> &ClightStmt {
     match stmt {
-        ClightStmt::Slabel(_, inner) => unlabel(inner),
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => unlabel(inner),
         _ => stmt,
     }
 }
@@ -562,6 +581,8 @@ fn integer_expression(expr: &ClightExpr, fuel: &mut usize, inputs: &mut BTreeSet
         ClightExpr::Ebinop(_, a, b, _) => {
             integer_expression(a, fuel, inputs) && integer_expression(b, fuel, inputs)
         }
+        ClightExpr::Econdition(c, a, b, _) => integer_expression(c, fuel, inputs)
+            && integer_expression(a, fuel, inputs) && integer_expression(b, fuel, inputs),
         _ => false,
     }
 }
@@ -582,7 +603,7 @@ fn align_machine_inputs(
     context: Option<(&FunctionData, crate::x86::types::Node)>,
 ) -> Option<()> {
     let mut actual = BTreeSet::new();
-    if !integer_expression(expr, &mut 96, &mut actual) {
+    if !integer_expression(expr, &mut eval.fuel.clone(), &mut actual) {
         return None;
     }
     if actual == args.iter().copied().collect() {
@@ -684,7 +705,7 @@ fn store_source_value(
 /// acceptance decision is used.
 pub struct Validator {
     solver: Solver,
-    checks: std::cell::Cell<[usize; 4]>,
+    checks: std::cell::Cell<[usize; 5]>,
 }
 
 #[derive(Clone, Copy)]
@@ -693,6 +714,7 @@ enum Domain {
     FrameStore,
     FrameLoad,
     WordOperation,
+    FlagEffect,
 }
 
 struct Effect {
@@ -709,7 +731,7 @@ impl Validator {
         solver.set_params(&params);
         Self {
             solver,
-            checks: std::cell::Cell::new([0; 4]),
+            checks: std::cell::Cell::new([0; 5]),
         }
     }
 
@@ -752,7 +774,9 @@ impl Validator {
             .and_then(|(f, n)| f.word_inputs.get(&n))
             .cloned()
             .unwrap_or_default();
-        let domain = if word_inputs.is_empty() {
+        let domain = if matches!(inst, RTLInst::Iop(Operation::Oflagselect(_), _, _)) {
+            Domain::FlagEffect
+        } else if word_inputs.is_empty() {
             Domain::Integer
         } else {
             Domain::WordOperation
@@ -764,7 +788,14 @@ impl Validator {
                 (RTLInst::Iop(op, args, dst), ClightStmt::Sset(id, rhs))
                     if *dst == *id as RTLReg =>
                 {
-                    align_machine_inputs(eval, rhs, args, context)?;
+                    let mut direct_inputs = BTreeSet::new();
+                    let direct_flag_view = matches!(op, Operation::Oflagselect(_))
+                        && integer_expression(rhs, &mut eval.fuel.clone(), &mut direct_inputs)
+                        && direct_inputs.iter().all(|reg| args.contains(reg));
+                    // A flag predicate can be constant (e.g. TEST always
+                    // clears OF). Extra machine inputs remain unconstrained,
+                    // so their omission is proved, not assumed, by the query.
+                    if !direct_flag_view { align_machine_inputs(eval, rhs, args, context)?; }
                     let machine = machine_op(eval, op, args)?;
                     let destination = eval.reg(*dst)?.ty;
                     // A widened carrier needs architectural extension evidence,
@@ -772,10 +803,14 @@ impl Validator {
                     if destination.bits > machine.ty.bits {
                         return None;
                     }
-                    let c = eval
+                    let mut c = eval
                         .expr(&convert_expr(rhs, &mut ctx))?
-                        .cast(destination)
-                        .cast(machine.ty);
+                        .cast(destination);
+                    if matches!(op,Operation::Oflagselect(spec) if spec.result_bits==32)
+                        && destination.bits==32 {
+                        c = c.cast(IntTy { bits:32, signed:false });
+                    }
+                    let c = c.cast(machine.ty);
                     Some(Effect {
                         machine: machine.bits,
                         source: c.bits,
@@ -1018,7 +1053,7 @@ impl Validator {
             declarations,
             model,
             registers: BTreeSet::new(),
-            fuel: 96,
+            fuel: if matches!(domain, Domain::FlagEffect) { 2048 } else { 96 },
             memory: None,
             word_inputs: BTreeSet::new(),
             machine_overrides: HashMap::new(),

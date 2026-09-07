@@ -1090,7 +1090,7 @@ fn order_globals_for_aggregate_initializers<'a>(
                 }
                 collect_stmt_vars(body, out);
             }
-            CStmt::Labeled(_, body) => collect_stmt_vars(body, out),
+            (CStmt::Labeled(_, body) | CStmt::Effect(_, body)) => collect_stmt_vars(body, out),
             CStmt::Decl(decls) => {
                 for decl in decls {
                     if let Some(init) = &decl.init {
@@ -2657,16 +2657,19 @@ pub fn build_cast_from_relations(
         ctx.func_addrs_sorted = sorted;
     }
 
-    let mut stmt_map: HashMap<crate::x86::types::Node, CStmt> = HashMap::new();
+    let mut stmt_map: HashMap<(Address, Node), CStmt> = HashMap::new();
+    let mut function_edges = HashMap::new();
     for func in selected_functions {
         // func.statements is a HashMap; iterating it directly leaks non-deterministic order into convert_stmt -> record_var_type (which is first-wins), so a variable's recorded C type flips between runs. Walk nodes in sorted order.
         let mut nodes: Vec<crate::x86::types::Node> = func.statements.keys().copied().collect();
         nodes.sort_by_key(|node| exec_order_key(*node));
         for node in nodes {
             let clight_stmt = &func.statements[&node];
-            let converted = convert_stmt(clight_stmt, &mut ctx);
-            stmt_map.insert(node, converted);
+            let converted = convert_stmt_at(clight_stmt, &mut ctx, node);
+            stmt_map.insert((func.address, node), converted);
         }
+        function_edges.insert(func.address, edges.iter().copied().filter(|(from,_)|
+            func.successors.contains_key(from) || func.statements.contains_key(from)).collect());
     }
 
     build_translation_unit_from_stmt_map_with_types(
@@ -2676,9 +2679,8 @@ pub fn build_cast_from_relations(
         id_to_name,
         global_lvalue_aliases,
         &stmt_map,
-        edges,
+        &function_edges,
         &ctx.var_types,
-        &HashMap::new(),
     )
 }
 
@@ -2688,10 +2690,9 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     globals: &[GlobalData],
     id_to_name: &HashMap<usize, String>,
     global_lvalue_aliases: &HashMap<usize, CExpr>,
-    stmt_map: &HashMap<crate::x86::types::Node, CStmt>,
-    edges: &[(crate::x86::types::Node, crate::x86::types::Node)],
+    stmt_map: &HashMap<(Address, Node), CStmt>,
+    edges: &HashMap<Address, Vec<(Node, Node)>>,
     var_types: &HashMap<String, CType>,
-    optimized_node_to_func: &HashMap<crate::x86::types::Node, crate::x86::types::Address>,
 ) -> TranslationUnit {
     let data_model = db.data_model();
     let mut tu = TranslationUnit::new();
@@ -3392,13 +3393,13 @@ pub fn build_translation_unit_from_stmt_map_with_types(
 
         let func_addr = func.address;
 
-        let nodes_set: HashSet<_> = stmt_map
-            .keys()
-            .copied()
-            .filter(|n| {
-                func.statements.contains_key(n) || optimized_node_to_func.get(n) == Some(&func_addr)
-            })
-            .collect();
+        // One machine node can belong to several functions, with different
+        // selected types, structure worlds and occurrence identities. Never
+        // let a program-wide node map overwrite one owner's selected body.
+        let statements: HashMap<Node, &CStmt> = stmt_map.iter()
+            .filter_map(|(&(owner,node),statement)| (owner==func_addr).then_some((node,statement))).collect();
+        let nodes_set: HashSet<_> = statements.keys().copied().collect();
+        let function_edges = edges.get(&func_addr).map(Vec::as_slice).unwrap_or(&[]);
 
         // sseq bundling drops members whose clight_succ edges still point at
         // them, so remap member->synth edges to the live applied anchor.  The
@@ -3421,7 +3422,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         // from the top-level statement map.  Normalize BOTH endpoints to the
         // live Sseq anchor so an edge leaving the last absorbed member still
         // orders the anchor before its external successor.
-        let mut remapped_edges = remap_sseq_edges(edges, &sseq_member_to_head);
+        let mut remapped_edges = remap_sseq_edges(function_edges, &sseq_member_to_head);
 
         let entry_node = func.entry_node;
         // Normalize a top-level node id to the address loop_body is keyed by: resolve an sseq member to its bundle head, then mask both synthetic-address bits so synth nodes land on their base.
@@ -3465,7 +3466,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             entry_node,
             &nodes_set,
             &remapped_edges,
-            |n| stmt_map.get(&n).map_or(false, is_unconditional_exit),
+            |n| statements.get(&n).is_some_and(|s|is_unconditional_exit(s)),
             &loop_members,
             &node_innermost_loop,
             order_normalize,
@@ -3473,7 +3474,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         if dump_emit_order {
             eprintln!("[DUMP-EMIT] ordered_nodes={nodes:x?}");
             for &node in &nodes {
-                if let Some(stmt) = stmt_map.get(&node) {
+                if let Some(&stmt) = statements.get(&node) {
                     eprintln!("[DUMP-EMIT] node {node:x}: {stmt:?}");
                 }
             }
@@ -3481,7 +3482,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         let mut body_items = Vec::new();
         let mut body_terminated = false;
         for &node in &nodes {
-            if let Some(stmt) = stmt_map.get(&node) {
+            if let Some(&stmt) = statements.get(&node) {
                 if matches!(stmt, CStmt::Empty) {
                     continue;
                 }
@@ -3538,7 +3539,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             fb_nodes.sort_by_key(|node| exec_order_key(*node));
             for node in fb_nodes {
                 if let Some(cl_stmt) = func.statements.get(&node) {
-                    let cstmt = convert_stmt(cl_stmt, &mut fb_ctx);
+                    let cstmt = convert_stmt_at(cl_stmt, &mut fb_ctx, node);
                     let cstmt =
                         crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&cstmt, &|e| {
                             crate::decompile::passes::c_pass::helpers::inline_string_literals(
@@ -4530,7 +4531,7 @@ fn drop_void_captures_stmt(stmt: &mut CStmt, void_fns: &HashSet<String>) {
         CStmt::Switch(_, body) => drop_void_captures_stmt(body, void_fns),
         CStmt::While(_, body) | CStmt::DoWhile(body, _) => drop_void_captures_stmt(body, void_fns),
         CStmt::For(_, _, _, body) => drop_void_captures_stmt(body, void_fns),
-        CStmt::Labeled(_, inner) => drop_void_captures_stmt(inner, void_fns),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => drop_void_captures_stmt(inner, void_fns),
         CStmt::Block(items) => {
             for item in items.iter_mut() {
                 if let CBlockItem::Stmt(s) = item {
@@ -4678,7 +4679,7 @@ fn collect_var_origins_stmt(stmt: &CStmt, out: &mut HashSet<String>) {
                 collect_var_origins_stmt(s, out);
             }
         }
-        CStmt::Labeled(_, inner) => collect_var_origins_stmt(inner, out),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_var_origins_stmt(inner, out),
         _ => {}
     }
 }
@@ -4741,7 +4742,7 @@ fn collect_var_names_from_stmt(stmt: &CStmt, vars: &mut HashSet<String>) {
             }
             collect_var_names_from_stmt(body, vars);
         }
-        CStmt::Labeled(_, inner) => collect_var_names_from_stmt(inner, vars),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_var_names_from_stmt(inner, vars),
         CStmt::Block(items) => {
             for item in items {
                 match item {
@@ -4858,7 +4859,7 @@ fn collect_mutated_names_in_stmt(stmt: &CStmt, out: &mut HashSet<String>) {
             }
             collect_mutated_names_in_stmt(body, out);
         }
-        CStmt::Labeled(_, inner) => collect_mutated_names_in_stmt(inner, out),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_mutated_names_in_stmt(inner, out),
         CStmt::Block(items) => {
             for item in items {
                 if let CBlockItem::Stmt(s) = item {
@@ -4919,7 +4920,7 @@ fn infer_var_types_from_usage(
             infer_types_from_expr(e, var_types, extern_return_types);
             infer_var_types_from_usage(body, var_types, extern_return_types);
         }
-        CStmt::Labeled(_, inner) => {
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => {
             infer_var_types_from_usage(inner, var_types, extern_return_types)
         }
         CStmt::Sequence(stmts) => {
@@ -5310,7 +5311,7 @@ fn collect_bool_evidence<'a>(
             collect_bool_evidence_expr(e, evidence, false);
             collect_bool_evidence(body, evidence, false);
         }
-        CStmt::Labeled(_, inner) => collect_bool_evidence(inner, evidence, false),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_bool_evidence(inner, evidence, false),
         CStmt::Sequence(stmts) => {
             for s in stmts {
                 collect_bool_evidence(s, evidence, false);
@@ -5428,6 +5429,9 @@ fn strip_trivial_casts(stmt: &CStmt, var_types: &HashMap<String, CType>) -> CStm
         ),
         CStmt::Labeled(lbl, inner) => {
             CStmt::Labeled(lbl.clone(), Box::new(strip_trivial_casts(inner, var_types)))
+        }
+        CStmt::Effect(lbl, inner) => {
+            CStmt::Effect(lbl.clone(), Box::new(strip_trivial_casts(inner, var_types)))
         }
         CStmt::Sequence(stmts) => CStmt::Sequence(
             stmts
@@ -5553,7 +5557,7 @@ fn last_toplevel_return_expr(body: &CStmt) -> Option<CExpr> {
             match s {
                 CStmt::Return(Some(e)) => found = Some(e.clone()),
                 // A labeled block whose inner directly returns also exposes a tail return.
-                CStmt::Labeled(_, inner) => {
+                (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => {
                     if let CStmt::Return(Some(e)) = &**inner {
                         found = Some(e.clone());
                     }
@@ -5578,7 +5582,7 @@ fn fix_falloff_return_orphan(body: &mut CStmt) {
     let Some(CBlockItem::Stmt(last)) = items.last_mut() else {
         return;
     };
-    let CStmt::Labeled(_, inner) = last else {
+    let (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) = last else {
         return;
     };
     if is_unconditional_exit(inner) {
@@ -5622,7 +5626,7 @@ fn fix_bare_returns_in_stmt(stmt: &mut CStmt) {
         CStmt::While(_, body) | CStmt::DoWhile(body, _) => fix_bare_returns_in_stmt(body),
         CStmt::For(_, _, _, body) => fix_bare_returns_in_stmt(body),
         CStmt::Switch(_, body) => fix_bare_returns_in_stmt(body),
-        CStmt::Labeled(_, inner) => fix_bare_returns_in_stmt(inner),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => fix_bare_returns_in_stmt(inner),
         CStmt::Sequence(stmts) => {
             for s in stmts {
                 fix_bare_returns_in_stmt(s);
@@ -5653,7 +5657,7 @@ fn strip_return_values_in_stmt(stmt: &mut CStmt) {
         CStmt::While(_, body) | CStmt::DoWhile(body, _) => strip_return_values_in_stmt(body),
         CStmt::For(_, _, _, body) => strip_return_values_in_stmt(body),
         CStmt::Switch(_, body) => strip_return_values_in_stmt(body),
-        CStmt::Labeled(_, inner) => strip_return_values_in_stmt(inner),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => strip_return_values_in_stmt(inner),
         CStmt::Sequence(stmts) => {
             for s in stmts {
                 strip_return_values_in_stmt(s);
@@ -6675,6 +6679,9 @@ fn repair_arith_stmt(stmt: &CStmt, types: &HashMap<String, CType>) -> CStmt {
         CStmt::Labeled(lbl, inner) => {
             CStmt::Labeled(lbl.clone(), Box::new(repair_arith_stmt(inner, types)))
         }
+        CStmt::Effect(lbl, inner) => {
+            CStmt::Effect(lbl.clone(), Box::new(repair_arith_stmt(inner, types)))
+        }
         CStmt::Sequence(stmts) => {
             CStmt::Sequence(stmts.iter().map(|s| repair_arith_stmt(s, types)).collect())
         }
@@ -6810,6 +6817,10 @@ fn normalize_call_arity_stmt(stmt: &CStmt, counts: &HashMap<String, usize>) -> C
             Box::new(normalize_call_arity_stmt(b, counts)),
         ),
         CStmt::Labeled(lbl, inner) => CStmt::Labeled(
+            lbl.clone(),
+            Box::new(normalize_call_arity_stmt(inner, counts)),
+        ),
+        CStmt::Effect(lbl, inner) => CStmt::Effect(
             lbl.clone(),
             Box::new(normalize_call_arity_stmt(inner, counts)),
         ),
@@ -7158,6 +7169,16 @@ fn insert_casts_stmt(
             )),
         ),
         CStmt::Labeled(lbl, inner) => CStmt::Labeled(
+            lbl.clone(),
+            Box::new(insert_casts_stmt(
+                inner,
+                types,
+                callee_params,
+                callee_ret,
+                ret_type,
+            )),
+        ),
+        CStmt::Effect(lbl, inner) => CStmt::Effect(
             lbl.clone(),
             Box::new(insert_casts_stmt(
                 inner,
@@ -7671,6 +7692,9 @@ fn lower_byte_buffer_stmt(stmt: &CStmt, types: &HashMap<String, CType>) -> CStmt
         CStmt::Return(Some(expr)) => CStmt::Return(Some(lower_byte_buffer_expr(expr, types))),
         CStmt::Labeled(label, body) => {
             CStmt::Labeled(label.clone(), Box::new(lower_byte_buffer_stmt(body, types)))
+        }
+        CStmt::Effect(label, body) => {
+            CStmt::Effect(label.clone(), Box::new(lower_byte_buffer_stmt(body, types)))
         }
         CStmt::Decl(decls) => CStmt::Decl(lower_byte_buffer_decls(decls, types)),
         CStmt::Sequence(stmts) => CStmt::Sequence(
@@ -8218,6 +8242,9 @@ fn eliminate_dead_code(stmt: &CStmt) -> CStmt {
         CStmt::Labeled(label, inner) => {
             CStmt::Labeled(label.clone(), Box::new(eliminate_dead_code(inner)))
         }
+        CStmt::Effect(label, inner) => {
+            CStmt::Effect(label.clone(), Box::new(eliminate_dead_code(inner)))
+        }
         other => other.clone(),
     }
 }
@@ -8285,7 +8312,7 @@ fn is_control_flow_construct(stmt: &CStmt) -> bool {
         | CStmt::DoWhile(_, _)
         | CStmt::For(_, _, _, _)
         | CStmt::Switch(_, _) => true,
-        CStmt::Labeled(_, inner) => is_control_flow_construct(inner),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => is_control_flow_construct(inner),
         _ => false,
     }
 }
@@ -8295,7 +8322,7 @@ fn is_unconditional_exit(stmt: &CStmt) -> bool {
     match stmt {
         CStmt::Return(_) | CStmt::Goto(_) | CStmt::Break | CStmt::Continue => true,
         // Labeled stmt exit status depends on inner stmt (subsequent code still dead if inner exits).
-        CStmt::Labeled(_, inner) => is_unconditional_exit(inner),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => is_unconditional_exit(inner),
         CStmt::Block(items) => {
             // A block exits if its last statement exits
             items
@@ -8331,7 +8358,7 @@ fn is_unconditional_exit(stmt: &CStmt) -> bool {
 fn contains_goto_target(stmt: &CStmt) -> bool {
     match stmt {
         CStmt::Labeled(Label::Named(_), _) => true,
-        CStmt::Labeled(_, inner) => contains_goto_target(inner),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => contains_goto_target(inner),
         CStmt::Block(items) => items.iter().any(|item| match item {
             CBlockItem::Stmt(s) => contains_goto_target(s),
             _ => false,
@@ -8354,7 +8381,7 @@ fn contains_named_label(stmt: &CStmt) -> bool {
     match stmt {
         CStmt::Labeled(Label::Named(_), _) => true,
         CStmt::Labeled(Label::Case(_), _) | CStmt::Labeled(Label::Default, _) => true,
-        CStmt::Labeled(_, inner) => contains_named_label(inner),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => contains_named_label(inner),
         CStmt::Block(items) => items.iter().any(|item| match item {
             CBlockItem::Stmt(s) => contains_named_label(s),
             _ => false,
@@ -8397,6 +8424,7 @@ pub fn convert_stmt_at(stmt: &clight::ClightStmt, ctx: &mut ConversionContext, n
 
 pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> CStmt {
     match stmt {
+        clight::ClightStmt::Seffect(site,body) => CStmt::Effect(*site,Box::new(convert_stmt(body,ctx))),
         clight::ClightStmt::Sskip => CStmt::Empty,
 
         clight::ClightStmt::Sassign(lhs, rhs) => {
@@ -8749,7 +8777,7 @@ fn convert_switch_cases(
 fn switch_body_exits(stmt: &CStmt) -> bool {
     match stmt {
         CStmt::Goto(_) | CStmt::Break | CStmt::Continue | CStmt::Return(_) => true,
-        CStmt::Labeled(_, inner) => switch_body_exits(inner),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => switch_body_exits(inner),
         CStmt::Sequence(stmts) => stmts.last().map_or(false, switch_body_exits),
         CStmt::Block(items) => items
             .iter()
@@ -8888,7 +8916,7 @@ fn clight_stmt_exits(stmt: &clight::ClightStmt) -> bool {
         | clight::ClightStmt::Sbreak
         | clight::ClightStmt::Scontinue
         | clight::ClightStmt::Sreturn(_) => true,
-        clight::ClightStmt::Slabel(_, inner) => clight_stmt_exits(inner),
+        (clight::ClightStmt::Slabel(_, inner) | clight::ClightStmt::Seffect(_, inner)) => clight_stmt_exits(inner),
         clight::ClightStmt::Ssequence(stmts) => stmts.last().map_or(false, clight_stmt_exits),
         _ => false,
     }
@@ -8920,7 +8948,7 @@ fn collect_clight_goto_targets(
                 collect_clight_goto_targets(stmt, targets);
             }
         }
-        clight::ClightStmt::Slabel(_, inner) => {
+        (clight::ClightStmt::Slabel(_, inner) | clight::ClightStmt::Seffect(_, inner)) => {
             collect_clight_goto_targets(inner, targets);
         }
         _ => {}
@@ -8965,7 +8993,7 @@ fn contains_structured_clight_loop(stmt: &clight::ClightStmt) -> bool {
         clight::ClightStmt::Sswitch(_, cases) => cases
             .iter()
             .any(|(_, stmt)| contains_structured_clight_loop(stmt)),
-        clight::ClightStmt::Slabel(_, inner) => contains_structured_clight_loop(inner),
+        (clight::ClightStmt::Slabel(_, inner) | clight::ClightStmt::Seffect(_, inner)) => contains_structured_clight_loop(inner),
         _ => false,
     }
 }
@@ -11467,7 +11495,7 @@ mod ordering_tests {
                 | CStmt::DoWhile(body, _)
                 | CStmt::For(_, _, _, body)
                 | CStmt::Switch(_, body)
-                | CStmt::Labeled(_, body) => contains_return(body),
+                | (CStmt::Labeled(_, body) | CStmt::Effect(_, body)) => contains_return(body),
                 _ => false,
             }
         }
@@ -11583,7 +11611,7 @@ fn simplify_xor_self_in_stmt(stmt: &mut CStmt) {
                 simplify_xor_self_in_stmt(s);
             }
         }
-        CStmt::Labeled(_, inner) => simplify_xor_self_in_stmt(inner),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => simplify_xor_self_in_stmt(inner),
         _ => {}
     }
 }
@@ -11623,7 +11651,7 @@ fn strip_dead_expr_stmts(stmt: &mut CStmt) {
         CStmt::While(_, body) | CStmt::DoWhile(body, _) => strip_dead_expr_stmts(body),
         CStmt::For(_, _, _, body) => strip_dead_expr_stmts(body),
         CStmt::Switch(_, body) => strip_dead_expr_stmts(body),
-        CStmt::Labeled(_, inner) => strip_dead_expr_stmts(inner),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => strip_dead_expr_stmts(inner),
         _ => {}
     }
 }
@@ -11866,7 +11894,7 @@ fn count_leaf_stmts(stmt: &CStmt) -> usize {
             count_leaf_stmts(body)
         }
         CStmt::Switch(_, body) => count_leaf_stmts(body),
-        CStmt::Labeled(_, inner) => count_leaf_stmts(inner),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => count_leaf_stmts(inner),
         CStmt::Empty => 0,
         _ => 1,
     }
@@ -11938,7 +11966,7 @@ fn rewrite_tailcall_gotos_in_stmt(
                 }
             }
         }
-        CStmt::Labeled(_, inner) => rewrite_tailcall_gotos_in_stmt(inner, func_names, current_func),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => rewrite_tailcall_gotos_in_stmt(inner, func_names, current_func),
         _ => {}
     }
 }
@@ -11984,7 +12012,7 @@ fn collect_called_names_in_stmt(stmt: &CStmt, names: &mut HashSet<String>) {
                 }
             }
         }
-        CStmt::Labeled(_, inner) => collect_called_names_in_stmt(inner, names),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_called_names_in_stmt(inner, names),
         _ => {}
     }
 }
@@ -12338,7 +12366,7 @@ fn collect_call_arg_evidence_in_stmt(
                 }
             }
         }
-        CStmt::Labeled(_, inner) => collect_call_arg_evidence_in_stmt(inner, env, sites),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_call_arg_evidence_in_stmt(inner, env, sites),
         _ => {}
     }
 }
@@ -12455,6 +12483,7 @@ fn count_labels_in_stmt(
     rename_map: &mut HashMap<(String, usize), String>,
 ) {
     match stmt {
+        CStmt::Effect(_, inner) => count_labels_in_stmt(inner, counts, rename_map),
         CStmt::Labeled(Label::Named(name), inner) => {
             let occ = counts.entry(name.clone()).or_insert(0);
             *occ += 1;
@@ -12573,6 +12602,12 @@ fn rename_duplicate_labels_in_stmt(
                 inner, rename_map, occurrence,
             )),
         ),
+        CStmt::Effect(label, inner) => CStmt::Effect(
+            label.clone(),
+            Box::new(rename_duplicate_labels_in_stmt(
+                inner, rename_map, occurrence,
+            )),
+        ),
         _ => stmt.clone(),
     }
 }
@@ -12651,6 +12686,10 @@ fn remove_gotos_to_missing_labels(stmt: &CStmt, missing: &HashSet<String>) -> CS
             l.clone(),
             Box::new(remove_gotos_to_missing_labels(inner, missing)),
         ),
+        CStmt::Effect(l, inner) => CStmt::Effect(
+            l.clone(),
+            Box::new(remove_gotos_to_missing_labels(inner, missing)),
+        ),
         other => other.clone(),
     }
 }
@@ -12698,6 +12737,9 @@ fn forward_return_value(stmt: &CStmt) -> CStmt {
         ),
         CStmt::Labeled(l, inner) => {
             CStmt::Labeled(l.clone(), Box::new(forward_return_value(inner)))
+        }
+        CStmt::Effect(l, inner) => {
+            CStmt::Effect(l.clone(), Box::new(forward_return_value(inner)))
         }
         _ => stmt.clone(),
     }

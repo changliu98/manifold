@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "suite": "manifold-register-view-transforms",
+  "cases": [
+    {
+      "name": "byte_extension_is_not_a_register_copy",
+      "source": "cases/register_extension.c",
+      "description": "An in-place byte zero-extension clears the rest of the architectural register even though both views share the same Mreg.",
+      "cflags": ["-O2"],
+      "runs": [
+        {"name": "high_bit", "args": [], "expected": {"returncode": 0, "stdout": "", "stderr": ""}},
+        {"name": "low_bit", "args": ["x"], "expected": {"returncode": 0, "stdout": "", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "byte_to_quad_extension_uses_the_source_view",
+      "source": "cases/register_extension.c",
+      "description": "A byte-to-64-bit zero-extension may not be replaced by a 32-bit conversion.",
+      "cflags": ["-O2", "-DQUAD_RESULT=1"],
+      "runs": [
+        {"name": "high_bit", "args": [], "expected": {"returncode": 0, "stdout": "", "stderr": ""}},
+        {"name": "low_bit", "args": ["x"], "expected": {"returncode": 0, "stdout": "", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "word_to_quad_extension_uses_the_source_view",
+      "source": "cases/register_extension.c",
+      "description": "A word-to-64-bit zero-extension may not be replaced by a 32-bit conversion.",
+      "cflags": ["-O2", "-DWORD_SOURCE=1", "-DQUAD_RESULT=1"],
+      "runs": [
+        {"name": "high_bit", "args": [], "expected": {"returncode": 0, "stdout": "", "stderr": ""}},
+        {"name": "low_bit", "args": ["x"], "expected": {"returncode": 0, "stdout": "", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "word_extension_is_not_a_register_copy",
+      "source": "cases/register_extension.c",
+      "description": "A word zero-extension is a value transform, not an identity alias between overlapping register views.",
+      "cflags": ["-O2", "-DWORD_SOURCE=1"],
+      "runs": [
+        {"name": "high_bit", "args": [], "expected": {"returncode": 0, "stdout": "", "stderr": ""}},
+        {"name": "low_bit", "args": ["x"], "expected": {"returncode": 0, "stdout": "", "stderr": ""}}
+      ]
+    }
+  ]
+}

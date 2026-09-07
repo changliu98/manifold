@@ -877,6 +877,129 @@ ascent_par! {
     relation ptest(Address, Symbol, Symbol);
     // osel_compare_site(cmov_addr, compare_addr): from asm_pass; the compare whose flags this cmov consumes, so condition operands resolve at the compare site rather than the (possibly register-reusing) cmov site.
     relation osel_compare_site(Address, Address);
+    relation effect_flag_select(Address, crate::decompile::effects::flags::FlagSelect, Mreg, Mreg);
+    relation effect_capture(Address, Symbol, usize);
+    relation effect_capture_value(Address, RTLReg);
+    relation effect_rtl_binding(Address, crate::decompile::effects::flags::FlagSelect, Args, RTLReg);
+    relation effect_capture_address(Address, Addressing, Args, usize);
+    relation effect_frame_address_value(Address, Node, i64, RTLReg);
+    // A pass may fold across these boundaries only with a transfer contract.
+    // Until that schema exists, preserve the verifier's input vocabulary.
+    relation effect_value_boundary(Node);
+    relation settled_bp_frame_base(Address, Node, i64);
+    effect_value_boundary(consumer), effect_value_boundary(spec.capture) <--
+        effect_flag_select(consumer,spec,_,_);
+    #[local] relation effect_scope_function(Address);
+    effect_scope_function(function) <-- effect_flag_select(node,_,_,_), instr_in_function(node,function);
+    effect_frame_address_value(*function,*definition,*offset,*value) <--
+        effect_scope_function(function),
+        exact_stack_addr_lea_result(function,definition,_,offset,width,value), abi_pointer_size(width);
+    #[local] relation effect_bp_object(Address, i64, usize);
+    effect_bp_object(*capture, *disp, *width) <--
+        effect_capture(capture, memory, width),
+        op_indirect(memory, segment, base, index, _, disp, _),
+        if *segment == "NONE" || segment.is_empty(),
+        if Mreg::x86(*base) == Mreg::BP, if *index == "NONE" || index.is_empty(),
+        instr_in_function(capture, function), !func_sets_frame_pointer(function);
+
+    // Decoded frame coordinates are authoritative. No escaped C object is
+    // required in order to retain a machine read's obligation.
+    effect_capture_address(*capture, Addressing::Ainstack(*offset), Arc::new(vec![]), *width) <--
+        effect_capture(capture, _, width),
+        !effect_bp_object(capture, _, _),
+        frame_stack_read_bytes(_, capture, offset, width),
+        if matches!(*width, 1 | 2 | 4 | 8);
+
+    effect_capture_address(*capture, Addressing::Ainstack(*disp), Arc::new(vec![]), *width) <--
+        effect_capture(capture,memory,width),
+        op_indirect(memory,segment,base,index,_,disp,width),
+        if *segment=="NONE" || segment.is_empty(),
+        if *base=="RBP", if *index=="NONE" || index.is_empty(),
+        instr_in_function(capture,function), settled_bp_frame_base(function,capture,_),
+        if matches!(*width,1|2|4|8);
+
+    #[local] relation effect_capture_mreg(Address, usize, Mreg);
+    effect_capture_mreg(*capture, 0, Mreg::BP) <-- effect_bp_object(capture, _, _);
+    effect_capture_mreg(*capture, position, register) <--
+        effect_capture(capture, memory, _),
+        op_indirect(memory, segment, base, index, scale, disp, _),
+        if !matches!(*base, "RSP" | "ESP" | "RBP" | "EBP" | "RIP" | "EIP"),
+        let result = transl_addressing_rev(build_cmp_addrmode(base, index, *scale, *disp), None),
+        if let Ok((_, registers)) = result,
+        for (position, register) in registers.into_iter().enumerate();
+    ltl_inst_uses_mreg(capture, register) <-- effect_capture_mreg(capture, _, register);
+    reg_xtl(capture, register, value) <--
+        effect_capture_mreg(capture, _, register), reg_def_used(definition, register, capture),
+        !load_overwrites_base(definition, register), reg_xtl(definition, register, value);
+    reg_xtl(capture, register, value) <--
+        effect_capture_mreg(capture, _, register), reg_def_used(definition, register, capture),
+        load_overwrites_base(definition, register), is_def(definition, value), reg_xtl(definition, register, value);
+    #[local] relation effect_capture_arg(Address, usize, RTLReg);
+    effect_capture_arg(capture, position, value) <--
+        effect_capture_mreg(capture, position, register), reg_rtl(capture, register, value);
+    effect_capture_address(*capture, Addressing::Aindexed(*disp), Arc::new(vec![*base]), *width) <--
+        effect_bp_object(capture, disp, width), effect_capture_arg(capture, 0, base),
+        if matches!(*width, 1 | 2 | 4 | 8);
+    // Existing frame aliases carry exact coordinate/dominance evidence. They
+    // are alternative representations of this same read, not extra effects.
+    effect_capture_address(*capture, Addressing::Aindexed(*delta), Arc::new(vec![*base]), *width) <--
+        effect_capture(capture, _, width), escaped_frame_cmp_mem(_, capture, _, width, base, delta, _);
+    effect_capture_address(*capture, Addressing::Ainstack(*offset), Arc::new(vec![]), *width) <--
+        effect_capture(capture, _, width), escaped_scalar_cmp_mem(_, capture, offset, width, _);
+
+    effect_capture_address(*capture, addressing.clone(), args, *width) <--
+        effect_capture(capture, memory, width),
+        op_indirect(memory, segment, base, index, scale, disp, _),
+        if *segment == "NONE" || segment.is_empty(),
+        if !matches!(*base, "RSP" | "ESP" | "RBP" | "EBP" | "RIP" | "EIP"),
+        if matches!(*width, 1 | 2 | 4 | 8),
+        if let Ok((addressing, registers)) = transl_addressing_rev(build_cmp_addrmode(base, index, *scale, *disp), None),
+        agg args = build_call_args(position, value) in effect_capture_arg(capture, position, value),
+        if args.len() == registers.len();
+
+    effect_capture_address(*capture, Addressing::Aglobal(target, 0), Arc::new(vec![]), *width) <--
+        effect_capture(capture, memory, width),
+        op_indirect(memory, segment, base, index, _, disp, _),
+        if *segment == "NONE" || segment.is_empty(),
+        if is_rip(base), if *index == "NONE" || index.is_empty(),
+        if matches!(*width, 1 | 2 | 4 | 8),
+        instruction(capture, size, _, _, _, _, _, _, _, _),
+        let target = (*capture as i64).wrapping_add(*size as i64).wrapping_add(*disp) as Ident;
+
+    effect_capture_value(*capture, fresh_xtl_reg(*capture, Mreg::x86("RTEMP"))) <--
+        effect_capture(capture, _, _);
+    rtl_inst_candidate(*capture, RTLInst::Ibuiltin(name, inputs, BuiltinArg::BA(*value))) <--
+        effect_capture(capture, _, _), !effect_capture_address(capture, _, _, _),
+        effect_capture_value(capture, value),
+        agg inputs = crate::decompile::effects::builtin_inputs(position, operand) in effect_capture_arg(capture, position, operand),
+        let name = crate::decompile::effects::opaque_name(crate::decompile::effects::EffectId { instruction:*capture,slot:0 });
+    rtl_inst_candidate(*capture, RTLInst::Iload(chunk, address.clone(), args.clone(), *value)) <--
+        effect_capture_address(capture, address, args, width),
+        effect_capture_value(capture, value),
+        let chunk = match *width { 1 => MemoryChunk::MInt8Unsigned, 2 => MemoryChunk::MInt16Unsigned,
+            4 => MemoryChunk::MInt32, _ => MemoryChunk::MInt64 };
+
+    // The preserved and taken values use the ordinary two-address SSA split;
+    // the memory operand is captured at the original CMP/TEST, not re-read at
+    // CMOV after intervening stores or address-register assignments.
+    effect_rtl_binding(*consumer, *spec, complete, *destination) <--
+        effect_flag_select(consumer, spec, dst, _),
+        is_def(consumer, raw), reg_xtl(consumer, dst, raw), xtl_canonical(raw, destination),
+        op_args_collected(consumer, args), if args.len() == 2,
+        effect_capture_value(origin, loaded), if *origin == spec.capture,
+        if spec.valid(),
+        let complete = Arc::new(vec![args[0], args[1], *loaded]);
+    rtl_inst_candidate(*consumer, RTLInst::Iop(Operation::Oflagselect(*spec), args.clone(), *destination)) <--
+        effect_rtl_binding(consumer, spec, args, destination);
+
+    // This is a real effectful IR carrier, never a zero/skip fallback. The C
+    // admission check rejects unresolved carriers for executable output.
+    rtl_inst_candidate(*consumer, RTLInst::Ibuiltin(name, inputs, BuiltinArg::BA(*destination))) <--
+        effect_flag_select(consumer, spec, dst, _),
+        !effect_rtl_binding(consumer, _, _, _),
+        is_def(consumer, raw), reg_xtl(consumer, dst, raw), xtl_canonical(raw, destination),
+        agg inputs = crate::decompile::effects::builtin_inputs(position, value) in op_arg_mapping(consumer, position, value),
+        let name = crate::decompile::effects::opaque_name(spec.read_effect());
     // osel_flags_result_site(cmov_addr, arithmetic_addr): from asm_pass; the
     // condition consumes the arithmetic definition, not a later value placed
     // in the same architectural register while flags remain live.
@@ -3676,6 +3799,7 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
         if !mregs.is_empty(),
+        if !matches!(op, Operation::Oflagselect(_)),
         !sp_indexed_lea(addr),
         !setcc_compare_site(addr, _),
         !osel_rip_condition(addr, _, _),
@@ -3688,6 +3812,7 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
         if !mregs.is_empty(),
+        if !matches!(op, Operation::Oflagselect(_)),
         !sp_indexed_lea(addr),
         !setcc_compare_site(addr, _),
         !osel_rip_condition(addr, _, _),
@@ -3699,6 +3824,7 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
         if !mregs.is_empty(),
+        if !matches!(op, Operation::Oflagselect(_)),
         !sp_indexed_lea(addr),
         !osel_rip_condition(addr, _, _),
         lop_overwrites_input(addr, dst_reg),
@@ -3772,7 +3898,8 @@ ascent_par! {
     // established coalesced representation.
     relation lop_overwrites_input(Node, Mreg);
     lop_overwrites_input(addr, *dst_reg) <--
-        ltl_inst(addr, ?LTLInst::Lop(Operation::Osel(_, _), mregs, dst_reg)),
+        ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
+        if matches!(op, Operation::Osel(_, _) | Operation::Oflagselect(_)),
         for src in mregs.iter(),
         if src == dst_reg;
 
@@ -8957,46 +9084,43 @@ ascent_par! {
         instr_in_function(addr, func),
         !block_last_def(addr, _, r);
 
-    // Loop-induction param entry value: recompute the taint over FORWARD edges only, since tainting via the back-edge drops the param's first-iteration value and the walker is read uninitialized.
-    #[local] relation block_back_edge(Address, Address);
-    block_back_edge(blk, succ) <--
-        asm_block_next(blk, succ),
-        instr_in_function(blk, func),
-        settled_block_dom_set(func, blk, doms),
-        if doms.0.contains(succ);
+    // An incoming value is one input of a value join whenever SOME path from
+    // entry reaches the use without redefining the register. MUST liveness
+    // above remains the rule for ABI forwarding; it cannot initialize phis.
+    // This lattice handles irreducible/multiple-entry loops without guessing
+    // which CFG edge is a backedge or comparing instruction order.
+    #[local] lattice arg_reg_param_may_in(Address, Address, Mreg, Set<()>);
+    arg_reg_param_may_in(*func,*entry,*reg,Set::singleton(())) <--
+        arg_reg_used_somewhere(func,reg), is_arg_reg(reg), func_entry_block(func,entry);
+    arg_reg_param_may_in(*func,*successor,*reg,state.clone()) <--
+        arg_reg_param_may_in(func,block,reg,state),
+        !asm_defined_in_block(block,reg),
+        asm_block_next(block,successor), instr_in_function(successor,func);
+    #[local] relation arg_reg_param_may_at(Address, Address, Mreg);
+    arg_reg_param_may_at(*func,*node,*reg) <--
+        arg_reg_param_may_in(func,block,reg,_),
+        code_in_block(node,block), instr_in_function(node,func),
+        reg_use(node,reg), !trim_instruction(node), !block_last_def(node,_,reg),
+        !ltl_self_xor_zero(node,reg);
 
-    #[local] relation arg_reg_param_tainted_fwd(Address, Address, Mreg);
-    arg_reg_param_tainted_fwd(*func, *succ, *r) <--
-        arg_reg_param_reach(func, blk, r),
-        asm_defined_in_block(blk, r),
-        asm_block_next(blk, succ),
-        !block_back_edge(blk, succ),
-        instr_in_function(succ, func);
-    arg_reg_param_tainted_fwd(*func, *succ, *r) <--
-        arg_reg_param_tainted_fwd(func, blk, r),
-        asm_block_next(blk, succ),
-        !block_back_edge(blk, succ),
-        instr_in_function(succ, func);
+    reg_def_used(*func,*reg,*node) <-- arg_reg_param_may_at(func,node,reg);
 
-    #[local] relation arg_reg_param_live_block_fwd(Address, Address, Mreg);
-    arg_reg_param_live_block_fwd(*func, *blk, *r) <--
-        arg_reg_param_reach(func, blk, r),
-        !arg_reg_param_tainted_fwd(func, blk, r);
-
-    #[local] relation arg_reg_param_live_at_fwd(Address, Address, Mreg);
-    arg_reg_param_live_at_fwd(*func, *addr, *r) <--
-        arg_reg_param_live_block_fwd(func, blk, r),
-        code_in_block(addr, blk),
-        instr_in_function(addr, func),
-        !block_last_def(addr, _, r);
-
-    reg_def_used(*func_start, *mreg, *use_addr) <--
-        arg_reg_param_live_at_fwd(func_start, use_addr, mreg),
-        is_arg_reg(mreg),
-        reg_use(use_addr, mreg),
-        !trim_instruction(use_addr),
-        // Only the genuine loop delta: a use the MUST-live path drops because the param is tainted by its own back-edge; for non-loop uses arg_reg_param_live_at already binds the param.
-        !arg_reg_param_live_at(func_start, use_addr, mreg);
+    // Entry parameters have no ordinary is_def fact. Join their use-side
+    // identities explicitly; overwrite/load shadows must remain separate from
+    // the new value defined by that same machine instruction.
+    alias_edge(*parameter,*input) <--
+        arg_reg_param_may_at(func,node,reg), func_param_validated(func,reg),
+        reg_xtl(func,reg,parameter), reg_input_id_at_use(node,reg,input),
+        !load_overwrites_base(node,reg), !lop_overwrites_input(node,reg),
+        if parameter!=input;
+    alias_edge(*parameter,*input) <--
+        arg_reg_param_may_at(func,node,reg), func_param_validated(func,reg),
+        reg_xtl(func,reg,parameter), load_overwrite_use_id(node,reg,input),
+        if parameter!=input;
+    alias_edge(*parameter,*input) <--
+        arg_reg_param_may_at(func,node,reg), func_param_validated(func,reg),
+        reg_xtl(func,reg,parameter), lop_overwrite_use_id(node,reg,input),
+        if parameter!=input;
 
     alias_edge(def_id, use_id) <--
         reg_def_used(defaddr, mreg, useaddr),
@@ -24841,6 +24965,47 @@ mod tests {
                     access | (1u64 << 62),
                     RTLInst::Iop(Operation::Omul, Arc::new(vec![input, temp]), input)
                 )));
+        });
+    }
+
+    #[test]
+    fn irreducible_loop_keeps_the_incoming_value_without_claiming_must_liveness() {
+        on_large_stack(|| {
+            for killed_at_entry in [false,true] {
+                let mut prog = RTLPassProgram::default();
+                let (function,left,read,step) = (0x500_u64,0x900_u64,0x30_u64,0x700_u64);
+                prog.abi_pointer_size.push((8,));
+                prog.is_arg_reg.push((Mreg::DI,));
+                prog.func_param_validated.push((function,Mreg::DI));
+                for node in [function,left,read,step] {
+                    prog.instr_in_function.push((node,function));
+                    prog.code_in_block.push((node,node));
+                    prog.block_in_function.push((node,function));
+                    prog.block_boundaries.push((node,node,node+1));
+                }
+                // Neither entry to the cycle dominates the other: removing
+                // dominance backedges cannot recover its initial parameter.
+                for (from,to) in [(function,left),(function,read),(left,read),(read,step),(step,left)] {
+                    prog.ddisasm_cfg_edge.push((from,to,"branch"));
+                }
+                prog.reg_use.extend([(read,Mreg::DI),(step,Mreg::DI)]);
+                prog.reg_def.push((step,Mreg::DI));
+                prog.ltl_inst.push((read,LTLInst::Lload(MemoryChunk::MInt8Unsigned,Addressing::Aindexed(0),Arc::new(vec![Mreg::DI]),Mreg::AX)));
+                prog.ltl_inst.push((step,LTLInst::Lop(Operation::Oaddlimm(1),Arc::new(vec![Mreg::DI]),Mreg::DI)));
+                if killed_at_entry {
+                    prog.reg_def.push((function,Mreg::DI));
+                    prog.ltl_inst.push((function,LTLInst::Lop(Operation::Olongconst(0),Arc::new(vec![]),Mreg::DI)));
+                }
+                prog.run();
+                assert_eq!(prog.arg_reg_param_may_at.iter().any(|r|r==&(function,read,Mreg::DI)),!killed_at_entry);
+                assert!(!prog.arg_reg_param_live_at.iter().any(|r|r==&(function,read,Mreg::DI)));
+                if !killed_at_entry {
+                    let parameter = fresh_xtl_reg(function,Mreg::DI);
+                    let canonical = prog.xtl_canonical.iter().find_map(|&(raw,canonical)|
+                        (raw==parameter).then_some(canonical)).unwrap();
+                    assert!(prog.reg_rtl.iter().any(|r|r==&(read,Mreg::DI,canonical)));
+                }
+            }
         });
     }
 

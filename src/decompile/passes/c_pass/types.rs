@@ -605,6 +605,9 @@ pub enum Label {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CStmt {
     Empty,
+    /// Non-printing occurrence identity. Unlike an origin set, this marks one
+    /// selected statement and survives supported AST transformations.
+    Effect(crate::decompile::effects::EffectSite, Box<CStmt>),
 
     Expr(CExpr),
 
@@ -985,6 +988,7 @@ pub trait StmtTransform: ExprTransform {
     fn walk_stmt(&mut self, stmt: CStmt) -> CStmt {
         match stmt {
             CStmt::Empty => CStmt::Empty,
+            CStmt::Effect(site, body) => CStmt::Effect(site, Box::new(StmtTransform::transform_stmt(self,*body))),
             CStmt::Expr(e) => CStmt::Expr(self.transform_expr(e)),
             CStmt::Block(items) => CStmt::Block(
                 items

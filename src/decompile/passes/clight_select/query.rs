@@ -1331,7 +1331,7 @@ fn collect_call_evidence_stmt(
                 collect_call_evidence_stmt(stmt, ident_names, out);
             }
         }
-        ClightStmt::Slabel(_, stmt) => collect_call_evidence_stmt(stmt, ident_names, out),
+        (ClightStmt::Slabel(_, stmt) | ClightStmt::Seffect(_, stmt)) => collect_call_evidence_stmt(stmt, ident_names, out),
         _ => {}
     }
 }
@@ -2807,7 +2807,7 @@ pub fn extract_functions(
             }
             let is_bad = |s: &ClightStmt| -> bool {
                 let inner = match s {
-                    ClightStmt::Slabel(_, b) => b.as_ref(),
+                    (ClightStmt::Slabel(_, b) | ClightStmt::Seffect(_, b)) => b.as_ref(),
                     other => other,
                 };
                 if let ClightStmt::Sset(id, rhs) = inner {
@@ -4373,7 +4373,7 @@ fn clight_stmt_stats(stmt: &ClightStmt, acc: &mut (u32, u32, u32)) {
                 clight_stmt_stats(s, acc);
             }
         }
-        ClightStmt::Slabel(_, s) => clight_stmt_stats(s, acc),
+        (ClightStmt::Slabel(_, s) | ClightStmt::Seffect(_, s)) => clight_stmt_stats(s, acc),
     }
 }
 
@@ -4695,6 +4695,7 @@ fn cmp_clight_stmt(a: &ClightStmt, b: &ClightStmt) -> Ordering {
             S::Sswitch(_, _) => 11,
             S::Slabel(_, _) => 12,
             S::Sgoto(_) => 13,
+            S::Seffect(_,_) => 14,
         }
     };
     rank(a).cmp(&rank(b)).then_with(|| match (a, b) {
@@ -5532,7 +5533,7 @@ pub(crate) fn scan_field_ptr_evidence(
                 scan_field_ptr_evidence(s, ptr_regs, callee_sigs, name_to_ident, out);
             }
         }
-        ClightStmt::Slabel(_, inner) => {
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => {
             scan_field_ptr_evidence(inner, ptr_regs, callee_sigs, name_to_ident, out)
         }
         ClightStmt::Sswitch(_, cases) => {
@@ -5585,7 +5586,7 @@ pub(crate) fn widen_float_regs_by_defs<'a>(
                 walk(a, float_regs, grew);
                 walk(b, float_regs, grew);
             }
-            ClightStmt::Slabel(_, inner) => walk(inner, float_regs, grew),
+            (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => walk(inner, float_regs, grew),
             ClightStmt::Sswitch(_, cases) => {
                 for (_, s) in cases {
                     walk(s, float_regs, grew);
@@ -5668,7 +5669,7 @@ pub(crate) fn widen_ptr_regs_by_defs<'a>(
                 walk(a, ptr_regs, evidenced, grew);
                 walk(b, ptr_regs, evidenced, grew);
             }
-            ClightStmt::Slabel(_, inner) => walk(inner, ptr_regs, evidenced, grew),
+            (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => walk(inner, ptr_regs, evidenced, grew),
             ClightStmt::Sswitch(_, cases) => {
                 for (_, s) in cases {
                     walk(s, ptr_regs, evidenced, grew);
@@ -5820,7 +5821,7 @@ pub(crate) fn scan_field_ptr_conflicts(
                 scan_field_ptr_conflicts(s, ptr_regs, float_regs, callee_sigs, name_to_ident, out);
             }
         }
-        ClightStmt::Slabel(_, inner) => {
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => {
             scan_field_ptr_conflicts(inner, ptr_regs, float_regs, callee_sigs, name_to_ident, out)
         }
         ClightStmt::Sswitch(e, cases) => {
@@ -5920,7 +5921,7 @@ fn collect_field_defaults_stmt(
                 collect_field_defaults_stmt(st, out);
             }
         }
-        ClightStmt::Slabel(_, inner) => collect_field_defaults_stmt(inner, out),
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => collect_field_defaults_stmt(inner, out),
         _ => {}
     }
 }
@@ -6095,7 +6096,7 @@ pub fn collect_stmt_regs(stmt: &ClightStmt) -> Vec<RTLReg> {
                 collect_stmt_regs_inner(a, regs);
                 collect_stmt_regs_inner(b, regs);
             }
-            ClightStmt::Slabel(_, inner) => collect_stmt_regs_inner(inner, regs),
+            (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => collect_stmt_regs_inner(inner, regs),
             ClightStmt::Sswitch(e, cases) => {
                 collect_expr_regs(e, regs);
                 for (_, s) in cases {

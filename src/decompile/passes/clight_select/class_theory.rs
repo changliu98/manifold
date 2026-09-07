@@ -96,7 +96,7 @@ fn stmt_pins(s: &ClightStmt, out: &mut Vec<(Ident, bool)>) {
             stmt_pins(b, out);
         }
         ClightStmt::Ssequence(items) => items.iter().for_each(|i| stmt_pins(i, out)),
-        ClightStmt::Slabel(_, inner) => stmt_pins(inner, out),
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => stmt_pins(inner, out),
         ClightStmt::Sloop(a, b) => {
             stmt_pins(a, out);
             stmt_pins(b, out);

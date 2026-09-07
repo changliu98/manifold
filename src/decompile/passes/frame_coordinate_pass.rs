@@ -86,6 +86,7 @@ ascent_par! {
     relation reg_def(Address, Mreg);
     relation settled_block_dom_set(Address, Address, Set<Address>);
     relation stack_delta(Address, i64);
+    relation stack_base_move(Address, Symbol, Symbol);
 
     #[local] relation reachable_frame_node(Address, Address);
     reachable_frame_node(*func, *node) <--
@@ -235,6 +236,34 @@ ascent_par! {
     // update must make the header unknown instead of certifying iteration
     // one's address as a fixed local. Balanced cycles remain exact naturally.
     #[local] lattice frame_stack_offset(Address, Address, Dual<Set<i64>>);
+
+    // A frame pointer is a saved stack VALUE, not a function-wide mnemonic
+    // heuristic. Track its entry-relative coordinate at each CFG point. A
+    // bypass, partial/full redefinition or conflicting incoming base kills it.
+    #[local] relation frame_pointer_setup(Address);
+    frame_pointer_setup(node) <--
+        stack_base_move(node, src, dst), abi_pointer_size(width),
+        if Mreg::x86(*src)==Mreg::SP && Mreg::x86(*dst)==Mreg::BP,
+        if x86_gpr_view_width(src)==Some(*width) && x86_gpr_view_width(dst)==Some(*width);
+    #[local] relation frame_pointer_function(Address);
+    frame_pointer_function(func) <-- frame_pointer_setup(node), instr_in_function(node,func);
+    #[local] relation frame_pointer_kill(Address);
+    frame_pointer_kill(node) <-- reg_def(node,reg), if *reg==Mreg::BP;
+    frame_pointer_kill(node) <-- stack_base_move(node,_,dst), if Mreg::x86(*dst)==Mreg::BP;
+    frame_pointer_kill(node) <-- ppop(node,operand), op_register(operand,name), if Mreg::x86(*name)==Mreg::BP;
+    frame_pointer_kill(node) <-- instruction(node,_,_,"LEAVE",_,_,_,_,_,_);
+    #[local] lattice frame_pointer_offset(Address, Address, Dual<Set<i64>>);
+    frame_pointer_offset(*func,*entry,Dual(Set::default())) <--
+        frame_pointer_function(func), reachable_frame_node(func,entry), if func==entry;
+    frame_pointer_offset(*func,*succ,offset.clone()) <--
+        frame_stack_offset(func,node,offset), frame_pointer_setup(node),
+        frame_cfg_step(node,succ), reachable_frame_node(func,node), reachable_frame_node(func,succ);
+    frame_pointer_offset(*func,*succ,offset.clone()) <--
+        frame_pointer_offset(func,node,offset), !frame_pointer_kill(node),
+        frame_cfg_step(node,succ), reachable_frame_node(func,node), reachable_frame_node(func,succ);
+    frame_pointer_offset(*func,*succ,Dual(Set::default())) <--
+        frame_pointer_offset(func,node,_), frame_pointer_kill(node), !frame_pointer_setup(node),
+        frame_cfg_step(node,succ), reachable_frame_node(func,node), reachable_frame_node(func,succ);
 
     // `stack_delta` by itself is not sufficient proof: POP %rsp both advances
     // the old stack and replaces SP with the popped value. Admit only raw forms
@@ -495,6 +524,20 @@ impl IRPass for FrameCoordinatePass {
         prog.swap_db_fields(db);
         prog.run();
 
+        // Consume only settled MUST state. The legacy frame-slot namespace has
+        // one BP origin per function; do not conflate different saved bases.
+        let mut bp_points = Vec::new();
+        let mut bp_origins = std::collections::BTreeMap::<Address,std::collections::BTreeSet<i64>>::new();
+        for row in prog.frame_pointer_offset.iter() {
+            let row = row.read().expect("frame-pointer coordinate lock poisoned");
+            if let Some(offset) = exact_stack_offset(&row.2.0) {
+                bp_points.push((row.0,row.1,offset));
+                bp_origins.entry(row.0).or_default().insert(offset);
+            }
+        }
+        bp_points.retain(|(function,_,_)| bp_origins[function].len()==1);
+        bp_points.sort_unstable();
+
         // Read each final lattice row exactly once. An empty/multi-member Set
         // is ambiguous and deliberately publishes no exact shift.
         let mut state_points = std::collections::BTreeSet::new();
@@ -686,6 +729,7 @@ impl IRPass for FrameCoordinatePass {
         }
 
         prog.swap_db_fields(db);
+        db.rel_set("settled_bp_frame_base",bp_points.into_iter().collect::<ascent::boxcar::Vec<_>>());
         let entry_relation = ascent::boxcar::Vec::new();
         for fact in settled_entry_offsets {
             entry_relation.push(fact);
@@ -706,6 +750,7 @@ impl IRPass for FrameCoordinatePass {
         &[
             "settled_sp_entry_offset",
             "settled_sp_frame_shift",
+            "settled_bp_frame_base",
             "fixed_stack_probe_allocation",
         ]
     }
@@ -718,6 +763,34 @@ mod tests {
     use crate::decompile::passes::pass::IRPass;
     use crate::mreg::Mreg;
     use ascent::lattice::set::Set;
+
+    #[test]
+    fn frame_pointer_proof_is_point_keyed_and_survives_only_stack_pointer_changes() {
+        for variant in 0..6 {
+            let (entry,setup,change,read) = (500_u64,900_u64,700_u64,30_u64);
+            let mut db = DecompileDB::default();
+            db.rel_push("abi_pointer_size",(8_i64,));
+            for node in [entry,setup,change,read] {
+                db.rel_push("instr_in_function",(node,entry));
+                db.rel_push("code_in_block",(node,node));
+                db.rel_push("settled_block_dom_set",(entry,node,Set([entry,node].into_iter().collect())));
+            }
+            for (from,to) in [(entry,setup),(setup,change),(change,read)] {
+                db.rel_push("ddisasm_cfg_edge",(from,to,"branch"));
+            }
+            if variant==1 {db.rel_push("ddisasm_cfg_edge",(entry,read,"branch"));}
+            if variant==2 {db.rel_push("reg_def",(change,Mreg::BP));}
+            if variant==3 {db.rel_push("reg_def",(entry,Mreg::SP));}
+            else {db.rel_push("decoded_stack_pointer_delta",(entry,-8_i64));}
+            if variant==5 {db.rel_push("reg_def",(change,Mreg::SP));}
+            let (source,destination) = if variant==4 {("ESP","EBP")} else {("RSP","RBP")};
+            db.rel_push("stack_base_move",(setup,source,destination));
+            FrameCoordinatePass.run(&mut db);
+            let known = db.rel_iter::<(u64,u64,i64)>("settled_bp_frame_base")
+                .any(|row| *row==(entry,read,-8));
+            assert_eq!(known,matches!(variant,0|5),"variant {variant}");
+        }
+    }
 
     #[test]
     fn final_stack_state_rejects_forward_ambiguity() {

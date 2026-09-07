@@ -486,6 +486,7 @@ impl Printer {
                 self.writeln(";");
             }
 
+            CStmt::Effect(_, body) => self.print_stmt(body),
             CStmt::Labeled(label, body) => match label {
                 // Goto targets conventionally sit at column 0.
                 Label::Named(name) => {
@@ -624,7 +625,7 @@ impl Printer {
                     if let Some(last) = items.last() {
                         let should_strip = match last {
                             CBlockItem::Stmt(CStmt::Return(None)) => true,
-                            CBlockItem::Stmt(CStmt::Labeled(_, inner)) => {
+                            CBlockItem::Stmt((CStmt::Labeled(_, inner) | CStmt::Effect(_, inner))) => {
                                 matches!(**inner, CStmt::Return(None))
                             }
                             _ => false,
@@ -1211,7 +1212,7 @@ fn collect_called_names_stmt(stmt: &CStmt, names: &mut CallSites) {
                 }
             }
         }
-        CStmt::Labeled(_, inner) => collect_called_names_stmt(inner, names),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_called_names_stmt(inner, names),
         CStmt::Sequence(stmts) => {
             for s in stmts {
                 collect_called_names_stmt(s, names);

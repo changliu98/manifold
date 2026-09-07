@@ -296,6 +296,13 @@ fn fold_ssequence(stmts: &[Value]) -> Value {
 
 fn serialize_stmt(stmt: &ClightStmt, id_to_name: &HashMap<usize, String>) -> Value {
     match stmt {
+        ClightStmt::Seffect(site,body) => {
+            let mut value=serialize_stmt(body,id_to_name);
+            if let Some(fields)=value.as_object_mut() {
+                fields.insert("effect_origin".into(),json!({"function":site.function,"instruction":site.node,"epoch":site.epoch,"candidate":site.alternative}));
+            }
+            value
+        }
         ClightStmt::Sskip => json!({"tag": "Sskip"}),
 
         ClightStmt::Sassign(lhs, rhs) => json!({
@@ -931,7 +938,7 @@ fn collect_called_functions(stmt: &ClightStmt, names: &mut std::collections::Has
             collect_called_functions(s1, names);
             collect_called_functions(s2, names);
         }
-        ClightStmt::Slabel(_, s) => collect_called_functions(s, names),
+        (ClightStmt::Slabel(_, s) | ClightStmt::Seffect(_, s)) => collect_called_functions(s, names),
         ClightStmt::Sswitch(_, cases) => {
             for (_, s) in cases {
                 collect_called_functions(s, names);

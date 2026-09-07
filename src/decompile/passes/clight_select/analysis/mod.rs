@@ -8,6 +8,7 @@
 
 pub(crate) mod c_types;
 pub(crate) mod constraints;
+pub(crate) mod completeness;
 pub(crate) mod refinement;
 mod semantics;
 pub(crate) mod storage;
@@ -103,6 +104,11 @@ pub(crate) trait Analysis: Sync {
     /// The final trees have been installed on the blackboard. Audit only;
     /// representation changes must still request an upstream inference epoch.
     fn audit_selection(&self, _db: &mut DecompileDB) {}
+    /// Final C admission is owned by the same module as candidate admission.
+    /// This audit records evidence; it must not repair the selected program.
+    fn audit_emission(&self, _db: &mut DecompileDB) {}
+    /// Preserve precise selected origins before tree assembly absorbs nodes.
+    fn retain_origins(&self, _function: &FunctionData, _indices: &HashMap<Node,Option<usize>>, _statements: &mut HashMap<Node,ClightStmt>) {}
 }
 
 pub(crate) trait PreparedAnalysis {
@@ -142,7 +148,7 @@ pub(crate) struct Stack<'a> {
 
 // Preparation: storage evidence before value/word candidates. Constraint
 // construction: semantic guards before recursive C constraints, unchanged.
-static PRODUCTION: &[&dyn Analysis] = &[&storage::Storage, &semantics::Semantics, &c_types::CTypes];
+static PRODUCTION: &[&dyn Analysis] = &[&storage::Storage, &semantics::Semantics, &completeness::Completeness, &c_types::CTypes];
 
 impl<'a> Stack<'a> {
     pub(crate) fn new(analyses: &'a [&'a dyn Analysis]) -> Self {
@@ -210,6 +216,11 @@ impl<'a> Stack<'a> {
     pub(crate) fn audit_selection(&self, db: &mut DecompileDB) {
         for analysis in self.modules() {
             analysis.audit_selection(db);
+        }
+    }
+    pub(crate) fn audit_emission(&self, db: &mut DecompileDB) {
+        for analysis in self.modules() {
+            analysis.audit_emission(db);
         }
     }
 }

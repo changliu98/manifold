@@ -5359,6 +5359,45 @@ ascent_par! {
         preg_of(mreg, preg_of_r);
 
     #[local] relation cmp_cmov_link(Address, Address);
+    // Machine-rooted compound effects. The read obligation exists before
+    // any Mach candidate; RTL must complete it or retain an opaque carrier.
+    relation effect_flag_select(Address, crate::decompile::effects::flags::FlagSelect, Mreg, Mreg);
+    relation effect_capture(Address, Symbol, usize);
+    #[local] relation effect_flag_source(Address, crate::decompile::effects::flags::Producer, Symbol, i64, usize);
+    effect_flag_source(*origin, crate::decompile::effects::flags::Producer::Compare, *memory, *imm, *width) <--
+        pcmp(origin, memory, immediate), op_indirect(memory, _, _, _, _, _, width),
+        op_immediate(immediate, imm, _);
+    effect_flag_source(*origin, crate::decompile::effects::flags::Producer::Test, *memory, *imm, *width) <--
+        ptest(origin, memory, immediate), op_indirect(memory, _, _, _, _, _, width),
+        op_immediate(immediate, imm, _);
+    effect_flag_source(*origin, crate::decompile::effects::flags::Producer::Test, *memory, *imm, *width) <--
+        ptest(origin, immediate, memory), op_indirect(memory, _, _, _, _, _, width),
+        op_immediate(immediate, imm, _);
+
+    effect_flag_select(*consumer, spec, Mreg::x86(*dst_name), Mreg::x86(*src_name)) <--
+        arch_bit(64),
+        effect_flag_source(origin, producer, memory, immediate, width),
+        cmov_flags_origin(origin, consumer),
+        instruction(consumer, _, _, mnemonic, _, _, _, _, _, _),
+        if let Some(predicate) = crate::decompile::effects::flags::Predicate::cmov(mnemonic),
+        pcmov(consumer, _, dst, src), op_register(dst, dst_name), op_register(src, src_name),
+        if let Some(result_bits) = crate::decompile::passes::machine_storage_pass::register_bits(dst_name),
+        if matches!(result_bits, 32 | 64),
+        if crate::decompile::passes::machine_storage_pass::register_bits(src_name) == Some(result_bits),
+        let spec = crate::decompile::effects::flags::FlagSelect {
+            capture: *origin, producer: *producer, predicate, width: *width,
+            immediate: *immediate, result_bits,
+        };
+
+    #[local] relation effect_flag_select_site(Address);
+    effect_flag_select_site(consumer) <-- effect_flag_select(consumer, _, _, _);
+    effect_capture(spec.capture, *memory, spec.width) <--
+        effect_flag_select(_, spec, _, _),
+        effect_flag_source(origin, _, memory, _, _), if *origin == spec.capture;
+    node_unlowered_side_effect(origin) <-- effect_capture(origin, _, _);
+    mach_inst(*consumer, MachInst::Mop(Operation::Oflagselect(*spec), Arc::new(vec![*dst, *src]), *dst)) <--
+        effect_flag_select(consumer, spec, dst, src);
+
     cmp_cmov_link(addr0, addr1) <--
         pcmp(addr0, _, _),
         cmov_flags_origin(addr0, addr1);
@@ -5684,6 +5723,7 @@ ascent_par! {
         preg_of(cmp_arg1, preg_of_cmp1),
         cmp_cmov_link(addr0, addr1),
         pcmov(addr1, cmov_cond, dst_sym, src_sym),
+        !effect_flag_select_site(addr1),
         op_register(dst_sym, dst_str),
         op_register(src_sym, src_str),
         !reg_xmm(dst_str),
@@ -5719,6 +5759,7 @@ ascent_par! {
         preg_of(cmp_arg1, preg_of_cmp1),
         cmp_cmov_link(addr0, addr1),
         pcmov(addr1, cmov_cond, dst_sym, src_sym),
+        !effect_flag_select_site(addr1),
         op_register(dst_sym, dst_str),
         op_register(src_sym, src_str),
         !reg_xmm(dst_str),
@@ -5758,6 +5799,7 @@ ascent_par! {
         if *cmp_index == "NONE" || cmp_index.is_empty(),
         cmp_cmov_link(addr0, addr1),
         pcmov(addr1, cmov_cond, dst_sym, src_sym),
+        !effect_flag_select_site(addr1),
         op_register(dst_sym, dst_str),
         op_register(src_sym, src_str),
         !reg_xmm(dst_str),
@@ -5786,6 +5828,7 @@ ascent_par! {
         preg_of(cmp_arg2, preg_of_cmp2),
         cmp_cmov_link(addr0, addr1),
         pcmov(addr1, cmov_cond, dst_sym, src_sym),
+        !effect_flag_select_site(addr1),
         op_register(dst_sym, dst_str),
         op_register(src_sym, src_str),
         !reg_xmm(dst_str),
@@ -5812,6 +5855,7 @@ ascent_par! {
         preg_of(neg_arg, preg_of_neg),
         neg_cmov_link(addr0, addr1),
         pcmov(addr1, cmov_cond, dst_sym, src_sym),
+        !effect_flag_select_site(addr1),
         op_register(dst_sym, dst_str),
         op_register(src_sym, src_str),
         !reg_xmm(dst_str),
@@ -5846,6 +5890,7 @@ ascent_par! {
         op_register(sub_dst, sub_dst_str),
         cmov_flags_origin(addr0, addr1),
         pcmov(addr1, cmov_cond, dst_sym, src_sym),
+        !effect_flag_select_site(addr1),
         if arith_result_testcond_ok(*cmov_cond),
         op_register(dst_sym, dst_str),
         op_register(src_sym, src_str),
@@ -5896,6 +5941,7 @@ ascent_par! {
         preg_of(test_arg, preg_of_test),
         test_cmov_link(addr0, addr1),
         pcmov(addr1, cmov_cond, dst_sym, src_sym),
+        !effect_flag_select_site(addr1),
         op_register(dst_sym, dst_str),
         op_register(src_sym, src_str),
         !reg_xmm(dst_str),
@@ -5930,6 +5976,7 @@ ascent_par! {
         preg_of(test_arg, preg_of_test),
         test_cmov_link(addr0, addr1),
         pcmov(addr1, TestCond::CondE, dst_sym, src_sym),
+        !effect_flag_select_site(addr1),
         op_register(dst_sym, dst_str),
         op_register(src_sym, src_str),
         !reg_xmm(dst_str),
@@ -5954,6 +6001,7 @@ ascent_par! {
         preg_of(test_arg, preg_of_test),
         test_cmov_link(addr0, addr1),
         pcmov(addr1, TestCond::CondNe, dst_sym, src_sym),
+        !effect_flag_select_site(addr1),
         op_register(dst_sym, dst_str),
         op_register(src_sym, src_str),
         !reg_xmm(dst_str),
@@ -5981,6 +6029,7 @@ ascent_par! {
         op_immediate(mask_op, mask_val, _),
         test_cmov_link(addr0, addr1),
         pcmov(addr1, TestCond::CondE, dst_sym, src_sym),
+        !effect_flag_select_site(addr1),
         op_register(dst_sym, dst_str),
         op_register(src_sym, src_str),
         !reg_xmm(dst_str),
@@ -6002,6 +6051,7 @@ ascent_par! {
         op_immediate(mask_op, mask_val, _),
         test_cmov_link(addr0, addr1),
         pcmov(addr1, TestCond::CondNe, dst_sym, src_sym),
+        !effect_flag_select_site(addr1),
         op_register(dst_sym, dst_str),
         op_register(src_sym, src_str),
         !reg_xmm(dst_str),
@@ -6026,6 +6076,7 @@ ascent_par! {
         preg_of(test_arg, preg_of_test),
         and_cmov_link(addr0, addr1),
         pcmov(addr1, TestCond::CondE, dst_sym, src_sym),
+        !effect_flag_select_site(addr1),
         op_register(dst_sym, dst_str),
         op_register(src_sym, src_str),
         !reg_xmm(dst_str),
@@ -6050,6 +6101,7 @@ ascent_par! {
         preg_of(test_arg, preg_of_test),
         and_cmov_link(addr0, addr1),
         pcmov(addr1, TestCond::CondNe, dst_sym, src_sym),
+        !effect_flag_select_site(addr1),
         op_register(dst_sym, dst_str),
         op_register(src_sym, src_str),
         !reg_xmm(dst_str),
@@ -8457,9 +8509,19 @@ ascent_par! {
         let mc = refine_chunk_with_size(if *sz <= 4 { MemoryChunk::MInt32 } else { MemoryChunk::MInt64 }, *sz);
 
 
+    // Register views share one Mreg, but extending moves are value transforms,
+    // not identity copies. Offering Omove as an alternative lets copy/alias
+    // propagation erase a required truncation before selection can check it.
+    #[local] relation extending_register_move(Address);
+    extending_register_move(address) <--
+        instruction(address, _, _, mnemonic, source, destination, _, _, _, _),
+        if matches!(*mnemonic, "MOVZX" | "MOVSX" | "MOVSXD"),
+        op_register(source, _), op_register(destination, _);
+
     mach_inst(address, MachInst::Mop(Operation::Omove, Arc::new(args), *res)) <--
         pmov(address, rd, rs),
         !div_consumed(address),
+        !extending_register_move(address),
         op_register(rd, res_str),
         ireg_of(preg_of_r, Ireg::from(res_str)),
         preg_of(res, preg_of_r),
@@ -10358,6 +10420,10 @@ ascent_par! {
         instruction(address, _, _, mnem, _, _, _, _, _, _),
         let mnem_upper = mnem.to_ascii_uppercase(),
         let args = vec![*a1],
+        // This alternative converts between full 32/64-bit views. A byte or
+        // word source must use its own extension above, not a 32-bit cast.
+        if matches!((x86_gpr_view_width(r1_str), x86_gpr_view_width(r_str)),
+            (Some(4), Some(8)) | (Some(8), Some(4))),
         let cast_op = if mnem_upper.starts_with("MOVSXD") || mnem_upper.starts_with("CDQE") {
             Operation::Ocast32signed
         } else if !*r1_is_64 && *r_is_64 {
@@ -13943,6 +14009,41 @@ mod structural_dataflow_tests {
             crate::decompile::disassembly::load_from_binary(&mut db, &binary);
             crate::decompile::disassembly::load_preset(&mut db);
             db.run_pipeline(&binary, false, false);
+        });
+    }
+
+    #[test]
+    fn extending_register_moves_never_offer_value_identity_candidates() {
+        on_large_stack(|| {
+            for (mnemonic, source, destination, operation) in [
+                ("MOVZX", "AL", "EAX", Operation::Ocast8unsigned),
+                ("MOVZX", "AL", "RAX", Operation::Ocast8unsigned),
+                ("MOVZX", "AX", "EAX", Operation::Ocast16unsigned),
+                ("MOVZX", "AX", "RAX", Operation::Ocast16unsigned),
+                ("MOVSX", "AL", "EDX", Operation::Ocast8signed),
+                ("MOVSX", "AL", "RDX", Operation::Ocast8signed),
+                ("MOVSX", "AX", "EDX", Operation::Ocast16signed),
+                ("MOVSX", "AX", "RDX", Operation::Ocast16signed),
+                ("MOVSXD", "EAX", "RAX", Operation::Ocast32signed),
+                ("MOV", "RAX", "RDX", Operation::Omove),
+                ("MOV", "EAX", "EDX", Operation::Omove),
+            ] {
+                let mut prog = AsmPassProgram::default();
+                let node = 7;
+                prog.instruction.push((node, 3, "", mnemonic, "source", "destination", "", "", 0, 0));
+                prog.op_register.extend([("source", source), ("destination", destination)]);
+                prog.run();
+                let operations: BTreeSet<_> = prog.mach_inst.iter().filter_map(|(at, inst)| {
+                    if *at != node { return None; }
+                    if let MachInst::Mop(op, args, dst) = inst {
+                        assert_eq!(args.as_slice(), [Mreg::x86(source)]);
+                        assert_eq!(*dst, Mreg::x86(destination));
+                        Some(format!("{op:?}"))
+                    } else { None }
+                }).collect();
+                assert_eq!(operations, BTreeSet::from([format!("{operation:?}")]),
+                    "{mnemonic} {source} -> {destination}");
+            }
         });
     }
 

@@ -1042,6 +1042,13 @@ pub(crate) fn csharp_expr_from_cminor_sized(
             Box::new(CsharpminorExpr::Evar(*rhs)),
         )),
         CminorExpr::Eop(op, args) => {
+            if let Operation::Oflagselect(spec) = op {
+                return (args.len() == 3).then(|| {
+                    crate::decompile::effects::flags::select_expr(*spec,
+                        CsharpminorExpr::Evar(args[0]), CsharpminorExpr::Evar(args[1]),
+                        CsharpminorExpr::Evar(args[2]))
+                }).flatten();
+            }
             if let Operation::Osel(cond, _typ) = op {
                 if args.len() >= 2 {
                     let true_val = Box::new(CsharpminorExpr::Evar(args[0]));
@@ -1337,7 +1344,7 @@ fn extract_var_reads_from_stmt_recursive(stmt: &ClightStmt, reads: &mut Vec<Iden
                 extract_var_reads_from_stmt_recursive(case_stmt, reads);
             }
         }
-        ClightStmt::Slabel(_lbl, body) => {
+        ClightStmt::Slabel(_, body) | ClightStmt::Seffect(_, body) => {
             extract_var_reads_from_stmt_recursive(body, reads);
         }
         ClightStmt::Sgoto(_lbl) => {}
@@ -1428,7 +1435,7 @@ fn extract_var_writes_from_stmt_recursive(stmt: &ClightStmt, writes: &mut Vec<Id
                 extract_var_writes_from_stmt_recursive(case_stmt, writes);
             }
         }
-        ClightStmt::Slabel(_lbl, body) => {
+        ClightStmt::Slabel(_, body) | ClightStmt::Seffect(_, body) => {
             extract_var_writes_from_stmt_recursive(body, writes);
         }
     }

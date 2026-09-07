@@ -153,7 +153,7 @@ fn stmt_children(s: &CStmt) -> Vec<&CStmt> {
             }
             c
         }
-        CStmt::Switch(_, b) | CStmt::While(_, b) | CStmt::Labeled(_, b) | CStmt::DoWhile(b, _) => {
+        CStmt::Switch(_, b) | CStmt::While(_, b) | (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) | CStmt::DoWhile(b, _) => {
             vec![b.as_ref()]
         }
         CStmt::For(_, _, _, b) => vec![b.as_ref()],
@@ -347,6 +347,7 @@ fn normalize(s: &CStmt) -> CStmt {
             CStmt::For(i.clone(), c.clone(), u.clone(), Box::new(normalize(b)))
         }
         CStmt::Labeled(l, b) => CStmt::Labeled(l.clone(), Box::new(normalize(b))),
+        CStmt::Effect(l, b) => CStmt::Effect(l.clone(), Box::new(normalize(b))),
         CStmt::Sequence(ss) => CStmt::Sequence(ss.iter().map(normalize).collect()),
         _ => s.clone(),
     }
@@ -446,6 +447,7 @@ impl Cfg {
                 }
                 id
             }
+            CStmt::Effect(_, inner) => self.lower(inner, next, brk, cont),
             CStmt::Labeled(label, inner) => {
                 let id = self.add(None, vec![]);
                 if let Label::Named(l) = label {
@@ -830,6 +832,7 @@ impl Plan {
 
 /// Coalesce non-interfering, identical-CType locals and delete copies that become identities. Cross-type storage reuse is deliberately excluded: preserving every assignment conversion's value, timing, and floating-point environment effects is outside this pass's proof model. Returns the number of locals eliminated.
 fn run_coalesce(func: &mut FuncDef) -> usize {
+    let effect_protected = crate::decompile::effects::c::protected_names(func);
     // Candidates are plain, uninitialized automatic scalar locals whose address is never taken and whose writes are all represented exactly by the scalar CFG. Static/register/extern locals, qualified objects, inited locals, aliased locals, and vars with nested/compound/inc-dec writes are excluded because changing their storage or missing a def is unsound.
     let mut addr_taken: HashSet<String> = HashSet::new();
     collect_addr_taken_stmt(&func.body, &mut addr_taken);
@@ -842,6 +845,7 @@ fn run_coalesce(func: &mut FuncDef) -> usize {
         .filter(|d| {
             d.init.is_none()
                 && is_plain_auto_scalar(d)
+                && !effect_protected.contains(&d.name)
                 && !addr_taken.contains(&d.name)
                 && !complex.contains(&d.name)
         })
@@ -1147,6 +1151,7 @@ fn apply_plan_stmt(s: &CStmt, plan: &Plan) -> CStmt {
                 .collect(),
         ),
         CStmt::Labeled(l, b) => CStmt::Labeled(l.clone(), Box::new(apply_plan_stmt(b, plan))),
+        CStmt::Effect(l, b) => CStmt::Effect(l.clone(), Box::new(apply_plan_stmt(b, plan))),
         CStmt::Decl(ds) => CStmt::Decl(rewrite_decls(ds, plan)),
         _ => s.clone(),
     }
@@ -1204,7 +1209,7 @@ fn mark_complex_stmt(s: &CStmt, out: &mut HashSet<String>) {
             }),
         }),
         CStmt::Sequence(ss) => ss.iter().for_each(|x| mark_complex_stmt(x, out)),
-        CStmt::Labeled(_, b) => mark_complex_stmt(b, out),
+        (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => mark_complex_stmt(b, out),
         CStmt::Decl(ds) => ds.iter().for_each(|d| {
             if let Some(init) = &d.init {
                 mark_complex_initializer(init, out)
@@ -1416,6 +1421,7 @@ fn split_scalar_inits(func: &mut FuncDef) -> Vec<String> {
 /// exit.  A variable used uncast anywhere in a dereference address is excluded:
 /// `*(p + k)` requires `p` to remain pointer-typed just as much as `*p` does.
 fn demote_pointer_counters(func: &mut FuncDef) -> usize {
+    let effect_protected = crate::decompile::effects::c::protected_names(func);
     use std::collections::HashSet;
 
     let has_ptr_local = func.local_vars.iter().any(|d| d.ty.is_pointer());
@@ -1566,6 +1572,7 @@ fn demote_pointer_counters(func: &mut FuncDef) -> usize {
     for d in func.local_vars.iter_mut() {
         if d.ty.is_pointer()
             && d.storage_views.is_empty()
+            && !effect_protected.contains(&d.name)
             && self_add.contains(&d.name)
             && null_cmp.contains(&d.name)
             && !bare_deref.contains(&d.name)

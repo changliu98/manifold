@@ -1192,7 +1192,7 @@ pub fn wt_stmt(stmt: &ClightStmt, env: &dyn WtEnv, errs: &mut Vec<WtError>) {
                 wt_stmt(s, env, errs);
             }
         }
-        Slabel(_, inner) => wt_stmt(inner, env, errs),
+        Slabel(_, inner) | Seffect(_, inner) => wt_stmt(inner, env, errs),
     }
 }
 

@@ -859,6 +859,9 @@ pub type ClightLabeledStatements = Vec<(Option<Z>, ClightStmt)>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClightStmt {
+    /// Selected occurrence boundary. Unlike Slabel it is not a goto label and
+    /// tree assembly must not strip it while absorbing a statement's node.
+    Seffect(crate::decompile::effects::EffectSite, Box<ClightStmt>),
     Sskip,
     Sassign(ClightExpr, ClightExpr),
     Sset(Ident, ClightExpr),
@@ -882,6 +885,9 @@ pub enum ClightStmt {
 }
 
 pub fn is_long_operation(op: &Operation) -> bool {
+    // The normalized select materializes the complete x86-64 result; a
+    // 32-bit destination is explicitly zero-extended by its semantics.
+    if matches!(op, Operation::Oflagselect(_)) { return true; }
     matches!(
         op,
         Operation::Olongconst(_)

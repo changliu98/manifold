@@ -407,7 +407,7 @@ fn lvalue(expr: &ClightExpr, root: RTLReg, function: &FunctionData) -> Option<i6
 /// matching write inside a sequence cannot establish the other effects agree.
 pub(crate) fn primitive(stmt: &ClightStmt) -> &ClightStmt {
     match stmt {
-        ClightStmt::Slabel(_, inner) => primitive(inner),
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => primitive(inner),
         ClightStmt::Ssequence(items) if items.len() == 1 => primitive(&items[0]),
         _ => stmt,
     }

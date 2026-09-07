@@ -165,10 +165,21 @@ impl IRPass for StructuringPass {
         // These names denote externally observable memory cells, even though
         // reverse Stacking represents their writes as Sset.  Every later
         // scalar optimization must preserve that distinction.
-        let protected_stack_regs: HashSet<RTLReg> = observable_stack_storage_regs(db)
+        let mut protected_stack_regs: HashSet<RTLReg> = observable_stack_storage_regs(db)
             .into_values()
             .flatten()
             .collect();
+        // Copy/constant elimination currently has no effect-transfer schema.
+        // Preserve the explicit contract inputs instead of deleting a capture
+        // and trying to reconstruct its origin after the optimizer ran.
+        for &(node,) in db.rel_iter::<(Node,)>("effect_value_boundary") {
+            for statement in candidates.get(&node).into_iter().flatten() {
+                protected_stack_regs.extend(stmt_uses_set(statement));
+                if let CsharpminorStmt::Sset(dst, _) = statement {
+                    protected_stack_regs.insert(*dst);
+                }
+            }
+        }
 
         // Apply optimizations to the representative and all retained
         // alternatives in lockstep.
@@ -591,6 +602,7 @@ impl IRPass for StructuringPass {
     fn inputs(&self) -> &'static [&'static str] {
         &[
             "csharp_stmt_candidate",
+            "effect_value_boundary",
             "csharp_stmt",
             "instr_in_function",
             "single_def_const",
@@ -5075,6 +5087,35 @@ mod candidate_handoff_tests {
 
         assert_eq!(forward, reverse);
         assert_eq!(forward.len(), 3);
+    }
+
+    #[test]
+    fn effect_boundaries_keep_copy_and_constant_inputs_until_a_checked_transfer() {
+        let mut db = DecompileDB::default();
+        let function = 1_u64;
+        let value = Constant::Ointconst(7);
+        let statements = [
+            (30_u64, CsharpminorStmt::Sset(11, CsharpminorExpr::Econst(value.clone()))),
+            (10, CsharpminorStmt::Sset(12, CsharpminorExpr::Evar(11))),
+            (20, CsharpminorStmt::Sreturn(CsharpminorExpr::Evar(12))),
+        ];
+        for (node, statement) in &statements {
+            db.rel_push("csharp_stmt_candidate", (*node, statement.clone()));
+            db.rel_push("instr_in_function", (*node, function));
+        }
+        db.rel_push("emit_function", (function, "effect_boundary", 30_u64));
+        db.rel_push("func_entry_node", (function, 30_u64));
+        for edge in [(30_u64,10_u64),(10,20)] {
+            db.rel_push("next", edge);
+            db.rel_push("cminor_succ", edge);
+        }
+        db.rel_push("single_def_const", (11_u64, value));
+        db.rel_push("effect_value_boundary", (10_u64,));
+        db.rel_push("emit_inline_temp", 12_u64);
+        StructuringPass::default().run(&mut db);
+        for row in &statements[..2] {
+            assert!(db.rel_iter::<(Node,CsharpminorStmt)>("csharp_stmt").any(|actual|actual==row));
+        }
     }
 
     #[test]

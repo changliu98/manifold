@@ -109,7 +109,7 @@ pub fn stmt_cmp_class(stmt: &ClightStmt) -> Option<CmpClass> {
         ClightStmt::Sifthenelse(cond, a, b) => expr_cmp_class(cond)
             .or_else(|| stmt_cmp_class(a))
             .or_else(|| stmt_cmp_class(b)),
-        ClightStmt::Slabel(_, inner) => stmt_cmp_class(inner),
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => stmt_cmp_class(inner),
         ClightStmt::Ssequence(items) => items.iter().find_map(stmt_cmp_class),
         ClightStmt::Sset(_, rhs) => expr_cmp_class(rhs),
         ClightStmt::Sassign(lhs, rhs) => expr_cmp_class(lhs).or_else(|| expr_cmp_class(rhs)),

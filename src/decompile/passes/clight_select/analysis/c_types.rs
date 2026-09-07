@@ -938,7 +938,7 @@ fn constrain_stmt(
                 b,
             );
         }
-        ClightStmt::Slabel(_, inner) => {
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => {
             constrain_stmt(
                 t,
                 tyvar,

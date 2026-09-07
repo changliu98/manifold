@@ -216,7 +216,7 @@ fn stmt_has_expr(stmt: &CStmt, pred: &dyn Fn(&CExpr) -> bool) -> bool {
             CBlockItem::Stmt(s) => stmt_has_expr(s, pred),
             CBlockItem::Decl(_) => false,
         }),
-        CStmt::Labeled(_, inner) => stmt_has_expr(inner, pred),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => stmt_has_expr(inner, pred),
         CStmt::Sequence(stmts) => stmts.iter().any(|s| stmt_has_expr(s, pred)),
         _ => false,
     }
@@ -233,7 +233,7 @@ fn stmt_has(stmt: &CStmt, pred: &dyn Fn(&CStmt) -> bool) -> bool {
         | CStmt::DoWhile(b, _)
         | CStmt::For(_, _, _, b)
         | CStmt::Switch(_, b)
-        | CStmt::Labeled(_, b) => stmt_has(b, pred),
+        | (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => stmt_has(b, pred),
         CStmt::Block(items) => items.iter().any(|i| match i {
             CBlockItem::Stmt(s) => stmt_has(s, pred),
             _ => false,
@@ -317,7 +317,7 @@ fn count_if(out: &TestOutput, func: &str) -> usize {
             | CStmt::DoWhile(b, _)
             | CStmt::For(_, _, _, b)
             | CStmt::Switch(_, b)
-            | CStmt::Labeled(_, b) => count(b),
+            | (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => count(b),
             CStmt::Block(items) => items
                 .iter()
                 .map(|i| match i {
@@ -347,7 +347,7 @@ fn count_loops(out: &TestOutput, func: &str) -> usize {
             | CStmt::DoWhile(b, _)
             | CStmt::For(_, _, _, b)
             | CStmt::Switch(_, b)
-            | CStmt::Labeled(_, b) => count(b),
+            | (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => count(b),
             CStmt::Block(items) => items
                 .iter()
                 .map(|i| match i {

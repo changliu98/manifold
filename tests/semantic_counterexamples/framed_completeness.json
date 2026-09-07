@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "suite": "manifold-framed-effect-capture-contracts",
+  "cases": [
+    {
+      "name": "frame_pointer_captured_flags",
+      "source": "cases/effect_capture.c",
+      "description": "A proven frame pointer retains the original compared byte across an overwrite.",
+      "cflags": ["-O2", "-mno-red-zone", "-fno-omit-frame-pointer"],
+      "runs": [
+        {"name": "overflow", "args": [], "expected": {"returncode": 253, "stdout": "", "stderr": ""}},
+        {"name": "negative", "args": ["x"], "expected": {"returncode": 102, "stdout": "", "stderr": ""}}
+      ]
+    },
+    {
+      "name": "frame_pointer_word_zero_extension",
+      "source": "cases/effect_capture.c",
+      "description": "A frame-pointer read feeding CMOV retains both the capture and the complete 32-bit write semantics.",
+      "cflags": ["-O2", "-mno-red-zone", "-fno-omit-frame-pointer", "-DWORD_RESULT=1"],
+      "runs": [
+        {"name": "taken", "args": [], "expected": {"returncode": 83, "stdout": "", "stderr": ""}},
+        {"name": "untaken", "args": ["x"], "expected": {"returncode": 17, "stdout": "", "stderr": ""}}
+      ]
+    }
+  ]
+}

@@ -73,6 +73,7 @@ ascent_par! {
 
     relation cminor_succ(Node, Node);
     relation csharp_stmt(Node, CsharpminorStmt);
+    relation effect_value_boundary(Node);
     // Function-scoped structural worlds published by StructuringPass.  They
     // stay separate from csharp_stmt: unioning raw and rewritten control rows
     // here would contaminate goto threading, dead-chain suppression, and CFG
@@ -268,7 +269,21 @@ ascent_par! {
         clight_stmt(node, s),
         if let Some(stmt) = check_clight_stmt(s);
 
-    // Statement-level cmov: lift `Sset(dst, Econdition(cond,t,f))` to `Sifthenelse(cond, Sset(dst,t), Sset(dst,f))` so tests matching `if (...)...else...` succeed instead of seeing a ternary.
+    // Retain the value-form candidate at an effect boundary. Splitting it into
+    // two assignments is a separate representation choice, not permission to
+    // erase the primitive which the local value checker understands.
+    clight_stmt(node, ClightStmt::Sset(ident_from_reg(*dst), converted)) <--
+        effect_value_boundary(node),
+        abi_pointer_size(ptr_size),
+        csharp_stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
+        if matches!(expr,CsharpminorExpr::Econdition(..)),
+        all_var_types_global(all_var_types),
+        let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]),
+        let variants = build_var_type_map_variants(all_var_types,&vars_used),
+        for types in variants.iter(),
+        let converted = clight_expr_from_csharp_with_multi_types(expr,types,*ptr_size);
+
+    // Statement-level alternative for a conditional assignment.
     clight_stmt(node, stmt) <--
         abi_pointer_size(ptr_size),
         csharp_stmt(node, ?CsharpminorStmt::Sset(dst, expr)),
@@ -6592,7 +6607,10 @@ fn clight_expr_from_csharp_inner(
                     ClightExpr::Ecast(Box::new(inner_expr), default_int_type())
                 }
                 CminorUnop::Olongofintu => {
-                    ClightExpr::Ecast(Box::new(inner_expr), default_long_type())
+                    // This is zero extension from a 32-bit word, not a cast
+                    // from the operand's inferred signed carrier to long.
+                    ClightExpr::Ecast(Box::new(ClightExpr::Ecast(
+                        Box::new(inner_expr), default_uint_type())), default_long_type())
                 }
                 CminorUnop::Ointuoffloat | CminorUnop::Ointuofsingle => ClightExpr::Ecast(
                     Box::new(inner_expr),

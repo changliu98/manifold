@@ -392,6 +392,7 @@ pub struct DecompileDB {
 
     // Typed per-function trees produced by ClightSelectPass and consumed by ClightEmitPass.
     pub clight_selected_functions: Vec<SelectedFunction>,
+    pub(crate) effect_epoch: u32,
     pub committed_interfaces: CommittedInterfaces,
     pub interface_vars: InterfaceVars,
     pub interface_instance_dump: String,
@@ -455,6 +456,7 @@ impl Default for DecompileDB {
             target_abi: None,
 
             clight_selected_functions: Default::default(),
+            effect_epoch: 0,
             committed_interfaces: Default::default(),
             interface_vars: Default::default(),
             interface_instance_dump: Default::default(),
@@ -492,6 +494,11 @@ impl Default for DecompileDB {
 
 // Low-level relation store used by pass macros and codegen.
 impl DecompileDB {
+    pub fn unresolved_effect_count(&self) -> usize {
+        self.rel_iter::<(u64,crate::decompile::effects::Receipt)>("effect_receipt")
+            .filter(|(_,r)| r.artifact.stage==crate::decompile::effects::Stage::Emission
+                && r.outcome!=crate::decompile::effects::Outcome::Carried).count()
+    }
     pub fn abi(&self) -> &crate::abi::AbiConfig {
         self.target_abi
             .as_ref()
@@ -648,7 +655,7 @@ impl DecompileDB {
     /// immutable analyses and diagnostic timing do not belong to this swap.
     fn exchange_inference_outputs(&mut self, mut other: Box<Self>) -> Box<Self> {
         macro_rules! exchange { ($($field:ident),* $(,)?) => { $(std::mem::swap(&mut self.$field, &mut other.$field);)* }; }
-        exchange!(clight_selected_functions, committed_interfaces, interface_vars,
+        exchange!(effect_epoch, clight_selected_functions, committed_interfaces, interface_vars,
             interface_instance_dump, cast_selected_functions, cast_globals,
             cast_id_to_name, cast_struct_layouts, cast_var_types_for_emission,
             cast_raw_translation_unit, cast_post_emit_audit_trail, cast_optimized_translation_unit,
@@ -927,6 +934,7 @@ impl DecompileDB {
         let mut rollback: Option<(RelationCheckpoint, Box<DecompileDB>, usize)> = None;
         let mut epoch = 0_usize;
         let mut stage_index = 0_usize;
+        self.effect_epoch = 0;
         while stage_index < schedule.stages.len() {
             let stage = &schedule.stages[stage_index];
             if Some(stage_index) == rtl_stage && epoch == 0 && !self.semantic_ablations.disable_storage_search {
@@ -1001,6 +1009,7 @@ impl DecompileDB {
                         sub_db.ablate_flow_anchor_reopen = self.ablate_flow_anchor_reopen;
                         sub_db.ablate_flow_max_certification = self.ablate_flow_max_certification;
                         sub_db.semantic_ablations = self.semantic_ablations;
+                        sub_db.effect_epoch = self.effect_epoch;
                         sub_db.dump_interface_vars = self.dump_interface_vars;
                         sub_db.dump_interface_instance = self.dump_interface_instance;
                         sub_db.relations = cloned;
@@ -1130,6 +1139,7 @@ impl DecompileDB {
                         self.rel_set("semantic_frame_object_field", fields.into_iter().collect::<ascent::boxcar::Vec<_>>());
                         rollback = Some((previous, typed, stage_index + 1));
                         epoch += 1;
+                        self.effect_epoch = epoch as u32;
                         stage_index = restart;
                         continue;
                     }
@@ -1142,6 +1152,7 @@ impl DecompileDB {
         // The final storage discharge sees the actual post-selection C tree,
         // not a proposed type or an earlier epoch's declaration names.
         crate::decompile::passes::semantic_counterexample::ledger::check_emission(self);
+        crate::decompile::effects::finalize(self);
         log::info!("Decompilation pipeline completed.");
 
         // Comma-separated so one run can follow a whole slot web or branch
@@ -2075,14 +2086,18 @@ mod epoch_checkpoint_tests {
         db.rel_push("derived", (3_u64,));
         db.stack_struct_buffers.insert(1, HashMap::from([(10, 16)]));
         db.cast_id_to_name.insert(10, "original".into());
+        db.effect_epoch = 7;
         let old = db.exchange_checkpoint(original);
         let typed = db.exchange_inference_outputs(Box::new(DecompileDB::default()));
+        assert_eq!(db.effect_epoch,0);
+        db.effect_epoch = 8;
         assert!(db.stack_struct_buffers.is_empty() && db.cast_id_to_name.is_empty());
         assert_eq!(*db.relations["immutable_analysis"].data.downcast_ref::<std::sync::RwLock<u64>>().unwrap().read().unwrap(), 42);
         db.stack_struct_buffers.insert(1, HashMap::from([(10, 99)]));
         db.rel_push("derived", (99_u64,));
         db.exchange_checkpoint(old);
         db.exchange_inference_outputs(typed);
+        assert_eq!(db.effect_epoch,7);
         assert_eq!(db.stack_struct_buffers[&1][&10], 16);
         assert_eq!(db.cast_id_to_name[&10], "original");
         assert_eq!(db.rel_iter::<(u64,)>("derived").copied().collect::<Vec<_>>(), vec![(3,)]);

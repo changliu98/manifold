@@ -153,6 +153,8 @@ pub fn map_stmt_exprs(s: &CStmt, f: &impl Fn(&CExpr) -> Option<CExpr>) -> CStmt 
             },
             Box::new(map_stmt_exprs(inner, f)),
         ),
+        CStmt::Effect(site, inner) =>
+            CStmt::Effect(*site, Box::new(map_stmt_exprs(inner, f))),
         CStmt::Decl(decls) => CStmt::Decl(
             decls
                 .iter()
@@ -238,6 +240,8 @@ pub fn map_stmt_exprs_total(s: &CStmt, f: &impl Fn(&CExpr) -> CExpr) -> CStmt {
             },
             Box::new(map_stmt_exprs_total(inner, f)),
         ),
+        CStmt::Effect(site, inner) =>
+            CStmt::Effect(*site, Box::new(map_stmt_exprs_total(inner, f))),
         CStmt::Decl(decls) => CStmt::Decl(
             decls
                 .iter()
@@ -350,7 +354,7 @@ fn collect_goto_targets_inner(stmt: &CStmt, targets: &mut Vec<String>) {
             collect_gotos_from_expr(e, targets);
             collect_goto_targets_inner(inner, targets);
         }
-        CStmt::Labeled(_, inner) => collect_goto_targets_inner(inner, targets),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_goto_targets_inner(inner, targets),
         CStmt::Sequence(stmts) => {
             for s in stmts {
                 collect_goto_targets_inner(s, targets);
@@ -426,6 +430,10 @@ pub fn strip_dead_labels(stmt: &CStmt, dead_labels: &HashSet<String>) -> CStmt {
             strip_dead_labels(inner, dead_labels)
         }
         CStmt::Labeled(label, inner) => CStmt::Labeled(
+            label.clone(),
+            Box::new(strip_dead_labels(inner, dead_labels)),
+        ),
+        CStmt::Effect(label, inner) => CStmt::Effect(
             label.clone(),
             Box::new(strip_dead_labels(inner, dead_labels)),
         ),
@@ -598,6 +606,10 @@ pub fn flatten_blocks_and_cleanup(stmt: &CStmt) -> CStmt {
         CStmt::Labeled(label, inner) => {
             let cleaned_inner = flatten_blocks_and_cleanup(inner);
             CStmt::Labeled(label.clone(), Box::new(cleaned_inner))
+        }
+        CStmt::Effect(label, inner) => {
+            let cleaned_inner = flatten_blocks_and_cleanup(inner);
+            CStmt::Effect(label.clone(), Box::new(cleaned_inner))
         }
 
         other => other.clone(),
@@ -1000,7 +1012,7 @@ pub fn collect_defined_labels(stmt: &CStmt, out: &mut Vec<String>) {
             out.push(name.clone());
             collect_defined_labels(inner, out);
         }
-        CStmt::Labeled(_, inner) => collect_defined_labels(inner, out),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_defined_labels(inner, out),
         CStmt::Sequence(stmts) => {
             for s in stmts {
                 collect_defined_labels(s, out);
@@ -1030,7 +1042,7 @@ pub fn collect_defined_labels(stmt: &CStmt, out: &mut Vec<String>) {
 pub fn collect_goto_label_targets(stmt: &CStmt, targets: &mut Vec<String>) {
     match stmt {
         CStmt::Goto(label) => targets.push(label.clone()),
-        CStmt::Labeled(_, inner) => collect_goto_label_targets(inner, targets),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_goto_label_targets(inner, targets),
         CStmt::Sequence(stmts) => {
             for s in stmts {
                 collect_goto_label_targets(s, targets);
@@ -1060,7 +1072,7 @@ pub fn is_terminal_cstmt(stmt: &CStmt) -> bool {
         CStmt::Goto(_) => true,
         CStmt::Break => true,
         CStmt::Continue => true,
-        CStmt::Labeled(_, inner) => is_terminal_cstmt(inner),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => is_terminal_cstmt(inner),
         // Conversion wraps tail calls as `{ call; return; }`.  Treat the
         // wrapper by its last executable statement; otherwise the optimized
         // CFG invents fallthrough from a shared PLT tail-call node into the

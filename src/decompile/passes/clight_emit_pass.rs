@@ -137,7 +137,7 @@ fn count_assignments_to(stmt: &CStmt, destination: &str) -> usize {
         | CStmt::While(_, body)
         | CStmt::DoWhile(body, _)
         | CStmt::For(_, _, _, body)
-        | CStmt::Labeled(_, body) => count_assignments_to(body, destination),
+        | (CStmt::Labeled(_, body) | CStmt::Effect(_, body)) => count_assignments_to(body, destination),
         CStmt::Sequence(statements) => statements
             .iter()
             .map(|stmt| count_assignments_to(stmt, destination))
@@ -181,7 +181,7 @@ fn insert_va_start_after_assignment(
         | CStmt::While(_, body)
         | CStmt::DoWhile(body, _)
         | CStmt::For(_, _, _, body)
-        | CStmt::Labeled(_, body) => {
+        | (CStmt::Labeled(_, body) | CStmt::Effect(_, body)) => {
             insert_va_start_after_assignment(body, destination, va_list_local, last_named)
         }
         CStmt::Sequence(statements) => statements
@@ -398,7 +398,7 @@ fn collect_struct_names_from_stmt(
             collect_struct_names_from_stmt(body, opaque_params, result);
         }
         CStmt::Return(Some(e)) => collect_struct_names_from_expr(e, opaque_params, result),
-        CStmt::Labeled(_, body) => collect_struct_names_from_stmt(body, opaque_params, result),
+        (CStmt::Labeled(_, body) | CStmt::Effect(_, body)) => collect_struct_names_from_stmt(body, opaque_params, result),
         CStmt::Sequence(stmts) => {
             for s in stmts {
                 collect_struct_names_from_stmt(s, opaque_params, result);
@@ -2581,9 +2581,8 @@ impl IRPass for ClightEmitPass {
             );
         ctx.global_lvalue_aliases = global_lvalue_aliases.clone();
         let mut var_types_for_emission: HashMap<String, CType> = HashMap::new();
-        let mut all_statements: Vec<(Node, CStmt)> = Vec::new();
-        let mut all_edges: Vec<(Node, Node)> = Vec::new();
-        let mut node_to_func_addr: HashMap<Node, u64> = HashMap::new();
+        let mut all_statements: Vec<((Address, Node), CStmt)> = Vec::new();
+        let mut all_edges: HashMap<Address, Vec<(Node, Node)>> = HashMap::new();
 
         for func in &internal_functions {
             let mut statements = Vec::new();
@@ -2775,13 +2774,9 @@ impl IRPass for ClightEmitPass {
                 func_edges.extend(extra_edges);
             }
 
-            for (node, _) in &statements {
-                node_to_func_addr.insert(*node, func.address);
-            }
-
             // (Resolved TODO: late control-flow structuring is done by the post-select ForLoopPass; upstream structural recovery belongs in structuring_pass / clight_select, not at emission.)
-            all_statements.extend(statements);
-            all_edges.extend(func_edges);
+            all_statements.extend(statements.into_iter().map(|(node,stmt)| ((func.address,node),stmt)));
+            all_edges.insert(func.address,func_edges);
         }
 
         db.cast_selected_functions = internal_functions;
@@ -2800,7 +2795,7 @@ impl IRPass for ClightEmitPass {
             struct_defs.len()
         );
 
-        let stmt_map: HashMap<Node, CStmt> = all_statements.into_iter().collect();
+        let stmt_map: HashMap<(Address, Node), CStmt> = all_statements.into_iter().collect();
 
         log::info!(
             "Building translation unit from {} statements",
@@ -2817,7 +2812,6 @@ impl IRPass for ClightEmitPass {
             &stmt_map,
             &all_edges,
             &db.cast_var_types_for_emission,
-            &node_to_func_addr,
         );
         eprintln!(
             "[clight-emit] build_translation_unit (optimized TU): {:?}",

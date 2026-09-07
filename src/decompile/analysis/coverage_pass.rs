@@ -436,7 +436,7 @@ fn is_frame_register(name: &str) -> bool {
 fn is_trivial_stmt(stmt: &ClightStmt) -> bool {
     match stmt {
         ClightStmt::Sskip => true,
-        ClightStmt::Slabel(_, inner) => is_trivial_stmt(inner),
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => is_trivial_stmt(inner),
         ClightStmt::Ssequence(items) => items.iter().all(is_trivial_stmt),
         _ => false,
     }
@@ -456,7 +456,7 @@ fn stmt_has_comparison(stmt: &ClightStmt) -> bool {
         ClightStmt::Sset(_, e) => expr_has_comparison(e),
         ClightStmt::Sassign(l, r) => expr_has_comparison(l) || expr_has_comparison(r),
         ClightStmt::Ssequence(items) => items.iter().any(stmt_has_comparison),
-        ClightStmt::Slabel(_, inner) => stmt_has_comparison(inner),
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => stmt_has_comparison(inner),
         ClightStmt::Sloop(a, b) => stmt_has_comparison(a) || stmt_has_comparison(b),
         ClightStmt::Sreturn(Some(e)) => expr_has_comparison(e),
         ClightStmt::Scall(_, f, args) => {
@@ -495,7 +495,7 @@ fn expr_has_comparison(e: &ClightExpr) -> bool {
 fn stmt_returns(stmt: &ClightStmt) -> bool {
     match stmt {
         ClightStmt::Sreturn(_) => true,
-        ClightStmt::Slabel(_, inner) => stmt_returns(inner),
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => stmt_returns(inner),
         ClightStmt::Ssequence(items) => items.iter().any(stmt_returns),
         ClightStmt::Sifthenelse(_, a, b) => stmt_returns(a) || stmt_returns(b),
         ClightStmt::Sloop(a, b) => stmt_returns(a) || stmt_returns(b),
@@ -530,7 +530,7 @@ pub fn stmt_kind_label(stmt: &ClightStmt) -> Option<&'static str> {
 /// statement into a parent, so the two sides only compare equal unstripped.
 fn strip_labels(stmt: &ClightStmt) -> &ClightStmt {
     match stmt {
-        ClightStmt::Slabel(_, inner) => strip_labels(inner),
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => strip_labels(inner),
         _ => stmt,
     }
 }
@@ -562,7 +562,7 @@ fn collect_subtrees<'a>(stmt: &'a ClightStmt, out: &mut HashSet<&'a ClightStmt>)
     out.insert(stmt);
     match stmt {
         ClightStmt::Ssequence(items) => items.iter().for_each(|s| collect_subtrees(s, out)),
-        ClightStmt::Slabel(_, inner) => collect_subtrees(inner, out),
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => collect_subtrees(inner, out),
         ClightStmt::Sifthenelse(_, a, b) | ClightStmt::Sloop(a, b) => {
             collect_subtrees(a, out);
             collect_subtrees(b, out);
@@ -809,7 +809,7 @@ fn collect_emitted_witnesses(stmt: &CStmt, out: &mut Vec<EmittedStmtWitness>) {
             }
             collect_emitted_witnesses(body, out);
         }
-        CStmt::Labeled(_, inner) => collect_emitted_witnesses(inner, out),
+        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_emitted_witnesses(inner, out),
         CStmt::Sequence(items) => items
             .iter()
             .for_each(|stmt| collect_emitted_witnesses(stmt, out)),
@@ -1014,7 +1014,7 @@ fn stmt_idents(stmt: &ClightStmt, out: &mut Vec<Ident>) {
             stmt_idents(b, out);
         }
         ClightStmt::Ssequence(items) => items.iter().for_each(|i| stmt_idents(i, out)),
-        ClightStmt::Slabel(_, inner) => stmt_idents(inner, out),
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => stmt_idents(inner, out),
         ClightStmt::Sloop(a, b) => {
             stmt_idents(a, out);
             stmt_idents(b, out);

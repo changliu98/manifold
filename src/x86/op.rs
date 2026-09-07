@@ -302,6 +302,9 @@ pub enum Operation {
     /// the TEST instruction.  `width` is the TEST operand width in bytes and
     /// `rhs_shift` is eight only for the legacy AH/BH/CH/DH register views.
     Otestflags(TestResultCondition, usize, usize),
+    /// Deferred flag capture at Mach/Linear, completed with the original
+    /// memory read as operand 2 at RTL. An incomplete expansion stays opaque.
+    Oflagselect(crate::decompile::effects::flags::FlagSelect),
     Ocmp(Condition),
     Osel(Condition, Typ),
 }
