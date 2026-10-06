@@ -1841,6 +1841,7 @@ const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
     "semantic_storage_selected_target",
     "frame_read_storage_access_owner",
     "stack_var",
+    "stack_base_move",
     "variadic_register_save_area_init",
     // Exact initialized bytes back designated initializers when a synthetic
     // interior global is coalesced into a recovered aggregate owner.
@@ -2803,7 +2804,7 @@ impl IRPass for ClightEmitPass {
         );
 
         let t = std::time::Instant::now();
-        let mut tu = crate::decompile::passes::c_pass::convert::build_translation_unit_from_stmt_map_with_types(
+        let (mut tu, variable_origins) = crate::decompile::passes::c_pass::convert::from_relations::build_translation_unit_with_variable_origins(
             db,
             &db.cast_selected_functions,
             &db.cast_globals,
@@ -2817,6 +2818,7 @@ impl IRPass for ClightEmitPass {
             "[clight-emit] build_translation_unit (optimized TU): {:?}",
             t.elapsed()
         );
+        db.rel_set("emit_c_variable_origin", variable_origins.into_iter().collect::<ascent::boxcar::Vec<_>>());
         db.cast_post_emit_audit_trail =
             Some(crate::decompile::analysis::coverage_pass::PostEmitAuditTrail::new(&tu));
 
@@ -2955,6 +2957,14 @@ impl IRPass for ClightEmitPass {
         // Identify opaque libc structs (FILE, DIR) via C AST scan and RTL-level analysis.
         let t = std::time::Instant::now();
         let mut opaque_map = identify_opaque_libc_structs_from_tu(&tu);
+        for id in [
+            crate::x86::types::LIBC_FILE_RECORD,
+            crate::x86::types::LIBC_DIR_RECORD,
+        ] {
+            if let Some((typedef, _)) = crate::x86::types::libc_record(id) {
+                opaque_map.insert(format!("struct_{id:x}"), typedef.to_string());
+            }
+        }
         eprintln!(
             "[clight-emit] identify_opaque_libc_structs: {:?} ({} found)",
             t.elapsed(),
@@ -3139,6 +3149,7 @@ impl IRPass for ClightEmitPass {
             "cast_raw_translation_unit",
             "cast_post_emit_audit_trail",
             "cast_optimized_translation_unit",
+            "emit_c_variable_origin",
         ]
     }
 
@@ -3515,5 +3526,14 @@ mod tests {
 
         let emit = ClightEmitPass;
         assert!(emit.inputs().contains(&"is_global_array"));
+    }
+
+    #[test]
+    fn shared_frame_coordinates_are_available_in_parallel_emit_and_select() {
+        for pass in [&ClightSelectPass as &dyn IRPass, &ClightEmitPass as &dyn IRPass] {
+            for input in crate::decompile::analysis::frame_coordinates::INPUTS {
+                assert!(pass.inputs().contains(input) || pass.extra_reads().contains(input), "{} omitted {input}", pass.name());
+            }
+        }
     }
 }

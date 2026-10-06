@@ -40,6 +40,17 @@ const INT: IntTy = IntTy {
 };
 
 impl IntTy {
+    fn carrier(ty: &CType, model: DataModel) -> Option<Self> {
+        match ty {
+            CType::Pointer(pointee, _) if !matches!(pointee.as_ref(), CType::Function(..)) => {
+                Some(Self {
+                    bits: (model.pointer_size() * 8) as u32,
+                    signed: false,
+                })
+            }
+            _ => Self::from_c(ty, model),
+        }
+    }
     fn from_c(ty: &CType, model: DataModel) -> Option<Self> {
         match ty {
             CType::Int(size, sign) => Some(Self {
@@ -153,13 +164,26 @@ struct Eval<'a> {
 }
 
 impl Eval<'_> {
+    /// Native logical registers are independently modeled at the maximum
+    /// width supported by this checker. A C declaration is a projection of
+    /// that state; it must not erase native high bits before the query exists.
+    fn input_bits(reg: RTLReg) -> BV {
+        BV::new_const(format!("integer_input_{reg}"), 64)
+    }
+
+    fn c_input(&mut self, reg: RTLReg, ty: IntTy) -> Value {
+        self.registers.insert(reg);
+        Value::raw(Self::input_bits(reg), false).cast(ty)
+    }
+
     fn reg(&mut self, reg: RTLReg) -> Option<Value> {
         let ty = IntTy::from_c(self.declarations.get(&reg)?, self.model)?;
-        self.registers.insert(reg);
-        Some(Value::raw(
-            BV::new_const(format!("integer_input_{reg}"), ty.bits),
-            ty.signed,
-        ))
+        Some(self.c_input(reg, ty))
+    }
+
+    fn carrier(&mut self, reg: RTLReg) -> Option<Value> {
+        let ty = IntTy::carrier(self.declarations.get(&reg)?, self.model)?;
+        Some(self.c_input(reg, ty))
     }
 
     fn machine_reg(&mut self, reg: RTLReg, bits: u32) -> Option<Value> {
@@ -170,7 +194,12 @@ impl Eval<'_> {
         {
             return None;
         }
-        Some(self.machine_input(reg)?.cast(IntTy {
+        let value = self.machine_input(reg)?;
+        // A producer's partial result must not invent untouched high bits.
+        if value.ty.bits < bits {
+            return None;
+        }
+        Some(value.cast(IntTy {
             bits,
             signed: false,
         }))
@@ -180,7 +209,10 @@ impl Eval<'_> {
         if let Some(value) = self.machine_overrides.get(&reg) {
             return Some(value.clone());
         }
-        let value = self.reg(reg)?;
+        // Native state does not depend on whether a C declaration exists or
+        // which scalar class the candidate assigns to it.
+        self.registers.insert(reg);
+        let value = Value::raw(Self::input_bits(reg), false);
         if self.word_inputs.contains(&reg) {
             Some(
                 value
@@ -242,7 +274,23 @@ impl Eval<'_> {
             CExpr::Var(name) => self.reg(name.strip_prefix("var_")?.parse().ok()?),
             CExpr::IntLit(lit) => self.literal(lit),
             CExpr::Paren(inner) => self.expr(inner),
-            CExpr::Cast(ty, inner) => Some(self.expr(inner)?.cast(IntTy::from_c(ty, self.model)?)),
+            CExpr::Cast(ty, inner) => {
+                let target = IntTy::from_c(ty, self.model)?;
+                // Only an explicit integer cast consumes the target ABI's
+                // data-pointer bits. Bare pointer arithmetic remains outside
+                // the integer evaluator; its stride is not integer addition.
+                let value = if let CExpr::Var(name) = inner.as_ref() {
+                    let reg = name.strip_prefix("var_")?.parse().ok()?;
+                    if matches!(self.declarations.get(&reg), Some(CType::Pointer(..))) {
+                        self.carrier(reg)?
+                    } else {
+                        self.expr(inner)?
+                    }
+                } else {
+                    self.expr(inner)?
+                };
+                Some(value.cast(target))
+            }
             CExpr::Unary(op, inner) => {
                 let value = self.expr(inner)?;
                 let v = value.cast(value.ty.promoted());
@@ -277,8 +325,11 @@ impl Eval<'_> {
                 let ty = a.ty.common(b.ty);
                 let a = a.cast(ty);
                 let b = b.cast(ty);
-                Some(Value { bits: c.truth().ite(&a.bits, &b.bits), ty,
-                    defined: Bool::and(&[c.defined.clone(), c.truth().ite(&a.defined, &b.defined)]) })
+                Some(Value {
+                    bits: c.truth().ite(&a.bits, &b.bits),
+                    ty,
+                    defined: Bool::and(&[c.defined.clone(), c.truth().ite(&a.defined, &b.defined)]),
+                })
             }
             _ => None,
         }
@@ -428,13 +479,22 @@ fn c_binary(op: BinaryOp, left: Value, right: Value) -> Option<Value> {
 
 fn machine_op(eval: &mut Eval<'_>, op: &Operation, args: &[RTLReg]) -> Option<Value> {
     if let Operation::Oflagselect(spec) = op {
-        if args.len() != 3 || !spec.valid() { return None; }
+        if args.len() != 3 || !spec.valid() {
+            return None;
+        }
         let old = eval.machine_reg(args[0], spec.result_bits)?;
         let taken = eval.machine_reg(args[1], spec.result_bits)?;
         let memory = eval.machine_reg(args[2], (spec.width * 8) as u32)?;
         let predicate = crate::decompile::effects::flags::machine_predicate(*spec, &memory.bits)?;
         let selected = predicate.ite(&taken.bits, &old.bits);
-        return Some(Value::raw(if spec.result_bits == 32 { selected.zero_ext(32) } else { selected }, false));
+        return Some(Value::raw(
+            if spec.result_bits == 32 {
+                selected.zero_ext(32)
+            } else {
+                selected
+            },
+            false,
+        ));
     }
     use Operation::*;
     let (width, binary, immediate) = match op {
@@ -536,6 +596,15 @@ fn machine_op(eval: &mut Eval<'_>, op: &Operation, args: &[RTLReg]) -> Option<Va
 }
 
 fn machine_condition(eval: &mut Eval<'_>, cond: &Condition, args: &[RTLReg]) -> Option<Bool> {
+    machine_condition_at_width(eval, cond, args, None)
+}
+
+fn machine_condition_at_width(
+    eval: &mut Eval<'_>,
+    cond: &Condition,
+    args: &[RTLReg],
+    physical_width: Option<u32>,
+) -> Option<Bool> {
     use Condition::*;
     let (width, signed, cmp, immediate) = match cond {
         Ccomp(c) => (32, true, *c, None),
@@ -548,6 +617,7 @@ fn machine_condition(eval: &mut Eval<'_>, cond: &Condition, args: &[RTLReg]) -> 
         Ccompluimm(c, n) => (64, false, *c, Some(*n)),
         _ => return None,
     };
+    let width = physical_width.unwrap_or(width);
     if args.len() != if immediate.is_some() { 1 } else { 2 } {
         return None;
     }
@@ -581,8 +651,11 @@ fn integer_expression(expr: &ClightExpr, fuel: &mut usize, inputs: &mut BTreeSet
         ClightExpr::Ebinop(_, a, b, _) => {
             integer_expression(a, fuel, inputs) && integer_expression(b, fuel, inputs)
         }
-        ClightExpr::Econdition(c, a, b, _) => integer_expression(c, fuel, inputs)
-            && integer_expression(a, fuel, inputs) && integer_expression(b, fuel, inputs),
+        ClightExpr::Econdition(c, a, b, _) => {
+            integer_expression(c, fuel, inputs)
+                && integer_expression(a, fuel, inputs)
+                && integer_expression(b, fuel, inputs)
+        }
         _ => false,
     }
 }
@@ -622,7 +695,7 @@ fn align_machine_inputs(
         // Each producer is interpreted from the common state at the final
         // use. Do not recursively borrow a proof at an intermediate point.
         let mut value = if producer.operation == Operation::Omove && producer.arguments.len() == 1 {
-            eval.machine_input(producer.arguments[0])?
+            producer_copy_value(eval, producer, function)?
         } else {
             machine_op(eval, &producer.operation, &producer.arguments)?
         };
@@ -674,7 +747,7 @@ fn store_source_value(
         return None;
     }
     let mut value = if producer.operation == Operation::Omove && producer.arguments.len() == 1 {
-        eval.machine_reg(producer.arguments[0], bits)?
+        producer_copy_value(eval, producer, function)?
     } else {
         machine_op(eval, &producer.operation, &producer.arguments)?
     };
@@ -705,7 +778,7 @@ fn store_source_value(
 /// acceptance decision is used.
 pub struct Validator {
     solver: Solver,
-    checks: std::cell::Cell<[usize; 5]>,
+    checks: std::cell::Cell<[usize; 9]>,
 }
 
 #[derive(Clone, Copy)]
@@ -715,12 +788,78 @@ enum Domain {
     FrameLoad,
     WordOperation,
     FlagEffect,
+    LoadTransport,
+    CopyTransport,
+    SwitchInput,
+    ResultRepresentation,
+}
+
+/// Decoder-owned result semantics. No storage target is inferred from the
+/// proposed declaration, and proving this transfer does not prove aliasing.
+#[derive(Clone, Debug)]
+pub(crate) struct LoadValue {
+    pub node: crate::x86::types::Node,
+    pub chunk: MemoryChunk,
+    pub destination: RTLReg,
+    pub write_bits: Option<u32>,
+    pub signed_word_load: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CopyValue {
+    pub node: crate::x86::types::Node,
+    pub source: RTLReg,
+    pub destination: RTLReg,
+    pub bits: u32,
+    pub storage: bool,
+    /// Exact memory-input width/extension for a promoted stack load.
+    pub memory_input: Option<(u32, bool)>,
 }
 
 struct Effect {
     machine: BV,
     source: BV,
     defined: Bool,
+}
+
+fn native_copy_value(eval: &mut Eval<'_>, copy: &CopyValue, ptr64: bool) -> Option<Value> {
+    let (input_bits, signed) = copy.memory_input.unwrap_or((copy.bits, false));
+    let observed = input_bits.min(copy.bits);
+    let value = eval
+        .machine_reg(copy.source, observed)?
+        .cast(IntTy {
+            bits: observed,
+            signed,
+        })
+        .cast(IntTy {
+            bits: copy.bits,
+            signed: false,
+        });
+    Some(if !copy.storage && copy.bits == 32 && ptr64 {
+        value.cast(IntTy {
+            bits: 64,
+            signed: false,
+        })
+    } else {
+        value
+    })
+}
+
+fn producer_copy_value(
+    eval: &mut Eval<'_>,
+    producer: &super::producer_values::Producer,
+    function: &FunctionData,
+) -> Option<Value> {
+    if let Some(copy) = super::analysis::transfers::COPIES
+        .get(&function.analysis_facts)
+        .and_then(|copies| copies.get(&producer.definition))
+    {
+        // Omove may encode a byte load/store, not a register-width identity.
+        // Its actual access/extension belongs to the decoder-owned transfer.
+        native_copy_value(eval, copy, function.ptr64)
+    } else {
+        eval.machine_input(producer.arguments[0])
+    }
 }
 
 impl Validator {
@@ -731,7 +870,7 @@ impl Validator {
         solver.set_params(&params);
         Self {
             solver,
-            checks: std::cell::Cell::new([0; 5]),
+            checks: std::cell::Cell::new([0; 9]),
         }
     }
 
@@ -781,7 +920,7 @@ impl Validator {
         } else {
             Domain::WordOperation
         };
-        self.check_effect(domain, declarations, model, |eval| {
+        let checked = self.check_effect(domain, declarations, model, |eval| {
             eval.word_inputs = word_inputs;
             let mut ctx = ConversionContext::new(HashMap::new(), model);
             match (inst, unlabel(stmt)) {
@@ -795,7 +934,9 @@ impl Validator {
                     // A flag predicate can be constant (e.g. TEST always
                     // clears OF). Extra machine inputs remain unconstrained,
                     // so their omission is proved, not assumed, by the query.
-                    if !direct_flag_view { align_machine_inputs(eval, rhs, args, context)?; }
+                    if !direct_flag_view {
+                        align_machine_inputs(eval, rhs, args, context)?;
+                    }
                     let machine = machine_op(eval, op, args)?;
                     let destination = eval.reg(*dst)?.ty;
                     // A widened carrier needs architectural extension evidence,
@@ -803,12 +944,14 @@ impl Validator {
                     if destination.bits > machine.ty.bits {
                         return None;
                     }
-                    let mut c = eval
-                        .expr(&convert_expr(rhs, &mut ctx))?
-                        .cast(destination);
+                    let mut c = eval.expr(&convert_expr(rhs, &mut ctx))?.cast(destination);
                     if matches!(op,Operation::Oflagselect(spec) if spec.result_bits==32)
-                        && destination.bits==32 {
-                        c = c.cast(IntTy { bits:32, signed:false });
+                        && destination.bits == 32
+                    {
+                        c = c.cast(IntTy {
+                            bits: 32,
+                            signed: false,
+                        });
                     }
                     let c = c.cast(machine.ty);
                     Some(Effect {
@@ -829,10 +972,19 @@ impl Validator {
                     else {
                         return None;
                     };
-                    let machine = machine_condition(eval, cond, args)?;
-                    let expected = if *a as u64 == *yes && *b as u64 == *no {
+                    let width = context.and_then(|(f, node)| {
+                        super::analysis::observations::comparison_width(&f.analysis_facts, node)
+                    });
+                    let machine = machine_condition_at_width(eval, cond, args, width)?;
+                    let same_target = |a, b| {
+                        a == b
+                            || context.is_some_and(|(f, _)| {
+                                super::analysis::observations::same_target(&f.analysis_facts, a, b)
+                            })
+                    };
+                    let expected = if same_target(*a as u64, *yes) && same_target(*b as u64, *no) {
                         machine
-                    } else if *a as u64 == *no && *b as u64 == *yes {
+                    } else if same_target(*a as u64, *no) && same_target(*b as u64, *yes) {
                         machine.not()
                     } else {
                         return None;
@@ -847,7 +999,93 @@ impl Validator {
                 }
                 _ => None,
             }
-        })
+        });
+        // The result-range test is a necessary condition of its own. An
+        // equivalence query that was undecided or never ran (its family's
+        // bound was spent) proves nothing either way, so it must not waive a
+        // cast that cannot hold the native word.
+        if matches!(checked.verdict, Verdict::Unsupported | Verdict::Unknown) {
+            self.refute_result_cast(inst, stmt, declarations, model, context)
+                .unwrap_or(checked)
+        } else {
+            checked
+        }
+    }
+
+    /// Necessary result-range check, independent of interpreting pointer
+    /// arithmetic or proving its lifetime. Only a refutation is published;
+    /// fitting the cast range is never an equivalence/definedness certificate.
+    fn refute_result_cast(
+        &self,
+        inst: &RTLInst,
+        stmt: &ClightStmt,
+        declarations: &HashMap<RTLReg, CType>,
+        model: DataModel,
+        context: Option<(&FunctionData, crate::x86::types::Node)>,
+    ) -> Option<Check> {
+        let (RTLInst::Iop(op, args, dst), ClightStmt::Sset(id, rhs)) = (inst, unlabel(stmt)) else {
+            return None;
+        };
+        if *dst != *id as RTLReg {
+            return None;
+        }
+        let mut converter = ConversionContext::new(HashMap::new(), model);
+        let expression = convert_expr(rhs, &mut converter);
+        let mut current = &expression;
+        let mut casts = Vec::new();
+        loop {
+            match current {
+                CExpr::Paren(inner) => current = inner,
+                CExpr::Cast(ty, inner) => {
+                    casts.push(IntTy::carrier(ty, model)?);
+                    current = inner;
+                }
+                _ => break,
+            }
+        }
+        if !casts.iter().any(|ty| ty.bits < 64) {
+            return None;
+        }
+        let mut check =
+            self.check_effect(Domain::ResultRepresentation, declarations, model, |eval| {
+                eval.word_inputs = context
+                    .and_then(|(f, n)| f.word_inputs.get(&n))
+                    .cloned()
+                    .unwrap_or_default();
+                align_machine_inputs(eval, rhs, args, context)?;
+                let machine = machine_op(eval, op, args)?;
+                if !casts.iter().any(|ty| ty.bits < machine.ty.bits) {
+                    return None;
+                }
+                let mut projection = machine.clone();
+                for ty in casts.iter().rev() {
+                    projection = projection.cast(*ty);
+                }
+                projection = projection.cast(machine.ty);
+                Some(Effect {
+                    machine: machine.bits,
+                    source: projection.bits,
+                    defined: Bool::from_bool(true),
+                })
+            });
+        if check.verdict != Verdict::Refuted {
+            return None;
+        }
+        let Some(Witness::Value {
+            inputs,
+            machine,
+            source,
+            ..
+        }) = check.witness.take()
+        else {
+            return None;
+        };
+        check.witness = Some(Witness::Representation {
+            inputs,
+            machine,
+            projection: source,
+        });
+        Some(check)
     }
 
     pub(crate) fn check_store(
@@ -937,91 +1175,88 @@ impl Validator {
         declarations: &HashMap<RTLReg, CType>,
         function: &FunctionData,
     ) -> Check {
-        self.check_effect(
+        let load = LoadValue {
+            node: contract.node,
+            chunk: contract.chunk,
+            destination: contract.destination,
+            write_bits: contract.write_bits,
+            signed_word_load: contract.signed_word_load,
+        };
+        self.check_load_with(
             Domain::FrameLoad,
+            stmt,
+            &load,
+            declarations,
+            function,
+            |rhs| memory_theory::read_operand(rhs, contract, function),
+        )
+    }
+
+    /// Preserve the word fetched by a single load through the actual C
+    /// expression and assignment conversion. This universally quantified
+    /// transfer is necessary even for indexed/opaque addresses; it does not
+    /// establish that the address itself is correct or initialized.
+    pub(crate) fn check_load_transport(
+        &self,
+        stmt: &ClightStmt,
+        load: &LoadValue,
+        declarations: &HashMap<RTLReg, CType>,
+        function: &FunctionData,
+    ) -> Check {
+        self.check_load_with(
+            Domain::LoadTransport,
+            stmt,
+            load,
+            declarations,
+            function,
+            memory_theory::single_read_operand,
+        )
+    }
+
+    /// Omove has no intrinsic width. The observed width must come from a
+    /// decoded register write or an exact native storage event, never CType.
+    pub(crate) fn check_copy_transport(
+        &self,
+        stmt: &ClightStmt,
+        copy: &CopyValue,
+        declarations: &HashMap<RTLReg, CType>,
+        function: &FunctionData,
+    ) -> Check {
+        self.check_effect(
+            Domain::CopyTransport,
             declarations,
             function.data_model,
             |eval| {
                 let ClightStmt::Sset(destination, rhs) = memory_theory::primitive(stmt) else {
                     return None;
                 };
-                if *destination as RTLReg != contract.destination {
+                if *destination as RTLReg != copy.destination {
                     return None;
                 }
-                let operand = memory_theory::read_operand(rhs, contract, function)?;
-                let access = IntTy::from_c(
-                    &convert_clight_type(
-                        super::solve::clight_expr_type(operand),
-                        function.data_model,
-                    ),
-                    function.data_model,
-                )?;
-                let (bits, mut signed, mut result_bits) = match contract.chunk {
-                    MemoryChunk::MInt8Signed => (8, true, 32),
-                    MemoryChunk::MInt8Unsigned => (8, false, 32),
-                    MemoryChunk::MInt16Signed => (16, true, 32),
-                    MemoryChunk::MInt16Unsigned => (16, false, 32),
-                    MemoryChunk::MInt32 | MemoryChunk::MAny32 => (32, false, 32),
-                    MemoryChunk::MInt64 | MemoryChunk::MAny64 => (64, false, 64),
-                    _ => return None,
+                eval.word_inputs = function
+                    .word_inputs
+                    .get(&copy.node)
+                    .cloned()
+                    .unwrap_or_default();
+                align_machine_inputs(eval, rhs, &[copy.source], Some((function, copy.node)))?;
+                let destination = eval.reg(copy.destination)?.ty;
+                let result_bits = if !copy.storage
+                    && copy.bits == 32
+                    && function.ptr64
+                    && destination.bits > 32
+                {
+                    64
+                } else {
+                    copy.bits
                 };
-                if access.bits != bits || contract.width * 8 != bits as usize {
-                    return None;
-                }
-                let destination = eval.reg(contract.destination)?.ty;
-                let mut zero_upper_word = false;
-                if let Some(written) = contract.write_bits {
-                    if bits > written {
-                        return None;
-                    }
-                    match written {
-                        32 if function.ptr64 && destination.bits > 32 => {
-                            result_bits = 64;
-                            zero_upper_word = true;
-                        }
-                        64 if function.ptr64 => {
-                            // A 32-bit memory chunk alone cannot distinguish
-                            // MOVSXD from a 32-bit write that zeroes the high
-                            // word. Require the independent decoder evidence.
-                            if bits == 32 {
-                                if !contract.signed_word_load {
-                                    return None;
-                                }
-                                signed = true;
-                            }
-                            result_bits = 64;
-                        }
-                        8 | 16 | 32 => result_bits = written,
-                        _ => return None,
-                    }
-                }
-                if destination.bits > result_bits {
-                    return None;
-                }
-                let memory = BV::new_const(format!("frame_read_{}", contract.node), bits);
                 let machine_ty = IntTy {
                     bits: result_bits,
                     signed: false,
                 };
-                let machine = if zero_upper_word {
-                    Value::raw(memory.clone(), signed)
-                        .cast(IntTy {
-                            bits: 32,
-                            signed: false,
-                        })
-                        .cast(machine_ty)
-                } else {
-                    Value::raw(memory.clone(), signed).cast(machine_ty)
-                };
-                let mut ctx = ConversionContext::new(HashMap::new(), function.data_model);
-                // Substitute only this exact converted memory expression. The
-                // shared cell has arbitrary bits, not a guessed reaching value.
-                eval.memory = Some((
-                    convert_expr(operand, &mut ctx),
-                    Value::raw(memory, access.signed),
-                ));
+                let machine = native_copy_value(eval, copy, function.ptr64)?.cast(machine_ty);
+                let mut context = ConversionContext::new(HashMap::new(), function.data_model);
                 let source = eval
-                    .expr(&convert_expr(rhs, &mut ctx))?
+                    .expr(&convert_expr(rhs, &mut context))?
                     .cast(destination)
                     .cast(machine_ty);
                 Some(Effect {
@@ -1031,6 +1266,163 @@ impl Validator {
                 })
             },
         )
+    }
+
+    /// Hold a recovered switch's case/target mapping fixed and validate its
+    /// discriminant view. Every case predicate (and therefore the default)
+    /// must agree at the native comparison width. This is not a proof of the
+    /// comparison-tree recovery or of its target topology.
+    pub(crate) fn check_switch_input(
+        &self,
+        node: crate::x86::types::Node,
+        instruction: &RTLInst,
+        statement: &ClightStmt,
+        declarations: &HashMap<RTLReg, CType>,
+        function: &FunctionData,
+    ) -> Check {
+        self.check_effect(
+            Domain::SwitchInput,
+            declarations,
+            function.data_model,
+            |eval| {
+                let RTLInst::Icond(condition, arguments, _, _) = instruction else {
+                    return None;
+                };
+                if arguments.len() != 1 {
+                    return None;
+                }
+                let bits = match condition {
+                    Condition::Ccompimm(..) | Condition::Ccompuimm(..) => 32,
+                    Condition::Ccomplimm(..) | Condition::Ccompluimm(..) => 64,
+                    _ => return None,
+                };
+                let ClightStmt::Sswitch(expression, cases) = memory_theory::primitive(statement)
+                else {
+                    return None;
+                };
+                eval.word_inputs = function.word_inputs.get(&node).cloned().unwrap_or_default();
+                align_machine_inputs(eval, expression, arguments, Some((function, node)))?;
+                let machine = eval.machine_reg(arguments[0], bits)?;
+                let mut context = ConversionContext::new(HashMap::new(), function.data_model);
+                let source = eval.expr(&convert_expr(expression, &mut context))?;
+                let source = source.cast(source.ty.promoted());
+                let agreement = Bool::and(
+                    &cases
+                        .iter()
+                        .filter_map(|(value, _)| {
+                            value.map(|value| {
+                                machine
+                                    .bits
+                                    .eq(BV::from_i64(value, bits))
+                                    .eq(source.bits.eq(BV::from_i64(value, source.ty.bits)))
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                Some(Effect {
+                    machine: BV::from_u64(1, 1),
+                    source: agreement.ite(&BV::from_u64(1, 1), &BV::from_u64(0, 1)),
+                    defined: source.defined,
+                })
+            },
+        )
+    }
+
+    fn check_load_with<'a>(
+        &self,
+        domain: Domain,
+        stmt: &'a ClightStmt,
+        contract: &LoadValue,
+        declarations: &HashMap<RTLReg, CType>,
+        function: &FunctionData,
+        read_operand: impl FnOnce(&'a ClightExpr) -> Option<&'a ClightExpr>,
+    ) -> Check {
+        self.check_effect(domain, declarations, function.data_model, |eval| {
+            let ClightStmt::Sset(destination, rhs) = memory_theory::primitive(stmt) else {
+                return None;
+            };
+            if *destination as RTLReg != contract.destination {
+                return None;
+            }
+            let operand = read_operand(rhs)?;
+            let access = IntTy::from_c(
+                &convert_clight_type(super::solve::clight_expr_type(operand), function.data_model),
+                function.data_model,
+            )?;
+            let (bits, mut signed, mut result_bits) = match contract.chunk {
+                MemoryChunk::MInt8Signed => (8, true, 32),
+                MemoryChunk::MInt8Unsigned => (8, false, 32),
+                MemoryChunk::MInt16Signed => (16, true, 32),
+                MemoryChunk::MInt16Unsigned => (16, false, 32),
+                MemoryChunk::MInt32 | MemoryChunk::MAny32 => (32, false, 32),
+                MemoryChunk::MInt64 | MemoryChunk::MAny64 => (64, false, 64),
+                _ => return None,
+            };
+            if access.bits != bits {
+                return None;
+            }
+            let destination = eval.reg(contract.destination)?.ty;
+            let mut zero_upper_word = false;
+            if let Some(written) = contract.write_bits {
+                if bits > written {
+                    return None;
+                }
+                match written {
+                    32 if function.ptr64 && destination.bits > 32 => {
+                        result_bits = 64;
+                        zero_upper_word = true;
+                    }
+                    64 if function.ptr64 => {
+                        // A 32-bit memory chunk alone cannot distinguish
+                        // MOVSXD from a 32-bit write that zeroes the high
+                        // word. Require the independent decoder evidence.
+                        if bits == 32 {
+                            if !contract.signed_word_load {
+                                return None;
+                            }
+                            signed = true;
+                        }
+                        result_bits = 64;
+                    }
+                    8 | 16 | 32 => result_bits = written,
+                    _ => return None,
+                }
+            }
+            if destination.bits > result_bits {
+                return None;
+            }
+            let memory = BV::new_const(format!("frame_read_{}", contract.node), bits);
+            let machine_ty = IntTy {
+                bits: result_bits,
+                signed: false,
+            };
+            let machine = if zero_upper_word {
+                Value::raw(memory.clone(), signed)
+                    .cast(IntTy {
+                        bits: 32,
+                        signed: false,
+                    })
+                    .cast(machine_ty)
+            } else {
+                Value::raw(memory.clone(), signed).cast(machine_ty)
+            };
+            let mut ctx = ConversionContext::new(HashMap::new(), function.data_model);
+            // Substitute only this exact converted memory expression. The
+            // shared cell has arbitrary bits, not a guessed reaching value.
+            eval.memory = Some((
+                convert_expr(operand, &mut ctx),
+                Value::raw(memory, access.signed),
+            ));
+            let source = eval
+                .expr(&convert_expr(rhs, &mut ctx))?
+                .cast(destination)
+                .cast(machine_ty);
+            Some(Effect {
+                machine: machine.bits,
+                source: source.bits,
+                defined: source.defined,
+            })
+        })
     }
 
     fn check_effect(
@@ -1043,8 +1435,12 @@ impl Validator {
         // Adding an obligation family must not remove an existing family's
         // semantic vetoes by consuming its quota. Keep one reusable verifier,
         // with the same deterministic per-family bound and explicit Unknown.
+        // A result-representation query is one machine operation projected
+        // through a cast chain, run only for a narrowing cast; it is not
+        // bounded, so a large function's candidate count cannot turn a lossy
+        // cast back into an admissible one.
         let mut checks = self.checks.get();
-        if checks[domain as usize] >= 256 {
+        if checks[domain as usize] >= 256 && !matches!(domain, Domain::ResultRepresentation) {
             return Check::plain(Verdict::Unknown);
         }
         checks[domain as usize] += 1;
@@ -1053,7 +1449,11 @@ impl Validator {
             declarations,
             model,
             registers: BTreeSet::new(),
-            fuel: if matches!(domain, Domain::FlagEffect) { 2048 } else { 96 },
+            fuel: if matches!(domain, Domain::FlagEffect) {
+                2048
+            } else {
+                96
+            },
             memory: None,
             word_inputs: BTreeSet::new(),
             machine_overrides: HashMap::new(),
@@ -1079,9 +1479,7 @@ impl Validator {
                                     .registers
                                     .iter()
                                     .filter_map(|reg| {
-                                        let ty = IntTy::from_c(declarations.get(reg)?, model)?;
-                                        let input =
-                                            BV::new_const(format!("integer_input_{reg}"), ty.bits);
+                                        let input = Eval::input_bits(*reg);
                                         Some((*reg, m.eval(&input, true)?.as_u64()?))
                                     })
                                     .collect();
@@ -1152,6 +1550,81 @@ mod tests {
             ClightAttr::default(),
         )
     }
+
+    #[test]
+    fn physical_byte_comparison_accepts_promotions_but_rejects_changed_predicates() {
+        let mut function = FunctionData::new(
+            1,
+            "byte_comparison".into(),
+            vec![],
+            vec![],
+            None,
+            0,
+            10,
+            true,
+        );
+        super::super::analysis::observations::set_comparison(&mut function.analysis_facts, 10, 8);
+        let native = RTLInst::Icond(
+            Condition::Ccompimm(Comparison::Ceq, 0),
+            Arc::new(vec![1]),
+            Either::Right(20),
+            Either::Right(30),
+        );
+        let comparison = |op| {
+            ClightStmt::Sifthenelse(
+                ClightExpr::Ebinop(
+                    op,
+                    Box::new(ClightExpr::Ecast(
+                        Box::new(ClightExpr::Etempvar(1, int(true))),
+                        int(true),
+                    )),
+                    Box::new(ClightExpr::EconstInt(0, int(true))),
+                    int(true),
+                ),
+                Box::new(ClightStmt::Sgoto(20)),
+                Box::new(ClightStmt::Sgoto(30)),
+            )
+        };
+        let declarations = HashMap::from([(1, CType::char_signed())]);
+        let validator = Validator::new();
+        assert_eq!(
+            validator
+                .check_at(
+                    10,
+                    &native,
+                    &comparison(ClightBinaryOp::Oeq),
+                    &declarations,
+                    &function
+                )
+                .verdict,
+            Verdict::Equivalent
+        );
+        assert_eq!(
+            validator
+                .check_at(
+                    10,
+                    &native,
+                    &comparison(ClightBinaryOp::One),
+                    &declarations,
+                    &function
+                )
+                .verdict,
+            Verdict::Refuted
+        );
+        // Without the byte observation, the RTL32 comparison also observes
+        // bits the C byte cannot retain. They are not erased from the model.
+        assert_eq!(
+            validator
+                .check(
+                    &native,
+                    &comparison(ClightBinaryOp::Oeq),
+                    &declarations,
+                    function.data_model
+                )
+                .verdict,
+            Verdict::Refuted
+        );
+    }
     fn bin(op: ClightBinaryOp, ty: ClightType) -> ClightExpr {
         ClightExpr::Ebinop(
             op,
@@ -1164,6 +1637,231 @@ mod tests {
         [(1, CType::long()), (2, CType::long()), (3, CType::long())]
             .into_iter()
             .collect()
+    }
+
+    #[test]
+    fn a_narrow_c_input_cannot_define_the_machine_upper_bits() {
+        let validator = Validator::new();
+        let mut declarations = decls();
+        declarations.insert(1, CType::int());
+        let instruction = RTLInst::Iop(Operation::Oaddlimm(0), Arc::new(vec![1]), 3);
+        let signed_extension = ClightStmt::Sset(
+            3,
+            ClightExpr::Ecast(Box::new(ClightExpr::Etempvar(1, int(true))), long(true)),
+        );
+        assert_eq!(
+            validator
+                .check(
+                    &instruction,
+                    &signed_extension,
+                    &declarations,
+                    DataModel::Lp64
+                )
+                .verdict,
+            Verdict::Refuted
+        );
+
+        let mut function = FunctionData::new(
+            1,
+            "width_relation".into(),
+            vec![],
+            vec![],
+            None,
+            0,
+            10,
+            true,
+        );
+        function.word_inputs.insert(10, BTreeSet::from([1]));
+        assert_eq!(
+            validator
+                .check_at(
+                    10,
+                    &instruction,
+                    &signed_extension,
+                    &declarations,
+                    &function
+                )
+                .verdict,
+            Verdict::Refuted
+        );
+        let zero_extension = ClightStmt::Sset(
+            3,
+            ClightExpr::Ecast(
+                Box::new(ClightExpr::Ecast(
+                    Box::new(ClightExpr::Etempvar(1, int(true))),
+                    int(false),
+                )),
+                long(false),
+            ),
+        );
+        assert_eq!(
+            validator
+                .check_at(10, &instruction, &zero_extension, &declarations, &function)
+                .verdict,
+            Verdict::Equivalent
+        );
+    }
+
+    #[test]
+    fn decoded_copy_width_and_explicit_pointer_bridge_preserve_exact_bits() {
+        let function =
+            FunctionData::new(1, "copy_transfer".into(), vec![], vec![], None, 0, 10, true);
+        let mut declarations = decls();
+        declarations.insert(3, CType::uint());
+        let statement = ClightStmt::Sset(3, ClightExpr::Etempvar(1, long(true)));
+        let mut copy = CopyValue {
+            node: 10,
+            source: 1,
+            destination: 3,
+            bits: 32,
+            storage: true,
+            memory_input: None,
+        };
+        let checker = Validator::new();
+        assert_eq!(
+            checker
+                .check_copy_transport(&statement, &copy, &declarations, &function)
+                .verdict,
+            Verdict::Equivalent
+        );
+        copy.bits = 64;
+        assert_eq!(
+            checker
+                .check_copy_transport(&statement, &copy, &declarations, &function)
+                .verdict,
+            Verdict::Refuted
+        );
+
+        declarations.insert(1, CType::ptr(CType::Void));
+        let pointer = ClightType::Tpointer(Arc::new(ClightType::Tvoid), ClightAttr::default());
+        let statement = ClightStmt::Sset(
+            3,
+            ClightExpr::Ecast(
+                Box::new(ClightExpr::Etempvar(1, pointer.clone())),
+                int(false),
+            ),
+        );
+        copy.bits = 32;
+        assert_eq!(
+            checker
+                .check_copy_transport(&statement, &copy, &declarations, &function)
+                .verdict,
+            Verdict::Equivalent
+        );
+        copy.bits = 64;
+        assert_eq!(
+            checker
+                .check_copy_transport(&statement, &copy, &declarations, &function)
+                .verdict,
+            Verdict::Refuted
+        );
+        let mut function = function;
+        function.word_inputs.insert(10, BTreeSet::from([1]));
+        declarations.insert(3, CType::ulong());
+        let statement = ClightStmt::Sset(
+            3,
+            ClightExpr::Ecast(Box::new(ClightExpr::Etempvar(1, pointer)), long(false)),
+        );
+        assert_eq!(
+            checker
+                .check_copy_transport(&statement, &copy, &declarations, &function)
+                .verdict,
+            Verdict::Refuted,
+            "the C cast must not borrow the machine's upper-word normalization"
+        );
+    }
+
+    #[test]
+    fn indexed_load_transport_exposes_a_real_lost_bit_witness() {
+        let function = FunctionData::new(
+            1,
+            "indexed_transfer".into(),
+            vec![],
+            vec![],
+            None,
+            0,
+            10,
+            true,
+        );
+        let mut declarations = decls();
+        declarations.insert(1, CType::ptr(CType::ulong()));
+        declarations.insert(3, CType::uint());
+        let pointer = ClightType::Tpointer(Arc::new(long(false)), ClightAttr::default());
+        let address = ClightExpr::Ebinop(
+            ClightBinaryOp::Oadd,
+            Box::new(ClightExpr::Etempvar(1, pointer.clone())),
+            Box::new(ClightExpr::Etempvar(2, long(false))),
+            pointer,
+        );
+        let statement = ClightStmt::Sset(3, ClightExpr::Ederef(Box::new(address), long(false)));
+        let load = LoadValue {
+            node: 10,
+            chunk: MemoryChunk::MAny64,
+            destination: 3,
+            write_bits: Some(64),
+            signed_word_load: false,
+        };
+        let checker = Validator::new();
+        let check = checker.check_load_transport(&statement, &load, &declarations, &function);
+        assert_eq!(check.verdict, Verdict::Refuted);
+        let Some(Witness::Value {
+            machine,
+            source,
+            memory: Some(memory),
+            source_defined,
+            ..
+        }) = check.witness
+        else {
+            panic!("expected a concrete loaded-word counterexample");
+        };
+        assert!(source_defined);
+        assert_eq!(machine, memory);
+        assert_ne!(machine, source);
+        declarations.insert(3, CType::ulong());
+        assert_eq!(
+            checker
+                .check_load_transport(&statement, &load, &declarations, &function)
+                .verdict,
+            Verdict::Equivalent
+        );
+    }
+
+    #[test]
+    fn switch_input_preserves_machine_case_predicates_without_flattening_control() {
+        let mut function =
+            FunctionData::new(1, "switch_view".into(), vec![], vec![], None, 0, 10, true);
+        function.word_inputs.insert(10, BTreeSet::from([1]));
+        let native = RTLInst::Icond(
+            Condition::Ccompimm(Comparison::Ceq, -1),
+            Arc::new(vec![1]),
+            Either::Right(20),
+            Either::Right(30),
+        );
+        let statement = ClightStmt::Sswitch(
+            ClightExpr::Etempvar(1, int(true)),
+            vec![
+                (Some(-1), ClightStmt::Sgoto(20)),
+                (Some(0), ClightStmt::Sgoto(40)),
+                (None, ClightStmt::Sgoto(50)),
+            ],
+        );
+        let mut declarations = decls();
+        declarations.insert(1, CType::int());
+        let checker = Validator::new();
+        assert_eq!(
+            checker
+                .check_switch_input(10, &native, &statement, &declarations, &function)
+                .verdict,
+            Verdict::Equivalent
+        );
+        declarations.insert(1, CType::ulong());
+        assert_eq!(
+            checker
+                .check_switch_input(10, &native, &statement, &declarations, &function)
+                .verdict,
+            Verdict::Refuted,
+            "a machine 32-bit -1 case is not a zero-extended unsigned long -1 case"
+        );
     }
     fn operation(op: Operation) -> RTLInst {
         RTLInst::Iop(op, Arc::new(vec![1, 2]), 3)
@@ -1239,6 +1937,118 @@ mod tests {
     }
 
     #[test]
+    fn a_narrow_self_updated_carrier_does_not_hide_wide_multiply_bits() {
+        let declarations = HashMap::from([(1, CType::int())]);
+        let native = RTLInst::Iop(Operation::Omullimm(65537), Arc::new(vec![1]), 1);
+        let source = ClightStmt::Sset(
+            1,
+            ClightExpr::Ebinop(
+                ClightBinaryOp::Omul,
+                Box::new(ClightExpr::Ecast(
+                    Box::new(ClightExpr::Etempvar(1, int(true))),
+                    long(false),
+                )),
+                Box::new(ClightExpr::EconstLong(65537, long(false))),
+                long(false),
+            ),
+        );
+        let result = Validator::new().check(&native, &source, &declarations, DataModel::Lp64);
+        assert_eq!(result.verdict, Verdict::Refuted);
+        assert!(result.witness.is_some());
+        let wide = HashMap::from([(1, CType::ulong())]);
+        assert_eq!(
+            Validator::new()
+                .check(&native, &source, &wide, DataModel::Lp64)
+                .verdict,
+            Verdict::Equivalent
+        );
+    }
+
+    #[test]
+    fn pointer_result_casts_cannot_hide_a_native_address_high_word() {
+        use crate::x86::op::Addressing;
+        let pointer = ClightType::Tpointer(
+            Arc::new(ClightType::Tint(
+                ClightIntSize::I8,
+                ClightSignedness::Unsigned,
+                ClightAttr::default(),
+            )),
+            ClightAttr::default(),
+        );
+        let expression = ClightExpr::Ebinop(
+            ClightBinaryOp::Oadd,
+            Box::new(ClightExpr::Etempvar(1, pointer.clone())),
+            Box::new(ClightExpr::Etempvar(2, long(false))),
+            pointer,
+        );
+        let native = RTLInst::Iop(
+            Operation::Oleal(Addressing::Aindexed2(0)),
+            Arc::new(vec![1, 2]),
+            3,
+        );
+        let declarations = HashMap::from([
+            (1, CType::ptr(CType::char_unsigned())),
+            (2, CType::ulong()),
+            (3, CType::ulong()),
+        ]);
+        let bad = ClightStmt::Sset(
+            3,
+            ClightExpr::Ecast(Box::new(expression.clone()), int(false)),
+        );
+        let verdict = Validator::new().check(&native, &bad, &declarations, DataModel::Lp64);
+        assert_eq!(verdict.verdict, Verdict::Refuted);
+        assert!(matches!(
+            verdict.witness,
+            Some(Witness::Representation { .. })
+        ));
+        let wide = ClightStmt::Sset(3, ClightExpr::Ecast(Box::new(expression), long(false)));
+        assert_eq!(
+            Validator::new()
+                .check(&native, &wide, &declarations, DataModel::Lp64)
+                .verdict,
+            Verdict::Unsupported,
+            "representable bits do not prove pointer lifetime"
+        );
+    }
+
+    #[test]
+    fn a_spent_equivalence_bound_does_not_waive_the_result_representation() {
+        use crate::x86::op::Addressing;
+        let pointer = ClightType::Tpointer(Arc::new(ClightType::Tvoid), ClightAttr::default());
+        let sum = ClightExpr::Ebinop(
+            ClightBinaryOp::Oadd,
+            Box::new(ClightExpr::Etempvar(1, pointer.clone())),
+            Box::new(ClightExpr::Etempvar(2, long(true))),
+            pointer,
+        );
+        let native = RTLInst::Iop(
+            Operation::Oleal(Addressing::Aindexed2(0)),
+            Arc::new(vec![1, 2]),
+            3,
+        );
+        let declarations =
+            HashMap::from([(1, CType::long()), (2, CType::long()), (3, CType::long())]);
+        let truncated = ClightStmt::Sset(3, ClightExpr::Ecast(Box::new(sum), int(true)));
+        let v = Validator::new();
+        let spend = ClightStmt::Sset(3, bin(ClightBinaryOp::Oadd, int(false)));
+        for _ in 0..256 {
+            v.check(&operation(Operation::Oadd), &spend, &decls(), DataModel::Lp64);
+        }
+        assert_eq!(
+            v.check(&operation(Operation::Oadd), &spend, &decls(), DataModel::Lp64)
+                .verdict,
+            Verdict::Unknown,
+            "the integer family's bound is spent"
+        );
+        let verdict = v.check(&native, &truncated, &declarations, DataModel::Lp64);
+        assert_eq!(verdict.verdict, Verdict::Refuted);
+        assert!(matches!(
+            verdict.witness,
+            Some(Witness::Representation { .. })
+        ));
+    }
+
+    #[test]
     fn narrowing_is_checked_at_both_operation_and_assignment() {
         let v = Validator::new();
         let narrow = ClightStmt::Sset(3, bin(ClightBinaryOp::Oadd, int(false)));
@@ -1311,8 +2121,13 @@ mod tests {
             Box::new(ClightStmt::Sgoto(11)),
             Box::new(ClightStmt::Sgoto(12)),
         );
+        // The declaration alone does not prove the high machine word. This
+        // fixture explicitly supplies the CFG-derived zero-extension view.
+        let mut function =
+            FunctionData::new(1, "mixed_branch".into(), vec![], vec![], None, 0, 10, true);
+        function.word_inputs.insert(10, BTreeSet::from([2]));
         assert_eq!(
-            v.check(&machine, &stmt, &declarations, DataModel::Lp64)
+            v.check_at(10, &machine, &stmt, &declarations, &function)
                 .verdict,
             Verdict::Equivalent
         );
@@ -1322,7 +2137,7 @@ mod tests {
             Box::new(ClightStmt::Sgoto(12)),
         );
         assert_eq!(
-            v.check(&machine, &wrong, &declarations, DataModel::Lp64)
+            v.check_at(10, &machine, &wrong, &declarations, &function)
                 .verdict,
             Verdict::Refuted
         );
@@ -1332,7 +2147,7 @@ mod tests {
             Box::new(ClightStmt::Sgoto(11)),
         );
         assert_eq!(
-            v.check(&machine, &inverted, &declarations, DataModel::Lp64)
+            v.check_at(10, &machine, &inverted, &declarations, &function)
                 .verdict,
             Verdict::Equivalent
         );

@@ -185,31 +185,5 @@ pub(crate) fn extend_candidates(function: &mut FunctionData) {
         }
     }
     grammar.run();
-    let mut additions: Vec<_> = grammar.candidate.into_iter().collect();
-    additions.sort_by_key(|(node, parent, _)| (*node, *parent));
-    let all_worlds: BTreeSet<_> = function.structure_worlds.iter().copied().collect();
-    for (node, parent, stmt) in additions {
-        let Some(candidates) = function.node_statements.get_mut(&node) else {
-            continue;
-        };
-        let worlds = function
-            .candidate_structure_worlds
-            .entry(node)
-            .or_insert_with(|| vec![all_worlds.clone(); candidates.len()]);
-        while worlds.len() < candidates.len() {
-            worlds.push(all_worlds.clone());
-        }
-        let inherited = worlds[parent].clone();
-        if let Some(existing) = candidates.iter().position(|s| s == &stmt) {
-            worlds[existing].extend(inherited);
-        } else {
-            function
-                .analysis_candidates
-                .entry(node)
-                .or_default()
-                .insert(stmt.clone());
-            candidates.push(stmt);
-            worlds.push(inherited);
-        }
-    }
+    super::analysis::candidates::inherit(function, grammar.candidate.into_iter().collect());
 }

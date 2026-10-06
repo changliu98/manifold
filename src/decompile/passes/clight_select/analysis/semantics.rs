@@ -14,15 +14,17 @@ use crate::x86::types::{Node, RTLReg};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use z3::ast::{Bool, Dynamic};
 
-// The integer class has one deterministic concrete declaration per register.
-pub(super) fn integer_declarations(func: &FunctionData) -> HashMap<RTLReg, crate::decompile::passes::c_pass::types::CType> {
+// The explicit legacy profile remains the fallback for unrefined declarations.
+pub(super) fn integer_declarations(
+    func: &FunctionData,
+) -> HashMap<RTLReg, crate::decompile::passes::c_pass::types::CType> {
     use crate::decompile::passes::c_pass::convert::from_relations::convert_param_type_from_param;
     use crate::decompile::passes::c_pass::helpers::candtype_to_ctype;
     use crate::decompile::passes::c_pass::types::CType;
 
     let mut declarations = HashMap::new();
-    // Locals without an explicit declaration candidate are inferred later by
-    // emission. Their spelling is not committed here, so leave them unknown.
+    // Type evidence promotes observed singleton values into the explicit
+    // domain. Unmanaged emitter-inferred locals remain unknown here.
     for (&reg, cands) in &func.var_type_candidates {
         let rendered = CandType::I64(Sign::Signed);
         let candidate = anchor_index(cands, rendered, false)
@@ -38,6 +40,9 @@ pub(super) fn integer_declarations(func: &FunctionData) -> HashMap<RTLReg, crate
             declarations.insert(reg, ty);
         }
     }
+    if let Some(graph) = super::type_evidence::GRAPH.get(&func.analysis_facts) {
+        declarations.retain(|reg, _| !graph.fixed_storage.contains(reg));
+    }
     declarations
 }
 
@@ -47,6 +52,7 @@ pub(super) fn integer_declarations(func: &FunctionData) -> HashMap<RTLReg, crate
 fn semantic_candidate_conditions(
     t: &TypeDt,
     tyvar: &HashMap<RTLReg, Dynamic>,
+    concrete: &super::declarations::Declarations,
     func: &FunctionData,
     nodes: &[Node],
     selections: &HashMap<Node, Vec<Bool>>,
@@ -64,6 +70,9 @@ fn semantic_candidate_conditions(
     let mut gaps = 0usize;
     for node in nodes {
         for obligation in by_node.0.get(node).into_iter().flatten() {
+            if !obligation.checks_legacy() {
+                continue;
+            }
             let effect = obligation.family();
             let candidates = &func.node_statements[node];
             let checks: Vec<_> = candidates
@@ -84,7 +93,11 @@ fn semantic_candidate_conditions(
             if checks.iter().all(|check| check.verdict == Verdict::Refuted) {
                 gaps += 1;
             }
-            let guard = |regs: &BTreeSet<RTLReg>| {
+            let guard = |regs: &BTreeSet<RTLReg>,
+                         profile: &HashMap<
+                RTLReg,
+                crate::decompile::passes::c_pass::types::CType,
+            >| {
                 Bool::and(
                     &regs
                         .iter()
@@ -93,7 +106,18 @@ fn semantic_candidate_conditions(
                                 // render_type maps both int and bare struct models to the
                                 // integer carrier. Guard the emitted declaration, otherwise
                                 // Optimize can evade a veto with struct and still emit int.
-                                Bool::and(&[t.is_ptr(ty).not(), t.is_float(ty).not()])
+                                let class = Bool::and(&[t.is_ptr(ty).not(), t.is_float(ty).not()]);
+                                if !concrete.0.contains_key(reg) {
+                                    return class;
+                                }
+                                let exact = concrete.guard(
+                                    *reg,
+                                    profile.get(reg) == declarations.get(reg),
+                                    |candidate| {
+                                        profile.get(reg) == Some(&candidate.to_c(func.data_model))
+                                    },
+                                );
+                                Bool::and(&[class, exact])
                             })
                         })
                         .collect::<Vec<_>>(),
@@ -110,8 +134,12 @@ fn semantic_candidate_conditions(
                         .iter()
                         .enumerate()
                         .filter_map(|(ci, check)| {
-                            (check.verdict == Verdict::Equivalent)
-                                .then(|| Bool::and(&[vars[ci].clone(), guard(&check.registers)]))
+                            (check.verdict == Verdict::Equivalent).then(|| {
+                                Bool::and(&[
+                                    vars[ci].clone(),
+                                    guard(&check.registers, &declarations),
+                                ])
+                            })
                         })
                         .collect();
                     if !proved.is_empty() {
@@ -121,6 +149,16 @@ fn semantic_candidate_conditions(
             }
             for (ci, check) in checks.iter().enumerate() {
                 if check.verdict != Verdict::Refuted {
+                    continue;
+                }
+                if matches!(
+                    check.witness,
+                    Some(super::super::obligations::Witness::Representation { .. })
+                ) {
+                    // This result cast cannot express the native word under
+                    // the decoder's input relation, for ANY C declaration
+                    // profile. No address/lifetime equivalence is inferred.
+                    out.insert((*node, ci), Bool::from_bool(false));
                     continue;
                 }
                 let witnesses: Vec<Bool> = checks
@@ -144,12 +182,16 @@ fn semantic_candidate_conditions(
                                     .unwrap_or_else(|| Bool::from_bool(true))
                             })
                             .collect();
-                        Some(Bool::and(&[guard(&witness.registers), Bool::or(&active)]))
+                        Some(Bool::and(&[
+                            guard(&witness.registers, &declarations),
+                            Bool::or(&active),
+                        ]))
                     })
                     .collect();
                 if !witnesses.is_empty() {
                     let condition =
-                        Bool::and(&[guard(&check.registers), Bool::or(&witnesses)]).not();
+                        Bool::and(&[guard(&check.registers, &declarations), Bool::or(&witnesses)])
+                            .not();
                     out.entry((*node, ci))
                         .and_modify(|old: &mut Bool| {
                             *old = Bool::and(&[old.clone(), condition.clone()]);
@@ -157,6 +199,8 @@ fn semantic_candidate_conditions(
                         .or_insert(condition);
                 }
             }
+            // Concrete declarations are checked against the selected model
+            // by the shared refinement session, not an eager cross product.
         }
     }
     if counts[0] + counts[1] > 0 {
@@ -179,6 +223,8 @@ impl Analysis for Semantics {
         static READS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
             let mut reads = producer_values::INPUTS.to_vec();
             reads.extend_from_slice(&memory_theory::INPUTS);
+            reads.extend_from_slice(super::transfers::INPUTS);
+            reads.extend_from_slice(super::observations::INPUTS);
             reads.sort_unstable();
             reads.dedup();
             reads
@@ -197,6 +243,11 @@ impl Analysis for Semantics {
         functions: &mut [FunctionData],
     ) -> Option<Box<dyn PreparedAnalysis>> {
         memory_theory::collect(db, functions);
+        super::observations::collect(db, functions);
+        super::transfers::collect(db, functions);
+        for function in functions.iter_mut() {
+            super::transfers::project_frame_views(function);
+        }
         producer_values::collect(db, functions);
         for function in functions {
             word_views::extend_candidates(function);
@@ -208,11 +259,17 @@ impl Analysis for Semantics {
         function: &'a FunctionData,
         out: &mut super::super::obligations::Obligations<'a>,
     ) {
-        use super::super::obligations::{IntegerAt, ReadValue, WriteTarget, WriteValue};
+        use super::super::obligations::{
+            CopyTransport, IntegerAt, LoadTransport, ReadValue, SwitchInput, WriteTarget,
+            WriteValue,
+        };
         // Nodes are visited in sorted order by the shared compiler. Preserve
         // contract order within each node and independent verifier quotas.
         for (&node, inst) in &function.integer_anchors {
             out.push(node, IntegerAt(node, inst));
+            if matches!(inst, crate::x86::types::RTLInst::Icond(..)) {
+                out.push(node, SwitchInput(node, inst));
+            }
         }
         for contract in &function.storage_writes {
             out.push(contract.node, WriteTarget(contract));
@@ -222,6 +279,20 @@ impl Analysis for Semantics {
         }
         for contract in &function.storage_reads {
             out.push(contract.node, ReadValue(contract));
+        }
+        for (&node, load) in super::transfers::LOADS
+            .get(&function.analysis_facts)
+            .into_iter()
+            .flatten()
+        {
+            out.push(node, LoadTransport(load));
+        }
+        for (&node, copy) in super::transfers::COPIES
+            .get(&function.analysis_facts)
+            .into_iter()
+            .flatten()
+        {
+            out.push(node, CopyTransport(copy));
         }
     }
 }
@@ -238,10 +309,11 @@ impl PreparedAnalysis for Semantics {
 struct SemanticConditions {
     conditions: HashMap<(Node, usize), Bool>,
     preferences: Vec<Bool>,
+    repair_bound: usize,
 }
 impl CandidateAnalysis for SemanticConditions {
     fn prior_count(&self) -> usize {
-        self.preferences.len()
+        self.preferences.len() + self.repair_bound
     }
     fn constrain_function(&self, _cx: &FunctionContext<'_>, sink: &ConstraintSink<'_>) {
         for preference in &self.preferences {
@@ -267,6 +339,7 @@ pub(super) fn compile(
     let (conditions, preferences) = semantic_candidate_conditions(
         cx.types,
         cx.declarations,
+        cx.concrete_declarations,
         cx.function,
         cx.nodes,
         cx.selections,
@@ -277,5 +350,12 @@ pub(super) fn compile(
     Box::new(SemanticConditions {
         conditions,
         preferences,
+        // Refinement may add at most one proof-backed repair preference per
+        // node. Reserve its weight before establishing C's dominant stratum.
+        repair_bound: if cx.concrete_declarations.0.is_empty() {
+            0
+        } else {
+            cx.nodes.len()
+        },
     })
 }

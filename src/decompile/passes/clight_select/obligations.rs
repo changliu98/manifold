@@ -24,6 +24,13 @@ pub enum Verdict {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Witness {
+    /// No result in the candidate's explicit cast range can represent this
+    /// native word. `projection` is the cast image, not evaluated candidate C.
+    Representation {
+        inputs: BTreeMap<RTLReg, u64>,
+        machine: u64,
+        projection: u64,
+    },
     Value {
         /// Concrete integer-carrier bits, keyed by the input relation's names.
         inputs: BTreeMap<RTLReg, u64>,
@@ -57,6 +64,15 @@ impl Check {
 /// a dispatch arm or reimplementing declaration/world-guarded refutation.
 pub(crate) trait Obligation {
     fn family(&self) -> &'static str;
+    /// Native dependencies survive even when a candidate omits the effect.
+    fn native_registers(&self) -> BTreeSet<RTLReg> {
+        BTreeSet::new()
+    }
+    /// Necessary representation properties need not change the legacy
+    /// statement objective; they are discharged for selected type changes.
+    fn checks_legacy(&self) -> bool {
+        true
+    }
     fn check(
         &self,
         integers: &integer_semantics::Validator,
@@ -69,6 +85,12 @@ pub(crate) trait Obligation {
 impl<T: Obligation + ?Sized> Obligation for &T {
     fn family(&self) -> &'static str {
         (**self).family()
+    }
+    fn native_registers(&self) -> BTreeSet<RTLReg> {
+        (**self).native_registers()
+    }
+    fn checks_legacy(&self) -> bool {
+        (**self).checks_legacy()
     }
     fn check(
         &self,
@@ -97,8 +119,19 @@ pub(crate) struct IntegerAt<'a>(pub crate::x86::types::Node, pub &'a RTLInst);
 pub(crate) struct WriteTarget<'a>(pub &'a memory_theory::WriteContract);
 pub(crate) struct WriteValue<'a>(pub &'a RTLInst, pub &'a memory_theory::WriteContract);
 pub(crate) struct ReadValue<'a>(pub &'a memory_theory::ReadContract);
+pub(crate) struct LoadTransport<'a>(pub &'a integer_semantics::LoadValue);
+pub(crate) struct CopyTransport<'a>(pub &'a integer_semantics::CopyValue);
+pub(crate) struct SwitchInput<'a>(pub crate::x86::types::Node, pub &'a RTLInst);
+
+fn native_registers(inst: &RTLInst) -> BTreeSet<RTLReg> {
+    let (definition, uses) = crate::decompile::passes::rtl_optimize_pass::inst_def_use(inst);
+    definition.into_iter().chain(uses).collect()
+}
 
 impl Obligation for Integer<'_> {
+    fn native_registers(&self) -> BTreeSet<RTLReg> {
+        native_registers(self.0)
+    }
     fn family(&self) -> &'static str {
         "integer"
     }
@@ -113,6 +146,9 @@ impl Obligation for Integer<'_> {
     }
 }
 impl Obligation for IntegerAt<'_> {
+    fn native_registers(&self) -> BTreeSet<RTLReg> {
+        native_registers(self.1)
+    }
     fn family(&self) -> &'static str {
         "integer"
     }
@@ -127,6 +163,9 @@ impl Obligation for IntegerAt<'_> {
     }
 }
 impl Obligation for WriteValue<'_> {
+    fn native_registers(&self) -> BTreeSet<RTLReg> {
+        native_registers(self.0)
+    }
     fn family(&self) -> &'static str {
         "store-value"
     }
@@ -141,6 +180,9 @@ impl Obligation for WriteValue<'_> {
     }
 }
 impl Obligation for ReadValue<'_> {
+    fn native_registers(&self) -> BTreeSet<RTLReg> {
+        BTreeSet::from([self.0.destination])
+    }
     fn family(&self) -> &'static str {
         "load-value"
     }
@@ -155,6 +197,9 @@ impl Obligation for ReadValue<'_> {
     }
 }
 impl Obligation for WriteTarget<'_> {
+    fn native_registers(&self) -> BTreeSet<RTLReg> {
+        self.0.locals.clone()
+    }
     fn family(&self) -> &'static str {
         "store-target"
     }
@@ -174,6 +219,69 @@ impl Obligation for WriteTarget<'_> {
             witness: (verdict == Verdict::Refuted).then_some(Witness::Target),
             ..Check::plain(verdict)
         }
+    }
+}
+
+impl Obligation for LoadTransport<'_> {
+    fn family(&self) -> &'static str {
+        "load-transport"
+    }
+    fn checks_legacy(&self) -> bool {
+        false
+    }
+    fn native_registers(&self) -> BTreeSet<RTLReg> {
+        BTreeSet::from([self.0.destination])
+    }
+    fn check(
+        &self,
+        integers: &integer_semantics::Validator,
+        stmt: &ClightStmt,
+        declarations: &HashMap<RTLReg, CType>,
+        function: &FunctionData,
+    ) -> Check {
+        integers.check_load_transport(stmt, self.0, declarations, function)
+    }
+}
+
+impl Obligation for CopyTransport<'_> {
+    fn family(&self) -> &'static str {
+        "copy-transport"
+    }
+    fn checks_legacy(&self) -> bool {
+        false
+    }
+    fn native_registers(&self) -> BTreeSet<RTLReg> {
+        BTreeSet::from([self.0.source, self.0.destination])
+    }
+    fn check(
+        &self,
+        integers: &integer_semantics::Validator,
+        stmt: &ClightStmt,
+        declarations: &HashMap<RTLReg, CType>,
+        function: &FunctionData,
+    ) -> Check {
+        integers.check_copy_transport(stmt, self.0, declarations, function)
+    }
+}
+
+impl Obligation for SwitchInput<'_> {
+    fn family(&self) -> &'static str {
+        "switch-discriminant"
+    }
+    fn checks_legacy(&self) -> bool {
+        false
+    }
+    fn native_registers(&self) -> BTreeSet<RTLReg> {
+        native_registers(self.1)
+    }
+    fn check(
+        &self,
+        integers: &integer_semantics::Validator,
+        stmt: &ClightStmt,
+        declarations: &HashMap<RTLReg, CType>,
+        function: &FunctionData,
+    ) -> Check {
+        integers.check_switch_input(self.0, self.1, stmt, declarations, function)
     }
 }
 

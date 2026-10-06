@@ -5,3 +5,4 @@ pub mod debug_dump;
 pub mod ir_dump;
 pub mod lost_dump;
 pub mod pipeline_dot;
+pub mod recovered_types;

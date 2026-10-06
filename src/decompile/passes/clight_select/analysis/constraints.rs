@@ -45,6 +45,9 @@ pub(crate) struct ConstraintSink<'a> {
     backend: &'a dyn SolveBackend,
     // The per-function dominant soft weight (compat_w); carried here so the operator-typing rules in `type_of` can emit dominant-soft requirements without threading the weight through every recursive call.
     pub(crate) compat_w: u64,
+    soft_scale: u64,
+    evidence_scale: u64,
+    support_scale: u64,
     // Re-pick recording for multi-candidate nodes: every emitted condition is logged RAW and re-scored in Rust under the fixed model, since node selections are conditionally independent given it.
     record: RefCell<Option<Vec<RecordedCond>>>,
     // Per-function (guard, cond, weight) dedup for the OPTIMIZER side only: identical obligations carry the same MaxSMT meaning, and clause COUNT is the cost driver.
@@ -53,9 +56,68 @@ pub(crate) struct ConstraintSink<'a> {
 
 impl<'a> ConstraintSink<'a> {
     pub(crate) fn new(backend: &'a dyn SolveBackend, compat_w: u64) -> Self {
+        Self::with_secondary(backend, compat_w, 0)
+    }
+
+    pub(crate) fn with_secondary(
+        backend: &'a dyn SolveBackend,
+        compat_w: u64,
+        secondary_count: usize,
+    ) -> Self {
+        Self::with_objectives(backend, compat_w, secondary_count, 0)
+    }
+
+    pub(crate) fn with_objectives(
+        backend: &'a dyn SolveBackend,
+        compatibility_bound: u64,
+        secondary_count: usize,
+        evidence_count: usize,
+    ) -> Self {
+        Self::with_supported_objectives(
+            backend,
+            compatibility_bound,
+            secondary_count,
+            evidence_count,
+            0,
+        )
+    }
+
+    pub(crate) fn with_supported_objectives(
+        backend: &'a dyn SolveBackend,
+        compatibility_bound: u64,
+        secondary_count: usize,
+        evidence_count: usize,
+        support_count: usize,
+    ) -> Self {
+        let soft_scale = (secondary_count as u64)
+            .checked_add(1)
+            .expect("selection objective bound");
+        let evidence_scale = compatibility_bound
+            .checked_mul(soft_scale)
+            .expect("selection evidence bound");
+        let support_unit = evidence_count
+            .checked_add(1)
+            .expect("selection support bound");
+        let combined_evidence = support_count
+            .checked_mul(support_unit)
+            .and_then(|n| n.checked_add(evidence_count))
+            .expect("selection support bound");
+        let support_scale = evidence_scale
+            .checked_mul(support_unit as u64)
+            .expect("selection support weight");
+        let compat_w = compatibility_bound
+            .checked_mul(
+                (combined_evidence as u64)
+                    .checked_add(1)
+                    .expect("selection evidence bound"),
+            )
+            .expect("selection compatibility bound");
         ConstraintSink {
             backend,
             compat_w,
+            soft_scale,
+            evidence_scale,
+            support_scale,
             record: RefCell::new(None),
             asserted: RefCell::new(HashSet::new()),
         }
@@ -86,12 +148,12 @@ impl<'a> ConstraintSink<'a> {
 
     // A selection preference: never asserted into the optimizer, only recorded for the post-solve re-pick (no-op outside a recording scope -- with a single candidate there is nothing to prefer).
     pub(crate) fn prefer(&self, cond: &Bool, w: u64) {
-        self.log(Some(cond), w);
+        self.log(Some(cond), w * self.soft_scale);
     }
 
     // An unconditional penalty against the current candidate (e.g. capturing a void callee's result); recorded for the re-pick alongside its z3 assertion.
     pub(crate) fn penalize_candidate(&self, w: u64) {
-        self.log(None, w);
+        self.log(None, w * self.soft_scale);
     }
 
     // A structural requirement: always hard.
@@ -114,6 +176,7 @@ impl<'a> ConstraintSink<'a> {
         w: u64,
         tag: &'static str,
     ) {
+        let w = w * self.soft_scale;
         self.log(Some(cond), w);
         if !self.first_assert(guard, cond, w) {
             return;
@@ -129,24 +192,63 @@ impl<'a> ConstraintSink<'a> {
     // Soft assertion on a raw Bool (the candidate-penalty `!guard` forms and the priors).
     pub(crate) fn assert_soft_raw(&self, cond: &Bool, w: u64) {
         SOFT_CLAUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.backend.assert_soft(cond, w);
+        self.backend.assert_soft(cond, w * self.soft_scale);
+    }
+
+    /// Weight-one secondary objective. Even all its violations together
+    /// cannot buy one unit of the pre-existing selection objective.
+    pub(crate) fn assert_secondary(&self, cond: &Bool, tag: &'static str) {
+        self.assert_secondary_weighted(cond, 1, tag);
+    }
+
+    /// The analysis must include this weight in its declared objective bound.
+    pub(crate) fn assert_secondary_weighted(&self, cond: &Bool, weight: u64, tag: &'static str) {
+        self.log(Some(cond), weight);
+        if !self.first_assert(None, cond, weight) {
+            return;
+        }
+        SOFT_CLAUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        soft_tag_count(tag);
+        self.backend.assert_soft(cond, weight);
+    }
+
+    /// A module must account for every unit in evidence_count(). Exact
+    /// structural constraints and learned refutations remain hard.
+    pub(crate) fn assert_evidence_weighted(&self, cond: &Bool, weight: u64, tag: &'static str) {
+        let weight = weight
+            .checked_mul(self.evidence_scale)
+            .expect("selection evidence weight");
+        self.log(Some(cond), weight);
+        if !self.first_assert(None, cond, weight) {
+            return;
+        }
+        SOFT_CLAUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        soft_tag_count(tag);
+        self.backend.assert_soft(cond, weight);
+    }
+
+    pub(crate) fn assert_type_support(&self, cond: &Bool) {
+        self.log(Some(cond), self.support_scale);
+        if !self.first_assert(None, cond, self.support_scale) {
+            return;
+        }
+        SOFT_CLAUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        soft_tag_count("type_shape_support");
+        self.backend.assert_soft(cond, self.support_scale);
     }
 
     /// A formula involving another statement choice is not conditionally
     /// independent under a type-only model. Preserve the joint assignment for
     /// every referenced node (including its guard) during local re-picking.
     /// Module authors do not have to maintain a second dependency ledger for
-    /// function-wide or cross-candidate hard constraints.
+    /// function-wide or cross-candidate constraints OR objective terms.
     pub(crate) fn joint_nodes(&self, choices: &HashMap<Node, Vec<Bool>>) -> BTreeSet<Node> {
         let variables: HashMap<Dynamic, Node> = choices
             .iter()
             .flat_map(|(&node, vars)| vars.iter().map(move |var| (Dynamic::from_ast(var), node)))
             .collect();
         let mut protected = BTreeSet::new();
-        for (guard, condition, weight) in self.asserted.borrow().iter() {
-            if *weight != u64::MAX {
-                continue;
-            }
+        for (guard, condition, _) in self.asserted.borrow().iter() {
             let mut pending = vec![Dynamic::from_ast(condition)];
             let mut seen = HashSet::new();
             let mut joint = false;
@@ -183,5 +285,31 @@ pub(crate) static SOFT_TAGS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<&'sta
 fn soft_tag_count(tag: &'static str) {
     if std::env::var("MANIFOLD_SOFT_BREAKDOWN").is_ok() {
         *SOFT_TAGS.lock().unwrap().entry(tag).or_default() += 1;
+    }
+}
+
+#[cfg(test)]
+mod objective_tests {
+    use super::*;
+    #[derive(Default)]
+    struct Record(RefCell<Vec<u64>>);
+    impl SolveBackend for Record {
+        fn assert_hard(&self, _: &Bool) {}
+        fn assert_soft(&self, _: &Bool, weight: u64) {
+            self.0.borrow_mut().push(weight);
+        }
+    }
+    #[test]
+    fn evidence_and_compatibility_dominate_their_entire_lower_tiers() {
+        let backend = Record::default();
+        let sink = ConstraintSink::with_objectives(&backend, 4, 7, 5);
+        let primary = sink.soft_scale;
+        let evidence = sink.evidence_scale;
+        let compatibility = sink.compat_w * primary;
+        assert!(evidence > 3 * primary + 7);
+        assert!(compatibility > 5 * evidence + 3 * primary + 7);
+        let legacy = ConstraintSink::with_secondary(&backend, 4, 7);
+        assert_eq!(legacy.compat_w, 4);
+        assert_eq!(legacy.soft_scale, 8);
     }
 }

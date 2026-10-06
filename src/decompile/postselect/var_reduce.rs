@@ -3,6 +3,7 @@ use crate::decompile::elevator::config::CONFIG;
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::c_pass::types::*;
 use crate::decompile::passes::pass::IRPass;
+use crate::x86::types::{Address, RTLReg};
 use std::collections::{HashMap, HashSet};
 
 // complete read-only walkers
@@ -153,7 +154,10 @@ fn stmt_children(s: &CStmt) -> Vec<&CStmt> {
             }
             c
         }
-        CStmt::Switch(_, b) | CStmt::While(_, b) | (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) | CStmt::DoWhile(b, _) => {
+        CStmt::Switch(_, b)
+        | CStmt::While(_, b)
+        | (CStmt::Labeled(_, b) | CStmt::Effect(_, b))
+        | CStmt::DoWhile(b, _) => {
             vec![b.as_ref()]
         }
         CStmt::For(_, _, _, b) => vec![b.as_ref()],
@@ -830,8 +834,8 @@ impl Plan {
     }
 }
 
-/// Coalesce non-interfering, identical-CType locals and delete copies that become identities. Cross-type storage reuse is deliberately excluded: preserving every assignment conversion's value, timing, and floating-point environment effects is outside this pass's proof model. Returns the number of locals eliminated.
-fn run_coalesce(func: &mut FuncDef) -> usize {
+/// Coalesce non-interfering, identical-CType locals and delete copies that become identities. Cross-type storage reuse is deliberately excluded: preserving every assignment conversion's value, timing, and floating-point environment effects is outside this pass's proof model. Return the applied plan so representation provenance follows the same transformation as the AST.
+fn coalesce_locals(func: &mut FuncDef) -> Plan {
     let effect_protected = crate::decompile::effects::c::protected_names(func);
     // Candidates are plain, uninitialized automatic scalar locals whose address is never taken and whose writes are all represented exactly by the scalar CFG. Static/register/extern locals, qualified objects, inited locals, aliased locals, and vars with nested/compound/inc-dec writes are excluded because changing their storage or missing a def is unsound.
     let mut addr_taken: HashSet<String> = HashSet::new();
@@ -900,14 +904,50 @@ fn run_coalesce(func: &mut FuncDef) -> usize {
 
     // With no merge, preserve the AST byte-for-byte. Besides being cheaper, this prevents an empty plan from rewriting existing cast syntax or deleting a pre-existing self-assignment (which can be volatile).
     if plan.is_empty() {
-        return 0;
+        return plan;
     }
 
     // Apply the same-type plan and drop an original distinct-variable copy (`v = w`) when both now share a slot.
     func.body = apply_plan_stmt(&func.body, &plan);
+    let committed: HashSet<_> = func.local_vars.iter().filter(|d| d.type_committed)
+        .map(|d| plan.repof(&d.name).to_owned()).collect();
+    for declaration in &mut func.local_vars {
+        declaration.type_committed |= committed.contains(&declaration.name);
+    }
     func.local_vars
         .retain(|d| !plan.rename.contains_key(&d.name));
-    plan.rename.len()
+    plan
+}
+
+#[cfg(test)]
+fn run_coalesce(func: &mut FuncDef) -> usize {
+    coalesce_locals(func).rename.len()
+}
+
+/// Project existing value origins through the exact, already-applied merge
+/// plans. Keep the native function/register identities: two disjoint values
+/// sharing a C binding does not imply that their machine storage aliases.
+/// This changes no type or frame-coordinate evidence and invents no origins
+/// for declarations eliminated without a proven binding replacement.
+fn project_variable_origins(db: &mut DecompileDB, plans: &HashMap<String, Plan>) {
+    if plans.is_empty() {
+        return;
+    }
+    let mut origins: Vec<_> = db
+        .rel_iter::<(Address, RTLReg, String, String)>("emit_c_variable_origin")
+        .map(|(function, reg, owner, name)| {
+            let representative = plans
+                .get(owner)
+                .map_or(name.as_str(), |plan| plan.repof(name));
+            (*function, *reg, owner.clone(), representative.to_owned())
+        })
+        .collect();
+    origins.sort_unstable();
+    origins.dedup();
+    db.rel_set(
+        "emit_c_variable_origin",
+        origins.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
 }
 
 /// Same-CType union-find coalescing -> merge plan.
@@ -1572,6 +1612,7 @@ fn demote_pointer_counters(func: &mut FuncDef) -> usize {
     for d in func.local_vars.iter_mut() {
         if d.ty.is_pointer()
             && d.storage_views.is_empty()
+            && !d.type_committed
             && !effect_protected.contains(&d.name)
             && self_add.contains(&d.name)
             && null_cmp.contains(&d.name)
@@ -1645,13 +1686,20 @@ impl IRPass for VarReducePass {
         };
         let mut merged = 0usize;
         let mut split_total = 0usize;
+        let mut plans = HashMap::new();
         for decl in tu.decls.iter_mut() {
             if let TopLevelDecl::FuncDef(f) = decl {
                 // 0) Split eligible initializers into coalescing candidates; surviving assignments are re-fused at the end.
                 let split = split_scalar_inits(f);
                 split_total += split.len();
                 // 1) Merge non-interfering locals using CFG/liveness proof. Cross-statement single-use folding is deliberately absent: moving an rhs into a later expression needs evaluation-count, path, sequencing, and clobber proofs that this AST pass cannot establish mechanically.
-                merged += run_coalesce(f);
+                let plan = coalesce_locals(f);
+                merged += plan.rename.len();
+                if !plan.is_empty() {
+                    // Key on the actual emitted owner, including any header-
+                    // collision rename, never on a guessed function spelling.
+                    plans.insert(f.name.clone(), plan);
+                }
                 // 2) Re-fuse surviving split initializers (identity inverse of 0).
                 refuse_scalar_inits(f, &split);
                 // 3) Retype pointer locals used as integer countdown counters to `long` (UB-safe at -O2).
@@ -1666,6 +1714,9 @@ impl IRPass for VarReducePass {
                 log::warn!("coverage: cannot record var_reduce checkpoint: {reason}");
             }
         }
+        // Publish the AST and its binding projection together at this pass
+        // boundary; downstream readers must not see names that we removed.
+        project_variable_origins(db, &plans);
         log::info!(
             "var_reduce: coalesced {} locals, split {} initializers",
             merged,
@@ -1678,6 +1729,7 @@ impl IRPass for VarReducePass {
         &[
             "cast_optimized_translation_unit",
             "cast_post_emit_audit_trail",
+            "emit_c_variable_origin",
         ]
     }
 
@@ -1685,6 +1737,7 @@ impl IRPass for VarReducePass {
         &[
             "cast_optimized_translation_unit",
             "cast_post_emit_audit_trail",
+            "emit_c_variable_origin",
         ]
     }
 }
@@ -1698,20 +1751,49 @@ mod tests {
     }
 
     #[test]
+    fn coalescing_preserves_type_commitments_on_the_actual_representative() {
+        let mut committed = lv("b");
+        committed.type_committed = true;
+        let mut f = fd(vec![lv("a"), committed], vec![
+            assign("a", CExpr::int(1)), callstmt("consume", CExpr::var("a")),
+            assign("b", CExpr::int(2)), callstmt("consume", CExpr::var("b")),
+        ]);
+        assert_eq!(run_coalesce(&mut f), 1);
+        assert_eq!(f.local_vars.len(), 1);
+        assert!(f.local_vars[0].type_committed);
+        assert_eq!(f.local_vars[0].ty, CType::long());
+    }
+
+    #[test]
     fn storage_declarations_are_excluded_without_losing_other_coalescing() {
         let mut storage = lv("storage");
-        storage.storage_views.push(crate::decompile::passes::semantic_counterexample::ledger::ObjectView {
-            object: crate::decompile::passes::semantic_counterexample::ledger::ObjectId { function: 1, base: 0 },
-            offset: 0, extent: 8,
-        });
+        storage.storage_views.push(
+            crate::decompile::passes::semantic_counterexample::ledger::ObjectView {
+                object: crate::decompile::passes::semantic_counterexample::ledger::ObjectId {
+                    function: 1,
+                    base: 0,
+                },
+                offset: 0,
+                extent: 8,
+            },
+        );
         assert!(!is_plain_auto_scalar(&storage));
-        let mut function = fd(vec![storage,lv("a"),lv("b")], vec![
-            assign("a",CExpr::int(1)), callstmt("consume",CExpr::var("a")),
-            assign("b",CExpr::int(2)), callstmt("consume",CExpr::var("b")),
-            assign("storage",CExpr::int(3)), CStmt::Return(Some(CExpr::var("storage"))),
-        ]);
-        assert_eq!(run_coalesce(&mut function),1);
-        assert!(function.local_vars.iter().any(|v| v.name=="storage" && !v.storage_views.is_empty()));
+        let mut function = fd(
+            vec![storage, lv("a"), lv("b")],
+            vec![
+                assign("a", CExpr::int(1)),
+                callstmt("consume", CExpr::var("a")),
+                assign("b", CExpr::int(2)),
+                callstmt("consume", CExpr::var("b")),
+                assign("storage", CExpr::int(3)),
+                CStmt::Return(Some(CExpr::var("storage"))),
+            ],
+        );
+        assert_eq!(run_coalesce(&mut function), 1);
+        assert!(function
+            .local_vars
+            .iter()
+            .any(|v| v.name == "storage" && !v.storage_views.is_empty()));
     }
 
     fn assign(v: &str, e: CExpr) -> CStmt {
@@ -1760,6 +1842,221 @@ mod tests {
             local_vars: locals,
             loc: SourceLoc::unknown(),
         }
+    }
+
+    fn provenance_db(functions: Vec<FuncDef>) -> DecompileDB {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
+        let mut tu = TranslationUnit::new();
+        for function in functions {
+            tu.add_function(function);
+        }
+        db.cast_optimized_translation_unit = Some(tu);
+        db
+    }
+
+    fn origin(db: &mut DecompileDB, function: Address, reg: RTLReg, owner: &str, name: &str) {
+        db.rel_push(
+            "emit_c_variable_origin",
+            (function, reg, owner.to_owned(), name.to_owned()),
+        );
+    }
+
+    fn origins(db: &DecompileDB) -> std::collections::BTreeSet<(Address, RTLReg, String, String)> {
+        db.rel_iter::<(Address, RTLReg, String, String)>("emit_c_variable_origin")
+            .cloned()
+            .collect()
+    }
+
+    fn native_slot(
+        db: &mut DecompileDB,
+        node: Address,
+        reg: RTLReg,
+        offset: i64,
+        symbol: &'static str,
+    ) {
+        db.rel_push("stack_var", (100_u64, node, offset, reg));
+        db.rel_push("settled_bp_frame_base", (100_u64, node, -8_i64));
+        db.rel_push(
+            "instruction",
+            (
+                node, 4_usize, "", "MOV", symbol, "dst", "", "", 0_usize, 0_usize,
+            ),
+        );
+        db.rel_push(
+            "op_indirect",
+            (symbol, "NONE", "RBP", "NONE", 1_i64, offset, 8_usize),
+        );
+    }
+
+    fn disjoint_pair(a: &str, b: &str) -> FuncDef {
+        fd(
+            vec![lv(a), lv(b)],
+            vec![
+                assign(a, CExpr::int(1)),
+                callstmt("consume", CExpr::var(a)),
+                assign(b, CExpr::int(2)),
+                CStmt::Return(Some(CExpr::var(b))),
+            ],
+        )
+    }
+
+    #[test]
+    fn coalescing_preserves_native_identities_and_exported_stack_locations() {
+        let mut db = provenance_db(vec![disjoint_pair("a", "b")]);
+        origin(&mut db, 100, 101, "t", "a");
+        origin(&mut db, 100, 102, "t", "b");
+        native_slot(&mut db, 90, 101, -8, "slot_a");
+        native_slot(&mut db, 7, 102, -16, "slot_b");
+        let before = crate::debug::recovered_types::collect(&db).unwrap();
+        assert_eq!(before["variables"].as_array().unwrap().len(), 2);
+
+        VarReducePass.run(&mut db);
+
+        assert_eq!(
+            origins(&db),
+            std::collections::BTreeSet::from([
+                (100, 101, "t".into(), "a".into()),
+                (100, 102, "t".into(), "a".into()),
+            ])
+        );
+        let TopLevelDecl::FuncDef(f) =
+            &db.cast_optimized_translation_unit.as_ref().unwrap().decls[0]
+        else {
+            panic!()
+        };
+        assert_eq!(
+            f.local_vars.len(),
+            1,
+            "no dummy declarations to retain origins"
+        );
+        let after = crate::debug::recovered_types::collect(&db).unwrap();
+        assert_eq!(after["variables"].as_array().unwrap().len(), 2);
+        for old in before["variables"].as_array().unwrap() {
+            let new = after["variables"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|new| new["rbp_offset"] == old["rbp_offset"])
+                .unwrap();
+            assert_eq!(new["name"], "a");
+            for key in ["function_address", "type", "evidence_nodes"] {
+                assert_eq!(new[key], old[key], "changed {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn provenance_does_not_change_the_coalesced_c_program() {
+        let input = disjoint_pair("a", "b");
+        let mut expected = input.clone();
+        assert_eq!(run_all(&mut expected), 1);
+        let mut db = provenance_db(vec![input]);
+        origin(&mut db, 100, 101, "t", "a");
+        origin(&mut db, 100, 102, "t", "b");
+        VarReducePass.run(&mut db);
+        assert_eq!(
+            db.cast_optimized_translation_unit.as_ref().unwrap().decls[0],
+            TopLevelDecl::FuncDef(expected)
+        );
+    }
+
+    #[test]
+    fn provenance_is_scoped_to_the_emitted_function_owner() {
+        let mut merged = disjoint_pair("a", "b");
+        merged.name = "allocator_local".into();
+        let mut untouched = fd(
+            vec![lv("a"), lv("b")],
+            vec![
+                assign("a", CExpr::int(1)),
+                assign("b", CExpr::int(2)),
+                CStmt::Return(Some(add(CExpr::var("a"), CExpr::var("b")))),
+            ],
+        );
+        untouched.name = "other".into();
+        let mut db = provenance_db(vec![merged, untouched]);
+        origin(&mut db, 100, 101, "allocator_local", "b");
+        origin(&mut db, 200, 101, "other", "b");
+        VarReducePass.run(&mut db);
+        assert_eq!(
+            origins(&db),
+            std::collections::BTreeSet::from([
+                (100, 101, "allocator_local".into(), "a".into()),
+                (200, 101, "other".into(), "b".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn successive_merge_plans_compose_existing_origins() {
+        let mut db = provenance_db(vec![disjoint_pair("b", "c")]);
+        origin(&mut db, 100, 101, "t", "b");
+        origin(&mut db, 100, 102, "t", "c");
+        VarReducePass.run(&mut db);
+        let TopLevelDecl::FuncDef(f) =
+            &mut db.cast_optimized_translation_unit.as_mut().unwrap().decls[0]
+        else {
+            panic!()
+        };
+        *f = disjoint_pair("b", "a");
+        VarReducePass.run(&mut db);
+        let expected = std::collections::BTreeSet::from([
+            (100, 101, "t".into(), "a".into()),
+            (100, 102, "t".into(), "a".into()),
+        ]);
+        assert_eq!(origins(&db), expected);
+        let tree = db.cast_optimized_translation_unit.clone();
+        VarReducePass.run(&mut db);
+        assert_eq!(origins(&db), expected);
+        assert_eq!(db.cast_optimized_translation_unit, tree);
+    }
+
+    #[test]
+    fn absent_bindings_do_not_receive_invented_merge_provenance() {
+        let mut db = provenance_db(vec![disjoint_pair("a", "b")]);
+        origin(&mut db, 100, 101, "t", "b");
+        origin(&mut db, 100, 102, "t", "already_removed");
+        native_slot(&mut db, 90, 101, -8, "slot_a");
+        native_slot(&mut db, 7, 102, -16, "slot_b");
+        VarReducePass.run(&mut db);
+        assert!(origins(&db).contains(&(100, 102, "t".into(), "already_removed".into())));
+        let exported = crate::debug::recovered_types::collect(&db).unwrap();
+        assert_eq!(exported["variables"].as_array().unwrap().len(), 1);
+        assert_eq!(exported["variables"][0]["rbp_offset"], -8);
+    }
+
+    #[test]
+    fn multiple_value_origins_of_a_binding_all_follow_its_merge() {
+        let mut db = provenance_db(vec![disjoint_pair("a", "b")]);
+        for reg in [101, 102, 103] {
+            origin(&mut db, 100, reg, "t", "b");
+        }
+        VarReducePass.run(&mut db);
+        assert_eq!(
+            origins(&db),
+            [101, 102, 103]
+                .into_iter()
+                .map(|reg| (100, reg, "t".into(), "a".into()))
+                .collect()
+        );
+    }
+
+    #[test]
+    fn cross_type_locals_keep_distinct_value_origins() {
+        let mut function = disjoint_pair("a", "b");
+        function.local_vars[1].ty = CType::int();
+        let mut db = provenance_db(vec![function]);
+        origin(&mut db, 100, 101, "t", "a");
+        origin(&mut db, 100, 102, "t", "b");
+        let before = origins(&db);
+        VarReducePass.run(&mut db);
+        assert_eq!(origins(&db), before);
+    }
+
+    #[test]
+    fn origin_projection_is_a_declared_read_write_handoff() {
+        assert!(VarReducePass.inputs().contains(&"emit_c_variable_origin"));
+        assert!(VarReducePass.outputs().contains(&"emit_c_variable_origin"));
     }
 
     fn fl(value: f64) -> CExpr {

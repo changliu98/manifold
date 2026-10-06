@@ -35,6 +35,43 @@ fn max_refined_struct_xtype<'a>(
         .into_iter()
 }
 
+/// Signature types whose pointee is a scalar, pointer or function, never a record.
+fn is_non_record_pointer(xtype: &XType) -> bool {
+    matches!(
+        xtype,
+        XType::Xcharptr
+            | XType::Xcharptrptr
+            | XType::Xintptr
+            | XType::Xfloatptr
+            | XType::Xsingleptr
+            | XType::Xfuncptr
+    )
+}
+
+/// Record-layout admission shared by every pointer struct-identity producer:
+/// at least two non-overlapping fields that are not a uniform element stride
+/// (`StructLayoutProgram`). The key is the caller's own identity for a pointer
+/// class; the predicate never merges keys.
+pub(crate) fn valid_pointer_record_layouts(
+    accesses: impl IntoIterator<Item = (RTLReg, i64, MemoryChunk, bool)>,
+) -> HashSet<RTLReg> {
+    let mut program = StructLayoutProgram::default();
+    for (key, offset, chunk, load) in accesses {
+        program
+            .layout_access
+            .push((StructLayoutSource::Pointer(key), offset, chunk, load));
+    }
+    program.run();
+    program
+        .valid_struct_layout
+        .iter()
+        .filter_map(|(source,)| match source {
+            StructLayoutSource::Pointer(key) => Some(*key),
+            _ => None,
+        })
+        .collect()
+}
+
 fn struct_indexed_offset(addressing: &Addressing) -> Option<i64> {
     match addressing {
         Addressing::Aindexed(offset)
@@ -77,6 +114,22 @@ fn uniform_struct_layout<'a>(
         inp.map(|(&offset, &chunk)| (offset, chunk)).collect();
     fields.sort_unstable();
     std::iter::once(is_uniform_stride(&fields))
+}
+
+fn element_stride_layout<'a>(
+    inp: impl Iterator<Item = (&'a i64, &'a MemoryChunk)>,
+) -> impl Iterator<Item = bool> {
+    let mut fields: Vec<(i64, MemoryChunk)> =
+        inp.map(|(&offset, &chunk)| (offset, chunk)).collect();
+    fields.sort_unstable();
+    std::iter::once(fields.len() >= 2 && is_element_stride(&fields))
+}
+
+/// Same chunk everywhere and consecutive offsets exactly one element apart.
+fn is_element_stride(fields: &[(i64, MemoryChunk)]) -> bool {
+    let element = chunk_byte_size(&fields[0].1) as i64;
+    fields.iter().all(|(_, chunk)| *chunk == fields[0].1)
+        && fields.windows(2).all(|pair| pair[1].0 - pair[0].0 == element)
 }
 
 fn struct_fields_overlap(left_offset: i64, left_chunk: MemoryChunk, right_offset: i64) -> bool {
@@ -149,12 +202,26 @@ ascent_par! {
             in selected_layout_field(source, offset, chunk),
         if uniform;
 
+    // Through a POINTER, same-width accesses at the element stride (s[0],
+    // s[1]; argv[1], argv[2]) are fully explained by the pointee's element
+    // type; a record is a further hypothesis that needs evidence the element
+    // reading cannot explain (mixed widths or off-stride offsets). A fixed
+    // stack/global object keeps the configured coincidence threshold.
+    #[local] relation layout_is_element_stride(StructLayoutSource);
+    layout_is_element_stride(source) <--
+        selected_layout_field(source, _, _),
+        if matches!(source, StructLayoutSource::Pointer(_)),
+        agg uniform = element_stride_layout(offset, chunk)
+            in selected_layout_field(source, offset, chunk),
+        if uniform;
+
     relation valid_struct_layout(StructLayoutSource);
     valid_struct_layout(source) <--
         layout_field_count(source, count),
         if *count >= 2,
         !layout_has_overlap(source),
-        !layout_is_uniform_array(source);
+        !layout_is_uniform_array(source),
+        !layout_is_element_stride(source);
 }
 
 ascent_par! {
@@ -275,6 +342,11 @@ ascent_par! {
     call_site(node, *sym) <--
         call_target_func(node, callee),
         emit_function(callee, sym, _);
+    // Library calls are by NAME in RTL; call_target_func only covers
+    // by-address targets. A name the binary defines is not the library.
+    call_site(node, *name) <--
+        rtl_inst(node, ?RTLInst::Icall(_, either::Either::Right(either::Either::Right(name)), _, _, _)),
+        !emit_function(_, name, _);
 
     call_arg(call_node, *pos, *reg) <--
         call_arg_mapping(call_node, pos, reg);
@@ -312,6 +384,23 @@ ascent_par! {
             XType::Xbool | XType::Xint8signed | XType::Xint8unsigned |
             XType::Xint16signed | XType::Xint16unsigned);
 
+    // The ABI contract of a known callee also names the POINTEE: a value
+    // passed as, or returned as, char*/char**/int*/float*/function pointer
+    // addresses that element type. Constant-offset accesses through it are
+    // element accesses (s[1], argv[2]), not record fields.
+    ptr_rejected_as_struct(arg_reg) <--
+        call_site(node, func_name),
+        call_arg(node, arg_idx, arg_reg),
+        known_extern_signature(func_name, _, _, params),
+        if *arg_idx < params.len(),
+        if is_non_record_pointer(&params[*arg_idx]);
+
+    ptr_rejected_as_struct(*dst) <--
+        call_site(node, func_name),
+        rtl_inst(node, ?RTLInst::Icall(_, _, _, Some(dst), _)),
+        known_extern_signature(func_name, _, ret, _),
+        if is_non_record_pointer(ret);
+
     // Reject if variable-indexed access (likely array)
     #[local] relation ptr_has_variable_index(RTLReg);
 
@@ -345,6 +434,13 @@ ascent_par! {
         ptr_has_multiple_offsets(reg),
         !ptr_rejected_as_struct(reg),
         !ptr_has_variable_index(reg);
+
+    // The same exclusions, published for every other producer of pointer
+    // struct identity (ClightField's efield linkage) so no path admits a
+    // record this pass has evidence against.
+    relation ptr_record_rejected(RTLReg);
+    ptr_record_rejected(reg) <-- ptr_rejected_as_struct(reg);
+    ptr_record_rejected(reg) <-- ptr_has_variable_index(reg);
 
     #[local] relation ptr_is_data(RTLReg);
     ptr_is_data(reg) <--
@@ -680,6 +776,7 @@ impl IRPass for StructRecoveryPass {
             "ptr_deref",
             "ptr_deref_load",
             "ptr_is_struct_candidate",
+            "ptr_record_rejected",
             "struct_field_type",
             "refined_ptr_type",
             "stack_struct_field",

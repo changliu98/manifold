@@ -548,10 +548,10 @@ fn imul3_memory_operation(
 }
 
 // A load's memory width belongs to its source operand, not to the destination
-// register that receives the extended value. Most load rules flow through
-// `transl_load` and already preserve that distinction. Direct symbol-backed
-// MOV rules bypass that path, so refine their typed destination chunk with the
-// source width here. MOVSX/MOVZX also carry signedness in the mnemonic; keep
+// register that receives the extended value. Every typed MOV load, including
+// register-based/indexed and symbol-backed forms, must refine its destination
+// carrier chunk with the decoded source width. MOVSX/MOVZX also carry
+// signedness in the mnemonic; keep
 // that signedness while selecting the 8- or 16-bit source chunk.
 fn refine_direct_load_chunk(
     mnem: &str,
@@ -2862,6 +2862,17 @@ ascent_par! {
         let ty = if *sz <= 4 { Typ::Tint } else { Typ::Tany64 },
         let imm_int = *imm_sym as i64;
 
+    // A pointer-width immediate stored to a frame slot carries the same
+    // absolute-address evidence as a register move of it: when it is exactly a
+    // data symbol's linked address, the slot receives that object's address,
+    // not a number.
+    relation mach_imm_stack_symbol(Address, Ident);
+    mach_imm_stack_symbol(*addr, *ident) <--
+        mach_imm_stack_init(addr, _, imm, ?Typ::Tany64),
+        immediate_nonzero_data_symbol(*imm as Address),
+        resolved_addr_to_symbol(*imm as Address, ident, _offset),
+        if *ident != 0;
+
     // RIP base excluded: Mreg::x86("RIP") is Unknown so the row could never lower; RIP-relative immediate global stores have no lifting route and are silently dropped (FIXPLAN 3.8c).
     mach_imm_indirect_store(addr, imm_int, mc, base_mreg, *disp) <--
         pmov(addr, dst, src),
@@ -2894,14 +2905,16 @@ ascent_par! {
         ireg_hold_type(dststr.to_string(), typ);
 
     // SP-relative indexed load: treat as Mload with Aindexed2scaled addressing
-    mach_inst(addr, MachInst::Mload(*mc, addressing, Arc::new(args), Mreg::x86(dststr))) <--
+    mach_inst(addr, MachInst::Mload(mc, addressing, Arc::new(args), Mreg::x86(dststr))) <--
         pmov(addr, dst, src),
-        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        op_indirect(src, _, base_str, idx_str, scale, disp, source_width),
         if Mreg::x86(base_str) == Mreg::SP,
         if *idx_str != "NONE" && !idx_str.is_empty(),
         op_register(dst, dststr),
         ireg_hold_type(dststr.to_string(), typ),
-        type_to_memchunk(typ, mc),
+        type_to_memchunk(typ, destination_chunk),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        let mc = refine_direct_load_chunk(mnem, *destination_chunk, *source_width),
         ireg_of(preg_of_idx, Ireg::from(idx_str)),
         preg_of(idx_arg, preg_of_idx),
         let (addressing, args) = if *scale > 1 {
@@ -2976,16 +2989,18 @@ ascent_par! {
         };
 
     // BP-relative indexed load with frame pointer: treat as Mload
-    mach_inst(addr, MachInst::Mload(*mc, addressing, Arc::new(args), Mreg::x86(dststr))) <--
+    mach_inst(addr, MachInst::Mload(mc, addressing, Arc::new(args), Mreg::x86(dststr))) <--
         pmov(addr, dst, src),
-        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        op_indirect(src, _, base_str, idx_str, scale, disp, source_width),
         if Mreg::x86(base_str) == Mreg::BP,
         if *idx_str != "NONE" && !idx_str.is_empty(),
         op_register(dst, dststr),
         instr_in_function(addr, func),
         func_has_frame_pointer(func),
         ireg_hold_type(dststr.to_string(), typ),
-        type_to_memchunk(typ, mc),
+        type_to_memchunk(typ, destination_chunk),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        let mc = refine_direct_load_chunk(mnem, *destination_chunk, *source_width),
         ireg_of(preg_of_idx, Ireg::from(idx_str)),
         preg_of(idx_arg, preg_of_idx),
         let (addressing, args) = if *scale > 1 {
@@ -3006,15 +3021,7 @@ ascent_par! {
         ireg_hold_type(dststr.to_string(), typ),
         type_to_memchunk(typ, base_chunk),
         instruction(addr, _, _, mnem, _, _, _, _, _, _),
-        // For a sign/zero-extending GP load the accessed memory is the narrower SOURCE, so take the chunk from the mnemonic and operand width, not the 64-bit dst hold-type; float moves excluded.
-        let mnem_upper = mnem.to_ascii_uppercase(),
-        let mc = if (mnem_upper.contains("MOVZX") || mnem_upper.contains("MOVSX")
-            || mnem_upper.contains("MOVZB") || mnem_upper.contains("MOVSB")
-            || mnem_upper.contains("MOVZW") || mnem_upper.contains("MOVSW")) {
-            refine_chunk_with_size(chunk_from_mnem_ext(mnem), *msize)
-        } else {
-            *base_chunk
-        };
+        let mc = refine_direct_load_chunk(mnem, *base_chunk, *msize);
 
     // BP-base INDEXED load, BP not the frame pointer: preserve base+index (mirror the frame-pointer rule).
     mach_inst(addr, MachInst::Mload(mc, addressing, Arc::new(args), Mreg::x86(dststr))) <--
@@ -3028,15 +3035,7 @@ ascent_par! {
         ireg_hold_type(dststr.to_string(), typ),
         type_to_memchunk(typ, base_chunk),
         instruction(addr, _, _, mnem, _, _, _, _, _, _),
-        // Sign/zero-extending GP load: width comes from the SOURCE operand, not the 64-bit dst hold-type; float moves have their own XMM width rules.
-        let mnem_upper = mnem.to_ascii_uppercase(),
-        let mc = if (mnem_upper.contains("MOVZX") || mnem_upper.contains("MOVSX")
-            || mnem_upper.contains("MOVZB") || mnem_upper.contains("MOVSB")
-            || mnem_upper.contains("MOVZW") || mnem_upper.contains("MOVSW")) {
-            refine_chunk_with_size(chunk_from_mnem_ext(mnem), *msize)
-        } else {
-            *base_chunk
-        },
+        let mc = refine_direct_load_chunk(mnem, *base_chunk, *msize),
         ireg_of(preg_of_idx, Ireg::from(idx_str)),
         preg_of(idx_arg, preg_of_idx),
         let (addressing, args) = if *scale > 1 {
@@ -8222,11 +8221,11 @@ ascent_par! {
         if false_fallthrough == false_target;
 
 
-    transl_load_inferred(addr, *chunk, addrmode, regs.clone(), dst) <--
+    transl_load_inferred(addr, chunk, addrmode, regs.clone(), dst) <--
         pmov(addr, dst_sym, src),
         op_register(dst_sym, dst_str),
         let dst = Mreg::x86(dst_str),
-        op_indirect(src, _, r2, idx_str, _scale, disp, _),
+        op_indirect(src, _, r2, idx_str, _scale, disp, source_width),
         if Mreg::x86(r2) != Mreg::BP && Mreg::x86(r2) != Mreg::SP,
         if *idx_str == "NONE" || idx_str.is_empty(),
         let addrmode = Addrmode{
@@ -8238,17 +8237,18 @@ ascent_par! {
         preg_of(arg, preg_of_r2),
         let regs = Arc::new(vec![*arg]),
         ireg_hold_type(dst_str.to_string(), typ),
-        type_to_memchunk(typ, chunk),
+        type_to_memchunk(typ, destination_chunk),
         instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mnem_upper = mnem.to_ascii_uppercase(),
-        if !mnem_upper.contains("MOVZ") && !mnem_upper.contains("MOVS");
+        if !mnem_upper.contains("MOVZ") && !mnem_upper.contains("MOVS"),
+        let chunk = refine_direct_load_chunk(mnem, *destination_chunk, *source_width);
 
     // Indexed load (non-SP/non-BP base with index register)
-    transl_load_inferred(addr, *chunk, addrmode, regs.clone(), dst) <--
+    transl_load_inferred(addr, chunk, addrmode, regs.clone(), dst) <--
         pmov(addr, dst_sym, src),
         op_register(dst_sym, dst_str),
         let dst = Mreg::x86(dst_str),
-        op_indirect(src, _, r2, idx_str, scale, disp, _),
+        op_indirect(src, _, r2, idx_str, scale, disp, source_width),
         if Mreg::x86(r2) != Mreg::BP && Mreg::x86(r2) != Mreg::SP,
         if *idx_str != "NONE" && !idx_str.is_empty(),
         let addrmode = Addrmode{
@@ -8262,17 +8262,18 @@ ascent_par! {
         preg_of(idx_arg, preg_of_idx),
         let regs = Arc::new(vec![*arg, *idx_arg]),
         ireg_hold_type(dst_str.to_string(), typ),
-        type_to_memchunk(typ, chunk),
+        type_to_memchunk(typ, destination_chunk),
         instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mnem_upper = mnem.to_ascii_uppercase(),
-        if !mnem_upper.contains("MOVZ") && !mnem_upper.contains("MOVS");
+        if !mnem_upper.contains("MOVZ") && !mnem_upper.contains("MOVS"),
+        let chunk = refine_direct_load_chunk(mnem, *destination_chunk, *source_width);
 
     // Scaled-index load with no base register: mov disp(,%idx,scale), dst.
-    transl_load_inferred(addr, *chunk, addrmode, regs.clone(), dst) <--
+    transl_load_inferred(addr, chunk, addrmode, regs.clone(), dst) <--
         pmov(addr, dst_sym, src),
         op_register(dst_sym, dst_str),
         let dst = Mreg::x86(dst_str),
-        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        op_indirect(src, _, base_str, idx_str, scale, disp, source_width),
         if *base_str == "NONE" || base_str.is_empty(),
         if *idx_str != "NONE" && !idx_str.is_empty(),
         let addrmode = Addrmode{
@@ -8284,10 +8285,11 @@ ascent_par! {
         preg_of(idx_arg, preg_of_idx),
         let regs = Arc::new(vec![*idx_arg]),
         ireg_hold_type(dst_str.to_string(), typ),
-        type_to_memchunk(typ, chunk),
+        type_to_memchunk(typ, destination_chunk),
         instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mnem_upper = mnem.to_ascii_uppercase(),
-        if !mnem_upper.contains("MOVZ") && !mnem_upper.contains("MOVS");
+        if !mnem_upper.contains("MOVZ") && !mnem_upper.contains("MOVS"),
+        let chunk = refine_direct_load_chunk(mnem, *destination_chunk, *source_width);
 
     transl_load(addr, mc, addrmode, regs, dst) <--
         transl_load_inferred(addr, mc, addrmode, regs, dst);
@@ -14109,6 +14111,56 @@ mod structural_dataflow_tests {
                     *candidate_node == node
                         && matches!(inst, MachInst::Mload(MemoryChunk::MInt32, _, _, _))
                 }));
+            }
+        });
+    }
+
+    #[test]
+    fn typed_memory_loads_preserve_source_width_for_all_address_forms() {
+        on_large_stack(|| {
+            for (base, index, scale, frame_pointer) in [
+                ("RSI", "NONE", 1, false),
+                ("RSI", "RDX", 1, false),
+                ("RSI", "RDX", 4, false),
+                ("NONE", "RDX", 2, false),
+                ("RSP", "RDX", 4, false),
+                ("RBP", "RDX", 4, true),
+                ("RBP", "NONE", 1, false),
+                ("RBP", "RDX", 4, false),
+            ] {
+                for (mnemonic, destination, width) in [
+                    ("MOV", "AL", 1),
+                    ("MOV", "AX", 2),
+                    ("MOV", "EAX", 4),
+                    ("MOV", "RAX", 8),
+                    ("MOVZX", "EAX", 1),
+                    ("MOVSX", "RAX", 2),
+                ] {
+                    let mut prog = AsmPassProgram::default();
+                    let node = 7;
+                    let function = 0x9000;
+                    prog.instruction.push((node, 3, "", mnemonic, "memory", "destination", "", "", 0, 0));
+                    prog.op_register.push(("destination", destination));
+                    prog.op_indirect.push(("memory", "", base, index, scale, 32, width));
+                    prog.instr_in_function.push((node, function));
+                    if frame_pointer {
+                        prog.func_has_frame_pointer.push((function,));
+                    }
+                    if base == "NONE" {
+                        prog.abs_target_addr.push((node, 32));
+                        prog.resolved_addr_to_symbol.push((32, 32, 0));
+                    }
+                    prog.run();
+                    let widths: BTreeSet<_> = prog.mach_inst.iter().filter_map(|(at, inst)| {
+                        if *at != node { return None; }
+                        if let MachInst::Mload(chunk, _, _, dst) = inst {
+                            assert_eq!(*dst, Mreg::x86(destination));
+                            Some(crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(chunk))
+                        } else { None }
+                    }).collect();
+                    assert_eq!(widths, BTreeSet::from([width]),
+                        "{mnemonic} {base}+{index}*{scale} -> {destination}; frame-pointer={frame_pointer}");
+                }
             }
         });
     }

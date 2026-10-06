@@ -24,6 +24,7 @@ impl IRPass for AbiPass {
         populate_known_global_types(db);
         populate_known_func_param_pointee_size(db);
         populate_known_func_buffer_capacity(db);
+        populate_known_format_functions(db);
     }
 
     fn outputs(&self) -> &'static [&'static str] {
@@ -55,6 +56,7 @@ impl IRPass for AbiPass {
             "known_func_param_pointee_size",
             "known_func_param_byte_capacity",
             "known_func_param_element_capacity",
+            "known_format_function",
         ]
     }
 }
@@ -794,10 +796,29 @@ fn populate_hardcoded_signatures(db: &mut DecompileDB) {
         ("roundl", 1, Xfloat, &[Xfloat]),
     ];
 
+    // The headers name a library record where the hand table says only
+    // "pointer" (FILE * for fprintf's stream). Refine exactly those positions;
+    // every other hand-written choice stays as written.
+    let header: std::collections::HashMap<&str, (XType, &[XType])> =
+        super::abi_libc_prototypes::LIBC_PROTOTYPES
+            .iter()
+            .map(|&(name, ret, params, _)| (name, (ret, params)))
+            .collect();
+    let refine = |hand: XType, derived: Option<&XType>| match (hand, derived) {
+        (Xptr, Some(&XstructPtr(id))) if crate::x86::types::libc_record(id).is_some() => XstructPtr(id),
+        _ => hand,
+    };
     for &(name, param_count, ret_type, param_types) in signatures {
+        let derived = header.get(name);
+        let ret_type = refine(ret_type, derived.map(|(ret, _)| ret));
+        let param_types: Vec<XType> = param_types
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| refine(t, derived.and_then(|(_, params)| params.get(i))))
+            .collect();
         db.rel_push(
             "known_extern_signature",
-            (name, param_count, ret_type, Arc::new(param_types.to_vec())),
+            (name, param_count, ret_type, Arc::new(param_types)),
         );
     }
 
@@ -828,6 +849,69 @@ fn populate_hardcoded_signatures(db: &mut DecompileDB) {
     ];
     for &(name, fixed_args) in varargs {
         db.rel_push("known_varargs_function", (name, fixed_args));
+    }
+
+    // Header-derived glibc prototypes fill only symbols this table does not
+    // name, so its deliberate choices (e.g. width placeholders) are unchanged.
+    // Aliases the headers resolve to one declaration -- fstat64, the
+    // __isoc99_/__isoc23_ scanf and strtol families, *_unlocked, __*_chk --
+    // are exact symbols here, not string-rewritten names.
+    let named: BTreeSet<&str> = signatures.iter().map(|(name, ..)| *name).collect();
+    let variadic: BTreeSet<&str> = varargs.iter().map(|(name, _)| *name).collect();
+    for &(name, ret_type, param_types, is_variadic) in super::abi_libc_prototypes::LIBC_PROTOTYPES {
+        if named.contains(name) {
+            continue;
+        }
+        db.rel_push(
+            "known_extern_signature",
+            (name, param_types.len(), ret_type, Arc::new(param_types.to_vec())),
+        );
+        if is_variadic && !variadic.contains(name) {
+            db.rel_push("known_varargs_function", (name, param_types.len()));
+        }
+    }
+}
+
+// printf/scanf-family functions and the parameter holding their format
+// string (C11 7.21.6, POSIX, glibc fortify and ISO C redirect symbols). The
+// conversion string then names the type of every variadic argument.
+fn populate_known_format_functions(db: &mut DecompileDB) {
+    // (symbol, format parameter index, scanf family)
+    let formats: &[(Symbol, usize, bool)] = &[
+        ("printf", 0, false),
+        ("fprintf", 1, false),
+        ("dprintf", 1, false),
+        ("sprintf", 1, false),
+        ("snprintf", 2, false),
+        ("asprintf", 1, false),
+        ("syslog", 1, false),
+        ("err", 1, false),
+        ("errx", 1, false),
+        ("warn", 0, false),
+        ("warnx", 0, false),
+        ("error", 2, false),
+        ("error_at_line", 4, false),
+        ("obstack_printf", 1, false),
+        ("__printf_chk", 1, false),
+        ("__fprintf_chk", 2, false),
+        ("__dprintf_chk", 2, false),
+        ("__sprintf_chk", 3, false),
+        ("__snprintf_chk", 4, false),
+        ("__asprintf_chk", 2, false),
+        ("__syslog_chk", 2, false),
+        ("__obstack_printf_chk", 2, false),
+        ("scanf", 0, true),
+        ("fscanf", 1, true),
+        ("sscanf", 1, true),
+        ("__isoc99_scanf", 0, true),
+        ("__isoc99_fscanf", 1, true),
+        ("__isoc99_sscanf", 1, true),
+        ("__isoc23_scanf", 0, true),
+        ("__isoc23_fscanf", 1, true),
+        ("__isoc23_sscanf", 1, true),
+    ];
+    for &(name, index, scanf) in formats {
+        db.rel_push("known_format_function", (name, index, scanf));
     }
 }
 
@@ -981,9 +1065,9 @@ fn populate_known_global_types(db: &mut DecompileDB) {
 
     // REMOVED only Version, a GENERIC identifier that force-typed unrelated program types to char*; program_name and exit_failure are KEPT as specific gnulib names whose recovered evidence is too weak.
     let known_globals: &[(&str, XType)] = &[
-        ("stdout", Xptr),
-        ("stderr", Xptr),
-        ("stdin", Xptr),
+        ("stdout", XstructPtr(crate::x86::types::LIBC_FILE_RECORD)),
+        ("stderr", XstructPtr(crate::x86::types::LIBC_FILE_RECORD)),
+        ("stdin", XstructPtr(crate::x86::types::LIBC_FILE_RECORD)),
         ("optarg", Xcharptr),
         ("optind", Xint),
         ("opterr", Xint),

@@ -15,7 +15,11 @@ use std::collections::{BTreeMap, BTreeSet};
 /// selection registry unions these into the scheduler's declared dependencies.
 pub(crate) static INPUTS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
     let mut reads = crate::decompile::passes::semantic_counterexample::INPUTS.to_vec();
-    reads.extend_from_slice(&["semantic_storage_obligation", "frame_read_storage_access_owner", "rtl_inst"]);
+    reads.extend_from_slice(&[
+        "semantic_storage_obligation",
+        "frame_read_storage_access_owner",
+        "rtl_inst",
+    ]);
     reads.sort_unstable();
     reads.dedup();
     reads
@@ -421,6 +425,17 @@ pub(crate) fn read_operand<'a>(
     contract: &ReadContract,
     function: &FunctionData,
 ) -> Option<&'a ClightExpr> {
+    let operand = single_read_operand(rhs)?;
+    (lvalue(operand, contract.root, function) == Some(contract.offset)
+        && size(super::solve::clight_expr_type(operand), function.ptr64)
+            == Some(contract.width as i64))
+    .then_some(operand)
+}
+
+/// The sole value-producing read, without a claim about its address. Used by
+/// the load-transport obligation, which checks the declaration's preservation
+/// of the loaded word separately from target/alias/layout validation.
+pub(crate) fn single_read_operand(rhs: &ClightExpr) -> Option<&ClightExpr> {
     fn visit<'a>(
         expr: &'a ClightExpr,
         found: &mut Vec<&'a ClightExpr>,
@@ -446,11 +461,7 @@ pub(crate) fn read_operand<'a>(
     if found.len() != 1 {
         return None;
     }
-    let operand = found[0];
-    (lvalue(operand, contract.root, function) == Some(contract.offset)
-        && size(super::solve::clight_expr_type(operand), function.ptr64)
-            == Some(contract.width as i64))
-    .then_some(operand)
+    Some(found[0])
 }
 
 pub(crate) fn check(stmt: &ClightStmt, contract: &WriteContract, function: &FunctionData) -> Check {
@@ -726,7 +737,9 @@ mod tests {
             let outcome =
                 super::super::solve::solve_function_z3(&function, &HashMap::new(), &[]).unwrap();
             assert_eq!(outcome.0[&30], Some(0));
-            let decisions = super::super::analysis::storage::DECISIONS.get(&outcome.5).unwrap();
+            let decisions = super::super::analysis::storage::DECISIONS
+                .get(&outcome.5)
+                .unwrap();
             assert_eq!(decisions.len(), 1);
             assert!(!decisions[0].requires_replay);
             assert!(decisions[0].representation.is_some());

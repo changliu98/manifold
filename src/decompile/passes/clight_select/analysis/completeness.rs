@@ -38,7 +38,29 @@ struct Facts {
     epoch: u32,
     problems: Vec<Problem>,
 }
-const FACTS: ArtifactKey<Facts> = ArtifactKey::new("effect-completeness");
+const FACTS: ArtifactKey<Facts> = ArtifactKey::projected("effect-completeness", |facts, plan| {
+    let mut result = facts.clone();
+    for problem in &mut result.problems {
+        problem.inst = problem
+            .inst
+            .as_ref()
+            .map(|inst| plan.native(problem.node, inst));
+        // Scalar capture views describe reads at the capture, not the later
+        // flag-select consumer. Their reaching binding may differ.
+        problem.scalar_views = problem
+            .scalar_views
+            .iter()
+            .map(|reg| plan.read(problem.spec.capture, *reg))
+            .collect();
+    }
+    result
+});
+
+pub(super) fn has_contracts(function: &FunctionData) -> bool {
+    FACTS
+        .get(&function.analysis_facts)
+        .is_some_and(|facts| !facts.problems.is_empty())
+}
 
 fn value_inputs(expr: &ClightExpr, out: &mut BTreeSet<RTLReg>) {
     match expr {
@@ -614,6 +636,117 @@ struct Rules(BTreeMap<(Node, usize), Bool>);
 #[cfg(test)]
 mod read_tests {
     use super::*;
+    #[test]
+    fn effect_contract_and_candidates_share_binding_projection() {
+        use super::super::{bindings::BindingPlan, c_types::CTypes, Stack};
+        use crate::decompile::passes::clight_select::{
+            candtype::{CandType, Sign},
+            solve::solve_function_z3_with_stack,
+        };
+        use crate::decompile::passes::{clight_pass, cminor_pass};
+        use std::sync::Arc;
+        let spec = FlagSelect {
+            capture: 10,
+            producer: effects::flags::Producer::Compare,
+            predicate: effects::flags::Predicate::Equal,
+            width: 1,
+            immediate: 0,
+            result_bits: 64,
+        };
+        let inst = RTLInst::Iop(Operation::Oflagselect(spec), Arc::new(vec![1, 2, 3]), 4);
+        let long = ClightType::Tlong(ClightSignedness::Unsigned, ClightAttr::default());
+        let expression = cminor_pass::csharp_expr_from_cminor(&CminorExpr::Eop(
+            Operation::Oflagselect(spec),
+            Arc::new(vec![1, 2, 3]),
+        ))
+        .unwrap();
+        let types = (1..=5).map(|reg| (reg, long.clone())).collect();
+        let selection = ClightStmt::Sset(
+            4,
+            clight_pass::clight_expr_from_csharp_with_types(&expression, &types, 8),
+        );
+        let capture = ClightStmt::Sset(3, ClightExpr::Etempvar(5, long));
+        let plan = BindingPlan::from_test_events(
+            [((20, 1), 11), ((20, 2), 12), ((20, 3), 13), ((10, 5), 15)],
+            [((20, 4), 14), ((10, 3), 13)],
+        );
+        let mut f = FunctionData::new(
+            1,
+            "renamed_effect".into(),
+            vec![],
+            vec![],
+            None,
+            0,
+            10,
+            true,
+        );
+        FACTS.insert(
+            &mut f.analysis_facts,
+            Facts {
+                epoch: 0,
+                problems: vec![Problem {
+                    node: 20,
+                    spec,
+                    inst: Some(inst.clone()),
+                    captured: true,
+                    ordered: true,
+                    scalar_views: BTreeSet::from([5]),
+                    global_view: None,
+                }],
+            },
+        );
+        let original = f.analysis_facts.clone();
+        f.analysis_facts.project_bindings(&plan);
+        f.node_statements
+            .insert(10, vec![plan.statement(10, &capture)]);
+        f.node_statements
+            .insert(20, vec![plan.statement(20, &selection)]);
+        for reg in 11..=15 {
+            f.used_regs.insert(reg);
+            f.var_types.insert(reg, CandType::I64(Sign::Unsigned));
+            f.var_type_candidates
+                .insert(reg, vec![CandType::I64(Sign::Unsigned)]);
+        }
+        let problem = &FACTS.get(&f.analysis_facts).unwrap().problems[0];
+        assert!(!carries_value(&inst, &f.node_statements[&20][0]));
+        assert!(carries_value(
+            problem.inst.as_ref().unwrap(),
+            &f.node_statements[&20][0]
+        ));
+        assert!(carries_read(
+            problem.inst.as_ref().unwrap(),
+            &f.node_statements[&10][0],
+            &problem.scalar_views,
+            None
+        ));
+        assert_eq!(
+            FACTS.get(&original).unwrap().problems[0].inst.as_ref(),
+            Some(&inst)
+        );
+        let out = solve_function_z3_with_stack(
+            &f,
+            &HashMap::new(),
+            &[],
+            &Stack::new(&[&Completeness, &CTypes]),
+        )
+        .unwrap();
+        assert_eq!(out.0[&10], Some(0));
+        assert_eq!(out.0[&20], Some(0));
+        let mut state = ProgramSelectionState::default();
+        for (node, choice) in out.0 {
+            state.candidate_idx.insert((1, node), choice);
+        }
+        let mut db = DecompileDB::default();
+        Box::new(Completeness).publish(&mut db, &[f], &state);
+        let contracts: Vec<_> = db
+            .rel_iter::<SelectedContract>("effect_selected_contract")
+            .collect();
+        assert_eq!(contracts.len(), 1);
+        assert!(
+            contracts[0].select_present && contracts[0].capture_present && !contracts[0].refuted
+        );
+    }
+
     #[test]
     fn global_read_requires_the_exact_symbol_and_width() {
         let spec = FlagSelect {

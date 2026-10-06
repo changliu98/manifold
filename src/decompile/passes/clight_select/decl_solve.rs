@@ -1020,6 +1020,8 @@ mod tests {
                 .into_iter()
                 .collect(),
             var_decl_idx: [(reg, 0)].into_iter().collect(),
+            concrete_declarations: Default::default(),
+            binding_plan: Default::default(),
             loop_headers: HashSet::new(),
             switch_heads: HashSet::new(),
             reg_struct_ids: HashMap::new(),

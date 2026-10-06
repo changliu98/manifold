@@ -49,6 +49,27 @@ pub(crate) fn collect(db: &DecompileDB, functions: &mut [FunctionData]) {
     for &(node, function) in db.rel_iter::<(Node, Address)>("instr_in_function") {
         owners.entry(node).or_default().insert(function);
     }
+    // This collection can run again after binding recovery adds demands.
+    // Interpret native read/write identities in that same vocabulary before
+    // running any CFG analysis, not by renaming only its conclusions.
+    let plans: BTreeMap<_, _> = functions
+        .iter()
+        .filter_map(|function| {
+            super::analysis::bindings::PLAN
+                .get(&function.analysis_facts)
+                .map(|plan| (function.address, plan.clone()))
+        })
+        .collect();
+    for (&node, instruction) in &mut instructions {
+        if let Some(plan) = owners
+            .get(&node)
+            .filter(|owners| owners.len() == 1)
+            .and_then(|owners| owners.first())
+            .and_then(|owner| plans.get(owner))
+        {
+            *instruction = instruction.as_ref().map(|inst| plan.native(node, inst));
+        }
+    }
     let mut destinations: BTreeMap<Node, BTreeSet<Mreg>> = BTreeMap::new();
     for (node, inst) in db.rel_iter::<(Node, LTLInst)>("ltl_inst") {
         if let LTLInst::Lop(_, _, dst)
@@ -94,11 +115,19 @@ pub(crate) fn collect(db: &DecompileDB, functions: &mut [FunctionData]) {
     for &(function, usage, register, definition) in
         db.rel_iter::<(Address, Node, RTLReg, Node)>("rtl_available_value")
     {
+        let register = plans
+            .get(&function)
+            .map_or(register, |plan| plan.read(usage, register));
         equalities
             .entry((function, usage, register))
             .or_default()
             .insert(definition);
     }
+    let mut entries = BTreeMap::<Address, BTreeSet<Node>>::new();
+    for &(owner, entry) in db.rel_iter::<(Address, Node)>("rtl_function_entry") {
+        entries.entry(owner).or_default().insert(entry);
+    }
+    let edges: Vec<_> = db.rel_iter::<(Node, Node)>("rtl_succ").copied().collect();
     for function in functions {
         function.value_producers.clear();
         for read in &mut function.storage_reads {
@@ -116,7 +145,76 @@ pub(crate) fn collect(db: &DecompileDB, functions: &mut [FunctionData]) {
             .iter()
             .map(|w| w.node)
             .chain(function.word_inputs.keys().copied())
+            .chain(function.integer_anchors.keys().copied())
             .collect();
+        if let Some(&entry) = entries
+            .get(&function.address)
+            .filter(|e| e.len() == 1)
+            .and_then(|e| e.first())
+        {
+            let sole_owner = BTreeSet::from([function.address]);
+            let native: BTreeMap<_, _> = instructions
+                .iter()
+                .filter_map(|(&node, inst)| {
+                    (owners.get(&node) == Some(&sole_owner))
+                        .then(|| inst.clone().map(|i| (node, i)))
+                        .flatten()
+                })
+                .collect();
+            let mut definitions = BTreeMap::<RTLReg, BTreeSet<Node>>::new();
+            for (&node, inst) in &native {
+                if let Some(reg) = crate::decompile::passes::rtl_optimize_pass::inst_def_use(inst).0
+                {
+                    definitions.entry(reg).or_default().insert(node);
+                }
+            }
+            let mut queries = BTreeSet::new();
+            for &usage in &effect_nodes {
+                let Some(inst) = native.get(&usage) else {
+                    continue;
+                };
+                for reg in crate::decompile::passes::rtl_optimize_pass::inst_def_use(inst).1 {
+                    let Some(&definition) = definitions
+                        .get(&reg)
+                        .filter(|d| d.len() == 1)
+                        .and_then(|d| d.first())
+                    else {
+                        continue;
+                    };
+                    let Some(RTLInst::Iop(_, args, _)) = native.get(&definition) else {
+                        continue;
+                    };
+                    if args.is_empty() {
+                        continue;
+                    }
+                    let demanded = function
+                        .node_statements
+                        .get(&usage)
+                        .into_iter()
+                        .flatten()
+                        .any(|s| {
+                            let deps = super::analysis::declarations::dependencies(s);
+                            !deps.contains(&reg) && args.iter().all(|a| deps.contains(a))
+                        });
+                    if demanded {
+                        queries.insert((definition, reg, usage));
+                    }
+                }
+            }
+            if !queries.is_empty() {
+                let queries: Vec<_> = queries.into_iter().collect();
+                for (definition, reg, usage) in
+                    crate::decompile::passes::rtl_optimize_pass::available_value_queries(
+                        entry, &native, &edges, &queries,
+                    )
+                {
+                    equalities
+                        .entry((function.address, usage, reg))
+                        .or_default()
+                        .insert(definition);
+                }
+            }
+        }
         for (&(owner, usage, register), definitions) in &equalities {
             if owner != function.address || definitions.len() != 1 || !effect_nodes.contains(&usage)
             {
@@ -157,6 +255,40 @@ mod tests {
     use crate::decompile::passes::clight_select::memory_theory::WriteContract;
     use crate::decompile::passes::semantic_counterexample::ledger::ObjectId;
     use std::sync::Arc;
+
+    #[test]
+    fn queried_value_availability_is_structural_and_unknown_paths_kill_it() {
+        use crate::decompile::passes::rtl_optimize_pass::available_value_queries;
+        let instructions = BTreeMap::from([
+            (90, RTLInst::Inop),
+            (80, RTLInst::Iop(Operation::Omove, Arc::new(vec![1]), 2)),
+            (
+                4,
+                RTLInst::Iop(Operation::Oaddlimm(1), Arc::new(vec![2]), 3),
+            ),
+        ]);
+        let query = [(80, 2, 4)];
+        assert_eq!(
+            available_value_queries(90, &instructions, &[(90, 80), (80, 4)], &query),
+            BTreeSet::from(query)
+        );
+        assert!(available_value_queries(
+            90,
+            &instructions,
+            &[(90, 80), (80, 4), (90, 7), (7, 4)],
+            &query
+        )
+        .is_empty());
+        let mut overwritten = instructions.clone();
+        overwritten.insert(
+            7,
+            RTLInst::Iop(Operation::Ointconst(0), Arc::new(vec![]), 1),
+        );
+        assert!(
+            available_value_queries(90, &overwritten, &[(90, 80), (80, 7), (7, 4)], &query)
+                .is_empty()
+        );
+    }
 
     fn fixture() -> (DecompileDB, FunctionData) {
         let mut db = DecompileDB::default();

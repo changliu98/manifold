@@ -12,6 +12,7 @@ use z3::{Optimize, SatResult};
 
 use crate::decompile::elevator::config;
 use crate::decompile::passes::c_pass::types::{CType, TypeQualifiers};
+use crate::decompile::passes::clight_select::analysis::type_evidence::COMMITMENTS;
 use crate::decompile::passes::clight_select::candtype::{CandType, Sign};
 use crate::decompile::passes::clight_select::ctyping::{self, Severity};
 use crate::decompile::passes::clight_select::query::{
@@ -21,6 +22,7 @@ use crate::decompile::passes::clight_select::query::{
 use crate::decompile::passes::clight_select::select::{
     callee_ident_from_expr, ProgramSelectionState,
 };
+use crate::decompile::passes::clight_select::type_graph::TypeTerm;
 use crate::decompile::passes::clight_select::wt_audit::{self, AuditEnv};
 use crate::x86::types::{
     Address, ClightExpr, ClightSignedness, ClightStmt, ClightType, Ident, Node, ParamType, RTLReg,
@@ -224,11 +226,24 @@ fn called_global_decl_types(
     out
 }
 
+fn selected_concrete_type<'a>(
+    func: &FunctionData,
+    state: &'a ProgramSelectionState,
+    reg: RTLReg,
+) -> Option<&'a TypeTerm> {
+    COMMITMENTS
+        .get(state.analysis_results.get(&func.address)?)?
+        .get(&reg)
+}
+
 pub(crate) fn selected_reg_class(
     func: &FunctionData,
     state: &ProgramSelectionState,
     reg: RTLReg,
 ) -> Option<InterfaceClass> {
+    if let Some(ty) = selected_concrete_type(func, state, reg) {
+        return Some(InterfaceClass::from_clight(&ty.to_clight(func.data_model)));
+    }
     if let Some(candidate) = state.var_type_override.get(&(func.address, reg)) {
         return Some(InterfaceClass::from_candidate(*candidate));
     }
@@ -275,30 +290,6 @@ fn bare_reg(expr: &ClightExpr) -> Option<RTLReg> {
         ClightExpr::Ecast(inner, _) => bare_reg(inner),
         _ => None,
     }
-}
-
-fn selected_reg_candidate(
-    func: &FunctionData,
-    state: &ProgramSelectionState,
-    reg: RTLReg,
-) -> Option<CandType> {
-    state
-        .var_type_override
-        .get(&(func.address, reg))
-        .cloned()
-        .or_else(|| {
-            let candidates = func.var_type_candidates.get(&reg)?;
-            let index = state
-                .var_decl_idx
-                .get(&(func.address, reg))
-                .copied()
-                .unwrap_or(0);
-            candidates
-                .get(index)
-                .or_else(|| candidates.first())
-                .cloned()
-        })
-        .or_else(|| func.var_types.get(&reg).cloned())
 }
 
 fn collect_edges_stmt(
@@ -537,7 +528,9 @@ fn stmt_matches(
                     .iter()
                     .any(|(_, stmt)| stmt_matches(stmt, temp, global, returns))
         }
-        (ClightStmt::Slabel(_, stmt) | ClightStmt::Seffect(_, stmt)) => stmt_matches(stmt, temp, global, returns),
+        (ClightStmt::Slabel(_, stmt) | ClightStmt::Seffect(_, stmt)) => {
+            stmt_matches(stmt, temp, global, returns)
+        }
         _ => false,
     }
 }
@@ -778,10 +771,9 @@ fn declaration_vars(
             if func.param_regs.contains(&reg) {
                 continue;
             }
-            let Some(rank0_candidate) = selected_reg_candidate(func, state, reg) else {
+            let Some(rank0) = selected_reg_class(func, state, reg) else {
                 continue;
             };
-            let rank0 = InterfaceClass::from_candidate(rank0_candidate);
             let Some((target, _)) = declaration_vote_target(rank0, reg_votes) else {
                 continue;
             };
@@ -865,6 +857,19 @@ fn selected_temp_types(
         temps
             .entry(reg as Ident)
             .or_insert_with(|| wt_audit::candtype_to_clight(*candidate));
+    }
+    // Stage B must price the same concrete C declarations Stage A selected.
+    // Candidate indices are only compatibility projections for structural
+    // types; reconstructing their legacy representatives loses pointer depth
+    // and can price a different program before issuing a hard Stage-C pin.
+    if let Some(commitments) = state
+        .analysis_results
+        .get(&func.address)
+        .and_then(|r| COMMITMENTS.get(r))
+    {
+        for (&reg, ty) in commitments {
+            temps.insert(reg as Ident, ty.to_clight(func.data_model));
+        }
     }
     for (&reg, param) in func.param_regs.iter().zip(&func.param_types) {
         let overridden_param_ty = override_param
@@ -1626,6 +1631,77 @@ mod tests {
 
     fn synthetic_ids<const N: usize>() -> [u64; N] {
         std::array::from_fn(|index| index as u64 + 1)
+    }
+
+    #[test]
+    fn interface_pricing_consumes_exact_declarations_not_legacy_projections() {
+        let mut function = FunctionData::new(
+            1,
+            "exact_interface_input".into(),
+            vec![],
+            vec![],
+            None,
+            0,
+            7,
+            true,
+        );
+        function
+            .var_type_candidates
+            .insert(10, vec![CandType::PtrLong]);
+        function
+            .var_type_candidates
+            .insert(11, vec![CandType::PtrLong]);
+        let record = TypeTerm::Record {
+            union: false,
+            id: 19,
+        }
+        .pointer();
+        let nested = TypeTerm::from_candidate(CandType::I16(Sign::Unsigned), function.data_model)
+            .pointer()
+            .pointer();
+        let mut artifacts = crate::decompile::passes::clight_select::analysis::Artifacts::default();
+        COMMITMENTS.insert(
+            &mut artifacts,
+            BTreeMap::from([(10, record.clone()), (11, nested.clone())]),
+        );
+        let mut state = ProgramSelectionState::default();
+        state.analysis_results.insert(function.address, artifacts);
+        assert_eq!(
+            selected_reg_class(&function, &state, 10),
+            Some(InterfaceClass::PtrStruct(19))
+        );
+        let types = selected_temp_types(&function, &state, None);
+        assert_eq!(types[&10], record.to_clight(function.data_model));
+        assert_eq!(types[&11], nested.to_clight(function.data_model));
+    }
+
+    #[test]
+    fn explicit_interface_alternatives_remain_the_owner_during_marginal_pricing() {
+        let mut function = FunctionData::new(
+            1,
+            "interface_owner".into(),
+            vec![10],
+            vec![ParamType::Typed(XType::Xptr)],
+            None,
+            0,
+            7,
+            true,
+        );
+        function
+            .var_type_candidates
+            .insert(10, vec![CandType::PtrLong]);
+        let mut artifacts = crate::decompile::passes::clight_select::analysis::Artifacts::default();
+        COMMITMENTS.insert(
+            &mut artifacts,
+            BTreeMap::from([(
+                10,
+                TypeTerm::from_candidate(CandType::PtrChar, function.data_model),
+            )]),
+        );
+        let mut state = ProgramSelectionState::default();
+        state.analysis_results.insert(function.address, artifacts);
+        let types = selected_temp_types(&function, &state, Some((10, XType::Xint)));
+        assert_eq!(types[&10], wt_audit::xtype_to_clight(&XType::Xint));
     }
 
     fn int_ty() -> ClightType {

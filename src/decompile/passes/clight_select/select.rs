@@ -110,6 +110,11 @@ pub struct SelectedFunction {
     pub var_types: HashMap<RTLReg, CandType>,
     pub var_type_candidates: HashMap<RTLReg, Vec<CandType>>,
     pub var_decl_idx: HashMap<RTLReg, usize>,
+    /// Exact selection-owned declarations; legacy candidate indices are only
+    /// compatibility projections for types outside the old finite vocabulary.
+    pub concrete_declarations: BTreeMap<RTLReg, super::type_graph::TypeTerm>,
+    /// CFG-certified native definition webs behind the selected C bindings.
+    pub(crate) binding_plan: super::analysis::bindings::BindingPlan,
 
     pub loop_headers: HashSet<Node>,
     pub switch_heads: HashSet<Node>,
@@ -1007,8 +1012,18 @@ fn build_selected_function_from_program_state(
         }
     }
 
+    let concrete_declarations = program_state.analysis_results.get(&addr)
+        .and_then(|results| super::analysis::type_evidence::COMMITMENTS.get(results))
+        .cloned().unwrap_or_default();
     let mut stack_var_types = HashMap::new();
-    for &reg in stack_vars.into_iter().flatten() {
+    let binding_plan = super::analysis::bindings::PLAN.get(&func.analysis_facts).cloned().unwrap_or_default();
+    let storage_registers: HashSet<_> = stack_vars.into_iter().flatten().copied()
+        .chain(binding_plan.storage.iter().map(|(_, _, binding)| *binding)).collect();
+    for reg in storage_registers {
+        if let Some(term) = concrete_declarations.get(&reg) {
+            stack_var_types.insert(reg as Ident, term.to_clight(func.data_model));
+            continue;
+        }
         let index = var_decl_idx.get(&reg).copied().unwrap_or(0);
         let selected_type = var_type_candidates
             .get(&reg)
@@ -1116,6 +1131,8 @@ fn build_selected_function_from_program_state(
         var_types: func.var_types.clone(),
         var_type_candidates,
         var_decl_idx,
+        concrete_declarations,
+        binding_plan,
         loop_headers: if structured_world {
             func.loop_headers.clone()
         } else {

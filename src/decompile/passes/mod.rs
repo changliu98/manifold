@@ -1,5 +1,6 @@
 // Pipeline passes: each reverses one CompCert compilation stage (asm->mach->linear->ltl->rtl->cminor->csharpminor->clight->C).
 pub mod aarch64_asm_pass;
+mod abi_libc_prototypes;
 pub mod abi_pass;
 pub mod arm32_asm_pass;
 pub mod asm_pass;

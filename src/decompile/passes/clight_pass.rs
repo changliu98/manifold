@@ -1217,6 +1217,11 @@ ascent_par! {
     // selected statement is empty.  Forwarding through it would erase the
     // destination that the emitted goto must name.
     valid_next(node) <-- emit_goto_target(_, node);
+    // Copy propagation may erase a loop header's value-producing operation,
+    // but not its control identity. The loop assembler still enters/repeats
+    // at this header. Forwarding its incoming edges past it disconnects the
+    // assembled loop and can mistake its body arm for a continue frontier.
+    valid_next(node) <-- valid_loop(_, node);
 
     clight_succ(src, dst) <--
         cminor_succ(src, dst),
@@ -2561,6 +2566,28 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_deeper_slot_does_not_shift_an_indexed_buffer_alias() {
+        let mut db = DecompileDB::default();
+        let func = 1_u64;
+        db.rel_push("func_stacksz", (func, 100_u64, "saved_register_frame", 168_u64));
+        db.rel_push("stack_base_move", (10_u64, "RSP", "RBP"));
+        for node in [10_u64, 20, 30, 40, 50] { db.rel_push("instr_in_function", (node, func)); }
+        db.rel_push("rtl_inst", (20_u64, RTLInst::Iop(Operation::Oleal(Addressing::Ainstack(-160)), Arc::new(vec![]), 3)));
+        db.rel_push("canonical_exact_stack_addr_ptr_result", (20_u64, 3_u64));
+        db.rel_push("rtl_inst", (30_u64, RTLInst::Istore(MemoryChunk::MInt8Unsigned, Addressing::Aindexed2(0), Arc::new(vec![3, 4]), 5)));
+        db.rel_push("stack_var", (func, 20_u64, -160_i64, 6_u64));
+        db.rel_push("stack_var_chunk", (func, -160_i64, MemoryChunk::MInt64));
+        db.rel_push("stack_var", (func, 40_u64, 8_i64, 7_u64));
+        db.rel_push("stack_var", (func, 50_u64, -176_i64, 8_u64));
+        db.stack_struct_buffers.entry(func).or_default().insert(7, 160);
+        size_indexed_stack_arrays(&mut db);
+        let aliases: Vec<_> = db.rel_iter::<(Address, RTLReg, RTLReg, usize)>("stack_buffer_alias").copied().collect();
+        assert!(aliases.contains(&(func, 6, 7, 0)), "{aliases:?}");
+        assert!(!aliases.contains(&(func, 6, 7, 8)));
+        assert_eq!(db.stack_struct_buffers[&func][&7], 160);
+    }
+
+    #[test]
     fn directly_accessed_prefix_is_not_folded_into_a_buffer() {
         let mut db = DecompileDB::default();
         let func: Address = 0x3000;
@@ -2620,6 +2647,30 @@ mod tests {
                 .count(),
             0,
         );
+    }
+
+    #[test]
+    fn indexed_subword_views_preserve_a_uniform_wider_storage_carrier() {
+        for direct in [MemoryChunk::MAny64, MemoryChunk::MFloat64, MemoryChunk::MInt16Unsigned] {
+            let mut db = DecompileDB::default();
+            db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
+            let (func, base_node, read_node, address, local) = (1_u64,90_u64,20_u64,13_u64,17_u64);
+            db.rel_push("func_stacksz", (func, 100_u64, "views", 32_u64));
+            for node in [base_node,read_node] { db.rel_push("instr_in_function",(node,func)); }
+            db.rel_push("rtl_inst",(base_node,RTLInst::Iop(Operation::Oleal(Addressing::Ainstack(0)),Arc::new(vec![]),address)));
+            db.rel_push("rtl_inst",(read_node,RTLInst::Iload(MemoryChunk::MInt32,Addressing::Aindexed2scaled(4,0),Arc::new(vec![address,3]),4)));
+            db.rel_push("op_produces_ptr",(base_node,address));
+            db.rel_push("stack_var",(func,base_node,0_i64,local));
+            db.rel_push("stack_var_chunk",(func,0_i64,direct));
+            size_indexed_stack_arrays(&mut db);
+            let array=db.stack_array_buffers.get(&func).and_then(|a| a.get(&local));
+            if direct == MemoryChunk::MAny64 {
+                assert_eq!(array,Some(&(MemoryChunk::MInt64,4)));
+            } else {
+                assert!(array.is_none(), "unsupported carrier {direct:?}");
+            }
+        }
+        assert_eq!(memchunk_byte_size(&MemoryChunk::MAny32),4);
     }
 
     #[test]
@@ -3803,6 +3854,31 @@ mod tests {
     }
 
     #[test]
+    fn erased_loop_header_keeps_its_cfg_identity_and_function_ownership() {
+        let mut prog = ClightPassProgram::default();
+        // Layout order is intentionally unrelated to execution order.
+        let (func, entry, header, guard, body, exit) = (1,900,100,700,30,500);
+        prog.emit_function.push((func,"loop",entry));
+        prog.valid_loop.push((func,header));
+        prog.csharp_stmt.push((header,CsharpminorStmt::Snop));
+        for node in [entry,guard,body,exit] {
+            prog.emit_clight_stmt.push((func,node,ClightStmt::Sset(node as Ident,
+                ClightExpr::EconstLong(1,default_long_type()))));
+        }
+        for edge in [(entry,header),(header,guard),(guard,body),(guard,exit),(body,header)] {
+            prog.cminor_succ.push(edge);
+        }
+        prog.run();
+        assert!(prog.clight_succ.iter().any(|e| *e == (entry,header)));
+        assert!(prog.clight_succ.iter().any(|e| *e == (header,guard)));
+        assert!(!prog.clight_succ.iter().any(|e| *e == (entry,guard)));
+        assert!(prog.clight_function_owners.iter().any(|row| {
+            let (n, owners) = &*row.read().unwrap();
+            *n == header && owners.contains(&func)
+        }));
+    }
+
+    #[test]
     fn missing_exact_target_keeps_function_local_forwarding_ownership() {
         let mut prog = ClightPassProgram::default();
         let [func, source, missing, successor] = synthetic_ids();
@@ -4067,6 +4143,10 @@ impl IRPass for ClightFieldPass {
             "call_arg_mapping",
             "call_target_func",
             "reg_to_struct_id",
+            // Record admission for efield-linked pointer classes.
+            "ptr_record_rejected",
+            "ptr_deref",
+            "ptr_deref_load",
             "rtl_inst",
             "single_def_const",
             "op_produces_ptr",
@@ -8203,7 +8283,7 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
     // Canonicalize efield-detected struct identity by bucketing unmapped (func, reg) by exact (offset, chunk) shape hash and linking callsite-passing peers via union-find; kept imperative because fresh-ID allocation needs a counter Datalog cannot express directly.
     {
         use crate::decompile::analysis::struct_recovery_pass::{
-            chunk_byte_size, compute_layout_hash_from_tuples,
+            chunk_byte_size, compute_layout_hash_from_tuples, valid_pointer_record_layouts,
         };
         let mut shape_to_id: HashMap<u64, Ident> = HashMap::new();
         let mut next_id: usize = 1;
@@ -8363,11 +8443,63 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
             }
         }
 
+        // A field-shaped access is not by itself record evidence: `s[1]` and
+        // `argv[2]` are constant-offset ELEMENT accesses. A class without a
+        // recovery identity is admitted only when its complete linked access
+        // set -- efield fields plus every RTL dereference of its members,
+        // including offset 0 -- forms a record under the recovery pass's own
+        // layout predicate, and no member carries evidence against a record
+        // (a runtime index, or an ABI contract naming a non-record pointee).
+        let record_rejected: HashSet<RTLReg> = db
+            .rel_iter::<(RTLReg,)>("ptr_record_rejected")
+            .map(|&(reg,)| reg)
+            .collect();
+        let mut member_derefs: HashMap<RTLReg, Vec<(i64, MemoryChunk, bool)>> = HashMap::new();
+        for &(base, offset, chunk, _, _) in
+            db.rel_iter::<(RTLReg, i64, MemoryChunk, RTLReg, Address)>("ptr_deref")
+        {
+            member_derefs
+                .entry(base)
+                .or_default()
+                .push((offset, chunk, false));
+        }
+        for &(base, offset, chunk) in db.rel_iter::<(RTLReg, i64, MemoryChunk)>("ptr_deref_load") {
+            member_derefs
+                .entry(base)
+                .or_default()
+                .push((offset, chunk, true));
+        }
+        let mut class_accesses = Vec::new();
+        for (root, members) in &root_members {
+            if root_to_id.contains_key(root)
+                || members
+                    .iter()
+                    .any(|(_, base)| record_rejected.contains(&(*base as RTLReg)))
+            {
+                continue;
+            }
+            // Efield chunks merge loads and stores; an observed RTL load at
+            // the same offset remains the width authority.
+            for (offset, chunk) in root_fields.get(root).into_iter().flatten() {
+                class_accesses.push((*root, *offset, *chunk, false));
+            }
+            for (_, base) in members {
+                for &(offset, chunk, load) in member_derefs
+                    .get(&(*base as RTLReg))
+                    .into_iter()
+                    .flatten()
+                {
+                    class_accesses.push((*root, offset, chunk, load));
+                }
+            }
+        }
+        let admissible = valid_pointer_record_layouts(class_accesses);
+
         let mut sorted_roots: Vec<RTLReg> = root_members.keys().copied().collect();
         sorted_roots.sort();
 
         for root in &sorted_roots {
-            if root_to_id.contains_key(root) {
+            if root_to_id.contains_key(root) || !admissible.contains(root) {
                 continue;
             }
             let fields = match root_fields.get(root) {
@@ -8398,6 +8530,9 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
             };
             if let Some(&id) = root_to_id.get(root) {
                 for &(func_addr, base_off) in members {
+                    if record_rejected.contains(&(base_off as RTLReg)) {
+                        continue;
+                    }
                     let reg = base_off as Ident;
                     reg_to_canonical
                         .entry(reg)
@@ -8411,6 +8546,36 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
         new_rtsi.dedup();
         for tuple in new_rtsi {
             db.rel_push("reg_to_struct_id", tuple);
+        }
+
+        // A base left without a record identity keeps its raw dereferences:
+        // no member rewrite, no struct-pointer declaration candidate.
+        let dropped: HashSet<(Address, i64)> = root_members
+            .iter()
+            .flat_map(|(root, members)| {
+                let identified = root_to_id.contains_key(root);
+                let rejected = &record_rejected;
+                members
+                    .iter()
+                    .filter(move |(_, base)| {
+                        !identified || rejected.contains(&(*base as RTLReg))
+                    })
+                    .copied()
+            })
+            .collect();
+        if !dropped.is_empty() {
+            for (func, info) in func_field_info.iter_mut() {
+                info.retain(|(base, _), _| !dropped.contains(&(*func, *base)));
+            }
+            func_field_info.retain(|_, info| !info.is_empty());
+            let kept: ascent::boxcar::Vec<(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)> = db
+                .rel_iter::<(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)>(
+                    "emit_struct_fields",
+                )
+                .filter(|(func, base, _)| !dropped.contains(&(*func, *base)))
+                .map(|(func, base, fields)| (*func, *base, fields.clone()))
+                .collect();
+            db.rel_set("emit_struct_fields", kept);
         }
     }
 
@@ -9121,54 +9286,7 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         }
     }
 
-    let mut frame_tops: BTreeMap<Address, i64> = BTreeMap::new();
-    for (func, _, _, size) in db.rel_iter::<(Address, Address, Symbol, u64)>("func_stacksz") {
-        let Ok(size) = i64::try_from(*size) else {
-            continue;
-        };
-        if size <= 0 || size > 1 << 20 {
-            continue;
-        }
-        frame_tops
-            .entry(*func)
-            .and_modify(|current| *current = (*current).max(size))
-            .or_insert(size);
-    }
-    let mut framed_functions = HashSet::new();
-    for (setup, src, dst) in db.rel_iter::<(Address, &'static str, &'static str)>("stack_base_move")
-    {
-        if *src != "RSP" || *dst != "RBP" {
-            continue;
-        }
-        let Some(funcs) = node_funcs.get(setup) else {
-            continue;
-        };
-        if funcs.len() == 1 {
-            framed_functions.extend(funcs.iter().copied());
-        }
-    }
-    // A SysV leaf may place locals in the red zone below its explicit RSP
-    // subtraction. In a frame-pointer function the deepest exact stack_var
-    // coordinate is therefore stronger storage-bound evidence than
-    // func_stacksz alone. Normalize negative indexed ranges against the
-    // largest of those two machine-derived depths; positive caller-frame
-    // coordinates never contribute.
-    for func in &framed_functions {
-        let Some(lowest) = boundaries
-            .get(func)
-            .and_then(|offsets| offsets.iter().next())
-            .copied()
-        else {
-            continue;
-        };
-        let Some(depth) = lowest.checked_neg().filter(|depth| *depth > 0) else {
-            continue;
-        };
-        frame_tops
-            .entry(*func)
-            .and_modify(|current| *current = (*current).max(depth))
-            .or_insert(depth);
-    }
+    let coordinates = crate::decompile::analysis::frame_coordinates::FrameCoordinates::collect(db);
 
     let directly_accessed: HashSet<(Address, i64)> = db
         .rel_iter::<(Address, i64, MemoryChunk)>("stack_var_chunk")
@@ -9215,9 +9333,27 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
                     .iter()
                     .all(|direct| memchunk_byte_size(direct).max(1) == indexed_width)
             });
-        if origins.next().is_some() || !direct_base_is_compatible_element {
+        if origins.next().is_some() {
             continue;
         }
+        // A narrow indexed read can be a view of a wider physical carrier
+        // (e.g. word-sized initialization followed by subword element reads).
+        // Keep the carrier width for storage; the indexed expression retains
+        // its own chunk and byte scale. A width mismatch is not evidence that
+        // no object exists. Conflicting/noninteger carriers remain ambiguous.
+        let backing_chunk = if direct_base_is_compatible_element {
+            *chunk
+        } else {
+            let Some(chunks) = direct_access_chunks.get(&(func, base_ofs)) else { continue; };
+            if chunks.iter().any(|c| !matches!(c, MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned
+                | MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned | MemoryChunk::MInt32
+                | MemoryChunk::MInt64 | MemoryChunk::MAny32 | MemoryChunk::MAny64)) { continue; }
+            let widths: BTreeSet<_> = chunks.iter().map(memchunk_byte_size).collect();
+            let Some(&width) = widths.first().filter(|_| widths.len() == 1) else { continue; };
+            if width < indexed_width || width % indexed_width != 0 { continue; }
+            let Some(carrier) = unsigned_chunk_for_byte_width(width) else { continue; };
+            carrier
+        };
         let Some(locals) = slot_locals.get(&(func, base_ofs)) else {
             continue;
         };
@@ -9236,7 +9372,7 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         let limit = if base_ofs < 0 {
             0
         } else {
-            let Some(&frame_top) = frame_tops.get(&func) else {
+            let Some(frame_top) = coordinates.allocation(func) else {
                 continue;
             };
             if base_ofs >= frame_top {
@@ -9256,36 +9392,23 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         if byte_size <= 0 || byte_size > 1 << 20 {
             continue;
         }
-        // A framed function's negative Ainstack coordinate is BP-relative;
-        // storage buffers use the post-allocation [0, frame_size) coordinate.
-        // Translate the whole half-open range before overlap checks.  The
-        // unique frame size and structural RSP->RBP setup are both mandatory.
-        let (range_start, range_end) = if base_ofs < 0 && framed_functions.contains(&func) {
-            let Some(frame_top) = frame_tops.get(&func).copied() else {
-                continue;
-            };
-            let (Some(start), Some(end)) = (
-                base_ofs.checked_add(frame_top),
-                limit.checked_add(frame_top),
-            ) else {
-                continue;
-            };
-            if start < 0 || end > frame_top || start >= end {
-                continue;
-            }
-            (start, end)
-        } else {
-            (base_ofs, limit)
-        };
-        let elem = memchunk_byte_size(chunk).max(1);
+        let elem = memchunk_byte_size(&backing_chunk).max(1);
+        if !direct_base_is_compatible_element &&
+            (byte_size < elem as i64 || byte_size % elem as i64 != 0) {
+            continue; // Never cross a known boundary to fit a wider carrier.
+        }
+        // Coordinate origin is shared with emission and never inferred from
+        // the deepest object. Red-zone ranges can start below coordinate zero.
+        let Some(range_start) = coordinates.start(func, base_ofs) else { continue; };
+        let Some(range_end) = range_start.checked_add(byte_size) else { continue; };
         let count = ((byte_size as usize) + elem - 1) / elem;
         // Keep the SMALLEST element width seen (most conservative stride) and the largest count for it.
         let e = sized
             .entry((func, local))
-            .or_insert((range_start, range_end, *chunk, count));
+            .or_insert((range_start, range_end, backing_chunk, count));
         if elem < memchunk_byte_size(&e.2).max(1) {
-            *e = (range_start, range_end, *chunk, count);
-        } else if *chunk == e.2 && count > e.3 {
+            *e = (range_start, range_end, backing_chunk, count);
+        } else if backing_chunk == e.2 && count > e.3 {
             e.3 = count;
         }
     }
@@ -9404,9 +9527,11 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         };
         // Byte storage preserves machine pointer increments exactly even when
         // the source-level element type is unavailable.
+        let Some(start) = coordinates.start(func, low) else { continue; };
+        let Some(end) = start.checked_add(byte_size) else { continue; };
         sized.insert(
             (func, base_local),
-            (low, high, MemoryChunk::MInt8Unsigned, count),
+            (start, end, MemoryChunk::MInt8Unsigned, count),
         );
         exact_walk_arrays.insert((func, base_local));
         accepted_exact_walks.push((func, low, high, base_local, count));
@@ -9636,6 +9761,7 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
             if offsets.next().is_some() {
                 continue;
             }
+            let Some(start) = coordinates.start(func, start) else { continue; };
             let Some(end) = start.checked_add(size) else {
                 continue;
             };
@@ -9659,9 +9785,6 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         if *extent <= 0 || *extent > 1 << 20 {
             continue;
         }
-        let Some(end) = start.checked_add(*extent) else {
-            continue;
-        };
         let Some(locals) = slot_locals.get(&(*func, *start)) else {
             continue;
         };
@@ -9676,9 +9799,11 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         {
             continue;
         }
+        let Some(start) = coordinates.start(*func, *start) else { continue; };
+        let Some(end) = start.checked_add(*extent) else { continue; };
         ranges.push(StorageRange {
             func: *func,
-            start: *start,
+            start,
             end,
             local,
             kind: RangeKind::ByteBuffer,
@@ -9928,7 +10053,7 @@ fn memchunk_byte_size(c: &MemoryChunk) -> usize {
     match c {
         MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned => 1,
         MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => 2,
-        MemoryChunk::MInt32 | MemoryChunk::MFloat32 => 4,
+        MemoryChunk::MInt32 | MemoryChunk::MAny32 | MemoryChunk::MFloat32 => 4,
         MemoryChunk::MInt64 | MemoryChunk::MFloat64 | MemoryChunk::MAny64 => 8,
         _ => 1,
     }

@@ -25,6 +25,7 @@ fn print_usage_and_exit() -> ! {
         	--trace          generate debug trace files (.debug.yaml, .dataflow.yaml)\n\
         	--dump-ir        dump each IR stage to separate files (.asm, .mach, .linear, etc.)\n\
         	--dump-clight-json   export selected Clight IR as JSON (.clight.json)\n\
+        \t--dump-recovered-types export final C types and proven frame locations (.types.json)\n\
         \t--dump-interface-vars write deterministic interface domains (.interfaces.tsv)\n\
         \t--dump-interface-instance write the deterministic Stage-B instance (.interface-instance.tsv)\n\
         \t--ablate-scope=function disable program-scope interface commitment and dirty re-solves\n\
@@ -58,6 +59,7 @@ fn main() {
     let mut measure_rule_times = false;
     let mut dump_ir = false;
     let mut dump_clight_json = false;
+    let mut dump_recovered_types = false;
     let mut dump_deps = false;
     let mut dump_dead_rels = false;
     let mut dump_interface_vars = false;
@@ -74,6 +76,7 @@ fn main() {
             "--measure-rule-times" => measure_rule_times = true,
             "--dump-ir" => dump_ir = true,
             "--dump-clight-json" => dump_clight_json = true,
+            "--dump-recovered-types" => dump_recovered_types = true,
             "--dump-interface-vars" => dump_interface_vars = true,
             "--dump-interface-instance" => dump_interface_instance = true,
             "--ablate-scope=function" => ablate_scope_function = true,
@@ -82,6 +85,8 @@ fn main() {
             "--ablate-storage-search" => semantic_ablations.disable_storage_search = true,
             "--ablate-existing-storage-views" => semantic_ablations.disable_existing_views = true,
             "--ablate-call-observer-isolation" => semantic_ablations.global_call_observer = true,
+            "--ablate-type-recovery" => semantic_ablations.disable_type_recovery = true,
+            "--ablate-semantic-admission" => semantic_ablations.disable_semantic_admission = true,
             "--dump-deps" => dump_deps = true,
             "--dump-dead-rels" => dump_dead_rels = true,
             s if s.starts_with('-') => {
@@ -232,6 +237,15 @@ fn main() {
         }
     }
 
+    if dump_recovered_types {
+        let canonical = decompile::passes::clight_select::derive_canonical_path(
+            out_file_path.to_str().unwrap_or("output.light.c"));
+        let path = decompile::passes::clight_select::derive_with_suffix(&canonical, ".types.json");
+        if let Err(error) = debug::recovered_types::export(&prog, &path) {
+            eprintln!("Failed to export recovered types: {error}");
+            std::process::exit(1);
+        }
+    }
     let write_start = Instant::now();
     if let Some(parent_dir) = out_file_path.parent() {
         if !parent_dir.as_os_str().is_empty() {

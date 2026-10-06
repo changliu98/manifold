@@ -27,7 +27,14 @@ fn exact_repick_cannot_trade_a_hard_constraint_for_frontend_legality() {
     built.recorded.get_mut(&2).unwrap()[0].push((Some(Bool::from_bool(false)), u64::MAX));
     assert_eq!(opt.check(&[]), SatResult::Sat);
     let model = opt.get_model().unwrap();
-    let (choices, _, _, _) = extract_selection(&model, &built, &func, &HashMap::new(), true);
+    let (choices, _, _, _) = extract_selection(
+        &model,
+        &built,
+        &func,
+        &HashMap::new(),
+        true,
+        &BTreeSet::new(),
+    );
     assert_eq!(choices[&2], Some(1));
 }
 
@@ -47,6 +54,7 @@ fn theory_models_are_not_independently_repicked() {
         &func,
         &HashMap::new(),
         false,
+        &BTreeSet::new(),
     );
     assert_eq!(choices[&2], Some(1));
 }

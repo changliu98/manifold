@@ -19,7 +19,7 @@ pub enum Signedness {
     Unsigned,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IntSize {
     Char,
     Short,
@@ -657,6 +657,9 @@ pub struct VarDecl {
     pub alignment: Option<usize>,
     /// Proof-carrying machine storage views; not part of the printed C syntax.
     pub storage_views: Vec<crate::decompile::passes::semantic_counterexample::ledger::ObjectView>,
+    /// Non-printing selection commitment. Type-preserving transforms may
+    /// rename/coalesce this declaration but must not choose a different type.
+    pub type_committed: bool,
     pub init: Option<Initializer>,
     pub loc: SourceLoc,
 }
@@ -671,6 +674,7 @@ impl VarDecl {
             qualifiers: TypeQualifiers::none(),
             alignment: None,
             storage_views: Vec::new(),
+            type_committed: false,
             init: None,
             loc: SourceLoc::unknown(),
         }

@@ -347,6 +347,8 @@ fn emitted_shared_nodes_keep_each_functions_selected_statement_and_identity() {
             var_types: Default::default(),
             var_type_candidates: Default::default(),
             var_decl_idx: Default::default(),
+            concrete_declarations: Default::default(),
+            binding_plan: Default::default(),
             loop_headers: Default::default(),
             switch_heads: Default::default(),
             reg_struct_ids: Default::default(),

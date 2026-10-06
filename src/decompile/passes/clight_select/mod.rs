@@ -2,6 +2,7 @@ pub mod adequacy;
 pub(crate) mod analysis;
 pub mod branch_theory;
 pub mod candtype;
+pub mod type_graph;
 pub mod class_theory;
 pub mod ctyping;
 pub mod decl_solve;

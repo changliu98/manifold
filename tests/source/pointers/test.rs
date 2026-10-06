@@ -57,8 +57,11 @@ fn ptr_arith_accesses_adjacent_slots() {
     let recovered_fields = b.contains("ofs_0") && b.contains("ofs_4");
     let raw_offsets = count_memory_accesses(&OUTPUT, "test_ptr_arith") >= 2
         && (b.contains("+ 4") || b.contains("[4]"));
+    // `int *p` stepping to its next element is the same adjacent 4-byte slot,
+    // expressed in the element type (as the source `*(p + 1)` does).
+    let typed_elements = b.contains("int *") && (b.contains("+ 1") || b.contains("[1]"));
     assert!(
-        recovered_fields || raw_offsets,
+        recovered_fields || raw_offsets || typed_elements,
         "expected adjacent 4-byte accesses:\n{b}"
     );
 }

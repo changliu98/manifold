@@ -113,6 +113,22 @@ pub enum XType {
 
 pub type StructId = usize;
 
+/// Record identities of opaque C library types. A library contract (a
+/// prototype, a stdio global) names these pointees exactly; they carry no
+/// recovered layout and are emitted by their typedef name. The values are
+/// outside every recovered layout-hash identity.
+pub const LIBC_FILE_RECORD: StructId = 0x6c69_6263_4649_4c45; // "libcFILE"
+pub const LIBC_DIR_RECORD: StructId = 0x6c69_6263_0044_4952; // "libc\0DIR"
+
+/// (typedef name, declaring header) of a library record identity.
+pub fn libc_record(id: StructId) -> Option<(&'static str, &'static str)> {
+    match id {
+        LIBC_FILE_RECORD => Some(("FILE", "<stdio.h>")),
+        LIBC_DIR_RECORD => Some(("DIR", "<dirent.h>")),
+        _ => None,
+    }
+}
+
 /// The unknown-scalar class for a value known only to occupy one machine register, at the target's word width.
 /// Xany64 is the 64-bit word; on a 32-bit target the machine word is Xany32 and Xany64 would over-widen it to long.
 pub fn word_any_xtype(pointer_size: i64) -> XType {

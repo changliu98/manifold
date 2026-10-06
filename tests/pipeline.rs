@@ -538,6 +538,11 @@ dual_compiler_test!(closed_form_switch, "-O1");
 // Additional edge-case coverage
 
 dual_compiler_test!(scalar_edges, "-O0");
+dual_compiler_test!(type_recovery, "-O0");
+dual_compiler_test!(library_type_evidence, "-O0");
+dual_compiler_test!(boolean_values, "-O0");
+dual_compiler_test!(address_register_reuse, "-O0");
+dual_compiler_test!(storage_type_views, "-O0");
 dual_compiler_test!(memory_layout, "-O0");
 dual_compiler_test!(abi_edges, "-O0");
 dual_compiler_test!(control_edges, "-O0");
@@ -569,6 +574,7 @@ dual_compiler_test!(var_cross_block, "-O1");
 dual_compiler_test!(var_params, "-O1");
 dual_compiler_test!(var_return, "-O1");
 dual_compiler_test!(return_value_reuse, "-O2");
+dual_compiler_test!(value_bindings, "-O0");
 
 // Frame-slot flag written on several paths and then branched on
 

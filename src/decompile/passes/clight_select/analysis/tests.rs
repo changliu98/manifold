@@ -160,6 +160,34 @@ fn new_obligation_uses_shared_refutation_and_repick_guards() {
     }
 }
 
+#[test]
+fn semantic_admission_ablation_drops_obligation_vetoes() {
+    let mut f = fixture();
+    f.node_statements
+        .insert(10, vec![ClightStmt::Sskip, ClightStmt::Sreturn(None)]);
+    let extra = ExtraAnalysis(Verdict::Equivalent);
+    let modules: &[&dyn Analysis] = &[&c_types::CTypes, &extra];
+    let solve = |f: &FunctionData| {
+        super::super::solve::solve_function_z3_with_stack(
+            f,
+            &HashMap::new(),
+            &[],
+            &Stack::new(modules),
+        )
+        .unwrap()
+        .0[&10]
+    };
+    assert_eq!(solve(&f), Some(1));
+    ABLATIONS.insert(
+        &mut f.analysis_facts,
+        crate::decompile::elevator::SemanticAblations {
+            disable_semantic_admission: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(solve(&f), Some(0));
+}
+
 #[derive(Clone, Copy)]
 enum Behavior {
     Refine,
@@ -179,11 +207,11 @@ impl Analysis for Search {
     fn needs_refinement(&self, _function: &FunctionData) -> bool {
         true
     }
-    fn start_refinement(
+    fn start_refinement<'a>(
         &self,
-        cx: &FunctionContext<'_>,
+        cx: &FunctionContext<'a>,
         _opt: &Optimize,
-    ) -> Option<Box<dyn ModelAnalysis>> {
+    ) -> Option<Box<dyn ModelAnalysis + 'a>> {
         Some(Box::new(SearchSession {
             name: self.name,
             node: self.node,
@@ -319,6 +347,41 @@ impl CandidateAnalysis for Joint {
 #[test]
 fn global_analysis_constraint_cannot_be_bypassed_by_independent_repick() {
     let modules: &[&dyn Analysis] = &[&c_types::CTypes, &Joint];
+    let out = super::super::solve::solve_function_z3_with_stack(
+        &fixture(),
+        &HashMap::new(),
+        &[],
+        &Stack::new(modules),
+    )
+    .unwrap();
+    assert_ne!(out.0[&10], out.0[&20]);
+}
+
+struct SoftJoint;
+impl Analysis for SoftJoint {
+    fn name(&self) -> &'static str {
+        "joint-evidence"
+    }
+    fn build(&self, _: &FunctionContext<'_>) -> Option<Box<dyn CandidateAnalysis>> {
+        Some(Box::new(SoftJoint))
+    }
+}
+impl CandidateAnalysis for SoftJoint {
+    fn evidence_count(&self) -> usize {
+        1
+    }
+    fn constrain_function(&self, cx: &FunctionContext<'_>, sink: &ConstraintSink<'_>) {
+        sink.assert_evidence_weighted(
+            &cx.selections[&10][1].xor(&cx.selections[&20][1]),
+            1,
+            "test_joint_evidence",
+        );
+    }
+}
+
+#[test]
+fn global_analysis_objective_cannot_be_undone_by_independent_repick() {
+    let modules: &[&dyn Analysis] = &[&c_types::CTypes, &SoftJoint];
     let out = super::super::solve::solve_function_z3_with_stack(
         &fixture(),
         &HashMap::new(),

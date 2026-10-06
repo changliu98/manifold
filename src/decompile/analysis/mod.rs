@@ -1,6 +1,8 @@
 pub mod canary_vla_pass;
 pub mod closed_form_switch_pass;
 pub mod coverage_pass;
+pub(crate) mod format_string;
+pub(crate) mod frame_coordinates;
 pub mod global_array_pass;
 pub mod ptr_to_pass;
 pub mod relocation_points_to_pass;

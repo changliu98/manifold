@@ -514,6 +514,40 @@ fn analyze_rtl_availability(
     }
 }
 
+/// Demand-scoped availability for later translation validators. This reuses
+/// the optimizer's point-keyed must lattice, but is not restricted to the
+/// expressions the optimizer itself elected to inline. Calls kill the state.
+pub(crate) fn available_value_queries(
+    entry: Node,
+    instructions: &BTreeMap<Node, RTLInst>,
+    edges: &[(Node, Node)],
+    queries: &[(Node, RTLReg, Node)],
+) -> BTreeSet<(Node, RTLReg, Node)> {
+    let mut program = RtlAvailabilityProgram::default();
+    let mut introduced = BTreeMap::<Node, BTreeSet<RtlAvailableFact>>::new();
+    for &(definition, reg, usage) in queries {
+        program.inline_query.push((definition, reg, usage));
+        if let Some(RTLInst::Iop(_, args, dst)) = instructions.get(&definition) {
+            if *dst == reg && !args.contains(dst) {
+                introduced.entry(definition).or_default().insert(RtlAvailableFact::InlineExpr {
+                    intro: definition, dst: reg, args: args.iter().copied().collect(),
+                });
+            }
+        }
+    }
+    for (&node, instruction) in instructions {
+        if !matches!(instruction, RTLInst::Icall(..) | RTLInst::Itailcall(..) | RTLInst::Ibuiltin(..) | RTLInst::Istore(..)) {
+            program.rtl_avail_inst.push((node, instruction.clone()));
+        }
+        program.rtl_intro_facts.push((node, Set(introduced.remove(&node).unwrap_or_default())));
+    }
+    program.rtl_avail_succ.extend(edges.iter().copied());
+    program.rtl_avail_entry.push((entry,));
+    program.run();
+    let unavailable: BTreeSet<_> = program.inline_unavailable.iter().copied().collect();
+    queries.iter().copied().filter(|(definition, _, usage)| !unavailable.contains(&(*definition, *usage))).collect()
+}
+
 // Declarative RTL optimizer; _v2 outputs are diffed against the imperative results (debug-only: excluded entirely in release builds where nothing reads them).
 #[cfg(debug_assertions)]
 ascent_par! {

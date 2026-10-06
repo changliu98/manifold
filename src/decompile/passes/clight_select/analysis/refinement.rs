@@ -1,14 +1,13 @@
 //! One transactional model-refinement driver for all optional analyses.
 //!
 //! Base C and semantic constraints are outside the scope. If any optional
-//! analysis cannot discharge its obligations, the entire extension is popped
+//! analysis cannot finish its refinement, the optional extension is popped
 //! and its results are explicitly uncertified. No failed proof relaxes a base
 //! constraint. A learned clause must exclude its generating model.
 
-use super::constraints::RecordedCond;
 use super::{Artifacts, FunctionContext, Stack};
 use crate::x86::types::Node;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use z3::ast::Bool;
 use z3::{Model, Optimize, SatResult};
 
@@ -19,47 +18,90 @@ pub(crate) trait ModelAnalysis {
     fn inspect(&mut self, model: &Model) -> Result<Vec<Bool>, &'static str>;
     /// Joint commitments may not be independently re-picked after solving.
     fn coupled_nodes(&self) -> BTreeSet<Node>;
+    /// Restrictions required if the optional search is rolled back. A failed
+    /// semantic extension must not leave its unchecked representations enabled.
+    fn fallback_constraints(&self) -> Vec<Bool> {
+        Vec::new()
+    }
     fn finish(
         self: Box<Self>,
         model: Option<&Model>,
         reason: &'static str,
         results: &mut Artifacts,
     );
+    /// The terminal fallback is a different model. Modules may retain only
+    /// certificates whose complete guards hold in that model; by default an
+    /// aborted extension remains uncertified.
+    fn finish_fallback(
+        self: Box<Self>,
+        _model: Option<&Model>,
+        reason: &'static str,
+        results: &mut Artifacts,
+    ) {
+        self.finish(None, reason, results);
+    }
 }
 
-struct Entry {
+struct Entry<'a> {
     name: &'static str,
     rounds: usize,
-    analysis: Box<dyn ModelAnalysis>,
+    analysis: Box<dyn ModelAnalysis + 'a>,
 }
 
-pub(crate) struct Session {
-    entries: Vec<Entry>,
+pub(crate) struct Session<'a> {
+    entries: Vec<Entry<'a>>,
+    fallback: Vec<(Entry<'a>, &'static str)>,
     results: Artifacts,
+    coupled: BTreeSet<Node>,
+    resource_start: u32,
 }
 
-impl Session {
-    pub(crate) fn start(stack: &Stack<'_>, cx: &FunctionContext<'_>, opt: &Optimize) -> Self {
+fn resource_count(optimizer: &Optimize) -> Option<u32> {
+    match optimizer.get_statistics().value("rlimit count") {
+        Some(z3::StatisticsValue::UInt(count)) => Some(count),
+        _ => None,
+    }
+}
+
+fn remaining_work(limit: u32, start: u32, current: u32) -> u32 {
+    limit.saturating_sub(current.wrapping_sub(start))
+}
+
+impl<'a> Session<'a> {
+    pub(crate) fn start(stack: &Stack<'_>, cx: &FunctionContext<'a>, opt: &'a Optimize) -> Self {
         opt.push();
         let entries = stack
-            .modules()
-            .filter_map(|module| {
-                let analysis = module.start_refinement(cx, opt)?;
-                Some(Entry {
-                    name: module.name(),
-                    rounds: 0,
-                    analysis,
-                })
+            .refiners(cx, opt)
+            .into_iter()
+            .map(|(name, analysis)| Entry {
+                name,
+                rounds: 0,
+                analysis,
             })
             .collect();
         Self {
             entries,
+            fallback: Vec::new(),
             results: Artifacts::default(),
+            coupled: BTreeSet::new(),
+            resource_start: resource_count(opt).unwrap_or(0),
         }
     }
 
     pub(crate) fn active(&self) -> bool {
         !self.entries.is_empty()
+    }
+
+    /// One deterministic work allowance for the whole refinement transaction,
+    /// not a fresh full allowance on every Optimize::check. The unchanged
+    /// fallback gets its ordinary terminal solve after the extension is popped.
+    pub(crate) fn remaining_work(&self, optimizer: &Optimize, limit: u32) -> u32 {
+        if !self.active() {
+            return limit;
+        }
+        resource_count(optimizer).map_or(limit, |current| {
+            remaining_work(limit, self.resource_start, current)
+        })
     }
 
     /// True requests another solve. False permits extraction; any successful
@@ -69,10 +111,13 @@ impl Session {
         model: Option<&Model>,
         status: SatResult,
         opt: &Optimize,
-        selections: &HashMap<Node, Vec<Bool>>,
-        recorded: &mut HashMap<Node, Vec<Vec<RecordedCond>>>,
     ) -> bool {
         if !self.active() {
+            for (entry, reason) in self.fallback.drain(..) {
+                entry
+                    .analysis
+                    .finish_fallback(model, reason, &mut self.results);
+            }
             return false;
         }
         let mut failure = None;
@@ -113,39 +158,64 @@ impl Session {
             });
         }
         if let Some(reason) = failure {
+            let fallback: Vec<_> = self
+                .entries
+                .iter()
+                .flat_map(|entry| entry.analysis.fallback_constraints())
+                .collect();
             for entry in self.entries.drain(..) {
+                self.coupled.extend(entry.analysis.coupled_nodes());
                 eprintln!(
                     "[selection-analysis] {} uncertified: {}",
                     entry.name, reason
                 );
-                entry.analysis.finish(None, reason, &mut self.results);
+                self.fallback.push((entry, reason));
             }
             opt.pop();
+            for restriction in fallback {
+                opt.assert(&restriction);
+            }
             return true;
         }
         if refined {
             return true;
         }
         for entry in self.entries.drain(..) {
-            for node in entry.analysis.coupled_nodes() {
-                if let (Some(choices), Some(conditions)) =
-                    (selections.get(&node), recorded.get_mut(&node))
-                {
-                    for (guard, conditions) in choices.iter().zip(conditions) {
-                        conditions.push((Some(guard.clone()), u64::MAX));
-                    }
-                }
-            }
+            self.coupled.extend(entry.analysis.coupled_nodes());
             entry.analysis.finish(
                 model,
-                "all analysis witnesses and universal obligations discharged",
+                "model accepted; certification coverage reported separately",
                 &mut self.results,
             );
         }
         false
     }
 
-    pub(crate) fn into_results(self) -> Artifacts {
+    pub(crate) fn into_results(mut self) -> Artifacts {
+        for (entry, reason) in self.fallback.drain(..) {
+            entry
+                .analysis
+                .finish_fallback(None, reason, &mut self.results);
+        }
         self.results
+    }
+
+    pub(crate) fn coupled_nodes(&self) -> &BTreeSet<Node> {
+        &self.coupled
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::remaining_work;
+
+    #[test]
+    fn refinement_rounds_share_work_instead_of_resetting_it() {
+        assert_eq!(remaining_work(100, 500, 500), 100);
+        assert_eq!(remaining_work(100, 500, 530), 70);
+        assert_eq!(remaining_work(100, 500, 590), 10);
+        assert_eq!(remaining_work(100, 500, 600), 0);
+        assert_eq!(remaining_work(100, 500, 650), 0);
+        assert_eq!(remaining_work(100, u32::MAX - 9, 10), 80);
     }
 }

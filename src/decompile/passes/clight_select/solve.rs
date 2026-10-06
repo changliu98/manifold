@@ -12,6 +12,8 @@ use super::analysis::{self, Artifacts, Candidate, DeclarationContext, FunctionCo
 use z3::ast::{Bool, Dynamic};
 use z3::{Optimize, SatResult};
 
+mod audit;
+
 use crate::decompile::elevator::config::CONFIG;
 use crate::decompile::passes::clight_select::candtype::{CandType, Sign};
 use crate::decompile::passes::clight_select::propagator::{RawSolver, Theory, VetoTheory};
@@ -180,12 +182,14 @@ struct BuiltFunction {
     t: TypeDt,
     regs: Vec<RTLReg>,
     tyvar: HashMap<RTLReg, Dynamic>,
+    concrete_declarations: analysis::declarations::Declarations,
     structure_worlds: Vec<u8>,
     structure_world_var: HashMap<u8, Bool>,
     nodes: Vec<Node>,
     selvar: HashMap<Node, Vec<Bool>>,
     recorded: HashMap<Node, Vec<Vec<RecordedCond>>>,
     func_ret: Dynamic,
+    primary_unit: u64,
 }
 
 impl BuiltFunction {
@@ -200,11 +204,13 @@ impl BuiltFunction {
             names,
             registers: &self.regs,
             declarations: &self.tyvar,
+            concrete_declarations: &self.concrete_declarations,
             nodes: &self.nodes,
             selections: &self.selvar,
             worlds: &self.structure_worlds,
             world_variables: &self.structure_world_var,
             return_type: &self.func_ret,
+            primary_unit: self.primary_unit,
         }
     }
 }
@@ -252,8 +258,15 @@ fn build_function_constraints_with_stack(
             }
             tyvar.insert(reg, tv);
         }
+        let concrete_declarations = analysis::declarations::Declarations::build(
+            stack,
+            &declarations,
+            &regs,
+            &tyvar,
+            backend,
+        );
         for module in stack.modules() {
-            module.constrain_interfaces(&declarations, &tyvar, backend);
+            module.constrain_interfaces(&declarations, &tyvar, &concrete_declarations, backend);
         }
 
         // Diagnostic: dump the candidates the lifting pass produced for a target function (by name substring), to distinguish "correct candidate absent (lifting bug)" from "present but not selected (selector bug)".
@@ -408,16 +421,32 @@ fn build_function_constraints_with_stack(
             names: name_to_ident,
             registers: &regs,
             declarations: &tyvar,
+            concrete_declarations: &concrete_declarations,
             nodes: &nodes,
             selections: &selvar,
             worlds: &structure_worlds,
             world_variables: &structure_world_var,
             return_type: &func_ret,
+            primary_unit: 0, // the bound is established after all modules build
         };
         let analyses = stack.build(&cx);
         let extra_priors: usize = analyses.iter().map(|a| a.prior_count()).sum();
-        let compat_w = (regs.len() + authoritative_refinable_nodes + extra_priors) as u64 + 1;
-        let sink = ConstraintSink::new(backend, compat_w);
+        // The world preference can also be violated. Include it in the
+        // complete lower-tier bound; otherwise it can buy back one unit of
+        // evidence at a stratum boundary.
+        let world_prior = usize::from(structure_worlds.len() > 1);
+        let compat_w =
+            (regs.len() + authoritative_refinable_nodes + extra_priors + world_prior) as u64 + 1;
+        let secondary_count = analyses.iter().map(|a| a.secondary_count()).sum();
+        let evidence_count = analyses.iter().map(|a| a.evidence_count()).sum();
+        let support_count = analyses.iter().map(|a| a.support_count()).sum();
+        let sink = ConstraintSink::with_supported_objectives(
+            backend,
+            compat_w,
+            secondary_count,
+            evidence_count,
+            support_count,
+        );
         for analysis in &analyses {
             analysis.constrain_function(&cx, &sink);
         }
@@ -496,7 +525,20 @@ fn build_function_constraints_with_stack(
             // multiple authoritative candidates.  Do not let a newly added
             // flat sibling create a fresh objective term.
             if authoritative_candidates.len() > 1 {
-                sink.assert_soft_raw(&selvar[node][authoritative_candidates[0]], 1u64);
+                let parent = authoritative_candidates[0];
+                let family: BTreeSet<_> = std::iter::once(parent)
+                    .chain(analyses.iter().flat_map(|a| a.prior_family(*node, parent)))
+                    .filter(|i| authoritative_candidates.contains(i))
+                    .collect();
+                sink.assert_soft_raw(
+                    &Bool::or(
+                        &family
+                            .into_iter()
+                            .map(|i| selvar[node][i].clone())
+                            .collect::<Vec<_>>(),
+                    ),
+                    1u64,
+                );
             }
         }
         if let Some(authoritative) = structure_world_var.get(&func.authoritative_structure_world) {
@@ -508,12 +550,14 @@ fn build_function_constraints_with_stack(
             t,
             regs,
             tyvar,
+            concrete_declarations,
             structure_worlds,
             structure_world_var,
             nodes,
             selvar,
             recorded,
             func_ret,
+            primary_unit: secondary_count as u64 + 1,
         }
     }
 }
@@ -535,6 +579,7 @@ fn extract_selection(
     func: &FunctionData,
     name_to_ident: &HashMap<String, Ident>,
     allow_repick: bool,
+    coupled: &BTreeSet<Node>,
 ) -> (
     HashMap<Node, Option<usize>>,
     HashMap<RTLReg, usize>,
@@ -545,6 +590,7 @@ fn extract_selection(
         t,
         regs,
         tyvar,
+        concrete_declarations,
         structure_worlds,
         structure_world_var,
         nodes,
@@ -568,16 +614,8 @@ fn extract_selection(
     let wt_env = {
         let mut temps: HashMap<Ident, ClightType> = HashMap::new();
         for &reg in regs {
-            let rendered = render_type(t, m, &tyvar[&reg], reg, func, false);
-            // Type by the ANCHORED candidate, not the raw class render: the emitter prints candidates[anchor], so the anchored candidate is the decl gcc will see -- width/signedness fidelity the class-level model no longer carries (deterministic: anchor_index is a pure function).
-            let cands = &func.var_type_candidates[&reg];
-            let decl = anchor_index(cands, rendered, false)
-                .and_then(|i| cands.get(i).copied())
-                .unwrap_or(rendered);
-            temps.insert(
-                reg as Ident,
-                crate::decompile::passes::clight_select::wt_audit::candtype_to_clight(decl),
-            );
+            let decl = concrete_declarations.render(t, m, &tyvar[&reg], reg, func, false);
+            temps.insert(reg as Ident, decl.to_clight(func.data_model));
         }
         for (reg, candidate) in &func.var_types {
             if !tyvar.contains_key(reg) {
@@ -627,7 +665,10 @@ fn extract_selection(
                 };
                 // Re-pick only among candidates satisfying all hard
                 // obligations under the fixed model and structural world.
-                if let Some(per_cand) = recorded.get(&node).filter(|_| allow_repick) {
+                if let Some(per_cand) = recorded
+                    .get(&node)
+                    .filter(|_| allow_repick && !coupled.contains(&node))
+                {
                     let truth = |c: &Bool| m.truth(c).unwrap_or(false);
                     let cands = &func.node_statements[&node];
                     let mut best: Option<(u64, u64, u64, usize)> = None;
@@ -698,9 +739,20 @@ fn extract_selection(
     }
     for &reg in regs {
         let allow_void = ptr_ev.get(&reg).map(|e| !e.any_deref).unwrap_or(true);
-        let rendered = render_type(t, m, &tyvar[&reg], reg, func, allow_void);
+        let rendered = concrete_declarations.render(t, m, &tyvar[&reg], reg, func, allow_void);
+        // Compatibility index for older consumers. Structural commitments,
+        // not this lossy adapter, own emission and concrete C auditing.
+        let rendered = rendered
+            .legacy_candidate(func.data_model)
+            .unwrap_or_else(|| {
+                if rendered.is_pointer() {
+                    CandType::PtrLong
+                } else {
+                    CandType::I64(Sign::Signed)
+                }
+            });
         let cands = &func.var_type_candidates[&reg];
-        match anchor_index(cands, rendered, allow_void) {
+        match cands.iter().position(|candidate| *candidate == rendered) {
             Some(idx) => {
                 ty_out.insert(reg, idx);
             }
@@ -773,6 +825,8 @@ pub(crate) fn solve_function_z3_with_stack(
             (built, backend.into_softs())
         };
 
+        let audit = audit::Snapshot::start(func, &opt);
+
         BUILD_NS.fetch_add(
             build_t0.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -780,6 +834,18 @@ pub(crate) fn solve_function_z3_with_stack(
         let mut refinements =
             analysis::refinement::Session::start(stack, &built.context(func, name_to_ident), &opt);
         loop {
+            let remaining = refinements.remaining_work(&opt, CONFIG.solve.rlimit);
+            if remaining == 0 && refinements.active() {
+                eprintln!(
+                    "[selection-analysis] fn={:#x} shared refinement work budget exhausted",
+                    func.address
+                );
+                if refinements.advance(None, SatResult::Unknown, &opt) {
+                    continue;
+                }
+            }
+            params.set_u32("rlimit", remaining.max(1));
+            opt.set_params(&params);
             let check_t0 = std::time::Instant::now();
             let check_result = opt.check(&[]);
             CHECK_NS.fetch_add(
@@ -802,30 +868,62 @@ pub(crate) fn solve_function_z3_with_stack(
                 }
                 SatResult::Unknown | SatResult::Unsat => None,
             };
-            if refinements.advance(
-                model.as_ref(),
-                check_result,
-                &opt,
-                &built.selvar,
-                &mut built.recorded,
-            ) {
+            if refinements.advance(model.as_ref(), check_result, &opt) {
                 continue;
             }
             match model {
                 Some(m) => {
+                    if !built
+                        .concrete_declarations
+                        .0
+                        .keys()
+                        .all(|&reg| built.concrete_declarations.selected(&m, reg).is_some())
+                    {
+                        audit.finish(&built, func, &opt, &softs, None, SatResult::Unknown);
+                        return Err(SatResult::Unknown);
+                    }
+                    // A resource-limited partial model may retain the legacy
+                    // path, but cannot authorize a new concrete representation.
+                    if check_result != SatResult::Sat
+                        && built
+                            .concrete_declarations
+                            .admissions(&m)
+                            .values()
+                            .any(|s| *s != super::type_graph::TypeAdmission::LegacyFallback)
+                    {
+                        audit.finish(&built, func, &opt, &softs, None, SatResult::Unknown);
+                        return Err(SatResult::Unknown);
+                    }
                     report_cost("optimize", func, &m, &softs);
-                    let (cand_out, ty_out, ty_override, structure_world) =
-                        extract_selection(&m, &built, func, name_to_ident, true);
+                    let (cand_out, ty_out, ty_override, structure_world) = extract_selection(
+                        &m,
+                        &built,
+                        func,
+                        name_to_ident,
+                        true,
+                        refinements.coupled_nodes(),
+                    );
+                    let mut results = refinements.into_results();
+                    let commitments = built
+                        .concrete_declarations
+                        .commitments(&m, &cand_out, &results);
+                    analysis::type_evidence::COMMITMENTS.insert(&mut results, commitments);
+                    analysis::type_evidence::ADMISSIONS
+                        .insert(&mut results, built.concrete_declarations.admissions(&m));
+                    audit.finish(&built, func, &opt, &softs, Some(&m), check_result);
                     return Ok((
                         cand_out,
                         ty_out,
                         ty_override,
                         structure_world,
                         check_result,
-                        refinements.into_results(),
+                        results,
                     ));
                 }
-                None => return Err(check_result),
+                None => {
+                    audit.finish(&built, func, &opt, &softs, None, check_result);
+                    return Err(check_result);
+                }
             }
         }
     })
@@ -1105,11 +1203,28 @@ fn solve_function_propagator_attempt(
 
         let result = match model {
             Some(m) => {
+                if !built
+                    .concrete_declarations
+                    .0
+                    .keys()
+                    .all(|&reg| built.concrete_declarations.selected(&m, reg).is_some())
+                {
+                    return (Err(SatResult::Unknown), flow_injected);
+                }
+                if check_result != SatResult::Sat
+                    && built
+                        .concrete_declarations
+                        .admissions(&m)
+                        .values()
+                        .any(|s| *s != super::type_graph::TypeAdmission::LegacyFallback)
+                {
+                    return (Err(SatResult::Unknown), flow_injected);
+                }
                 report_cost("propagator", func, &m, &clauses);
                 let (cand_out, ty_out, ty_override, structure_world) =
                     // The propagator learns constraints spanning candidates.
                     // Independent re-picking cannot preserve those clauses.
-                    extract_selection(&m, &built, func, name_to_ident, false);
+                    extract_selection(&m, &built, func, name_to_ident, false, &BTreeSet::new());
                 // Guess-surface proxy. When the flow theory named a node in a
                 // clause and that node's final pick is not candidate 0, the
                 // weight-1 syntactic prior lost to behavioral evidence: the
@@ -1124,13 +1239,20 @@ fn solve_function_propagator_attempt(
                     let mut g = FLOW_STATS.lock().unwrap();
                     g.ties_determined_by_flow += ties;
                 }
+                let mut results = Artifacts::default();
+                let commitments = built
+                    .concrete_declarations
+                    .commitments(&m, &cand_out, &results);
+                analysis::type_evidence::COMMITMENTS.insert(&mut results, commitments);
+                analysis::type_evidence::ADMISSIONS
+                    .insert(&mut results, built.concrete_declarations.admissions(&m));
                 Ok((
                     cand_out,
                     ty_out,
                     ty_override,
                     structure_world,
                     check_result,
-                    Artifacts::default(),
+                    results,
                 ))
             }
             None => Err(check_result),
@@ -1478,7 +1600,9 @@ fn collect_reg_ptr_evidence_stmt(stmt: &ClightStmt, out: &mut BTreeMap<RTLReg, R
             collect_reg_ptr_evidence_stmt(a, out);
             collect_reg_ptr_evidence_stmt(b, out);
         }
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => collect_reg_ptr_evidence_stmt(inner, out),
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => {
+            collect_reg_ptr_evidence_stmt(inner, out)
+        }
         ClightStmt::Sswitch(e, cases) => {
             collect_reg_ptr_evidence_expr(e, out);
             for (_, s) in cases {
@@ -1570,7 +1694,9 @@ fn count_truncating_casts_stmt(stmt: &ClightStmt) -> u64 {
         ClightStmt::Sreturn(Some(e)) => count_truncating_casts_expr(e),
         ClightStmt::Sifthenelse(c, _, _) => count_truncating_casts_expr(c),
         ClightStmt::Sswitch(e, _) => count_truncating_casts_expr(e),
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => count_truncating_casts_stmt(inner),
+        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => {
+            count_truncating_casts_stmt(inner)
+        }
         _ => 0,
     }
 }

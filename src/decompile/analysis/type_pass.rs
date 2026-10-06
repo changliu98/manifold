@@ -26,6 +26,26 @@ fn chunk_xtype(chunk: &MemoryChunk) -> XType {
     }
 }
 
+/// Interpret a value view at the decoder's physical memory width. A stack
+/// get/set's `Typ` describes the promoted value, not the accessed object:
+/// loading one byte into EAX is still a one-byte access. Preserve an explicit
+/// chunk's interpretation only when its width agrees with the machine.
+fn storage_chunk_at_width(view: MemoryChunk, bytes: usize) -> MemoryChunk {
+    if view != MemoryChunk::Unknown
+        && crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(&view) == bytes
+    {
+        return view;
+    }
+    match bytes {
+        1 => MemoryChunk::MInt8Unsigned,
+        2 => MemoryChunk::MInt16Unsigned,
+        4 => MemoryChunk::MAny32,
+        8 => MemoryChunk::MAny64,
+        // An aggregate/vector access is not evidence for a narrower scalar.
+        _ => MemoryChunk::Unknown,
+    }
+}
+
 /// Map an operation to its output register's XType, returning None for unclassified operations.
 fn op_output_xtype(op: &Operation) -> Option<XType> {
     use Operation::*;
@@ -80,8 +100,8 @@ fn op_output_xtype(op: &Operation) -> Option<XType> {
         Onegfs | Oabsfs | Oaddfs | Osubfs | Omulfs | Odivfs | Osingleofint | Osingleoflong
         | Osingleoffloat => Some(XType::Xsingle),
 
-        // Comparison/flag result (boolean)
-        Ocmp(_) | Otestflags(_, _, _) => Some(XType::Xbool),
+        // A comparison/flag result is 0 or 1, but _Bool is a claim about every
+        // value of the destination web, proven by the must-analysis below.
 
         _ => None,
     }
@@ -182,6 +202,85 @@ fn is_pointer_xtype(xt: &XType) -> bool {
     )
 }
 
+// Operations whose result is always 0 or 1.
+fn bool_producing_operation(op: &Operation) -> bool {
+    crate::x86::types::is_boolean_operation(op)
+        || matches!(
+            op,
+            Operation::Ointconst(0 | 1)
+                | Operation::Olongconst(0 | 1)
+                | Operation::Oandimm(1)
+                | Operation::Oandlimm(1)
+        )
+}
+
+// Unary operations that map {0, 1} onto {0, 1}.
+fn bool_transfer_operation(op: &Operation) -> bool {
+    matches!(
+        op,
+        Operation::Omove
+            | Operation::Oxorimm(1)
+            | Operation::Oxorlimm(1)
+            | Operation::Ocast8signed
+            | Operation::Ocast8unsigned
+            | Operation::Ocast16signed
+            | Operation::Ocast16unsigned
+            | Operation::Ocast32signed
+            | Operation::Ocast32unsigned
+    )
+}
+
+// An RTL definition whose value is 0 or 1 whenever its input is.
+fn rtl_bool_definition(inst: &RTLInst) -> bool {
+    matches!(inst, RTLInst::Iop(op, args, _)
+        if bool_producing_operation(op) || (bool_transfer_operation(op) && args.len() == 1))
+}
+
+// Every register an RTL instruction writes, including each half of a split
+// builtin result.
+fn rtl_defined_registers(inst: &RTLInst) -> Vec<RTLReg> {
+    fn collect(arg: &BuiltinArg<RTLReg>, out: &mut Vec<RTLReg>) {
+        match arg {
+            BuiltinArg::BA(reg) => out.push(*reg),
+            BuiltinArg::BASplitLong(a, b) | BuiltinArg::BAAddPtr(a, b) => {
+                collect(a, out);
+                collect(b, out);
+            }
+            _ => {}
+        }
+    }
+    match inst {
+        RTLInst::Iop(_, _, dst) | RTLInst::Iload(_, _, _, dst) => vec![*dst],
+        RTLInst::Icall(_, _, _, Some(dst), _) => vec![*dst],
+        RTLInst::Ibuiltin(_, _, result) => {
+            let mut out = Vec::new();
+            collect(result, &mut out);
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn rtl_reads_register(inst: &RTLInst, reg: RTLReg) -> bool {
+    crate::decompile::passes::rtl_optimize_pass::inst_def_use(inst).1.contains(&reg)
+}
+
+// A pointer XType that names its pointee. Generic Xptr (void*/unknown) names
+// none; recovered record identities are assigned after this pass, while a C
+// library record (FILE, DIR) is named exactly by its library contract.
+fn is_precise_pointer_xtype(xt: &XType) -> bool {
+    match xt {
+        XType::Xcharptr
+        | XType::Xcharptrptr
+        | XType::Xintptr
+        | XType::Xfloatptr
+        | XType::Xsingleptr
+        | XType::Xfuncptr => true,
+        XType::XstructPtr(id) => crate::x86::types::libc_record(*id).is_some(),
+        _ => false,
+    }
+}
+
 // A bare floating XType, i.e. a value the machine must keep in a float
 // register. The pointer-to-float types are NOT floating: those values live in
 // general-purpose registers like any other pointer.
@@ -201,6 +300,8 @@ ascent_par! {
     relation alias_edge(RTLReg, RTLReg);
     relation stack_var(Address, Address, i64, RTLReg);
     relation mach_imm_stack_init(Address, i64, i64, Typ);
+    relation decoded_stack_read_bytes(Address, Symbol, i64, usize);
+    relation decoded_stack_write_bytes(Address, Symbol, i64, usize);
     relation ltl_inst(Node, LTLInst);
     relation rtl_inst(Node, RTLInst);
     relation reg_rtl(Node, Mreg, RTLReg);
@@ -226,6 +327,12 @@ ascent_par! {
 
     relation call_site(Node, Symbol);
     relation call_arg(Node, usize, RTLReg);
+    // Machine reaching definitions (def, register, use).
+    relation reg_def_used(Address, Mreg, Address);
+    relation reg_use(Address, Mreg);
+    relation renderable_stack_addr_result(Node, i64, RTLReg);
+    // (symbol, format parameter index, scanf family) from the ABI knowledge.
+    relation known_format_function(Symbol, usize, bool);
     relation call_return_reg(Node, RTLReg);
     relation call_arg_mapping(Node, usize, RTLReg);
     relation abi_shared_arg_slots(bool);
@@ -285,6 +392,74 @@ ascent_par! {
     call_arg(node, pos, reg) <--
         call_arg_mapping(node, pos, reg);
 
+    // Format-directed variadic types (C11 7.21.6.1/7.21.6.2). A conversion
+    // specification names the type the callee reads for each variadic
+    // argument, so for a constant format it is prototype evidence about the
+    // caller's value. Library calls are by NAME in RTL (call_site only covers
+    // by-address targets), and a name the binary defines itself is not the
+    // library function.
+    #[local] relation extern_call_name(Node, Symbol);
+    extern_call_name(node, *name) <--
+        rtl_inst(node, ?RTLInst::Icall(_, Either::Right(Either::Right(name)), _, _, _)),
+        !emit_function(_, name, _);
+    extern_call_name(node, *name) <--
+        rtl_inst(node, ?RTLInst::Itailcall(_, Either::Right(Either::Right(name)), _)),
+        !emit_function(_, name, _);
+
+    #[local] relation string_value(RTLReg, String);
+    string_value(*dst, content.clone()) <--
+        rtl_inst(_, ?RTLInst::Iop(Operation::Oindirectsymbol(sym_id), _, dst)),
+        ident_to_symbol(sym_id, label),
+        string_data(label.to_string(), content, _);
+
+    #[local] relation format_arg_type(Node, usize, XType);
+    format_arg_type(*node, *format_index + 1 + offset, xtype) <--
+        extern_call_name(node, name),
+        known_format_function(name, format_index, scanf),
+        call_arg(node, format_index, format_reg),
+        string_value(format_reg, content),
+        for (offset, xtype) in crate::decompile::analysis::format_string::format_argument_types(content, *scanf);
+
+    emit_var_type_candidate(*arg_reg, *xtype) <--
+        format_arg_type(node, position, xtype),
+        call_arg(node, position, arg_reg);
+
+    // Interprocedural value binding (C11 6.5.2.2): a call assigns each
+    // argument to the callee's parameter and its returned value to the call
+    // result, so a PRECISE pointee named on either side names the other.
+    // Generic Xptr names no pointee and does not travel; a hard 32-bit
+    // integer destination is never retyped as a pointer.
+    #[local] relation callee_param_reg(Address, usize, RTLReg);
+    callee_param_reg(*func, *pos, *reg) <--
+        func_param_position_type(func, pos, _),
+        abi_int_arg_position(mreg, pos),
+        reg_rtl(func, mreg, reg);
+
+    #[local] relation call_value_binding(RTLReg, RTLReg);
+    call_value_binding(*arg, *param) <--
+        call_target_func(node, callee),
+        call_arg(node, pos, arg),
+        callee_param_reg(callee, pos, param);
+    call_value_binding(*returned, *result) <--
+        call_target_func(node, callee),
+        call_return_reg(node, result),
+        emit_function_return(callee, returned);
+
+    emit_var_type_candidate(*to, *xtype) <--
+        call_value_binding(from, to),
+        emit_var_type_candidate(from, xtype),
+        if is_precise_pointer_xtype(xtype),
+        !hard_int32(*to);
+    emit_var_type_candidate(*from, *xtype) <--
+        call_value_binding(from, to),
+        emit_var_type_candidate(to, xtype),
+        if is_precise_pointer_xtype(xtype),
+        !hard_int32(*from);
+    is_ptr(*arg_reg) <--
+        format_arg_type(node, position, xtype),
+        if is_pointer_xtype(xtype),
+        call_arg(node, position, arg_reg);
+
 
     // 1. Direct type emission from instructions; each instruction encodes width and signedness, emitting concrete types directly
 
@@ -339,24 +514,83 @@ ascent_par! {
     // type evidence must follow.
     #[local] relation stack_web_chunk(RTLReg, MemoryChunk);
 
-    stack_web_chunk(rtl_reg, *chunk) <--
-        ltl_inst(node, ?LTLInst::Lload(chunk, Addressing::Ainstack(ofs), _, _)),
-        stack_var(_, node, *ofs, rtl_reg);
-    stack_web_chunk(rtl_reg, *chunk) <--
-        ltl_inst(node, ?LTLInst::Lstore(chunk, Addressing::Ainstack(ofs), _, _)),
-        stack_var(_, node, *ofs, rtl_reg);
-    stack_web_chunk(rtl_reg, chunk) <--
+    // Separate physical accesses from promoted value views at their producer.
+    // The bool is the operand role (false = read, true = write). Joining by
+    // access site and role associates the decoded width with the LTL event;
+    // stack_var already supplies its structural web and normalized coordinate.
+    // No raw BP/SP displacement is compared to a rebased stack coordinate.
+    #[local] relation stack_value_view(Node, i64, bool, MemoryChunk);
+    #[local] relation stack_memory_view(Node, i64, bool, MemoryChunk);
+    #[local] relation decoded_stack_access(Node, bool, Symbol, i64, usize);
+    #[local] relation conflicting_stack_access(Node, bool);
+    #[local] relation stack_storage_chunk(Node, i64, bool, MemoryChunk);
+
+    decoded_stack_access(*node, false, *base, *ofs, *width) <--
+        decoded_stack_read_bytes(node, base, ofs, width);
+    decoded_stack_access(*node, true, *base, *ofs, *width) <--
+        decoded_stack_write_bytes(node, base, ofs, width);
+    conflicting_stack_access(*node, *write) <--
+        decoded_stack_access(node, write, base, ofs, width),
+        decoded_stack_access(node, write, other_base, other_ofs, other_width),
+        if (base, ofs, width) != (other_base, other_ofs, other_width);
+
+    stack_memory_view(*node, *ofs, false, *chunk) <--
+        ltl_inst(node, ?LTLInst::Lload(chunk, Addressing::Ainstack(ofs), _, _));
+    stack_memory_view(*node, *ofs, true, *chunk) <--
+        ltl_inst(node, ?LTLInst::Lstore(chunk, Addressing::Ainstack(ofs), _, _));
+    stack_value_view(node, ofs, write, chunk) <--
+        stack_memory_view(node, ofs, write, chunk);
+    stack_value_view(*node, *ofs, false, chunk) <--
         ltl_inst(node, ?LTLInst::Lgetstack(_, ofs, typ, _)),
-        stack_var(_, node, *ofs, rtl_reg),
         let chunk = crate::decompile::passes::rtl_pass::typ_to_chunk(*typ);
-    stack_web_chunk(rtl_reg, chunk) <--
+    stack_value_view(*node, *ofs, true, chunk) <--
         ltl_inst(node, ?LTLInst::Lsetstack(_, _, ofs, typ)),
-        stack_var(_, node, *ofs, rtl_reg),
         let chunk = crate::decompile::passes::rtl_pass::typ_to_chunk(*typ);
-    stack_web_chunk(rtl_reg, chunk) <--
+    stack_value_view(*node, *ofs, true, chunk) <--
         mach_imm_stack_init(node, ofs, _, typ),
-        stack_var(_, node, ofs, rtl_reg),
         let chunk = crate::decompile::passes::rtl_pass::typ_to_chunk(*typ);
+
+    // Decoder evidence wins over every value-level alternative of the same
+    // event, including a simultaneous Lstore(byte) and Lsetstack(Tint).
+    stack_storage_chunk(*node, *ofs, *write, storage_chunk_at_width(*view, *width)) <--
+        stack_value_view(node, ofs, write, view),
+        decoded_stack_access(node, write, _, _, width),
+        !conflicting_stack_access(node, write);
+    // Synthetic memory operations can lack a decoded event. Their explicit
+    // MemoryChunk is an access width; a promoted get/set Typ is not.
+    stack_storage_chunk(node, ofs, write, chunk) <--
+        stack_memory_view(node, ofs, write, chunk),
+        !decoded_stack_access(node, write, _, _, _);
+    stack_storage_chunk(*node, *ofs, *write, MemoryChunk::Unknown) <--
+        stack_value_view(node, ofs, write, _),
+        conflicting_stack_access(node, write);
+    stack_storage_chunk(*node, *ofs, *write, MemoryChunk::Unknown) <--
+        stack_value_view(node, ofs, write, _),
+        !decoded_stack_access(node, write, _, _, _),
+        !stack_memory_view(node, ofs, write, _);
+
+    // Only physical storage evidence authorizes a concrete declaration in
+    // selection. An unknown event poisons a would-be narrow scalar proposal,
+    // rather than silently disappearing when other events have known widths.
+    relation type_recovery_storage_chunk(RTLReg, MemoryChunk);
+    // Point- and role-preserving handoff for selection's typed evidence graph.
+    // Consumers needing a value type must not reinterpret these as value defs.
+    relation type_storage_access(Address, Node, RTLReg, i64, bool, MemoryChunk);
+    type_storage_access(func, node, reg, ofs, write, chunk) <--
+        stack_storage_chunk(node, ofs, write, chunk),
+        stack_var(func, node, ofs, reg);
+    type_recovery_storage_chunk(reg, chunk) <--
+        type_storage_access(_, _, reg, _, _, chunk);
+
+    stack_web_chunk(reg, chunk) <--
+        type_recovery_storage_chunk(reg, chunk),
+        if *chunk != MemoryChunk::Unknown;
+    // Keep legacy value-type hypotheses when an event has no precise storage
+    // interpretation. They remain candidates, never physical-width evidence.
+    stack_web_chunk(reg, view) <--
+        stack_value_view(node, ofs, write, view),
+        stack_storage_chunk(node, ofs, write, ?MemoryChunk::Unknown),
+        stack_var(_, node, ofs, reg);
 
     // Suppress a narrow candidate only when a wider access belongs to the same
     // value web. A wider access in another lifetime at the same coordinate is
@@ -436,7 +670,156 @@ ascent_par! {
         let src = args[0],
         emit_var_type_candidate(src, xt),
         if !is_pointer_xtype(xt),
-        if !is_float_xtype(xt);
+        if !is_float_xtype(xt),
+        // _Bool is a VALUE-domain claim proven per web below; a copy's
+        // destination may have other definitions outside {0, 1}.
+        if *xt != XType::Xbool;
+
+    // _Bool value webs (C11 6.3.1.2): declaring a byte web _Bool preserves
+    // every value exactly when EVERY value stored into it is 0 or 1. The
+    // claim is per DEFINITION, via machine reaching definitions: a reused
+    // register (clang's `xor al,0xff; and al,1` for `!b`) may hold a
+    // non-boolean intermediate that never reaches the store. A value is
+    // refuted when its defining operation is not a 0/1 producer or transfer,
+    // when a transfer's reaching input is refuted or unknown, or when it is
+    // read from a refuted web. Refutation is the least fixpoint; its
+    // complement over byte webs is the claim, so `b = !b` cycles stay _Bool.
+    #[local] relation ltl_bool_producer(Node, Mreg);
+    ltl_bool_producer(*node, *dst) <--
+        ltl_inst(node, ?LTLInst::Lop(op, _, dst)),
+        if bool_producing_operation(op);
+    #[local] relation ltl_bool_transfer(Node, Mreg, Mreg);
+    ltl_bool_transfer(*node, *dst, args[0]) <--
+        ltl_inst(node, ?LTLInst::Lop(op, args, dst)),
+        if bool_transfer_operation(op),
+        if args.len() == 1;
+    #[local] relation ltl_stack_read(Node, Mreg, RTLReg);
+    ltl_stack_read(*node, *dst, *web) <--
+        ltl_inst(node, ?LTLInst::Lgetstack(_, ofs, _, dst)),
+        stack_var(_, node, ofs, web);
+    ltl_stack_read(*node, *dst, *web) <--
+        ltl_inst(node, ?LTLInst::Lload(_, Addressing::Ainstack(ofs), _, dst)),
+        stack_var(_, node, ofs, web);
+    #[local] relation ltl_stack_write(Node, Mreg, RTLReg);
+    ltl_stack_write(*node, *src, *web) <--
+        ltl_inst(node, ?LTLInst::Lsetstack(src, _, ofs, _)),
+        stack_var(_, node, ofs, web);
+    ltl_stack_write(*node, *src, *web) <--
+        ltl_inst(node, ?LTLInst::Lstore(_, Addressing::Ainstack(ofs), _, src)),
+        stack_var(_, node, ofs, web);
+    #[local] relation use_has_reaching_def(Node, Mreg);
+    use_has_reaching_def(*used, *mreg) <-- reg_def_used(_, mreg, used);
+
+    #[local] relation def_may_exceed_bool(Node, Mreg);
+    #[local] relation web_may_exceed_bool(RTLReg);
+    def_may_exceed_bool(*def, *mreg) <--
+        reg_def_used(def, mreg, _),
+        !ltl_bool_producer(*def, *mreg),
+        !ltl_bool_transfer(*def, *mreg, _),
+        !ltl_stack_read(*def, *mreg, _);
+    def_may_exceed_bool(*node, *dst) <--
+        ltl_bool_transfer(node, dst, src),
+        reg_def_used(def, src, node),
+        def_may_exceed_bool(def, src);
+    def_may_exceed_bool(*node, *dst) <--
+        ltl_bool_transfer(node, dst, src),
+        !use_has_reaching_def(*node, *src);
+    def_may_exceed_bool(*node, *dst) <--
+        ltl_stack_read(node, dst, web),
+        web_may_exceed_bool(web);
+    web_may_exceed_bool(*web) <--
+        ltl_stack_write(node, src, web),
+        reg_def_used(def, src, node),
+        def_may_exceed_bool(def, src);
+    web_may_exceed_bool(*web) <--
+        ltl_stack_write(node, src, web),
+        !use_has_reaching_def(*node, *src);
+    web_may_exceed_bool(*web) <--
+        mach_imm_stack_init(node, ofs, value, _),
+        if *value != 0 && *value != 1,
+        stack_var(_, node, ofs, web);
+    // A slot whose address is materialized can be written through that
+    // address -- passed, stored or returned -- which no stack write above
+    // observes.
+    web_may_exceed_bool(*web) <--
+        renderable_stack_addr_result(node, ofs, _),
+        stack_var(func, node, ofs, _),
+        stack_var(func, _, ofs, web);
+
+    // Positive evidence: a computed boolean store, or both constants. A byte
+    // only ever initialised to 0 is not thereby a flag.
+    #[local] relation web_bool_evidence(RTLReg);
+    #[local] relation ltl_constant_def(Node, Mreg);
+    ltl_constant_def(*node, *dst) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Ointconst(_) | Operation::Olongconst(_), _, dst));
+    web_bool_evidence(*web) <--
+        ltl_stack_write(node, src, web),
+        reg_def_used(def, src, node),
+        ltl_bool_producer(def, src),
+        !ltl_constant_def(*def, *src);
+    web_bool_evidence(*web) <--
+        ltl_stack_write(node, src, web),
+        reg_def_used(def, src, node),
+        ltl_bool_transfer(def, src, _);
+    #[local] relation web_bool_constant(RTLReg, i64);
+    web_bool_constant(*web, *value) <--
+        mach_imm_stack_init(node, ofs, value, _),
+        if *value == 0 || *value == 1,
+        stack_var(_, node, ofs, web);
+    web_bool_evidence(*web) <--
+        web_bool_constant(web, 0),
+        web_bool_constant(web, 1);
+
+    // Only byte storage can be a C _Bool object; an int-sized flag is an int.
+    #[local] relation web_wider_than_byte(RTLReg);
+    web_wider_than_byte(*reg) <--
+        stack_web_chunk(reg, chunk),
+        if !matches!(chunk, MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned | MemoryChunk::MBool);
+    emit_var_type_candidate(*reg, XType::Xbool) <--
+        stack_web_chunk(reg, chunk),
+        if matches!(chunk, MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned | MemoryChunk::MBool),
+        !web_wider_than_byte(*reg),
+        web_bool_evidence(reg),
+        !web_may_exceed_bool(*reg);
+
+    // A register web is one C variable for ALL of its values, so a comparison
+    // makes it _Bool only when no value the web can hold exceeds {0, 1}: gcc's
+    // `setle al; movzx eax, al; add eax, 1` is one web holding 1 or 2. It is
+    // refuted by an explicit definition that is not a 0/1 producer or
+    // transfer, by a transfer of a refuted web, and by a read that a refuted
+    // definition reaches -- parameters enter as definitions at the function
+    // start -- or that no definition reaches. Stack webs are also written by
+    // stores, so their claim is the stack analysis above.
+    #[local] relation stack_web(RTLReg);
+    stack_web(*web) <-- stack_var(_, _, _, web);
+    #[local] relation ltl_read_web(Node, Mreg, RTLReg);
+    ltl_read_web(*node, *mreg, *web) <--
+        reg_use(node, mreg),
+        reg_rtl(node, mreg, web),
+        rtl_inst(node, inst),
+        if rtl_reads_register(inst, *web);
+    #[local] relation reg_web_may_exceed_bool(RTLReg);
+    reg_web_may_exceed_bool(web) <--
+        rtl_inst(_, inst),
+        if !rtl_bool_definition(inst),
+        for web in rtl_defined_registers(inst);
+    reg_web_may_exceed_bool(*dst) <--
+        rtl_inst(_, ?RTLInst::Iop(op, args, dst)),
+        if bool_transfer_operation(op),
+        if args.len() == 1,
+        reg_web_may_exceed_bool(args[0]);
+    reg_web_may_exceed_bool(*web) <--
+        ltl_read_web(node, mreg, web),
+        reg_def_used(def, mreg, node),
+        def_may_exceed_bool(def, mreg);
+    reg_web_may_exceed_bool(*web) <--
+        ltl_read_web(node, mreg, web),
+        !use_has_reaching_def(*node, *mreg);
+    emit_var_type_candidate(*dst, XType::Xbool) <--
+        rtl_inst(_, ?RTLInst::Iop(op, _, dst)),
+        if is_boolean_operation(op),
+        !stack_web(*dst),
+        !reg_web_may_exceed_bool(*dst);
 
     // A move joins two DISTINCT value webs, so a float candidate crossing it
     // must still answer to the destination's own register file. Forwarding it
@@ -901,7 +1284,7 @@ ascent_par! {
         emit_var_type_candidate(src, ty),
         ptr_store_chunk(p, src, chunk),
         ptr_load_chunk(p, dst, chunk),
-        if !matches!(ty, XType::Xfloat | XType::Xsingle);
+        if !matches!(ty, XType::Xfloat | XType::Xsingle | XType::Xbool);
     emit_var_type_candidate(dst, ty) <--
         emit_var_type_candidate(src, ty),
         ptr_store_chunk(p, src, chunk),
@@ -1508,6 +1891,206 @@ mod tests {
             .emit_var_type_candidate
             .iter()
             .any(|row| *row == (web, XType::Xany64)));
+    }
+
+    #[test]
+    fn byte_storage_is_not_widened_by_promoted_stack_get_and_set() {
+        let mut prog = TypePassProgram::default();
+        let (func, store, reload, web, offset) = (1, 7, 3, 101, -20);
+        prog.stack_var
+            .extend([(func, store, offset, web), (func, reload, offset, web)]);
+        prog.decoded_stack_write_bytes
+            .push((store, "RBP", offset, 1));
+        prog.decoded_stack_read_bytes
+            .push((reload, "RBP", offset, 1));
+        prog.ltl_inst.extend([
+            (
+                store,
+                LTLInst::Lstore(
+                    MemoryChunk::MInt8Unsigned,
+                    Addressing::Ainstack(offset),
+                    Arc::new(vec![]),
+                    Mreg::DX,
+                ),
+            ),
+            (
+                store,
+                LTLInst::Lsetstack(Mreg::DX, Slot::Local, offset, Typ::Tint),
+            ),
+            (
+                reload,
+                LTLInst::Lgetstack(Slot::Local, offset, Typ::Tint, Mreg::AX),
+            ),
+        ]);
+        prog.run();
+        assert!(prog
+            .type_recovery_storage_chunk
+            .iter()
+            .any(|row| *row == (web, MemoryChunk::MInt8Unsigned)));
+        assert!(!prog
+            .type_recovery_storage_chunk
+            .iter()
+            .any(|(reg, chunk)| *reg == web && *chunk != MemoryChunk::MInt8Unsigned));
+        assert!(prog
+            .emit_var_type_candidate
+            .iter()
+            .any(|row| *row == (web, XType::Xint8unsigned)));
+        assert!(!prog
+            .emit_var_type_candidate
+            .iter()
+            .any(|row| *row == (web, XType::Xint)));
+    }
+
+    #[test]
+    fn physical_storage_width_follows_the_access_across_coordinate_rebasing() {
+        let mut prog = TypePassProgram::default();
+        let (func, node, web) = (1, 9, 101);
+        prog.stack_var.push((func, node, 24, web));
+        // Raw RSP displacement and the normalized LTL coordinate differ.
+        prog.decoded_stack_read_bytes.push((node, "RSP", 88, 2));
+        prog.ltl_inst.push((
+            node,
+            LTLInst::Lgetstack(Slot::Local, 24, Typ::Tlong, Mreg::AX),
+        ));
+        prog.run();
+        assert!(prog
+            .type_recovery_storage_chunk
+            .iter()
+            .any(|row| *row == (web, MemoryChunk::MInt16Unsigned)));
+        assert!(!prog
+            .type_recovery_storage_chunk
+            .iter()
+            .any(|(reg, chunk)| *reg == web && *chunk != MemoryChunk::MInt16Unsigned));
+        assert!(prog
+            .emit_var_type_candidate
+            .iter()
+            .any(|row| *row == (web, XType::Xint16unsigned)));
+    }
+
+    #[test]
+    fn actual_wide_access_still_prevents_a_narrow_stack_object_hypothesis() {
+        let mut prog = TypePassProgram::default();
+        let (func, store, reload, web, offset) = (1, 8, 2, 101, -24);
+        prog.stack_var
+            .extend([(func, store, offset, web), (func, reload, offset, web)]);
+        prog.decoded_stack_write_bytes
+            .push((store, "RBP", offset, 8));
+        prog.decoded_stack_read_bytes
+            .push((reload, "RBP", offset, 1));
+        prog.ltl_inst.extend([
+            (
+                store,
+                LTLInst::Lsetstack(Mreg::DX, Slot::Local, offset, Typ::Tany64),
+            ),
+            (
+                reload,
+                LTLInst::Lgetstack(Slot::Local, offset, Typ::Tint, Mreg::AX),
+            ),
+        ]);
+        prog.run();
+        assert!(prog
+            .type_recovery_storage_chunk
+            .iter()
+            .any(|row| *row == (web, MemoryChunk::MInt8Unsigned)));
+        assert!(prog
+            .type_recovery_storage_chunk
+            .iter()
+            .any(|row| *row == (web, MemoryChunk::MAny64)));
+        assert!(prog
+            .emit_var_type_candidate
+            .iter()
+            .any(|row| *row == (web, XType::Xany64)));
+        assert!(!prog
+            .emit_var_type_candidate
+            .iter()
+            .any(|row| *row == (web, XType::Xint8unsigned)));
+    }
+
+    #[test]
+    fn conflicting_decoded_accesses_do_not_authorize_a_storage_width() {
+        let mut prog = TypePassProgram::default();
+        let (func, node, web) = (1, 9, 101);
+        prog.stack_var.push((func, node, -8, web));
+        prog.decoded_stack_read_bytes
+            .extend([(node, "RBP", -8, 1), (node, "RBP", -8, 2)]);
+        prog.ltl_inst.push((
+            node,
+            LTLInst::Lgetstack(Slot::Local, -8, Typ::Tint, Mreg::AX),
+        ));
+        prog.run();
+        assert!(prog
+            .type_recovery_storage_chunk
+            .iter()
+            .any(|row| *row == (web, MemoryChunk::Unknown)));
+        assert!(!prog
+            .type_recovery_storage_chunk
+            .iter()
+            .any(|(reg, chunk)| *reg == web && *chunk != MemoryChunk::Unknown));
+        // A fallback C candidate is not a claim of four-byte physical storage.
+        assert!(prog
+            .emit_var_type_candidate
+            .iter()
+            .any(|row| *row == (web, XType::Xint)));
+    }
+
+    #[test]
+    fn unknown_access_is_not_hidden_by_another_known_byte_access() {
+        let mut prog = TypePassProgram::default();
+        let (func, store, reload, web, offset) = (1, 8, 2, 101, -24);
+        prog.stack_var
+            .extend([(func, store, offset, web), (func, reload, offset, web)]);
+        prog.ltl_inst.extend([
+            (
+                store,
+                LTLInst::Lstore(
+                    MemoryChunk::MInt8Unsigned,
+                    Addressing::Ainstack(offset),
+                    Arc::new(vec![]),
+                    Mreg::DX,
+                ),
+            ),
+            (
+                reload,
+                LTLInst::Lgetstack(Slot::Local, offset, Typ::Tint, Mreg::AX),
+            ),
+        ]);
+        prog.run();
+        assert!(prog
+            .type_recovery_storage_chunk
+            .iter()
+            .any(|row| *row == (web, MemoryChunk::MInt8Unsigned)));
+        assert!(prog
+            .type_recovery_storage_chunk
+            .iter()
+            .any(|row| *row == (web, MemoryChunk::Unknown)));
+    }
+
+    #[test]
+    fn narrow_storage_does_not_narrow_the_value_being_stored() {
+        let mut prog = TypePassProgram::default();
+        let (func, node, web, source, offset) = (1, 9, 101, 102, -8);
+        prog.stack_var.push((func, node, offset, web));
+        prog.decoded_stack_write_bytes
+            .push((node, "RBP", offset, 1));
+        prog.reg_rtl.push((node, Mreg::AX, source));
+        prog.ltl_inst.push((
+            node,
+            LTLInst::Lstore(
+                MemoryChunk::MInt8Unsigned,
+                Addressing::Ainstack(offset),
+                Arc::new(vec![]),
+                Mreg::AX,
+            ),
+        ));
+        prog.run();
+        assert!(prog
+            .emit_var_type_candidate
+            .iter()
+            .any(|row| *row == (web, XType::Xint8unsigned)));
+        assert!(!prog
+            .emit_var_type_candidate
+            .iter()
+            .any(|(reg, _)| *reg == source));
     }
 
     #[test]

@@ -577,7 +577,16 @@ impl Printer {
             self.write("volatile ");
         }
 
-        self.print_type_with_name(&decl.ty, &decl.name);
+        // A declaration whose type is exactly Bool names a C _Bool object:
+        // selection only proposes it for a value whose every definition is 0
+        // or 1, so the object preserves those values. Bool as an expression
+        // or pointee type keeps its historical int spelling.
+        if matches!(decl.ty, CType::Bool) {
+            self.write("_Bool ");
+            self.write(&decl.name);
+        } else {
+            self.print_type_with_name(&decl.ty, &decl.name);
+        }
         self.print_var_alignment(decl);
 
         if let Some(ref init) = decl.init {
@@ -1268,6 +1277,16 @@ fn collect_needed_includes(tu: &TranslationUnit) -> Vec<&'static str> {
     for (header, fns) in &super::header_db::header_db().includes {
         if fns.iter().any(|f| sites.names.contains(*f)) {
             includes.insert(*header);
+        }
+    }
+    // A library record's typedef name needs its declaring header even when
+    // no function from that header is called in this translation unit.
+    let text = format!("{tu:?}");
+    for id in [crate::x86::types::LIBC_FILE_RECORD, crate::x86::types::LIBC_DIR_RECORD] {
+        if let Some((typedef, header)) = crate::x86::types::libc_record(id) {
+            if text.contains(&format!("TypedefName(\"{typedef}\")")) {
+                includes.insert(header);
+            }
         }
     }
     includes.into_iter().collect()

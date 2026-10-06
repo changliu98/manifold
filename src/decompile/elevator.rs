@@ -382,6 +382,12 @@ pub struct SemanticAblations {
     pub disable_storage_search: bool,
     pub disable_existing_views: bool,
     pub global_call_observer: bool,
+    /// Selection without the TypeRecovery module: no evidence graph, bindings,
+    /// declaration alternatives or projections; declarations keep the legacy profile.
+    pub disable_type_recovery: bool,
+    /// Selection without validator-backed admission: no value/effect obligations
+    /// and no declaration-transfer refinement. Their fact collection still runs.
+    pub disable_semantic_admission: bool,
 }
 
 pub struct DecompileDB {

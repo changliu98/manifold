@@ -75,6 +75,32 @@ fn is_exact_signature_value_type(xtype: &XType) -> bool {
     !matches!(xtype, XType::Xvoid | XType::Xany32 | XType::Xany64)
 }
 
+fn integer_value_bits(xtype: XType) -> Option<u32> {
+    match xtype {
+        XType::Xbool => Some(1),
+        XType::Xint8signed | XType::Xint8unsigned => Some(8),
+        XType::Xint16signed | XType::Xint16unsigned => Some(16),
+        XType::Xint | XType::Xintunsigned | XType::Xany32 => Some(32),
+        XType::Xlong | XType::Xlongunsigned | XType::Xany64 => Some(64),
+        _ => None,
+    }
+}
+
+/// A subword load/cast hint at the caller describes a value view, not a
+/// license to truncate the callee's interface to that storage width. Vote
+/// with its integer-promotion carrier. A definition-side narrow parameter
+/// remains authoritative; caller-only evidence cannot manufacture one.
+fn argument_value_type(xtype: XType) -> XType {
+    match xtype {
+        XType::Xbool
+        | XType::Xint8signed
+        | XType::Xint8unsigned
+        | XType::Xint16signed
+        | XType::Xint16unsigned => XType::Xint,
+        _ => xtype,
+    }
+}
+
 fn signature_addr_preserving_op(op: &Operation) -> bool {
     matches!(
         op,
@@ -157,6 +183,7 @@ ascent_par! {
     relation emit_function_param_type_candidate(Address, RTLReg, XType);
     relation func_has_param_evidence(Address, usize);
     relation call_target_func(Node, Address);
+    relation func_tailcalls_local(Address, Address);
     relation call_return_reg(Node, RTLReg);
     relation call_arg(Node, usize, RTLReg);
     relation call_has_arg_evidence(Node, usize);
@@ -174,6 +201,11 @@ ascent_par! {
     relation emit_function_void_candidate(Address);
     relation emit_function_return_type_xtype_candidate(Address, XType);
     relation function_return_point_reg(Address, Node, RTLReg);
+    relation ax_value_addr(Node, Node);
+    relation abi_ret_int_reg(Mreg);
+    relation ltl_inst(Node, LTLInst);
+    relation reg_def_used(Node, Mreg, Node);
+    relation machine_register_write_view(Node, Mreg, u32);
     relation rtl_inst(Node, RTLInst);
     relation emit_var_type_candidate(RTLReg, XType);
     relation op_produces_ptr(Node, RTLReg);
@@ -199,6 +231,56 @@ ascent_par! {
     signature_return_move_source(*dst, args[0]) <--
         rtl_inst(_, ?RTLInst::Iop(Operation::Omove, args, dst)),
         if args.len() == 1;
+
+    // Storage and expression types are different claims. A byte local may
+    // feed a full-width arithmetic result; the storage type anywhere on its
+    // coalesced web must not truncate that result at the function boundary.
+    // Use the producing instruction's decoded register carrier, not the
+    // narrower range suggested by a cast or memory chunk. In particular a
+    // byte load into EAX defines an integer return carrier, including its
+    // sign/zero extension. A narrow C return would let recompilation discard
+    // the upper bits even when an original binary caller observes them.
+    // Keep at least the integer-promotion carrier for partial GPR writes;
+    // projecting the interface onto fewer bits needs caller/ABI evidence.
+    #[local] relation signature_produced_value_type(Node, Mreg, XType);
+    signature_produced_value_type(*node, *reg, xtype) <--
+        machine_register_write_view(node, reg, bits),
+        if matches!(reg, Mreg::X86(_)),
+        if matches!(*bits, 8 | 16 | 32 | 64),
+        let xtype = if *bits == 64 { XType::Xlong } else { XType::Xint };
+    signature_produced_value_type(*node, *dst, *xtype) <--
+        ltl_inst(node, ?LTLInst::Lop(Operation::Omove, args, dst)),
+        if args.len() == 1,
+        !machine_register_write_view(node, *dst, _),
+        reg_def_used(source, args[0], *node),
+        signature_produced_value_type(source, args[0], xtype);
+
+    #[local] relation signature_return_value_type(Address, XType);
+    signature_return_value_type(*func, *xtype) <--
+        function_return_point_reg(func, ret, _),
+        ax_value_addr(ret, definition),
+        abi_ret_int_reg(reg),
+        signature_produced_value_type(definition, reg, xtype);
+    // Preserve the same carrier across internal forwarding boundaries. The
+    // positive call-graph fixpoint propagates producer evidence, not guessed
+    // candidate types, and an unseeded recursive component invents nothing.
+    signature_produced_value_type(*call, *reg, *xtype) <--
+        call_target_func(call, target),
+        signature_return_value_type(target, xtype),
+        abi_ret_int_reg(reg);
+    signature_return_value_type(func, xtype) <--
+        func_tailcalls_local(func, target),
+        signature_return_value_type(target, xtype);
+    emit_function_return_type_xtype_candidate(func, xtype) <--
+        signature_return_value_type(func, xtype);
+
+    #[local] relation signature_return_needs_narrowing_proof(Address, XType);
+    signature_return_needs_narrowing_proof(*func, *candidate) <--
+        emit_function_return_type_xtype_candidate(func, candidate),
+        signature_return_value_type(func, value),
+        if let (Some(candidate_bits), Some(value_bits)) =
+            (integer_value_bits(*candidate), integer_value_bits(*value)),
+        if candidate_bits < value_bits;
 
     emit_function_return_type_xtype_candidate(func, xtype) <--
         function_return_point_reg(func, _, return_reg),
@@ -276,7 +358,7 @@ ascent_par! {
             in signature_call_arg_pointer_type_candidate(node, position, xtype);
 
     #[local] relation signature_call_arg_scalar_type_candidate(Node, usize, XType);
-    signature_call_arg_scalar_type_candidate(node, position, xtype) <--
+    signature_call_arg_scalar_type_candidate(node, position, argument_value_type(*xtype)) <--
         signature_selected_call_arg(node, position, reg),
         !signature_hard_pointer_reg(reg),
         signature_call_arg_type_candidate(node, position, xtype),
@@ -776,6 +858,7 @@ ascent_par! {
     reconciled_return_type(f, ty) <--
         emit_function_has_return_candidate(f),
         emit_function_return_type_xtype_candidate(f, ty),
+        !signature_return_needs_narrowing_proof(f, ty),
         !emit_function_void_candidate(f);
 
     // Case 3: def has_return but no xtype. The only evidence is "a value was left in the return REGISTER", so the floor is one machine word at the TARGET's width; a fixed Xany64 prints long and claims i386's 4-byte EAX return is 8 bytes.
@@ -789,6 +872,7 @@ ascent_par! {
     // Case 4: def xtype present without has_return (unusual but preserves behavior)
     reconciled_return_type(f, ty) <--
         emit_function_return_type_xtype_candidate(f, ty),
+        !signature_return_needs_narrowing_proof(f, ty),
         !emit_function_has_return_candidate(f),
         !emit_function_void_candidate(f);
 
@@ -820,9 +904,14 @@ ascent_par! {
 
     relation emit_function_return_type_xtype_selected(Address, XType);
     emit_function_return_type_xtype_selected(f, selected) <--
-        emit_function_return_type_xtype_candidate(f, _),
+        admissible_function_return_type(f, _),
         agg selected = max_refined_xtype(xtype)
-            in emit_function_return_type_xtype_candidate(f, xtype);
+            in admissible_function_return_type(f, xtype);
+
+    #[local] relation admissible_function_return_type(Address, XType);
+    admissible_function_return_type(f, xtype) <--
+        emit_function_return_type_xtype_candidate(f, xtype),
+        !signature_return_needs_narrowing_proof(f, xtype);
 
     relation emit_function_param_type_selected(Address, RTLReg, XType);
     emit_function_param_type_selected(f, reg, selected) <--
@@ -920,8 +1009,13 @@ impl IRPass for SignatureReconciliationPass {
             "emit_function_void_candidate",
             "emit_function_return_type_xtype_candidate",
             "function_return_point_reg",
+            "ax_value_addr",
+            "abi_ret_int_reg",
+            "ltl_inst",
+            "machine_register_write_view",
             "emit_function_signature_candidate",
             "call_target_func",
+            "func_tailcalls_local",
             "call_return_reg",
             "call_args_collected_candidate",
             "call_float_args_collected",
@@ -993,6 +1087,7 @@ mod tests {
     use crate::decompile::passes::pass::IRPass;
     use crate::mreg::Mreg;
     use crate::x86::op::{Addressing, Operation};
+    use crate::x86::types::LTLInst;
     use crate::x86::types::{CallConv, MemoryChunk, RTLInst, Signature, XType};
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -1065,8 +1160,14 @@ mod tests {
         program.reconciled_int_count.push((100, 6));
         program.run();
         assert!(program.is_varargs_fn.iter().any(|r| *r == (100,)));
-        assert!(program.signature_effective_int_count.iter().any(|r| *r == (100, 2)));
-        assert!(!program.signature_effective_int_count.iter().any(|r| *r == (100, 6)));
+        assert!(program
+            .signature_effective_int_count
+            .iter()
+            .any(|r| *r == (100, 2)));
+        assert!(!program
+            .signature_effective_int_count
+            .iter()
+            .any(|r| *r == (100, 6)));
     }
 
     #[test]
@@ -1254,6 +1355,31 @@ mod tests {
     }
 
     #[test]
+    fn a_callers_storage_view_does_not_narrow_the_callee_value_interface() {
+        let mut prog = SignatureReconciliationProgram::default();
+        for (position, xtype) in [
+            XType::Xint8signed,
+            XType::Xint8unsigned,
+            XType::Xint16signed,
+            XType::Xint16unsigned,
+            XType::Xbool,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let reg = position as u64 + 100;
+            prog.call_arg.push((10, position, reg));
+            prog.emit_var_type_candidate.push((reg, xtype));
+        }
+        prog.run();
+        assert_eq!(prog.signature_call_arg_type_at_site.len(), 5);
+        assert!(prog
+            .signature_call_arg_type_at_site
+            .iter()
+            .all(|(_, _, ty)| *ty == XType::Xint));
+    }
+
+    #[test]
     fn selected_rtl_call_args_replace_stale_setup_values() {
         let call = 0x40;
         let target = 0x1000;
@@ -1300,6 +1426,227 @@ mod tests {
             .signature_call_arg_type_at_site
             .iter()
             .any(|row| row == &(consuming_call, 4, XType::Xcharptr)));
+    }
+
+    #[test]
+    fn returned_arithmetic_value_is_not_truncated_to_a_storage_type() {
+        let mut prog = SignatureReconciliationProgram::default();
+        let (func, definition, ret, reg) = (1, 30, 4, 101);
+        prog.abi_ret_int_reg.push((Mreg::AX,));
+        prog.function_return_point_reg.push((func, ret, reg));
+        prog.ax_value_addr.push((ret, definition));
+        prog.machine_register_write_view
+            .push((definition, Mreg::AX, 32));
+        prog.emit_function_has_return_candidate.push((func,));
+        prog.emit_function_return_type_xtype_candidate
+            .push((func, XType::Xint8unsigned));
+        prog.ltl_inst.push((
+            definition,
+            LTLInst::Lop(Operation::Oaddimm(300), Arc::new(vec![Mreg::AX]), Mreg::AX),
+        ));
+        prog.run();
+        assert!(prog
+            .reconciled_return_type_selected
+            .iter()
+            .any(|row| *row == (func, XType::Xint)));
+        assert!(prog
+            .emit_function_return_type_xtype_selected
+            .iter()
+            .any(|row| *row == (func, XType::Xint)));
+    }
+
+    #[test]
+    fn returned_value_evidence_is_declared_to_the_parallel_scheduler() {
+        let pass = SignatureReconciliationPass;
+        for relation in [
+            "function_return_point_reg",
+            "ax_value_addr",
+            "abi_ret_int_reg",
+            "ltl_inst",
+            "reg_def_used",
+            "call_target_func",
+            "func_tailcalls_local",
+            "machine_register_write_view",
+        ] {
+            assert!(
+                pass.inputs().contains(&relation),
+                "undeclared return-value input: {relation}"
+            );
+        }
+    }
+
+    #[test]
+    fn returned_value_type_follows_reaching_definitions_not_address_order() {
+        let mut prog = SignatureReconciliationProgram::default();
+        let (func, arithmetic, copied, ret, reg) = (1, 90, 3, 20, 101);
+        prog.abi_ret_int_reg.push((Mreg::AX,));
+        prog.function_return_point_reg.push((func, ret, reg));
+        prog.ax_value_addr.push((ret, copied));
+        prog.emit_function_has_return_candidate.push((func,));
+        prog.emit_function_return_type_xtype_candidate
+            .push((func, XType::Xint8unsigned));
+        prog.ltl_inst.extend([
+            (
+                arithmetic,
+                LTLInst::Lop(Operation::Oaddlimm(300), Arc::new(vec![Mreg::DX]), Mreg::DX),
+            ),
+            (
+                copied,
+                LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::DX]), Mreg::AX),
+            ),
+        ]);
+        prog.reg_def_used.push((arithmetic, Mreg::DX, copied));
+        prog.machine_register_write_view
+            .push((arithmetic, Mreg::DX, 64));
+        prog.run();
+        assert!(prog
+            .reconciled_return_type_selected
+            .iter()
+            .any(|row| *row == (func, XType::Xlong)));
+    }
+
+    #[test]
+    fn a_narrow_value_range_does_not_project_the_return_abi_onto_a_byte() {
+        let mut prog = SignatureReconciliationProgram::default();
+        let (func, arithmetic, narrowed, ret, reg) = (1, 3, 30, 20, 101);
+        prog.abi_ret_int_reg.push((Mreg::AX,));
+        prog.function_return_point_reg.push((func, ret, reg));
+        prog.ax_value_addr.push((ret, narrowed));
+        prog.emit_function_has_return_candidate.push((func,));
+        prog.emit_function_return_type_xtype_candidate
+            .extend([(func, XType::Xint), (func, XType::Xint8unsigned)]);
+        prog.ltl_inst.extend([
+            (
+                arithmetic,
+                LTLInst::Lop(Operation::Oaddimm(300), Arc::new(vec![Mreg::AX]), Mreg::AX),
+            ),
+            (
+                narrowed,
+                LTLInst::Lop(
+                    Operation::Ocast8unsigned,
+                    Arc::new(vec![Mreg::AX]),
+                    Mreg::AX,
+                ),
+            ),
+        ]);
+        prog.reg_def_used.push((arithmetic, Mreg::AX, narrowed));
+        prog.machine_register_write_view
+            .push((narrowed, Mreg::AX, 32));
+        prog.run();
+        assert!(prog
+            .reconciled_return_type_selected
+            .iter()
+            .any(|row| *row == (func, XType::Xint)));
+    }
+
+    #[test]
+    fn returned_value_carriers_propagate_through_calls_and_tailcalls() {
+        let mut prog = SignatureReconciliationProgram::default();
+        prog.abi_ret_int_reg.push((Mreg::AX,));
+        for (func, ret, definition) in [(1, 10, 9), (2, 20, 19)] {
+            prog.function_return_point_reg.push((func, ret, 101 + func));
+            prog.ax_value_addr.push((ret, definition));
+            prog.emit_function_has_return_candidate.push((func,));
+            prog.emit_function_return_type_xtype_candidate
+                .push((func, XType::Xint8unsigned));
+        }
+        prog.ltl_inst.push((
+            9,
+            LTLInst::Lop(Operation::Oaddimm(300), Arc::new(vec![Mreg::AX]), Mreg::AX),
+        ));
+        prog.call_target_func.push((19, 1));
+        prog.machine_register_write_view.push((9, Mreg::AX, 32));
+        prog.func_tailcalls_local
+            .extend([(3, 2), (4, 3), (3, 4), (5, 6), (6, 5)]);
+        prog.run();
+        for func in [1, 2, 3, 4] {
+            assert!(
+                prog.reconciled_return_type_selected
+                    .iter()
+                    .any(|row| *row == (func, XType::Xint)),
+                "function {func}"
+            );
+        }
+        for func in [5, 6] {
+            assert!(!prog
+                .emit_function_return_type_xtype_selected
+                .iter()
+                .any(|(f, _)| *f == func));
+        }
+    }
+
+    #[test]
+    fn returned_integer_carriers_do_not_inherit_subword_storage_signedness() {
+        for (bits, expected) in [
+            (8, XType::Xint),
+            (16, XType::Xint),
+            (32, XType::Xint),
+            (64, XType::Xlong),
+        ] {
+            let mut prog = SignatureReconciliationProgram::default();
+            prog.abi_ret_int_reg.push((Mreg::AX,));
+            prog.function_return_point_reg.push((1, 3, 101));
+            prog.ax_value_addr.push((3, 9));
+            prog.emit_function_has_return_candidate.push((1,));
+            prog.emit_function_return_type_xtype_candidate
+                .extend([(1, XType::Xint8signed), (1, XType::Xint8unsigned)]);
+            prog.machine_register_write_view.push((9, Mreg::AX, bits));
+            prog.ltl_inst.push((
+                9,
+                LTLInst::Lgetstack(
+                    crate::x86::types::Slot::Local,
+                    -1,
+                    crate::x86::types::Typ::Tint,
+                    Mreg::AX,
+                ),
+            ));
+            prog.run();
+            assert!(
+                prog.reconciled_return_type_selected
+                    .iter()
+                    .any(|row| *row == (1, expected)),
+                "{bits} bits: {:?}",
+                prog.reconciled_return_type_selected
+            );
+        }
+    }
+
+    #[test]
+    fn a_decoded_copy_width_is_not_widened_by_its_source_carrier() {
+        let mut prog = SignatureReconciliationProgram::default();
+        prog.abi_ret_int_reg.push((Mreg::AX,));
+        prog.emit_function_has_return_candidate.push((1,));
+        prog.function_return_point_reg.push((1, 3, 101));
+        prog.ax_value_addr.push((3, 9));
+        prog.machine_register_write_view
+            .extend([(7, Mreg::DX, 64), (9, Mreg::AX, 32)]);
+        prog.ltl_inst.push((
+            9,
+            LTLInst::Lop(Operation::Omove, Arc::new(vec![Mreg::DX]), Mreg::AX),
+        ));
+        prog.reg_def_used.push((7, Mreg::DX, 9));
+        prog.run();
+        assert!(prog
+            .reconciled_return_type_selected
+            .iter()
+            .any(|row| *row == (1, XType::Xint)));
+    }
+
+    #[test]
+    fn unrelated_wide_definitions_do_not_change_the_return_interface() {
+        let mut prog = SignatureReconciliationProgram::default();
+        prog.abi_ret_int_reg.push((Mreg::AX,));
+        prog.emit_function_has_return_candidate.push((1,));
+        prog.emit_function_return_type_xtype_candidate
+            .push((1, XType::Xint8unsigned));
+        prog.function_return_point_reg.push((1, 3, 101));
+        prog.ax_value_addr.push((3, 9));
+        prog.machine_register_write_view.push((2, Mreg::AX, 64));
+        prog.run();
+        assert!(prog
+            .reconciled_return_type_selected
+            .iter()
+            .any(|row| *row == (1, XType::Xint8unsigned)));
     }
 
     #[test]

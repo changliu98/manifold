@@ -823,6 +823,7 @@ ascent_par! {
     relation rtl_next(Node, Node);
     relation mach_imm_indirect_store(Address, i64, MemoryChunk, Mreg, i64);
     relation mach_imm_stack_init(Address, i64, i64, Typ);
+    relation mach_imm_stack_symbol(Address, Ident);
     // SETcc materialized directly into a scalar frame cell.  The x86 frontend
     // carries both the structural flags origin and normalized condition args,
     // because no single Mach instruction can both compute the boolean and
@@ -1949,6 +1950,7 @@ ascent_par! {
 
     rtl_inst_candidate(addr, inst) <--
         mach_imm_stack_init(addr, ofs, imm_val, typ),
+        !mach_imm_stack_symbol(addr, _),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, ofs, rtl_reg),
         let op = match typ {
@@ -1960,6 +1962,7 @@ ascent_par! {
 
     rtl_inst_candidate(addr, inst) <--
         mach_imm_stack_init(addr, ofs, imm_val, typ),
+        !mach_imm_stack_symbol(addr, _),
         instr_in_function(addr, func_start),
         !stack_xtl(func_start, addr, ofs, _),
         let rtl_reg = fresh_stack_slot_reg(*addr),
@@ -1969,6 +1972,22 @@ ascent_par! {
             _ => Operation::Ointconst(*imm_val),
         },
         let inst = RTLInst::Iop(op, Arc::new(vec![]), rtl_reg);
+
+    // The stored immediate is a data symbol's address (asm_pass evidence).
+    rtl_inst_candidate(addr, inst) <--
+        mach_imm_stack_init(addr, ofs, _, _),
+        mach_imm_stack_symbol(addr, ident),
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, ofs, rtl_reg),
+        let inst = RTLInst::Iop(Operation::Oindirectsymbol(*ident as usize), Arc::new(vec![]), *rtl_reg);
+
+    rtl_inst_candidate(addr, inst) <--
+        mach_imm_stack_init(addr, ofs, _, _),
+        mach_imm_stack_symbol(addr, ident),
+        instr_in_function(addr, func_start),
+        !stack_xtl(func_start, addr, ofs, _),
+        let rtl_reg = fresh_stack_slot_reg(*addr),
+        let inst = RTLInst::Iop(Operation::Oindirectsymbol(*ident as usize), Arc::new(vec![]), rtl_reg);
 
     // Stack identities currently name a frame offset, not a byte interval.  A
     // SETcc therefore cannot safely define that identity when one of its
@@ -4835,6 +4854,33 @@ ascent_par! {
 
     temp_test_mem_mreg_args(addr, 0, Mreg::BP) <--
         frameless_bp_test_mem(_, addr, _, _);
+
+    // A framed BP- or SP-relative TEST operand is a scalar frame slot: its
+    // tested value is the slot's canonical stack SSA value, exactly as the
+    // scalar stack CMP reads it. Without a definition here the flag consumer
+    // reads a fresh register nothing defines (clang -O0 lowers every _Bool
+    // test to `test byte [rbp-k], 1; jcc`).
+    #[local] relation scalar_stack_test_var_slot(Address, Address, i64);
+    scalar_stack_test_var_slot(func_start, addr, *disp) <--
+        test_mem_consumer_link(addr, _),
+        ptest(addr, mem_sym, _),
+        op_indirect(mem_sym, _, base_str, idx_str, _, disp, _),
+        if Mreg::x86(*base_str) == Mreg::BP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        instr_in_function(addr, func_start),
+        func_sets_frame_pointer(func_start);
+    scalar_stack_test_var_slot(func_start, addr, *disp) <--
+        test_mem_consumer_link(addr, _),
+        ptest(addr, mem_sym, _),
+        op_indirect(mem_sym, _, base_str, idx_str, _, disp, _),
+        if Mreg::x86(*base_str) == Mreg::SP,
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        instr_in_function(addr, func_start);
+
+    rtl_inst_candidate(*addr, RTLInst::Iop(Operation::Omove, Arc::new(vec![*slot_value]), *fresh_reg)) <--
+        scalar_stack_test_var_slot(func_start, addr, slot),
+        stack_var(func_start, addr, slot, slot_value),
+        temp_test_mem_reg(addr, fresh_reg);
 
     temp_test_mem_args_rtl(addr, pos, rtl_reg) <--
         temp_test_mem_mreg_args(addr, pos, mreg),
@@ -15456,14 +15502,9 @@ ascent_par! {
         !has_single_type(reg),
         !is_int16signed(reg);
 
-    emit_var_type_candidate(reg, XType::Xbool) <--
-        is_bool(reg),
-        !has_ptr_type(reg),
-        !has_float_type(reg),
-        !has_single_type(reg),
-        !has_long_type(reg),
-        !has_int_type(reg),
-        !has_subint_type(reg);
+    // No Xbool here: one setcc definition does not make a web's every value
+    // 0/1 (x86 `setcc al` is a partial write merged into the EAX web). _Bool
+    // is proposed only by the type pass's per-definition must-analysis.
 
 
     emit_var_type_candidate(reg, XType::Xlongunsigned) <--

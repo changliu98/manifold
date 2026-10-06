@@ -65,11 +65,11 @@ impl Analysis for Storage {
     fn audit_selection(&self, db: &mut DecompileDB) {
         storage::ledger::check_selection(db);
     }
-    fn start_refinement(
+    fn start_refinement<'a>(
         &self,
-        cx: &FunctionContext<'_>,
+        cx: &FunctionContext<'a>,
         opt: &Optimize,
-    ) -> Option<Box<dyn ModelAnalysis>> {
+    ) -> Option<Box<dyn ModelAnalysis + 'a>> {
         if !self.needs_refinement(cx.function) {
             return None;
         }

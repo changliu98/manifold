@@ -596,15 +596,27 @@ fn header_collision_policy(selected_functions: &[SelectedFunction]) -> LocalDefP
 }
 
 #[derive(Default)]
-struct EscapedStackArrayLayouts {
-    arrays: HashMap<Address, HashMap<RTLReg, (MemoryChunk, usize)>>,
-    members: HashMap<Address, HashMap<RTLReg, (RTLReg, usize)>>,
+pub(crate) struct EscapedStackArrayLayouts {
+    pub(crate) arrays: HashMap<Address, HashMap<RTLReg, (MemoryChunk, usize)>>,
+    pub(crate) members: HashMap<Address, HashMap<RTLReg, (RTLReg, usize)>>,
 }
 
 #[derive(Default)]
-struct EscapedStackBufferLayouts {
-    buffers: HashMap<Address, HashMap<RTLReg, usize>>,
-    members: HashMap<Address, HashMap<RTLReg, (RTLReg, usize, MemoryChunk)>>,
+pub(crate) struct EscapedStackBufferLayouts {
+    pub(crate) buffers: HashMap<Address, HashMap<RTLReg, usize>>,
+    pub(crate) members: HashMap<Address, HashMap<RTLReg, (RTLReg, usize, MemoryChunk)>>,
+}
+
+/// The same allocation decisions must be visible before declaration selection
+/// and during emission. A field/local name absorbed by an allocation is an
+/// access view, not an independent scalar whose declaration may be narrowed.
+pub(crate) fn escaped_stack_layouts(
+    db: &DecompileDB,
+) -> (EscapedStackArrayLayouts, EscapedStackBufferLayouts) {
+    let mut arrays = derive_escaped_stack_array_layouts(db);
+    let buffers = derive_escaped_stack_buffer_layouts(db, &arrays);
+    remove_buffer_owned_array_layouts(&mut arrays, &buffers);
+    (arrays, buffers)
 }
 
 type StackBufferAliases = HashMap<Address, HashMap<RTLReg, (RTLReg, usize)>>;
@@ -872,18 +884,18 @@ fn derive_global_aggregate_coalescing(
             let width = chunk_byte_size(chunk);
             let value = if let Some(pointer) = owner.aggregate_relocation_init.get(offset) {
                 Some(CExpr::Cast(
-                    ctype_from_memchunk(chunk),
+                    ctype_from_memchunk(chunk, db.data_model()),
                     Box::new(pointer.clone()),
                 ))
             } else if let Some(member) = member_at_offset.get(offset).copied() {
                 if let Some(pointer) = member.pointer_init.first() {
                     Some(CExpr::Cast(
-                        ctype_from_memchunk(chunk),
+                        ctype_from_memchunk(chunk, db.data_model()),
                         Box::new(pointer.clone()),
                     ))
                 } else {
                     member.scalar_value.as_ref().map(|scalar| {
-                        CExpr::Cast(ctype_from_memchunk(chunk), Box::new(scalar.to_cexpr()))
+                        CExpr::Cast(ctype_from_memchunk(chunk, db.data_model()), Box::new(scalar.to_cexpr()))
                     })
                 }
             } else {
@@ -1183,53 +1195,11 @@ fn derive_stack_buffer_aliases(db: &DecompileDB) -> StackBufferAliases {
             .or_default()
             .insert((base, offset));
     }
-    let mut node_owners: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
-    for &(node, func) in db.rel_iter::<(Node, Address)>("instr_in_function") {
-        node_owners.entry(node).or_default().insert(func);
-    }
-    let mut framed_functions = HashSet::new();
-    for &(setup, src, dst) in
-        db.rel_iter::<(Address, &'static str, &'static str)>("stack_base_move")
-    {
-        if src == "RSP" && dst == "RBP" {
-            if let Some(owners) = node_owners.get(&setup) {
-                if owners.len() == 1 {
-                    framed_functions.extend(owners.iter().copied());
-                }
-            }
-        }
-    }
-    let mut frame_tops: BTreeMap<Address, i64> = BTreeMap::new();
-    for &(func, _, _, size) in
-        db.rel_iter::<(Address, Address, crate::x86::types::Symbol, u64)>("func_stacksz")
-    {
-        let Ok(size) = i64::try_from(size) else {
-            continue;
-        };
-        frame_tops
-            .entry(func)
-            .and_modify(|current| *current = (*current).max(size))
-            .or_insert(size);
-    }
+    let coordinates = crate::decompile::analysis::frame_coordinates::FrameCoordinates::collect(db);
     let stack_rows: Vec<_> = db
         .rel_iter::<(Address, Node, i64, RTLReg)>("stack_var")
         .copied()
         .collect();
-    let coordinate_variants = |func: Address, offset: i64| {
-        let mut variants = vec![offset];
-        if offset < 0 && framed_functions.contains(&func) {
-            if let Some(normalized) = frame_tops
-                .get(&func)
-                .and_then(|top| offset.checked_add(*top))
-                .filter(|normalized| *normalized >= 0)
-            {
-                variants.push(normalized);
-            }
-        }
-        variants.sort_unstable();
-        variants.dedup();
-        variants
-    };
     // Independently sized byte buffers also own every exact stack cell inside
     // their interval.  Publish those aliases here even when no overlapping
     // range forced the Clight sizer's coalescing path.
@@ -1243,7 +1213,7 @@ fn derive_stack_buffer_aliases(db: &DecompileDB) -> StackBufferAliases {
                 .filter_map(|(owner, _, offset, local)| {
                     (*owner == func && *local == base).then_some(*offset)
                 })
-                .flat_map(|offset| coordinate_variants(func, offset))
+                .filter_map(|offset| coordinates.start(func, offset))
                 .collect();
             for &(owner, _, cell_offset, member) in &stack_rows {
                 if owner != func {
@@ -1253,7 +1223,7 @@ fn derive_stack_buffer_aliases(db: &DecompileDB) -> StackBufferAliases {
                     let Some(end) = base_offset.checked_add(size) else {
                         continue;
                     };
-                    for cell in coordinate_variants(func, cell_offset) {
+                    if let Some(cell) = coordinates.start(func, cell_offset) {
                         if cell < *base_offset || cell >= end {
                             continue;
                         }
@@ -1398,7 +1368,7 @@ fn stack_local_physical_types(db: &DecompileDB, function: Address) -> HashMap<St
         .map(|(local, chunk)| {
             (
                 crate::decompile::passes::c_pass::helpers::param_name_for_reg(local),
-                ctype_from_memchunk(&chunk),
+                ctype_from_memchunk(&chunk, db.data_model()),
             )
         })
         .collect()
@@ -1489,55 +1459,23 @@ fn stack_buffer_alias_byte_expr(base: &str, offset: usize) -> CExpr {
 /// multiple locations for one backing local, and buffers extending outside
 /// the allocated frame are deliberately rejected.
 fn derive_raw_frame_buffer_layouts(db: &DecompileDB) -> RawFrameBufferLayouts {
+    let coordinates = crate::decompile::analysis::frame_coordinates::FrameCoordinates::collect(db);
+    // Frame-coordinate conversion and ownership of surviving BP values are
+    // separate facts. The latter still needs exact instruction ownership.
     let mut node_owners: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
-    for &(node, func) in db.rel_iter::<(Node, Address)>("instr_in_function") {
-        node_owners.entry(node).or_default().insert(func);
+    for &(node, function) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        node_owners.entry(node).or_default().insert(function);
     }
-
-    let mut framed_functions = HashSet::new();
-    for &(setup, src, dst) in
-        db.rel_iter::<(Address, &'static str, &'static str)>("stack_base_move")
-    {
-        if src != "RSP" || dst != "RBP" {
-            continue;
-        }
-        let Some(owners) = node_owners.get(&setup) else {
-            continue;
-        };
-        if owners.len() == 1 {
-            framed_functions.extend(owners.iter().copied());
-        }
-    }
-
-    let mut size_candidates: BTreeMap<Address, BTreeSet<i64>> = BTreeMap::new();
-    for &(func, _, _, size) in
-        db.rel_iter::<(Address, Address, crate::x86::types::Symbol, u64)>("func_stacksz")
-    {
-        let Ok(size) = i64::try_from(size) else {
-            continue;
-        };
-        if size > 0 {
-            size_candidates.entry(func).or_default().insert(size);
-        }
-    }
-    let frame_sizes: HashMap<Address, i64> = size_candidates
-        .into_iter()
-        .filter_map(|(func, sizes)| {
-            (framed_functions.contains(&func) && sizes.len() == 1)
-                .then(|| (func, *sizes.first().unwrap()))
-        })
+    let frame_sizes: HashMap<Address, i64> = db.stack_struct_buffers.keys()
+        .filter_map(|&func| coordinates.origin(func).filter(|size| *size > 0).map(|size| (func, size)))
         .collect();
 
     let mut base_offsets: BTreeMap<(Address, RTLReg), BTreeSet<i64>> = BTreeMap::new();
     for &(func, _, offset, local) in db.rel_iter::<(Address, Node, i64, RTLReg)>("stack_var") {
-        let Some(&frame_size) = frame_sizes.get(&func) else {
+        if !frame_sizes.contains_key(&func) {
             continue;
-        };
-        let normalized = if offset < 0 {
-            offset.checked_add(frame_size)
-        } else {
-            Some(offset)
-        };
+        }
+        let normalized = coordinates.start(func, offset);
         if let Some(normalized) = normalized.filter(|offset| *offset >= 0) {
             base_offsets
                 .entry((func, local))
@@ -1872,6 +1810,7 @@ pub(crate) fn derive_exact_stack_buffer_store_sites(
 fn rewrite_exact_stack_buffer_stores(
     body: &CStmt,
     stores: &HashMap<(RTLReg, RTLReg), (RTLReg, usize, MemoryChunk)>,
+    model: crate::abi::DataModel,
 ) -> CStmt {
     fn unwrapped_var(expr: &CExpr) -> Option<&str> {
         match expr {
@@ -1892,7 +1831,7 @@ fn rewrite_exact_stack_buffer_stores(
                 (
                     crate::decompile::passes::c_pass::helpers::param_name_for_reg(base),
                     offset,
-                    ctype_from_memchunk(&chunk),
+                    ctype_from_memchunk(&chunk, model),
                 ),
             )
         })
@@ -2660,6 +2599,8 @@ pub fn build_cast_from_relations(
     let mut stmt_map: HashMap<(Address, Node), CStmt> = HashMap::new();
     let mut function_edges = HashMap::new();
     for func in selected_functions {
+        ctx.var_types.extend(func.concrete_declarations.iter().map(|(&reg, term)|
+            (crate::decompile::passes::c_pass::helpers::param_name_for_reg(reg), term.to_c(ctx.data_model))));
         // func.statements is a HashMap; iterating it directly leaks non-deterministic order into convert_stmt -> record_var_type (which is first-wins), so a variable's recorded C type flips between runs. Walk nodes in sorted order.
         let mut nodes: Vec<crate::x86::types::Node> = func.statements.keys().copied().collect();
         nodes.sort_by_key(|node| exec_order_key(*node));
@@ -2694,6 +2635,24 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     edges: &HashMap<Address, Vec<(Node, Node)>>,
     var_types: &HashMap<String, CType>,
 ) -> TranslationUnit {
+    build_translation_unit_with_variable_origins(db, selected_functions, globals, id_to_name,
+        global_lvalue_aliases, stmt_map, edges, var_types).0
+}
+
+/// Record the emitter's actual register-to-name mapping without annotating or
+/// constraining the C AST. Consumers must look up types in the final C tree;
+/// a removed or renamed declaration does not retain credit by provenance alone.
+pub fn build_translation_unit_with_variable_origins(
+    db: &DecompileDB,
+    selected_functions: &[SelectedFunction],
+    globals: &[GlobalData],
+    id_to_name: &HashMap<usize, String>,
+    global_lvalue_aliases: &HashMap<usize, CExpr>,
+    stmt_map: &HashMap<(Address, Node), CStmt>,
+    edges: &HashMap<Address, Vec<(Node, Node)>>,
+    var_types: &HashMap<String, CType>,
+) -> (TranslationUnit, Vec<(Address, RTLReg, String, String)>) {
+    let mut variable_origins = Vec::new();
     let data_model = db.data_model();
     let mut tu = TranslationUnit::new();
     let mut func_var_types = var_types.clone();
@@ -2856,6 +2815,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 },
                 alignment: None,
                 storage_views: Vec::new(),
+                type_committed: false,
                 init: Some(Initializer::Expr(CExpr::FloatLit(FloatLiteral {
                     value,
                     suffix,
@@ -3275,6 +3235,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             qualifiers: TypeQualifiers::none(),
             alignment: None,
             storage_views: Vec::new(),
+            type_committed: false,
             init,
             loc: SourceLoc::unknown(),
         });
@@ -3297,7 +3258,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
 
     let local_def_policy = header_collision_policy(selected_functions);
     let func_renames = &local_def_policy.renames;
-    let mut escaped_stack_arrays = derive_escaped_stack_array_layouts(db);
+    let (escaped_stack_arrays, escaped_stack_buffers) = escaped_stack_layouts(db);
     let stack_buffer_aliases = derive_stack_buffer_aliases(db);
     let mut absorbed_buffer_roots: HashMap<Address, HashSet<RTLReg>> = HashMap::new();
     for &(func, root) in db.rel_iter::<(Address, RTLReg)>("stack_buffer_address_root") {
@@ -3316,8 +3277,6 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             _ => None,
         })
         .collect();
-    let escaped_stack_buffers = derive_escaped_stack_buffer_layouts(db, &escaped_stack_arrays);
-    remove_buffer_owned_array_layouts(&mut escaped_stack_arrays, &escaped_stack_buffers);
     let exact_stack_buffer_stores =
         derive_exact_stack_buffer_stores(db, &stack_buffer_aliases, &escaped_stack_buffers);
     let raw_frame_buffers = derive_raw_frame_buffer_layouts(db);
@@ -3596,6 +3555,10 @@ pub fn build_translation_unit_from_stmt_map_with_types(
 
         // Per-function local variable types seeded from clight_select's refined candidates, built BEFORE strip_trivial_casts so a (long)float_var is not reduced to a bare float under a pointer cast.
         let mut local_var_types = func_var_types.clone();
+        let concrete_declarations: HashMap<_, _> = func.concrete_declarations.iter()
+            .map(|(&reg, term)| (crate::decompile::passes::c_pass::helpers::param_name_for_reg(reg), term.to_c(data_model)))
+            .collect();
+        let committed_names: HashSet<_> = concrete_declarations.keys().cloned().collect();
         for (reg, candidates) in &func.var_type_candidates {
             let idx = func.var_decl_idx.get(reg).copied().unwrap_or(0);
             if let Some(type_str) = candidates.get(idx).or_else(|| func.var_types.get(reg)) {
@@ -3606,6 +3569,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 local_var_types.insert(var_name, ctype);
             }
         }
+        local_var_types.extend(concrete_declarations.iter().map(|(name, ty)| (name.clone(), ty.clone())));
 
         let function_stack_buffer_aliases = stack_buffer_aliases.get(&func.address);
         let stack_buffer_alias_names: HashSet<String> = function_stack_buffer_aliases
@@ -3614,7 +3578,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             .map(|member| crate::decompile::passes::c_pass::helpers::param_name_for_reg(*member))
             .collect();
         if let Some(stores) = exact_stack_buffer_stores.get(&func.address) {
-            body = rewrite_exact_stack_buffer_stores(&body, stores);
+            body = rewrite_exact_stack_buffer_stores(&body, stores, data_model);
         }
 
         // Every canonical local in a proven escaped uniform region denotes an
@@ -3655,7 +3619,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 let name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(*base);
                 local_var_types.insert(
                     name,
-                    CType::Array(Box::new(ctype_from_memchunk(chunk)), Some(*count)),
+                    CType::Array(Box::new(ctype_from_memchunk(chunk, data_model)), Some(*count)),
                 );
             }
         }
@@ -3680,7 +3644,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 .collect();
             let access_types: HashMap<RTLReg, CType> = members
                 .iter()
-                .map(|(member, (_, _, chunk))| (*member, ctype_from_memchunk(chunk)))
+                .map(|(member, (_, _, chunk))| (*member, ctype_from_memchunk(chunk, data_model)))
                 .collect();
             let mut backing_regs: HashSet<RTLReg> = escaped_stack_buffers
                 .buffers
@@ -3811,17 +3775,19 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         if let Some(forced) = db.decl_solve_force_ptr_regs.get(&func.address) {
             for reg in forced {
                 let var_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(*reg);
+                if committed_names.contains(&var_name) { continue; }
                 local_var_types.insert(var_name, CType::ptr(CType::Void));
             }
         }
 
-        infer_var_types_from_usage(&body, &mut local_var_types, &extern_return_types);
+        infer_var_types_from_usage(&body, &committed_names, &mut local_var_types, &extern_return_types);
 
         // Legacy force-long override, the register analogue of field
         // force-long.
         if let Some(forced) = db.decl_solve_force_long_regs.get(&func.address) {
             for reg in forced {
                 let var_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(*reg);
+                if committed_names.contains(&var_name) { continue; }
                 local_var_types.insert(var_name, CType::long());
             }
         }
@@ -3838,7 +3804,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 if matches!(local_var_types.get(&var_name), Some(CType::Array(..))) {
                     continue;
                 }
-                let elem = ctype_from_memchunk(chunk);
+                let elem = ctype_from_memchunk(chunk, data_model);
                 local_var_types.insert(var_name, CType::Array(Box::new(elem), Some(*count)));
             }
         }
@@ -3934,7 +3900,11 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                     .cloned()
                     .unwrap_or_else(CType::int);
                 let storage_views = semantic_views.get(&name).cloned().unwrap_or_default();
+                if let Some(committed) = concrete_declarations.get(&name) {
+                    assert_eq!(&ty, committed, "emission changed a selected declaration in {}: {name}", func.name);
+                }
                 VarDecl {
+                    type_committed: committed_names.contains(&name),
                     name,
                     ty,
                     storage_class: StorageClass::default(),
@@ -3992,6 +3962,11 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         for v in &local_vars {
             renamer.ensure_mapping(&v.name);
         }
+        let origins: Vec<_> = local_vars.iter().map(|v| &v.name)
+            .chain(params.iter().filter_map(|p| p.name.as_ref()))
+            .filter_map(|name| name.strip_prefix("var_")?.parse::<RTLReg>().ok()
+                .map(|reg| (reg, renamer.rename(name))))
+            .collect();
         let body = StmtTransform::transform_stmt(&mut renamer, body);
         let params: Vec<FuncParam> = params
             .iter()
@@ -4099,6 +4074,8 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 h.finish()
             );
         }
+        variable_origins.extend(origins.into_iter().map(|(reg, name)|
+            (func_addr, reg, func_def.name.clone(), name)));
         tu.add_function(func_def);
     }
 
@@ -4450,6 +4427,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 qualifiers: TypeQualifiers::none(),
                 alignment: None,
                 storage_views: Vec::new(),
+                type_committed: false,
                 init: None,
                 loc: SourceLoc::unknown(),
             }));
@@ -4469,6 +4447,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 },
                 alignment: None,
                 storage_views: Vec::new(),
+                type_committed: false,
                 init: None,
                 loc: SourceLoc::unknown(),
             }));
@@ -4491,7 +4470,9 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         }
     }
 
-    tu
+    variable_origins.sort();
+    variable_origins.dedup();
+    (tu, variable_origins)
 }
 
 // The innermost Call(Var(name), ...) of a possibly cast-wrapped call expression, returning the callee name, or None when it is not such a call.
@@ -4878,61 +4859,63 @@ fn collect_mutated_names_in_stmt(stmt: &CStmt, out: &mut HashSet<String>) {
 
 fn infer_var_types_from_usage(
     stmt: &CStmt,
+    fixed: &HashSet<String>,
     var_types: &mut HashMap<String, CType>,
     extern_return_types: &HashMap<String, CType>,
 ) {
     match stmt {
-        CStmt::Expr(e) => infer_types_from_expr(e, var_types, extern_return_types),
-        CStmt::Return(Some(e)) => infer_types_from_expr(e, var_types, extern_return_types),
+        CStmt::Expr(e) => infer_types_from_expr(e, fixed, var_types, extern_return_types),
+        CStmt::Return(Some(e)) => infer_types_from_expr(e, fixed, var_types, extern_return_types),
         CStmt::Block(items) => {
             for item in items {
                 if let CBlockItem::Stmt(s) = item {
-                    infer_var_types_from_usage(s, var_types, extern_return_types);
+                    infer_var_types_from_usage(s, fixed, var_types, extern_return_types);
                 }
             }
         }
         CStmt::If(cond, then_s, else_s) => {
-            infer_types_from_expr(cond, var_types, extern_return_types);
-            infer_var_types_from_usage(then_s, var_types, extern_return_types);
+            infer_types_from_expr(cond, fixed, var_types, extern_return_types);
+            infer_var_types_from_usage(then_s, fixed, var_types, extern_return_types);
             if let Some(e) = else_s {
-                infer_var_types_from_usage(e, var_types, extern_return_types);
+                infer_var_types_from_usage(e, fixed, var_types, extern_return_types);
             }
         }
         CStmt::While(cond, body) | CStmt::DoWhile(body, cond) => {
-            infer_types_from_expr(cond, var_types, extern_return_types);
-            infer_var_types_from_usage(body, var_types, extern_return_types);
+            infer_types_from_expr(cond, fixed, var_types, extern_return_types);
+            infer_var_types_from_usage(body, fixed, var_types, extern_return_types);
         }
         CStmt::For(init, cond, update, body) => {
             if let Some(fi) = init {
                 if let crate::decompile::passes::c_pass::types::ForInit::Expr(e) = fi {
-                    infer_types_from_expr(e, var_types, extern_return_types);
+                    infer_types_from_expr(e, fixed, var_types, extern_return_types);
                 }
             }
             if let Some(e) = cond {
-                infer_types_from_expr(e, var_types, extern_return_types);
+                infer_types_from_expr(e, fixed, var_types, extern_return_types);
             }
             if let Some(e) = update {
-                infer_types_from_expr(e, var_types, extern_return_types);
+                infer_types_from_expr(e, fixed, var_types, extern_return_types);
             }
-            infer_var_types_from_usage(body, var_types, extern_return_types);
+            infer_var_types_from_usage(body, fixed, var_types, extern_return_types);
         }
         CStmt::Switch(e, body) => {
-            infer_types_from_expr(e, var_types, extern_return_types);
-            infer_var_types_from_usage(body, var_types, extern_return_types);
+            infer_types_from_expr(e, fixed, var_types, extern_return_types);
+            infer_var_types_from_usage(body, fixed, var_types, extern_return_types);
         }
         (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => {
-            infer_var_types_from_usage(inner, var_types, extern_return_types)
+            infer_var_types_from_usage(inner, fixed, var_types, extern_return_types)
         }
         CStmt::Sequence(stmts) => {
             for s in stmts {
-                infer_var_types_from_usage(s, var_types, extern_return_types);
+                infer_var_types_from_usage(s, fixed, var_types, extern_return_types);
             }
         }
         _ => {}
     }
 }
 
-fn insert_or_refine(var_types: &mut HashMap<String, CType>, name: String, new_ty: CType) {
+fn insert_or_refine(fixed: &HashSet<String>, var_types: &mut HashMap<String, CType>, name: String, new_ty: CType) {
+    if fixed.contains(&name) { return; }
     match var_types.get(&name) {
         None => {
             var_types.insert(name, new_ty);
@@ -4958,6 +4941,32 @@ fn insert_or_refine(var_types: &mut HashMap<String, CType>, name: String, new_ty
     }
 }
 
+#[cfg(test)]
+mod declaration_commitment_tests {
+    use super::*;
+    #[test]
+    fn usage_inference_cannot_retype_a_selected_structural_declaration() {
+        let short_pointer = CType::ptr(CType::Int(IntSize::Short, Signedness::Unsigned));
+        let mut types = HashMap::from([
+            ("precise".to_owned(), short_pointer.clone()),
+            ("unknown".to_owned(), CType::ptr(CType::Void)),
+        ]);
+        let body = CStmt::Sequence(["precise", "unknown"].into_iter().map(|name|
+            CStmt::Expr(CExpr::deref(CExpr::cast(CType::ptr(CType::char_signed()), CExpr::var(name))))).collect());
+        infer_var_types_from_usage(&body, &HashSet::from(["precise".to_owned()]), &mut types, &HashMap::new());
+        assert_eq!(types["precise"], short_pointer);
+        assert_eq!(types["unknown"], CType::ptr(CType::char_signed()));
+    }
+    #[test]
+    fn known_call_return_is_not_a_second_authority_over_committed_types() {
+        let mut types = HashMap::from([("result".to_owned(), CType::long())]);
+        let body = CStmt::Expr(CExpr::assign(CExpr::var("result"), CExpr::call(CExpr::var("allocate"), vec![])));
+        let returns = HashMap::from([("allocate".to_owned(), CType::ptr(CType::Void))]);
+        infer_var_types_from_usage(&body, &HashSet::from(["result".to_owned()]), &mut types, &returns);
+        assert_eq!(types["result"], CType::long());
+    }
+}
+
 fn extract_var_name(expr: &CExpr) -> Option<&str> {
     match expr {
         CExpr::Var(name) => Some(name.as_str()),
@@ -4974,6 +4983,7 @@ fn is_default_int_scalar_ty(t: Option<&CType>) -> bool {
 
 fn infer_types_from_expr(
     expr: &CExpr,
+    fixed: &HashSet<String>,
     var_types: &mut HashMap<String, CType>,
     extern_return_types: &HashMap<String, CType>,
 ) {
@@ -4982,7 +4992,7 @@ fn infer_types_from_expr(
             if let CExpr::Cast(ty, cast_inner) = inner.as_ref() {
                 if let Some(name) = extract_var_name(cast_inner) {
                     if ty.is_pointer() {
-                        insert_or_refine(var_types, name.to_string(), ty.clone());
+                        insert_or_refine(fixed, var_types, name.to_string(), ty.clone());
                     }
                 }
             } else if let CExpr::Paren(paren_inner) = inner.as_ref() {
@@ -4992,7 +5002,7 @@ fn infer_types_from_expr(
                     if let CExpr::Cast(ty, cast_inner) = lhs.as_ref() {
                         if let Some(name) = extract_var_name(cast_inner) {
                             if ty.is_pointer() {
-                                insert_or_refine(var_types, name.to_string(), ty.clone());
+                                insert_or_refine(fixed, var_types, name.to_string(), ty.clone());
                             }
                         }
                     }
@@ -5002,29 +5012,31 @@ fn infer_types_from_expr(
                     .entry(name.clone())
                     .or_insert_with(|| CType::ptr(CType::Void));
             }
-            infer_types_from_expr(inner, var_types, extern_return_types);
+            infer_types_from_expr(inner, fixed, var_types, extern_return_types);
         }
         CExpr::Unary(UnaryOp::Not, inner) => {
             if let Some(name) = extract_var_name(inner) {
-                var_types.entry(name.to_string()).or_insert(CType::Bool);
+                // Operand of `!` says nothing about its value set; keep int
+                // (the spelling CType::Bool used to print as).
+                var_types.entry(name.to_string()).or_insert(CType::int());
             }
-            infer_types_from_expr(inner, var_types, extern_return_types);
+            infer_types_from_expr(inner, fixed, var_types, extern_return_types);
         }
         CExpr::Assign(_, lhs, rhs) => {
             if let CExpr::Var(name) = lhs.as_ref() {
                 if let CExpr::Cast(ty, _) = rhs.as_ref() {
                     if ty.is_pointer() {
-                        insert_or_refine(var_types, name.clone(), ty.clone());
+                        insert_or_refine(fixed, var_types, name.clone(), ty.clone());
                     }
                 }
                 if matches!(rhs.as_ref(), CExpr::StringLit(_)) {
-                    insert_or_refine(var_types, name.clone(), CType::ptr(CType::char_signed()));
+                    insert_or_refine(fixed, var_types, name.clone(), CType::ptr(CType::char_signed()));
                 }
                 if let CExpr::Call(callee, _) = rhs.as_ref() {
                     if let CExpr::Var(func_name) = callee.as_ref() {
                         if let Some(ret_ty) = extern_return_types.get(func_name.as_str()) {
                             // The result of a known POINTER-returning call is that pointer (a declared return type, not a cast inference); overrides only a default int/long scalar that would truncate it.
-                            if ret_ty.is_pointer() && is_default_int_scalar_ty(var_types.get(name))
+                            if !fixed.contains(name) && ret_ty.is_pointer() && is_default_int_scalar_ty(var_types.get(name))
                             {
                                 var_types.insert(name.clone(), ret_ty.clone());
                             } else {
@@ -5034,16 +5046,16 @@ fn infer_types_from_expr(
                     }
                 }
             }
-            infer_types_from_expr(lhs, var_types, extern_return_types);
-            infer_types_from_expr(rhs, var_types, extern_return_types);
+            infer_types_from_expr(lhs, fixed, var_types, extern_return_types);
+            infer_types_from_expr(rhs, fixed, var_types, extern_return_types);
         }
         CExpr::Call(func, args) => {
             if let CExpr::Var(func_name) = func.as_ref() {
-                infer_call_arg_types(func_name, args, var_types);
+                infer_call_arg_types(func_name, args, fixed, var_types);
             }
-            infer_types_from_expr(func, var_types, extern_return_types);
+            infer_types_from_expr(func, fixed, var_types, extern_return_types);
             for arg in args {
-                infer_types_from_expr(arg, var_types, extern_return_types);
+                infer_types_from_expr(arg, fixed, var_types, extern_return_types);
             }
         }
         CExpr::MemberPtr(inner, _) => {
@@ -5052,7 +5064,7 @@ fn infer_types_from_expr(
                     .entry(name.clone())
                     .or_insert_with(|| CType::ptr(CType::Void));
             }
-            infer_types_from_expr(inner, var_types, extern_return_types);
+            infer_types_from_expr(inner, fixed, var_types, extern_return_types);
         }
         CExpr::Index(base, index) => {
             if let CExpr::Var(name) = base.as_ref() {
@@ -5060,30 +5072,30 @@ fn infer_types_from_expr(
                     .entry(name.clone())
                     .or_insert_with(|| CType::ptr(CType::Void));
             }
-            infer_types_from_expr(base, var_types, extern_return_types);
-            infer_types_from_expr(index, var_types, extern_return_types);
+            infer_types_from_expr(base, fixed, var_types, extern_return_types);
+            infer_types_from_expr(index, fixed, var_types, extern_return_types);
         }
         CExpr::Unary(_, inner)
         | CExpr::Cast(_, inner)
         | CExpr::Paren(inner)
         | CExpr::SizeofExpr(inner)
         | CExpr::Member(inner, _) => {
-            infer_types_from_expr(inner, var_types, extern_return_types);
+            infer_types_from_expr(inner, fixed, var_types, extern_return_types);
         }
         CExpr::Binary(_, lhs, rhs) => {
-            infer_types_from_expr(lhs, var_types, extern_return_types);
-            infer_types_from_expr(rhs, var_types, extern_return_types);
+            infer_types_from_expr(lhs, fixed, var_types, extern_return_types);
+            infer_types_from_expr(rhs, fixed, var_types, extern_return_types);
         }
         CExpr::Ternary(c, t, e) => {
-            infer_types_from_expr(c, var_types, extern_return_types);
-            infer_types_from_expr(t, var_types, extern_return_types);
-            infer_types_from_expr(e, var_types, extern_return_types);
+            infer_types_from_expr(c, fixed, var_types, extern_return_types);
+            infer_types_from_expr(t, fixed, var_types, extern_return_types);
+            infer_types_from_expr(e, fixed, var_types, extern_return_types);
         }
         _ => {}
     }
 }
 
-fn infer_call_arg_types(func_name: &str, args: &[CExpr], var_types: &mut HashMap<String, CType>) {
+fn infer_call_arg_types(func_name: &str, args: &[CExpr], fixed: &HashSet<String>, var_types: &mut HashMap<String, CType>) {
     let char_ptr = || CType::ptr(CType::char_signed());
     let void_ptr = || CType::ptr(CType::Void);
     let str_first: &[&str] = &[
@@ -5138,7 +5150,7 @@ fn infer_call_arg_types(func_name: &str, args: &[CExpr], var_types: &mut HashMap
     ];
     if str_first.contains(&func_name) {
         if let Some(name) = args.first().and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), char_ptr());
+            insert_or_refine(fixed, var_types, name.to_string(), char_ptr());
         }
     }
     let str_second: &[&str] = &[
@@ -5160,83 +5172,84 @@ fn infer_call_arg_types(func_name: &str, args: &[CExpr], var_types: &mut HashMap
     ];
     if str_second.contains(&func_name) {
         if let Some(name) = args.get(1).and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), char_ptr());
+            insert_or_refine(fixed, var_types, name.to_string(), char_ptr());
         }
     }
     if func_name == "fprintf" {
         if let Some(name) = args.get(1).and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), char_ptr());
+            insert_or_refine(fixed, var_types, name.to_string(), char_ptr());
         }
     }
     if func_name == "snprintf" || func_name == "__snprintf_chk" {
         if let Some(name) = args.get(2).and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), char_ptr());
+            insert_or_refine(fixed, var_types, name.to_string(), char_ptr());
         }
     }
     if matches!(func_name, "memset" | "memcpy" | "memmove" | "memcmp") {
         if let Some(name) = args.first().and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), void_ptr());
+            insert_or_refine(fixed, var_types, name.to_string(), void_ptr());
         }
         if matches!(func_name, "memcpy" | "memmove" | "memcmp") {
             if let Some(name) = args.get(1).and_then(extract_var_name) {
-                insert_or_refine(var_types, name.to_string(), void_ptr());
+                insert_or_refine(fixed, var_types, name.to_string(), void_ptr());
             }
         }
     }
     if matches!(func_name, "memset" | "memcpy" | "memmove" | "memcmp") {
         if let Some(name) = args.get(2).and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), CType::ulong());
+            insert_or_refine(fixed, var_types, name.to_string(), CType::ulong());
         }
     }
     if func_name == "error" || func_name == "error_at_line" {
         if let Some(name) = args.first().and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), CType::int());
+            insert_or_refine(fixed, var_types, name.to_string(), CType::int());
         }
         if let Some(name) = args.get(1).and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), CType::int());
+            insert_or_refine(fixed, var_types, name.to_string(), CType::int());
         }
     }
     if func_name == "getopt_long" || func_name == "getopt" {
         if let Some(name) = args.first().and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), CType::int());
+            insert_or_refine(fixed, var_types, name.to_string(), CType::int());
         }
         if let Some(name) = args.get(1).and_then(extract_var_name) {
             insert_or_refine(
+                fixed,
                 var_types,
                 name.to_string(),
                 CType::ptr(CType::ptr(CType::char_signed())),
             );
         }
         if let Some(name) = args.get(2).and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), char_ptr());
+            insert_or_refine(fixed, var_types, name.to_string(), char_ptr());
         }
     }
     if matches!(func_name, "exit" | "_exit" | "_Exit") {
         if let Some(name) = args.first().and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), CType::int());
+            insert_or_refine(fixed, var_types, name.to_string(), CType::int());
         }
     }
     if matches!(func_name, "fwrite" | "fread") {
         if let Some(name) = args.first().and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), void_ptr());
+            insert_or_refine(fixed, var_types, name.to_string(), void_ptr());
         }
     }
     if func_name == "fgets" {
         if let Some(name) = args.first().and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), char_ptr());
+            insert_or_refine(fixed, var_types, name.to_string(), char_ptr());
         }
         if let Some(name) = args.get(1).and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), CType::int());
+            insert_or_refine(fixed, var_types, name.to_string(), CType::int());
         }
     }
     if func_name == "setlocale" {
         if let Some(name) = args.first().and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), CType::int());
+            insert_or_refine(fixed, var_types, name.to_string(), CType::int());
         }
     }
     if func_name == "open" {
         if let Some(name) = args.get(1).and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), CType::int());
+            insert_or_refine(fixed, var_types, name.to_string(), CType::int());
         }
     }
     if matches!(
@@ -5244,7 +5257,7 @@ fn infer_call_arg_types(func_name: &str, args: &[CExpr], var_types: &mut HashMap
         "close" | "read" | "write" | "dup" | "dup2" | "fcntl" | "ioctl" | "isatty"
     ) {
         if let Some(name) = args.first().and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), CType::int());
+            insert_or_refine(fixed, var_types, name.to_string(), CType::int());
         }
     }
     if matches!(
@@ -5252,7 +5265,7 @@ fn infer_call_arg_types(func_name: &str, args: &[CExpr], var_types: &mut HashMap
         "strtol" | "strtoul" | "strtoll" | "strtoull" | "strtod"
     ) {
         if let Some(name) = args.get(2).and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), CType::int());
+            insert_or_refine(fixed, var_types, name.to_string(), CType::int());
         }
     }
 }
@@ -6311,7 +6324,7 @@ fn rebase_byte_add_through_char(
 }
 
 /// CType for a memory chunk (element type of a runtime-indexed stack array).
-fn ctype_from_memchunk(chunk: &MemoryChunk) -> CType {
+fn ctype_from_memchunk(chunk: &MemoryChunk, model: crate::abi::DataModel) -> CType {
     use crate::decompile::passes::c_pass::types::{FloatSize, IntSize, Signedness};
     match chunk {
         // CompCert MBool is a one-byte memory chunk.  CType::Bool currently
@@ -6325,6 +6338,8 @@ fn ctype_from_memchunk(chunk: &MemoryChunk) -> CType {
         MemoryChunk::MInt32 | MemoryChunk::MAny32 => CType::Int(IntSize::Int, Signedness::Signed),
         MemoryChunk::MFloat32 => CType::Float(FloatSize::Float),
         MemoryChunk::MFloat64 => CType::Float(FloatSize::Double),
+        MemoryChunk::MInt64 | MemoryChunk::MAny64 if model.long_size() != 8 =>
+            CType::Int(IntSize::LongLong, Signedness::Signed),
         _ => CType::long(),
     }
 }
@@ -9507,6 +9522,18 @@ fn order_nodes_dfs(
 #[cfg(test)]
 mod escaped_stack_array_tests {
     use super::*;
+
+    #[test]
+    fn physical_qword_carriers_remain_64_bit_on_every_data_model() {
+        use crate::abi::DataModel;
+        use crate::decompile::passes::c_pass::types::{IntSize,Signedness};
+        for chunk in [MemoryChunk::MInt64,MemoryChunk::MAny64] {
+            assert_eq!(ctype_from_memchunk(&chunk,DataModel::Lp64),CType::long());
+            for model in [DataModel::Ilp32,DataModel::Llp64] {
+                assert_eq!(ctype_from_memchunk(&chunk,model),CType::Int(IntSize::LongLong,Signedness::Signed));
+            }
+        }
+    }
     use crate::decompile::passes::c_pass::types::FloatSize;
 
     #[test]
@@ -9738,7 +9765,7 @@ mod escaped_stack_array_tests {
             Box::new(CExpr::Var(source_name.clone())),
         ));
         assert_eq!(
-            rewrite_exact_stack_buffer_stores(&body, &stores[&func]),
+            rewrite_exact_stack_buffer_stores(&body, &stores[&func], db.data_model()),
             CStmt::Expr(CExpr::Assign(
                 AssignOp::Assign,
                 Box::new(stack_buffer_alias_value_expr(

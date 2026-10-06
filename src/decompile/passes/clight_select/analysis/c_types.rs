@@ -67,6 +67,7 @@ impl Analysis for CTypes {
         &self,
         cx: &DeclarationContext<'_>,
         tyvar: &HashMap<RTLReg, Dynamic>,
+        concrete: &super::declarations::Declarations,
         backend: &dyn SolveBackend,
     ) {
         let (t, interface_pins) = (cx.types, cx.pins);
@@ -75,13 +76,100 @@ impl Analysis for CTypes {
         // byte-identical, including compat_w and variable counts.
         for (reg, xtype) in interface_pins {
             if let Some(variable) = tyvar.get(reg) {
-                backend.assert_hard(&variable._eq(xtype_to_ty(t, xtype)));
+                let matches = if concrete.0.contains_key(reg) {
+                    interface_class_matches(t, variable, InterfaceClass::from_xtype(xtype))
+                } else {
+                    // The legacy renderer has only class representatives.
+                    // Do not let a deeper solver shape satisfy C rules and
+                    // then flatten it on output without a concrete owner.
+                    variable._eq(xtype_to_ty(t, xtype))
+                };
+                backend.assert_hard(&matches);
             }
         }
     }
 
-    fn build(&self, _cx: &FunctionContext<'_>) -> Option<Box<dyn CandidateAnalysis>> {
-        Some(Box::new(CTypes))
+    fn build(&self, cx: &FunctionContext<'_>) -> Option<Box<dyn CandidateAnalysis>> {
+        let mut support = Vec::new();
+        for &reg in cx.registers {
+            let mut proposed: Vec<_> = cx.function.var_type_candidates[&reg]
+                .iter()
+                .map(|c| cand_to_ty(cx.types, *c))
+                .collect();
+            if let Some(choice) = cx.concrete_declarations.0.get(&reg) {
+                proposed.extend(
+                    choice
+                        .proposed
+                        .iter()
+                        .map(|id| term_to_ty(cx.types, cx.concrete_declarations.term(*id))),
+                );
+                // Exact-domain closure already proves shape support here.
+                if choice.alternatives.iter().all(|(id, _)| {
+                    proposed.contains(&term_to_ty(cx.types, cx.concrete_declarations.term(*id)))
+                }) {
+                    continue;
+                }
+            }
+            if !proposed.is_empty() {
+                support.push(Bool::or(
+                    &proposed
+                        .iter()
+                        .map(|ty| cx.declarations[&reg]._eq(ty))
+                        .collect::<Vec<_>>(),
+                ));
+            }
+        }
+        Some(Box::new(SupportedCTypes { support }))
+    }
+}
+
+/// A committed abstract class admits every structural type in that class,
+/// not just its representative. In particular PtrInt includes char**, void*,
+/// and integer pointers, exactly as InterfaceClass::from_clight specifies.
+/// Equating it with ptr(int) would accidentally pin pointer depth as well.
+fn interface_class_matches(t: &TypeDt, variable: &Dynamic, class: InterfaceClass) -> Bool {
+    match class {
+        InterfaceClass::Void => t.is_void(variable),
+        InterfaceClass::Int => t.is_int(variable),
+        InterfaceClass::Float => t.is_float(variable),
+        InterfaceClass::PtrInt => {
+            let pointee = t.pointee(variable);
+            Bool::and(&[
+                t.is_ptr(variable),
+                t.is_float(&pointee).not(),
+                t.is_func(&pointee).not(),
+                t.is_struct(&pointee).not(),
+            ])
+        }
+        InterfaceClass::PtrFloat => {
+            Bool::and(&[t.is_ptr(variable), t.is_float(&t.pointee(variable))])
+        }
+        InterfaceClass::PtrFunc => {
+            Bool::and(&[t.is_ptr(variable), t.is_func(&t.pointee(variable))])
+        }
+        InterfaceClass::PtrStruct(id) => variable._eq(t.ptr(&t.struct_(id as i64))),
+    }
+}
+
+struct SupportedCTypes {
+    support: Vec<Bool>,
+}
+impl CandidateAnalysis for SupportedCTypes {
+    fn support_count(&self) -> usize {
+        self.support.len()
+    }
+    fn constrain_function(&self, _: &FunctionContext<'_>, sink: &ConstraintSink<'_>) {
+        for supported in &self.support {
+            sink.assert_type_support(supported);
+        }
+    }
+    fn constrain_candidate(
+        &self,
+        cx: &FunctionContext<'_>,
+        candidate: &Candidate<'_>,
+        sink: &ConstraintSink<'_>,
+    ) {
+        CTypes.constrain_candidate(cx, candidate, sink);
     }
 }
 
@@ -311,6 +399,21 @@ pub(crate) fn cand_to_ty(t: &TypeDt, candidate: CandType) -> Dynamic {
         | CandType::I16(_)
         | CandType::I32(_)
         | CandType::I64(_) => t.int(),
+    }
+}
+
+/// The C-class theory is a projection of an exact structural declaration,
+/// never a second authority for its width, signedness or pointer depth.
+pub(crate) fn term_to_ty(t: &TypeDt, term: &super::super::type_graph::TypeTerm) -> Dynamic {
+    use super::super::type_graph::TypeTerm;
+    match term {
+        TypeTerm::Void => t.void(),
+        TypeTerm::Bool | TypeTerm::Integer(..) => t.int(),
+        TypeTerm::Float(_) => t.float(),
+        TypeTerm::Pointer(inner) | TypeTerm::Array(inner, _) => t.ptr(&term_to_ty(t, inner)),
+        TypeTerm::Record { union: false, id } => t.struct_(*id as i64),
+        TypeTerm::Record { union: true, id } => t.union_(*id as i64),
+        TypeTerm::Function { .. } => t.func(),
     }
 }
 
@@ -1028,6 +1131,12 @@ pub(crate) fn anchor_index(
     // (which does carry the upstream sign evidence) pick. Width still binds, so a narrow candidate
     // is never widened onto or narrowed into.
     if rendered.is_integer() {
+        // A Bool candidate is only proposed for a value whose every definition
+        // is 0 or 1 (type pass), so it is that value's exact integer
+        // representative; nearest-width would otherwise always widen it.
+        if let Some(i) = cands.iter().position(|c| *c == CandType::Bool) {
+            return Some(i);
+        }
         if let Some(i) = cands
             .iter()
             .position(|c| c.is_integer() && c.width() == rendered.width())
@@ -1067,4 +1176,65 @@ pub(crate) fn anchor_index(
         .filter(|(_, c)| c.class() == rc)
         .min_by_key(|(i, c)| (c.width().abs_diff(rw), *i))
         .map(|(i, _)| i)
+}
+
+#[cfg(test)]
+mod interface_class_tests {
+    use super::*;
+    use crate::abi::DataModel;
+    use crate::decompile::passes::clight_select::type_graph::TypeTerm;
+    use z3::ast::Ast;
+
+    #[test]
+    fn class_membership_matches_the_program_level_abstraction() {
+        let types = TypeDt::build();
+        let model = DataModel::Lp64;
+        let mut terms: Vec<_> = [
+            CandType::I8(Sign::Unsigned),
+            CandType::I32(Sign::Signed),
+            CandType::I64(Sign::Unsigned),
+            CandType::F32,
+            CandType::F64,
+            CandType::PtrChar,
+            CandType::PtrCharPtr,
+            CandType::PtrVoid,
+            CandType::PtrDouble,
+            CandType::PtrFunc,
+            CandType::PtrStruct(7),
+        ]
+        .into_iter()
+        .map(|c| TypeTerm::from_candidate(c, model))
+        .collect();
+        terms.push(TypeTerm::Record { union: true, id: 8 }.pointer());
+        terms.push(
+            TypeTerm::Record {
+                union: false,
+                id: 7,
+            }
+            .pointer()
+            .pointer(),
+        );
+        let classes = [
+            InterfaceClass::Int,
+            InterfaceClass::Float,
+            InterfaceClass::PtrInt,
+            InterfaceClass::PtrFloat,
+            InterfaceClass::PtrFunc,
+            InterfaceClass::PtrStruct(7),
+            InterfaceClass::PtrStruct(8),
+            InterfaceClass::Void,
+        ];
+        for term in terms {
+            let expected = InterfaceClass::from_clight(&term.to_clight(model));
+            for class in classes {
+                assert_eq!(
+                    interface_class_matches(&types, &term_to_ty(&types, &term), class)
+                        .simplify()
+                        .as_bool(),
+                    Some(class == expected),
+                    "{term:?}: {class:?}"
+                );
+            }
+        }
+    }
 }

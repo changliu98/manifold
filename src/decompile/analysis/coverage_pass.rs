@@ -1598,8 +1598,9 @@ fn record_selected(
         let mut idents = Vec::new();
         stmt_idents(stmt, &mut idents);
         for i in idents {
-            live_webs.insert(i as u64);
-            live_def_nodes.insert(web_def_node(i as u64));
+            let native = func.binding_plan.native_register(i as u64);
+            live_webs.insert(native);
+            live_def_nodes.insert(web_def_node(native));
         }
     }
 
@@ -1626,7 +1627,11 @@ fn record_selected(
             continue;
         }
         for cand in cands {
-            let stripped = strip_labels(cand);
+            // Selection's binding vocabulary is a projection of this raw
+            // candidate. Compare in the same vocabulary as the selected tree;
+            // transport names must not be decoded as native definition ids.
+            let bound = func.binding_plan.statement(*node, cand);
+            let stripped = strip_labels(&bound);
             let matched = subtrees.contains(stripped)
                 || matches!(stripped, ClightStmt::Sifthenelse(cond, _, _)
                     if selected_conditions.contains(cond)
@@ -2469,11 +2474,28 @@ mod tests {
             var_types: Default::default(),
             var_type_candidates: Default::default(),
             var_decl_idx: Default::default(),
+            concrete_declarations: Default::default(),
+            binding_plan: Default::default(),
             loop_headers: Default::default(),
             switch_heads: Default::default(),
             reg_struct_ids: Default::default(),
             loop_info: Default::default(),
         }
+    }
+
+    #[test]
+    fn binding_transport_names_do_not_become_native_definition_addresses() {
+        use crate::decompile::passes::clight_select::analysis::bindings::Binding;
+        let native = 0x8000_0000_0010_0000;
+        let binding = u64::MAX;
+        let mut function = selected_func(vec![(0x1000,ClightStmt::Sset(binding as Ident,
+            ClightExpr::EconstInt(1,int_ty())))]);
+        function.binding_plan.bindings.insert(binding,Binding {native,definitions:[0x1000].into_iter().collect()});
+        let (mut selected,mut comparisons,mut webs,mut definitions,mut returns) =
+            (HashSet::new(),HashSet::new(),HashSet::new(),HashSet::new(),HashSet::new());
+        record_selected(&function,None,&mut selected,&mut comparisons,&mut webs,&mut definitions,&mut returns);
+        assert_eq!(webs,HashSet::from([native]));
+        assert_eq!(definitions,HashSet::from([web_def_node(native)]));
     }
 
     /// A bare shell: no artifacts anywhere, no functions, nothing justified.

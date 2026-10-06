@@ -1808,6 +1808,62 @@ mod structural_lattice_tests {
     }
 
     #[test]
+    fn range_switch_default_includes_the_rowless_root_exit() {
+        let [head, second, third, below, gap, middle, above] = synthetic_ids();
+        let condition = |cmp, value, yes, no| {
+            CsharpminorStmt::Scond(
+                Condition::Ccompimm(cmp, value),
+                vec![CsharpminorExpr::Evar(7)],
+                yes,
+                no,
+            )
+        };
+        // x<=10 takes BELOW; 11..12 takes GAP; 13..16 takes MIDDLE;
+        // x>16 takes ABOVE. A switch rooted at HEAD cannot use just ABOVE
+        // as its default: the unbounded BELOW arm has no enumerable rows.
+        let stmts = vec![
+            (head, condition(Comparison::Cgt, 10, second, below)),
+            (second, condition(Comparison::Cle, 12, gap, third)),
+            (third, condition(Comparison::Cle, 16, middle, above)),
+            (
+                below,
+                CsharpminorStmt::Sreturn(CsharpminorExpr::Econst(Constant::Ointconst(1))),
+            ),
+            (
+                gap,
+                CsharpminorStmt::Sreturn(CsharpminorExpr::Econst(Constant::Ointconst(2))),
+            ),
+            (
+                middle,
+                CsharpminorStmt::Sreturn(CsharpminorExpr::Econst(Constant::Ointconst(3))),
+            ),
+            (
+                above,
+                CsharpminorStmt::Sreturn(CsharpminorExpr::Econst(Constant::Ointconst(4))),
+            ),
+        ];
+        let mut preds: HashMap<u64, Vec<u64>> = HashMap::new();
+        for (node, stmt) in &stmts {
+            if let CsharpminorStmt::Scond(_, _, yes, no) = stmt {
+                preds.entry(*yes).or_default().push(*node);
+                preds.entry(*no).or_default().push(*node);
+            }
+        }
+        let result = structure(
+            &stmts,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            Some(head),
+            &preds,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert!(!result.valid_switches.iter().any(|(root, _)| *root == head));
+    }
+
+    #[test]
     fn parity_partition_is_not_collapsed_to_a_single_switch_case() {
         let [head, small, parity, nonprime, prime, trial] = synthetic_ids();
         const DISC: u64 = 7;
@@ -2399,7 +2455,7 @@ fn structure_with_memo(
                 h, m, r, v, t
             ));
         }
-        for (head, reg, cases) in &tree_results {
+        for (head, reg, cases, _) in &tree_results {
             buf.push_str(&format!(
                 "[CF6] walker root {:#x} reg=r{} cases={:?}\n",
                 head,
@@ -2417,7 +2473,8 @@ fn structure_with_memo(
     for (_, member, reg, _, _) in &switch_chain_members {
         kept_members_by_reg.entry(*reg).or_default().insert(*member);
     }
-    for (head, reg, ref cases) in &tree_results {
+    let mut tree_dispatch_members = HashMap::<Node, HashSet<Node>>::new();
+    for (head, reg, cases, dispatch_members) in &tree_results {
         if ascent_chain_nodes.contains(head) {
             continue;
         }
@@ -2473,6 +2530,7 @@ fn structure_with_memo(
                 kept.insert(member_node);
             }
             valid_switches.push((*head, *reg));
+            tree_dispatch_members.insert(*head, dispatch_members.clone());
         }
     }
 
@@ -2511,6 +2569,11 @@ fn structure_with_memo(
                 member_heads.entry(*m).or_default().push(*h);
             }
         }
+        for (head, members) in &tree_dispatch_members {
+            for member in members.iter().filter(|member| *member != head) {
+                member_heads.entry(*member).or_default().push(*head);
+            }
+        }
         for v in member_heads.values_mut() {
             v.sort_unstable();
             v.dedup();
@@ -2530,12 +2593,18 @@ fn structure_with_memo(
                 .collect();
             let mut chain: HashSet<Node> = rows.iter().map(|(m, _)| *m).collect();
             chain.insert(head);
+            // Case rows omit range splitters and other pure dispatch plumbing.
+            // Reuse the walker's actual CFG footprint: an edge into a rowless
+            // splitter is internal, but an unbounded edge to a body is not.
+            if let Some(members) = tree_dispatch_members.get(&head) {
+                chain.extend(members);
+            }
             let case_targets: HashSet<Node> = rows.iter().map(|(_, t)| *t).collect();
             // Taint fixpoint mirroring clight's chain_member_tainted: union of local and cminor_succ preds is a superset, so the mirror can only over-taint (safe: skips rewrites), never under-taint.
             let mut tainted: HashSet<Node> = HashSet::new();
             loop {
                 let mut changed = false;
-                for &(m, _) in &rows {
+                for &m in &chain {
                     if m == head || tainted.contains(&m) {
                         continue;
                     }
@@ -2554,11 +2623,7 @@ fn structure_with_memo(
                     break;
                 }
             }
-            let mut members: Vec<Node> = rows
-                .iter()
-                .map(|(m, _)| *m)
-                .filter(|m| *m != head)
-                .collect();
+            let mut members: Vec<Node> = chain.iter().copied().filter(|m| *m != head).collect();
             members.sort_unstable();
             members.dedup();
             // Leaf = exactly one chain-exiting branch. Rewrite is sound: untainted leaves are only reached through suppressed in-chain compares, so `goto exit` IS the no-match branch.
@@ -2626,6 +2691,15 @@ fn structure_with_memo(
                 if let Some(target) = unmatched.filter(|target| !chain.contains(target)) {
                     default_targets.insert(target);
                 }
+            }
+            // A root range guard may have an unbounded branch that emits no
+            // case rows. Its exit is still part of the default domain. Ignoring
+            // it can replace a live case body with a later leaf's default.
+            // One switch has one default: conflicting exits keep the CFG.
+            default_targets.extend(exits);
+            if default_targets.len() > 1 {
+                demoted_heads.insert(head);
+                continue;
             }
             if default_targets.len() == 1 {
                 switch_defaults.push((head, *default_targets.iter().next().unwrap()));
@@ -2889,7 +2963,12 @@ fn detect_comparison_tree_switches(
     stmts: &[(Node, CsharpminorStmt)],
     next_map: &HashMap<Node, Node>,
     cond_break_nodes: &HashSet<Node>,
-) -> Vec<(Node, u64, Vec<(i64, Node, Node)>)> {
+) -> Vec<(Node, u64, Vec<(i64, Node, Node)>, HashSet<Node>)> {
+    #[derive(Default)]
+    struct TreeWalk {
+        visited: HashSet<Node>,
+        dispatch: HashSet<Node>,
+    }
     let stmt_map: HashMap<Node, &CsharpminorStmt> = stmts.iter().map(|(n, s)| (*n, s)).collect();
 
     let stmt_node_set: HashSet<Node> = stmts.iter().map(|(n, _)| *n).collect();
@@ -2950,9 +3029,9 @@ fn detect_comparison_tree_switches(
         resolve_reg: &dyn Fn(RTLReg) -> (RTLReg, i64),
         cond_break_nodes: &HashSet<Node>,
         cases: &mut Vec<(i64, Node, Node)>,
-        visited: &mut HashSet<Node>,
+        visited: &mut TreeWalk,
     ) {
-        if !visited.insert(node) {
+        if !visited.visited.insert(node) {
             return;
         }
 
@@ -2975,6 +3054,7 @@ fn detect_comparison_tree_switches(
                             if *src == disc_reg {
                                 if let Some(off) = switch_disc_offset(op, cst) {
                                     if let Some(&next) = seq_next_map.get(&node) {
+                                        visited.dispatch.insert(node);
                                         // The path interval is in root space (compare offsets renormalize), so it passes through unchanged.
                                         walk_tree(
                                             next,
@@ -3033,6 +3113,7 @@ fn detect_comparison_tree_switches(
                 match stmt_map.get(&node) {
                     Some(CsharpminorStmt::Sjump(t)) => {
                         if *t != node {
+                            visited.dispatch.insert(node);
                             walk_tree(
                                 *t,
                                 disc_reg,
@@ -3051,6 +3132,7 @@ fn detect_comparison_tree_switches(
                     }
                     Some(CsharpminorStmt::Snop) => {
                         if let Some(&next) = seq_next_map.get(&node) {
+                            visited.dispatch.insert(node);
                             walk_tree(
                                 next,
                                 disc_reg,
@@ -3082,6 +3164,7 @@ fn detect_comparison_tree_switches(
                         };
                         if rebase_copy {
                             if let Some(&next) = seq_next_map.get(&node) {
+                                visited.dispatch.insert(node);
                                 walk_tree(
                                     next,
                                     disc_reg,
@@ -3114,6 +3197,11 @@ fn detect_comparison_tree_switches(
         };
         let offset = derive_off + inline_off + path_off;
         let is_disc = root_reg == disc_reg;
+        // Every condition traversed below belongs to the dispatch footprint,
+        // even when it only partitions paths and contributes no case rows.
+        // In particular, a mask test on the source of a masked discriminant
+        // must not be mistaken for a default body.
+        visited.dispatch.insert(node);
 
         match cond {
             // Ceq: true branch = case body, false continues
@@ -3563,7 +3651,7 @@ fn detect_comparison_tree_switches(
     }
 
     // Find switch roots (Ceq/Cne/range-guard on a register, possibly via offset binop) and walk to enumerate cases; out-of-range branches reach a Ceq/Cne leaf or fall through to default.
-    let mut results: Vec<(Node, u64, Vec<(i64, Node, Node)>)> = Vec::new();
+    let mut results = Vec::new();
     let mut used_heads: HashSet<Node> = HashSet::new();
 
     for (node, s) in stmts {
@@ -3609,7 +3697,7 @@ fn detect_comparison_tree_switches(
                 }
 
                 let mut cases: Vec<(i64, Node, Node)> = Vec::new();
-                let mut visited = HashSet::new();
+                let mut visited = TreeWalk::default();
                 walk_tree(
                     *node,
                     root_reg,
@@ -3628,7 +3716,7 @@ fn detect_comparison_tree_switches(
                 // The walker deliberately stops at loop-exit conditions.  A
                 // candidate that reaches one is therefore incomplete, not a
                 // smaller valid switch: retain the original comparison tree.
-                if visited.iter().any(|n| cond_break_nodes.contains(n)) {
+                if visited.visited.iter().any(|n| cond_break_nodes.contains(n)) {
                     continue;
                 }
 
@@ -3638,7 +3726,7 @@ fn detect_comparison_tree_switches(
                 // arbitrary CFG joins.  Lifting the mask would otherwise turn
                 // "all even values" into only `case 0` and delete the parity
                 // branch, so preserve the original comparison tree.
-                let has_discriminant_mask = visited.iter().any(|visited_node| {
+                let has_discriminant_mask = visited.visited.iter().any(|visited_node| {
                     let Some(CsharpminorStmt::Scond(cond, args, _, _)) = stmt_map.get(visited_node)
                     else {
                         return false;
@@ -3670,7 +3758,7 @@ fn detect_comparison_tree_switches(
                 let distinct_targets: HashSet<Node> = cases.iter().map(|(_, t, _)| *t).collect();
                 if cases.len() >= 3 && distinct_targets.len() >= 2 {
                     used_heads.insert(*node);
-                    results.push((*node, root_reg as u64, cases));
+                    results.push((*node, root_reg as u64, cases, visited.dispatch));
                 }
             }
         }
@@ -5095,7 +5183,10 @@ mod candidate_handoff_tests {
         let function = 1_u64;
         let value = Constant::Ointconst(7);
         let statements = [
-            (30_u64, CsharpminorStmt::Sset(11, CsharpminorExpr::Econst(value.clone()))),
+            (
+                30_u64,
+                CsharpminorStmt::Sset(11, CsharpminorExpr::Econst(value.clone())),
+            ),
             (10, CsharpminorStmt::Sset(12, CsharpminorExpr::Evar(11))),
             (20, CsharpminorStmt::Sreturn(CsharpminorExpr::Evar(12))),
         ];
@@ -5105,7 +5196,7 @@ mod candidate_handoff_tests {
         }
         db.rel_push("emit_function", (function, "effect_boundary", 30_u64));
         db.rel_push("func_entry_node", (function, 30_u64));
-        for edge in [(30_u64,10_u64),(10,20)] {
+        for edge in [(30_u64, 10_u64), (10, 20)] {
             db.rel_push("next", edge);
             db.rel_push("cminor_succ", edge);
         }
@@ -5114,7 +5205,9 @@ mod candidate_handoff_tests {
         db.rel_push("emit_inline_temp", 12_u64);
         StructuringPass::default().run(&mut db);
         for row in &statements[..2] {
-            assert!(db.rel_iter::<(Node,CsharpminorStmt)>("csharp_stmt").any(|actual|actual==row));
+            assert!(db
+                .rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt")
+                .any(|actual| actual == row));
         }
     }
 
