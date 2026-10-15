@@ -8,7 +8,7 @@
 //! memory and changed branch topology are unsupported. A frame read assumes
 //! live, readable storage; no reaching writer or initialization is invented.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use either::Either;
 use z3::ast::{Ast, Bool, BV};
@@ -160,7 +160,10 @@ struct Eval<'a> {
     /// Other dereferences, calls, or memory expressions remain unsupported.
     memory: Option<(CExpr, Value)>,
     word_inputs: BTreeSet<RTLReg>,
-    machine_overrides: HashMap<RTLReg, Value>,
+    // Ordered: dropping these Z3 terms frees AST ids, and Z3 recycles freed ids.
+    // Hash order here would make later term ids, and the optimizer's choice
+    // among equal-cost models, depend on the per-process hash seed.
+    machine_overrides: BTreeMap<RTLReg, Value>,
 }
 
 impl Eval<'_> {
@@ -684,7 +687,7 @@ fn align_machine_inputs(
     }
     let (function, node) = context?;
     let mut needed = BTreeSet::new();
-    let mut bindings = HashMap::new();
+    let mut bindings = BTreeMap::new();
     for &arg in args {
         if actual.contains(&arg) {
             needed.insert(arg);
@@ -1456,7 +1459,7 @@ impl Validator {
             },
             memory: None,
             word_inputs: BTreeSet::new(),
-            machine_overrides: HashMap::new(),
+            machine_overrides: BTreeMap::new(),
         };
         let obligation = build(&mut eval);
         let mut witness = None;

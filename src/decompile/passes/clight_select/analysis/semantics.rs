@@ -59,11 +59,11 @@ fn semantic_candidate_conditions(
     worlds: &[u8],
     world_vars: &HashMap<u8, Bool>,
     by_node: super::super::obligations::Obligations<'_>,
-) -> (HashMap<(Node, usize), Bool>, Vec<Bool>) {
+) -> (BTreeMap<(Node, usize), Bool>, Vec<Bool>) {
     use super::super::obligations::{Validator, Verdict};
     let declarations = integer_declarations(func);
     let validator = Validator::new();
-    let mut out = HashMap::new();
+    let mut out = BTreeMap::new();
     let mut preferences = Vec::new();
     let mut counts = [0usize; 4];
     let mut effect_counts: BTreeMap<&'static str, [usize; 4]> = BTreeMap::new();
@@ -307,7 +307,8 @@ impl PreparedAnalysis for Semantics {
     }
 }
 struct SemanticConditions {
-    conditions: HashMap<(Node, usize), Bool>,
+    // Ordered for a deterministic Z3 release order (see integer_semantics Eval).
+    conditions: BTreeMap<(Node, usize), Bool>,
     preferences: Vec<Bool>,
     repair_bound: usize,
 }
