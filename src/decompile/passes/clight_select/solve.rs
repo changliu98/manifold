@@ -28,7 +28,7 @@ use crate::x86::types::{
 
 struct OptimizeBackend<'a> {
     opt: &'a Optimize,
-    // Recorded only so the A/B can price this engine's model on the same scale as the other's; never read by the search itself.
+    // Asserted by `flush` once every weight is known; also prices the model for the engine A/B.
     softs: RefCell<Vec<(Bool, u64)>>,
 }
 
@@ -49,9 +49,93 @@ impl SolveBackend for OptimizeBackend<'_> {
     fn assert_hard(&self, cond: &Bool) {
         self.opt.assert(cond);
     }
+    // Deferred to `flush`: the strata are known only once every weight is.
     fn assert_soft(&self, cond: &Bool, weight: u64) {
-        self.opt.assert_soft(cond, weight, None);
         self.softs.borrow_mut().push((cond.clone(), weight));
+    }
+}
+
+impl OptimizeBackend<'_> {
+    /// Assert the recorded soft clauses as lexicographic objective strata.
+    ///
+    /// Weight classes are visited heaviest first. A stratum closes once the
+    /// gcd of its weights exceeds the total weight of every lighter clause:
+    /// two different costs of the stratum then differ by more than all
+    /// lighter clauses together, so minimizing the strata in order reaches
+    /// the weighted-sum optimum itself (ties may resolve to a different
+    /// optimal model). `reserve` is the total weight of the `reserve_at`
+    /// clauses refinement may add later; it counts as a present class.
+    /// Z3 ranks objectives by first declaration, so every stratum is
+    /// declared here, heaviest first.
+    fn flush(&self, reserve_at: u64, reserve: u64) -> SoftGroups {
+        let softs = self.softs.borrow();
+        let mut mass: BTreeMap<u64, u128> = BTreeMap::new();
+        for (_, weight) in softs.iter() {
+            *mass.entry(*weight).or_default() += u128::from(*weight);
+        }
+        *mass.entry(reserve_at).or_default() += u128::from(reserve);
+        let mut lighter: u128 = mass.values().sum();
+        let mut stratum_of: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut strata = 0;
+        let mut divisor = 0;
+        for (&weight, &class_mass) in mass.iter().rev() {
+            lighter -= class_mass;
+            divisor = gcd(divisor, weight);
+            stratum_of.insert(weight, strata);
+            if u128::from(divisor) > lighter {
+                strata += 1;
+                divisor = 0;
+            }
+        }
+        let groups: Vec<z3::Symbol> = (0..strata)
+            .map(|k| z3::Symbol::String(format!("stratum{k}")))
+            .collect();
+        let mut members = vec![Vec::new(); strata];
+        for (cond, weight) in softs.iter() {
+            members[stratum_of[weight]].push((cond, *weight));
+        }
+        for (group, members) in groups.iter().zip(&members) {
+            if members.is_empty() {
+                // Only the reserved class lives here. A true clause costs
+                // nothing but fixes the stratum's rank now.
+                self.opt
+                    .assert_soft(&Bool::from_bool(true), reserve_at, Some(group.clone()));
+            }
+            for (cond, weight) in members {
+                self.opt.assert_soft(*cond, *weight, Some(group.clone()));
+            }
+        }
+        SoftGroups(
+            stratum_of
+                .into_iter()
+                .map(|(weight, k)| (weight, groups[k].clone()))
+                .collect(),
+        )
+    }
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// One function's objective strata by weight class, so a soft clause that
+/// refinement adds joins the stratum `flush` reserved for its weight.
+#[derive(Default)]
+pub(crate) struct SoftGroups(BTreeMap<u64, z3::Symbol>);
+
+// Strata exist only after the build; the build-time context carries none.
+static NO_SOFT_GROUPS: SoftGroups = SoftGroups(BTreeMap::new());
+
+impl SoftGroups {
+    pub(crate) fn assert_soft(&self, opt: &Optimize, cond: &Bool, weight: u64) {
+        let group = self
+            .0
+            .get(&weight)
+            .unwrap_or_else(|| panic!("soft weight {weight} has no reserved objective stratum"));
+        opt.assert_soft(cond, weight, Some(group.clone()));
     }
 }
 
@@ -190,6 +274,7 @@ struct BuiltFunction {
     recorded: HashMap<Node, Vec<Vec<RecordedCond>>>,
     func_ret: Dynamic,
     primary_unit: u64,
+    soft_groups: SoftGroups,
 }
 
 impl BuiltFunction {
@@ -211,6 +296,7 @@ impl BuiltFunction {
             world_variables: &self.structure_world_var,
             return_type: &self.func_ret,
             primary_unit: self.primary_unit,
+            soft_groups: &self.soft_groups,
         }
     }
 }
@@ -428,6 +514,7 @@ fn build_function_constraints_with_stack(
             world_variables: &structure_world_var,
             return_type: &func_ret,
             primary_unit: 0, // the bound is established after all modules build
+            soft_groups: &NO_SOFT_GROUPS,
         };
         let analyses = stack.build(&cx);
         let extra_priors: usize = analyses.iter().map(|a| a.prior_count()).sum();
@@ -558,6 +645,7 @@ fn build_function_constraints_with_stack(
             recorded,
             func_ret,
             primary_unit: secondary_count as u64 + 1,
+            soft_groups: SoftGroups::default(),
         }
     }
 }
@@ -814,13 +902,20 @@ pub(crate) fn solve_function_z3_with_stack(
 
         let (mut built, softs) = {
             let backend = OptimizeBackend::new(&opt);
-            let built = build_function_constraints_with_stack(
+            let mut built = build_function_constraints_with_stack(
                 t,
                 func,
                 name_to_ident,
                 interface_pins,
                 &backend,
                 stack,
+            );
+            // Refinement may add one repair preference per selectable node.
+            built.soft_groups = backend.flush(
+                built.primary_unit,
+                (built.selvar.len() as u64)
+                    .checked_mul(built.primary_unit)
+                    .expect("selection repair bound"),
             );
             (built, backend.into_softs())
         };
@@ -1847,7 +1942,12 @@ pub(crate) fn resolve_dirty_functions(
     let mut resolved_count = 0usize;
     let mut fallback_count = 0usize;
 
-    for func in functions.iter_mut() {
+    // Every function first receives the same program-level commitments. A
+    // dirty re-solve then reads only its own clone plus those commitments, so
+    // the re-solves are independent: they run in parallel, and their results
+    // are applied in function order.
+    let mut jobs: Vec<(usize, FunctionData, Vec<(RTLReg, XType)>)> = Vec::new();
+    for (index, func) in functions.iter_mut().enumerate() {
         func.callee_signatures = signatures.clone();
         let mut globals = func.known_global_types.as_ref().clone();
         for (&ident, xtype) in &committed.globals {
@@ -1936,13 +2036,25 @@ pub(crate) fn resolve_dirty_functions(
         // A one-candidate vector still materializes a Ty variable;
         // cardinality was a generation artifact, never certainty.
         drop(materialize_pin);
+        jobs.push((index, resolve_func, pins));
+    }
 
-        match solve_function_engine(
-            &resolve_func,
-            name_to_ident,
-            &pins,
-            maximal_flow_certification,
-        ) {
+    let outcomes: Vec<(usize, FunctionData, Result<SolveOutcome, SatResult>)> = jobs
+        .into_par_iter()
+        .map(|(index, resolve_func, pins)| {
+            let outcome = solve_function_engine(
+                &resolve_func,
+                name_to_ident,
+                &pins,
+                maximal_flow_certification,
+            );
+            (index, resolve_func, outcome)
+        })
+        .collect();
+
+    for (index, resolve_func, outcome) in outcomes {
+        let func = &mut functions[index];
+        match outcome {
             Ok((
                 candidates,
                 declarations,

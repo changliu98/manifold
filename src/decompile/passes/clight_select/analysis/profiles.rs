@@ -429,10 +429,10 @@ impl ModelAnalysis for Profiles<'_> {
                                     }
                                 }
                                 if !repairs.is_empty() {
-                                    self.optimizer.assert_soft(
+                                    self.cx.soft_groups.assert_soft(
+                                        self.optimizer,
                                         &Bool::or(&repairs),
                                         self.cx.primary_unit,
-                                        None,
                                     );
                                     self.repair_preferences.insert(node);
                                 }

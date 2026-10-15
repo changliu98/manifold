@@ -60,6 +60,8 @@ pub(crate) struct FunctionContext<'a> {
     pub return_type: &'a Dynamic,
     /// One ordinary semantic preference, already scaled below C legality.
     pub primary_unit: u64,
+    /// Objective strata; a soft clause added during refinement must join them.
+    pub soft_groups: &'a super::solve::SoftGroups,
 }
 
 pub(crate) struct Candidate<'a> {
