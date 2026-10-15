@@ -244,7 +244,7 @@ fn solve_function(
                 func.address,
                 match first {
                     SatResult::Unsat => "UNSAT",
-                    SatResult::Unknown => "unknown (rlimit/timeout)",
+                    SatResult::Unknown => "unknown (work allowance exhausted or incomplete)",
                     SatResult::Sat => "sat but no model",
                 },
                 func.node_statements.len(),
@@ -893,12 +893,6 @@ pub(crate) fn solve_function_z3_with_stack(
         let build_t0 = std::time::Instant::now();
         let t = TypeDt::build();
         let opt = Optimize::new();
-        let mut params = z3::Params::new();
-        // Use the deterministic rlimit budget, not wall-clock timeout, which is a hang backstop only; z3 4.8.x ignores rlimit through Optimize params, so the model-reuse path guards itself.
-        params.set_u32("rlimit", CONFIG.solve.rlimit);
-        params.set_u32("timeout", CONFIG.solve.timeout_ms);
-        params.set_u32("random_seed", 0);
-        opt.set_params(&params);
 
         let (mut built, softs) = {
             let backend = OptimizeBackend::new(&opt);
@@ -939,8 +933,9 @@ pub(crate) fn solve_function_z3_with_stack(
                     continue;
                 }
             }
-            params.set_u32("rlimit", remaining.max(1));
-            opt.set_params(&params);
+            let allowance = remaining.max(1);
+            opt.set_params(&analysis::refinement::work_allowance(allowance));
+            let work_before = analysis::refinement::resource_count(&opt);
             let check_t0 = std::time::Instant::now();
             let check_result = opt.check(&[]);
             CHECK_NS.fetch_add(
@@ -949,17 +944,14 @@ pub(crate) fn solve_function_z3_with_stack(
             );
             let model = match check_result {
                 SatResult::Sat => opt.get_model(),
-                // Only reuse deterministic resource-limited partial models,
-                // and only outside an uncertified analysis extension.
-                SatResult::Unknown if !refinements.active() => {
-                    let resource_budget = opt
-                        .get_reason_unknown()
-                        .is_some_and(|r| r.contains("resource"));
-                    if resource_budget {
-                        opt.get_model()
-                    } else {
-                        None
-                    }
+                // Only reuse a partial model that the work allowance cut off
+                // (deterministic), and only outside an uncertified analysis
+                // extension.
+                SatResult::Unknown
+                    if !refinements.active()
+                        && analysis::refinement::exhausted(&opt, work_before, allowance) =>
+                {
+                    opt.get_model()
                 }
                 SatResult::Unknown | SatResult::Unsat => None,
             };

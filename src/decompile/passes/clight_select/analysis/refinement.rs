@@ -53,18 +53,40 @@ pub(crate) struct Session<'a> {
     fallback: Vec<(Entry<'a>, &'static str)>,
     results: Artifacts,
     coupled: BTreeSet<Node>,
-    resource_start: u32,
+    resource_start: u64,
 }
 
-fn resource_count(optimizer: &Optimize) -> Option<u32> {
+/// The context's cumulative Z3 work count (rlimit units). Z3 omits a
+/// statistic that is still zero and reports one above u32::MAX as a double.
+pub(crate) fn resource_count(optimizer: &Optimize) -> u64 {
     match optimizer.get_statistics().value("rlimit count") {
-        Some(z3::StatisticsValue::UInt(count)) => Some(count),
-        _ => None,
+        Some(z3::StatisticsValue::UInt(count)) => u64::from(count),
+        Some(z3::StatisticsValue::Double(count)) => count as u64,
+        None => 0,
     }
 }
 
-fn remaining_work(limit: u32, start: u32, current: u32) -> u32 {
-    limit.saturating_sub(current.wrapping_sub(start))
+/// The parameters of one selection Optimize check: a deterministic work
+/// allowance and nothing else. Optimize validates the whole set against its
+/// `opt.*` keys and drops all of it over one unknown key such as
+/// `random_seed` (silently under this crate); a wall-clock timeout would
+/// make the selected model depend on machine load.
+pub(crate) fn work_allowance(allowance: u32) -> z3::Params {
+    let mut params = z3::Params::new();
+    params.set_u32("rlimit", allowance);
+    params
+}
+
+/// Whether a check that began at work count `before` stopped because it used
+/// its whole `allowance`. Z3's reason string does not say (an exhausted
+/// allowance may read "canceled", like a cancellation); the count does.
+pub(crate) fn exhausted(optimizer: &Optimize, before: u64, allowance: u32) -> bool {
+    resource_count(optimizer).saturating_sub(before) >= u64::from(allowance)
+}
+
+fn remaining_work(limit: u32, start: u64, current: u64) -> u32 {
+    let left = u64::from(limit).saturating_sub(current.saturating_sub(start));
+    u32::try_from(left).expect("remaining work is at most the limit")
 }
 
 impl<'a> Session<'a> {
@@ -84,7 +106,7 @@ impl<'a> Session<'a> {
             fallback: Vec::new(),
             results: Artifacts::default(),
             coupled: BTreeSet::new(),
-            resource_start: resource_count(opt).unwrap_or(0),
+            resource_start: resource_count(opt),
         }
     }
 
@@ -99,9 +121,7 @@ impl<'a> Session<'a> {
         if !self.active() {
             return limit;
         }
-        resource_count(optimizer).map_or(limit, |current| {
-            remaining_work(limit, self.resource_start, current)
-        })
+        remaining_work(limit, self.resource_start, resource_count(optimizer))
     }
 
     /// True requests another solve. False permits extraction; any successful
@@ -210,12 +230,36 @@ mod budget_tests {
     use super::remaining_work;
 
     #[test]
+    fn the_work_allowance_bounds_an_optimize_check() {
+        use z3::ast::Bool;
+        z3::with_z3_config(&z3::Config::new(), || {
+            let opt = z3::Optimize::new();
+            let xs: Vec<Bool> = (0..24).map(|i| Bool::new_const(format!("x{i}"))).collect();
+            for (i, x) in xs.iter().enumerate() {
+                opt.assert_soft(x, (i % 5 + 1) as u64, None);
+            }
+            for pair in xs.windows(2) {
+                opt.assert(&Bool::or(&[pair[0].not(), pair[1].not()]));
+            }
+            opt.set_params(&super::work_allowance(1));
+            let before = super::resource_count(&opt);
+            assert_eq!(opt.check(&[]), z3::SatResult::Unknown);
+            assert!(super::exhausted(&opt, before, 1));
+            opt.set_params(&super::work_allowance(u32::MAX));
+            let before = super::resource_count(&opt);
+            assert_eq!(opt.check(&[]), z3::SatResult::Sat);
+            assert!(!super::exhausted(&opt, before, u32::MAX));
+        });
+    }
+
+    #[test]
     fn refinement_rounds_share_work_instead_of_resetting_it() {
         assert_eq!(remaining_work(100, 500, 500), 100);
         assert_eq!(remaining_work(100, 500, 530), 70);
         assert_eq!(remaining_work(100, 500, 590), 10);
         assert_eq!(remaining_work(100, 500, 600), 0);
         assert_eq!(remaining_work(100, 500, 650), 0);
-        assert_eq!(remaining_work(100, u32::MAX - 9, 10), 80);
+        let past_u32 = u64::from(u32::MAX) + 10;
+        assert_eq!(remaining_work(100, past_u32 - 20, past_u32), 80);
     }
 }

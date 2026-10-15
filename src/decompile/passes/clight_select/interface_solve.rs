@@ -1174,10 +1174,9 @@ pub(crate) fn solve_with_global_feedback(
     let (choices, declaration_choices, solve_result, no_model) =
         z3::with_z3_config(&z3::Config::new(), || {
             let opt = Optimize::new();
-            let mut params = z3::Params::new();
-            params.set_u32("random_seed", 0);
-            params.set_u32("timeout", config::CONFIG.solve.timeout_ms);
-            opt.set_params(&params);
+            opt.set_params(&super::analysis::refinement::work_allowance(
+                config::CONFIG.solve.rlimit,
+            ));
             let zvars: Vec<Int> = vars
                 .vars
                 .iter()

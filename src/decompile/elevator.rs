@@ -150,9 +150,9 @@ pub mod config {
 
     /// clight_select: z3 resource budgets.
     pub struct SolveConfig {
-        /// z3 Optimize rlimit budget. CAVEAT: z3 4.8.x ignores rlimit via Optimize params (UNRESOLVED O-9) -- the wall timeout is the only effective backstop on such libs.
+        /// Deterministic work allowance (Z3 rlimit units) of one selection solve check: Stage A/C per function, where one refinement transaction shares a single allowance, and Stage B per program. A backstop against runaway solves, not a tuning knob: with the stratified objective the largest SURE per-function solve uses 433M units in all, and a cut below a function's natural need only adds the terminal re-solve.
         pub rlimit: u32,
-        /// z3 wall timeout per function.
+        /// Wall-clock backstop of the propagator ablation engine only. The default Optimize engine has none, so its output does not depend on machine load.
         pub timeout_ms: u32,
     }
 
@@ -248,7 +248,7 @@ pub mod config {
             work_bound: 8_000_000,
         },
         solve: SolveConfig {
-            rlimit: 20_000_000,
+            rlimit: 500_000_000,
             timeout_ms: 120_000,
         },
         select: SelectConfig {
