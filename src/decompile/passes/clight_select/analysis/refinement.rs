@@ -84,9 +84,8 @@ pub(crate) fn exhausted(optimizer: &Optimize, before: u64, allowance: u32) -> bo
     resource_count(optimizer).saturating_sub(before) >= u64::from(allowance)
 }
 
-fn remaining_work(limit: u32, start: u64, current: u64) -> u32 {
-    let left = u64::from(limit).saturating_sub(current.saturating_sub(start));
-    u32::try_from(left).expect("remaining work is at most the limit")
+fn spent(limit: u32, start: u64, current: u64) -> bool {
+    current.saturating_sub(start) >= u64::from(limit)
 }
 
 impl<'a> Session<'a> {
@@ -114,14 +113,14 @@ impl<'a> Session<'a> {
         !self.entries.is_empty()
     }
 
-    /// One deterministic work allowance for the whole refinement transaction,
-    /// not a fresh full allowance on every Optimize::check. The unchanged
-    /// fallback gets its ordinary terminal solve after the extension is popped.
-    pub(crate) fn remaining_work(&self, optimizer: &Optimize, limit: u32) -> u32 {
-        if !self.active() {
-            return limit;
-        }
-        remaining_work(limit, self.resource_start, resource_count(optimizer))
+    /// Whether the refinement transaction has spent its shared work `limit`,
+    /// counted over all of its checks rather than reset on each. Consulted
+    /// before a round, never inside a check: the round under way finishes
+    /// within its check allowance, so the transaction ends within one check
+    /// of `limit`. The unchanged fallback gets its ordinary terminal solve
+    /// after the extension is popped.
+    pub(crate) fn spent_work(&self, optimizer: &Optimize, limit: u32) -> bool {
+        self.active() && spent(limit, self.resource_start, resource_count(optimizer))
     }
 
     /// True requests another solve. False permits extraction; any successful
@@ -227,7 +226,7 @@ impl<'a> Session<'a> {
 
 #[cfg(test)]
 mod budget_tests {
-    use super::remaining_work;
+    use super::spent;
 
     #[test]
     fn the_work_allowance_bounds_an_optimize_check() {
@@ -254,12 +253,13 @@ mod budget_tests {
 
     #[test]
     fn refinement_rounds_share_work_instead_of_resetting_it() {
-        assert_eq!(remaining_work(100, 500, 500), 100);
-        assert_eq!(remaining_work(100, 500, 530), 70);
-        assert_eq!(remaining_work(100, 500, 590), 10);
-        assert_eq!(remaining_work(100, 500, 600), 0);
-        assert_eq!(remaining_work(100, 500, 650), 0);
+        assert!(!spent(100, 500, 500));
+        assert!(!spent(100, 500, 530));
+        assert!(!spent(100, 500, 599));
+        assert!(spent(100, 500, 600));
+        assert!(spent(100, 500, 650));
         let past_u32 = u64::from(u32::MAX) + 10;
-        assert_eq!(remaining_work(100, past_u32 - 20, past_u32), 80);
+        assert!(!spent(100, past_u32 - 20, past_u32));
+        assert!(spent(100, past_u32 - 200, past_u32));
     }
 }

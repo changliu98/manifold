@@ -150,8 +150,10 @@ pub mod config {
 
     /// clight_select: z3 resource budgets.
     pub struct SolveConfig {
-        /// Deterministic work allowance (Z3 rlimit units) of one selection solve check: Stage A/C per function, where one refinement transaction shares a single allowance, and Stage B per program. A backstop against runaway solves, not a tuning knob: with the stratified objective the largest SURE per-function solve uses 433M units in all, and a cut below a function's natural need only adds the terminal re-solve.
+        /// Deterministic work allowance (Z3 rlimit units) of every selection Optimize check: Stage A/C per function, each refinement round included, and Stage B per program. A backstop against runaway checks, not a tuning knob: with the stratified objective the largest SURE per-function solve uses 433M units over all of its checks.
         pub rlimit: u32,
+        /// Work (Z3 rlimit units) a function's refinement transaction may spend over all of its rounds before it starts no further round; the round under way still finishes within `rlimit`. Tuned: every SURE campaign before checks were bounded ran refinement under this gate, and stretching it to `rlimit` multiplied O2 selection time ninefold.
+        pub refinement_rlimit: u32,
         /// Wall-clock backstop of the propagator ablation engine only. The default Optimize engine has none, so its output does not depend on machine load.
         pub timeout_ms: u32,
     }
@@ -249,6 +251,7 @@ pub mod config {
         },
         solve: SolveConfig {
             rlimit: 500_000_000,
+            refinement_rlimit: 20_000_000,
             timeout_ms: 120_000,
         },
         select: SelectConfig {

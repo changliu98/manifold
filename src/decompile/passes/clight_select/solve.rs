@@ -887,12 +887,14 @@ pub(crate) fn solve_function_z3_with_stack(
     interface_pins: &[(RTLReg, XType)],
     stack: &Stack<'_>,
 ) -> Result<SolveOutcome, SatResult> {
-    // Fresh Z3 context per function: reusing one leaks MaxSMT state across functions and makes tie-breaking depend on rayon order. Do not set random_seed -- z3 rejects it and warns to stderr.
+    // Fresh Z3 context per function: reusing one leaks MaxSMT state across functions and makes tie-breaking depend on rayon order. Do not set random_seed -- Optimize rejects it, and with it the whole parameter set.
     let cfg = z3::Config::new();
     z3::with_z3_config(&cfg, || {
         let build_t0 = std::time::Instant::now();
         let t = TypeDt::build();
         let opt = Optimize::new();
+        // Bounds every check on its own, including each refinement round.
+        opt.set_params(&analysis::refinement::work_allowance(CONFIG.solve.rlimit));
 
         let (mut built, softs) = {
             let backend = OptimizeBackend::new(&opt);
@@ -923,8 +925,7 @@ pub(crate) fn solve_function_z3_with_stack(
         let mut refinements =
             analysis::refinement::Session::start(stack, &built.context(func, name_to_ident), &opt);
         loop {
-            let remaining = refinements.remaining_work(&opt, CONFIG.solve.rlimit);
-            if remaining == 0 && refinements.active() {
+            if refinements.spent_work(&opt, CONFIG.solve.refinement_rlimit) {
                 eprintln!(
                     "[selection-analysis] fn={:#x} shared refinement work budget exhausted",
                     func.address
@@ -933,8 +934,6 @@ pub(crate) fn solve_function_z3_with_stack(
                     continue;
                 }
             }
-            let allowance = remaining.max(1);
-            opt.set_params(&analysis::refinement::work_allowance(allowance));
             let work_before = analysis::refinement::resource_count(&opt);
             let check_t0 = std::time::Instant::now();
             let check_result = opt.check(&[]);
@@ -949,7 +948,11 @@ pub(crate) fn solve_function_z3_with_stack(
                 // extension.
                 SatResult::Unknown
                     if !refinements.active()
-                        && analysis::refinement::exhausted(&opt, work_before, allowance) =>
+                        && analysis::refinement::exhausted(
+                            &opt,
+                            work_before,
+                            CONFIG.solve.rlimit,
+                        ) =>
                 {
                     opt.get_model()
                 }
