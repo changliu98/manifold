@@ -8362,6 +8362,16 @@ ascent_par! {
         instr_in_function(ret_addr, func_start),
         abi_ret_int_reg(rr),
         def_reaches_return(ret_addr, def_addr, *rr),
+        ax_call_result_used_in_body(def_addr),
+        !ax_return_def_disqualified(func_start, def_addr);
+
+    // A consumed call result reaching the return is disqualified on the same evidence as a plain AX value: the return's block computes a float and none computes an int, so the call's AX is stale there (c_strtod: the cached newlocale() result reaches `pxor %xmm0,%xmm0; ret`).
+    ax_return_def_disqualified(func_start, *def_addr) <--
+        func_x0_inblock_return(func_start),
+        !func_ax_inblock_return(func_start),
+        instr_in_function(ret_addr, func_start),
+        abi_ret_int_reg(ret_reg),
+        def_reaches_return(ret_addr, def_addr, *ret_reg),
         ax_call_result_used_in_body(def_addr);
 
     // The X0 def consumed by an X0-to-memory store (intra-block last def, else lattice membership at the store's block) - same def-reaches-point shape as def_reaches_return/def_reaches_call.

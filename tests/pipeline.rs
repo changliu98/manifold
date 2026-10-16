@@ -579,3 +579,7 @@ dual_compiler_test!(value_bindings, "-O0");
 // Frame-slot flag written on several paths and then branched on
 
 dual_compiler_test!(slot_flag_branch, "-O0");
+
+// A float return reached by a stale call result in the integer return register
+
+dual_compiler_test!(float_return_stale_call, "-O2");
