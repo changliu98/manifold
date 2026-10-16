@@ -582,6 +582,7 @@ mod tests {
                 types: &types,
                 function,
                 pins: &[],
+                interfaces: &crate::decompile::passes::clight_select::syntax::interfaces::InterfaceTerms::default(),
             };
             supported(&cx, 30)
         };

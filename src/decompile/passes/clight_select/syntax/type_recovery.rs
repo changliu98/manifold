@@ -104,6 +104,7 @@ impl crate::decompile::passes::clight_select::syntax::Component for TypeRecovery
             types: cx.types,
             function: cx.function,
             pins: &[],
+            interfaces: &crate::decompile::passes::clight_select::syntax::interfaces::InterfaceTerms::default(),
         };
         for hint in crate::decompile::passes::clight_select::syntax::type_flow::HINTS
             .get(&cx.function.analysis_facts)
@@ -315,7 +316,7 @@ impl crate::decompile::passes::clight_select::syntax::Component for TypeRecovery
                     .get(&node)
                     .map(|bs| bs[index].clone())
                     .unwrap_or_else(|| Bool::from_bool(true));
-                let mut add = |reg, xtype| {
+                let mut add = |reg, xtype, guard: Bool| {
                     use crate::decompile::passes::clight_select::candtype::CandType;
                     let candidate = CandType::from_xtype(&xtype);
                     if !candidate.is_pointer()
@@ -332,15 +333,25 @@ impl crate::decompile::passes::clight_select::syntax::Component for TypeRecovery
                         interface_sites
                             .entry((node, reg, term))
                             .or_default()
-                            .push(guard.clone());
+                            .push(guard);
                     }
                 };
+                // An open callee interface is evidence for each alternative
+                // under its selector.
+                let mut add_interface = |reg, committed: crate::x86::types::XType, open: Option<&crate::decompile::passes::clight_select::syntax::interfaces::Alternatives>| match open {
+                    Some(alternatives) => {
+                        for (xtype, selected) in alternatives {
+                            add(reg, *xtype, Bool::and(&[guard.clone(), selected.clone()]));
+                        }
+                    }
+                    None => add(reg, committed, guard.clone()),
+                };
                 if let Some(dst) = dst {
-                    add(*dst as RTLReg, signature.return_type);
+                    add_interface(*dst as RTLReg, signature.return_type, cx.interfaces.ret(ident));
                 }
-                for (argument, xtype) in arguments.iter().zip(&signature.param_types) {
+                for (position, (argument, xtype)) in arguments.iter().zip(&signature.param_types).enumerate() {
                     if let Some(reg) = interface_argument(argument) {
-                        add(reg, *xtype);
+                        add_interface(reg, *xtype, cx.interfaces.param(ident, position));
                     }
                 }
             }
@@ -542,6 +553,7 @@ mod tests {
             types: &types,
             function: &f,
             pins: &pins,
+            interfaces: &crate::decompile::passes::clight_select::syntax::interfaces::InterfaceTerms::default(),
         };
         let variable = types.fresh();
         let variables = HashMap::from([(3, variable.clone())]);
@@ -572,6 +584,7 @@ mod tests {
             types: &types,
             function: &f,
             pins: &[(3, XType::Xlong)],
+            interfaces: &crate::decompile::passes::clight_select::syntax::interfaces::InterfaceTerms::default(),
         };
         assert!(TypeRecovery.declaration_alternatives(&cx, 3).is_empty());
     }

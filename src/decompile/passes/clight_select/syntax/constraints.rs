@@ -156,6 +156,12 @@ impl<'a> ConstraintSink<'a> {
         self.log(None, w * self.soft_scale);
     }
 
+    /// A penalty against the current candidate that applies only when `cond`
+    /// holds in the model, where an open interface choice decides it.
+    pub(crate) fn penalize_candidate_when(&self, cond: &Bool, w: u64) {
+        self.log(Some(&cond.not()), w * self.soft_scale);
+    }
+
     // A structural requirement: always hard.
     pub(crate) fn assert_structural(&self, guard: Option<&Bool>, cond: &Bool) {
         self.log(Some(cond), u64::MAX);

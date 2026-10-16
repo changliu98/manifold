@@ -6,11 +6,12 @@ use crate::decompile::passes::clight_select::candtype::{CandClass, CandType, Sig
 use crate::decompile::passes::clight_select::query::{FunctionData, InterfaceClass, KnownGlobalTypes};
 use crate::decompile::passes::clight_select::select::callee_ident_from_expr;
 use crate::decompile::passes::clight_select::syntax::constraints::{ConstraintSink, ModelView, SolveBackend};
+use crate::decompile::passes::clight_select::syntax::interfaces::{self, InterfaceTerms};
 use crate::decompile::passes::clight_select::syntax::{Candidate, CandidateAnalysis, DeclarationContext, FunctionContext};
 use crate::x86::types::XType;
 use crate::x86::types::{ClightBinaryOp, ClightExpr, ClightStmt, ClightType, Ident, RTLReg};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use z3::ast::{Bool, Dynamic, Int};
 use z3::{DatatypeAccessor, DatatypeBuilder, DatatypeSort, Sort};
 
@@ -42,8 +43,17 @@ impl crate::decompile::passes::clight_select::syntax::Component for CTypes {
         let pinned_non_pointer = interface_pins.iter().any(|(pinned_reg, xtype)| {
             *pinned_reg == reg && !InterfaceClass::from_xtype(xtype).is_pointer()
         });
+        // An open own parameter relaxes the same pruning exactly when the
+        // chosen class would as a pin.
+        let open = own_parameter(cx, reg);
         if func.must_pointer_regs.contains(&reg) && !pinned_non_pointer {
-            backend.assert_hard(&t.is_ptr(tv));
+            match open.filter(|alts| alts.iter().any(|(x, _)| !InterfaceClass::from_xtype(x).is_pointer())) {
+                Some(alternatives) => {
+                    let non_pointer = interfaces::chooses(alternatives, |x| !InterfaceClass::from_xtype(x).is_pointer());
+                    backend.assert_hard(&Bool::or(&[non_pointer, t.is_ptr(tv)]));
+                }
+                None => backend.assert_hard(&t.is_ptr(tv)),
+            }
         }
         // Float-class pruning (RC-1): the is_float axis is otherwise free, so require positive upstream float evidence; excluding the float variant HARD cannot cause UNSAT since nothing forces is_float.
         let cands = func.var_type_candidates.get(&reg);
@@ -59,7 +69,14 @@ impl crate::decompile::passes::clight_select::syntax::Component for CTypes {
         });
         let has_float_evidence = pinned_float || (has_float_cand && !has_concrete_ptr);
         if !has_float_evidence {
-            backend.assert_hard(&t.is_float(tv).not());
+            let is_float = |x: &XType| matches!(x, XType::Xfloat | XType::Xsingle);
+            match open.filter(|alts| alts.iter().any(|(x, _)| is_float(x))) {
+                Some(alternatives) => backend.assert_hard(&Bool::or(&[
+                    interfaces::chooses(alternatives, is_float),
+                    t.is_float(tv).not(),
+                ])),
+                None => backend.assert_hard(&t.is_float(tv).not()),
+            }
         }
     }
 
@@ -74,17 +91,28 @@ impl crate::decompile::passes::clight_select::syntax::Component for CTypes {
         // Stage-C only: the committed own-interface class is a hard input to
         // the dirty re-solve.  Stage A passes an empty slice and remains
         // byte-identical, including compat_w and variable counts.
+        let matches = |reg: &RTLReg, variable: &Dynamic, xtype: &XType| {
+            if concrete.0.contains_key(reg) {
+                interface_class_matches(t, variable, InterfaceClass::from_xtype(xtype))
+            } else {
+                // The legacy renderer has only class representatives.
+                // Do not let a deeper solver shape satisfy C rules and
+                // then flatten it on output without a concrete owner.
+                variable._eq(xtype_to_ty(t, xtype))
+            }
+        };
         for (reg, xtype) in interface_pins {
             if let Some(variable) = tyvar.get(reg) {
-                let matches = if concrete.0.contains_key(reg) {
-                    interface_class_matches(t, variable, InterfaceClass::from_xtype(xtype))
-                } else {
-                    // The legacy renderer has only class representatives.
-                    // Do not let a deeper solver shape satisfy C rules and
-                    // then flatten it on output without a concrete owner.
-                    variable._eq(xtype_to_ty(t, xtype))
-                };
-                backend.assert_hard(&matches);
+                backend.assert_hard(&matches(reg, variable, xtype));
+            }
+        }
+        // An open own parameter is the C parameter object itself: its
+        // declaration takes the chosen alternative's class.
+        for reg in &cx.function.param_regs {
+            if let (Some(variable), Some(alternatives)) = (tyvar.get(reg), own_parameter(cx, *reg)) {
+                for (xtype, selected) in alternatives {
+                    backend.assert_hard(&selected.implies(matches(reg, variable, xtype)));
+                }
             }
         }
     }
@@ -180,21 +208,52 @@ impl CandidateAnalysis for CTypes {
         candidate: &Candidate<'_>,
         sink: &ConstraintSink<'_>,
     ) {
-        let rules = RuleSink {
-            common: sink,
-            agree_seen: RefCell::new(HashSet::new()),
-        };
-        constrain_stmt(
-            cx.types,
-            cx.declarations,
-            &rules,
-            candidate.selected,
-            cx.function,
-            cx.names,
-            cx.return_type,
-            sink.compat_w,
-            candidate.statement,
-        );
+        // A statement naming open globals is typed once per combination of
+        // their alternatives, each pass conditioned on its selectors, so a
+        // pinned choice yields exactly the committed declaration's rules.
+        let mut named = BTreeSet::new();
+        interfaces::globals_named(candidate.statement, &mut named);
+        let open: Vec<(Ident, &interfaces::Alternatives)> = named
+            .into_iter()
+            .filter_map(|symbol| cx.interfaces.global(symbol).map(|alts| (symbol, alts)))
+            .collect();
+        let mut cases: Vec<(Vec<Bool>, HashMap<Ident, ClightType>)> = vec![(Vec::new(), HashMap::new())];
+        for (symbol, alternatives) in &open {
+            cases = cases
+                .into_iter()
+                .flat_map(|(selectors, globals)| {
+                    alternatives.iter().enumerate().map(move |(index, (_, selected))| {
+                        let mut selectors = selectors.clone();
+                        selectors.push(selected.clone());
+                        let mut globals = globals.clone();
+                        if let Some(ty) = interfaces::global_declaration(cx.function, *symbol, alternatives, index) {
+                            globals.insert(*symbol, ty);
+                        }
+                        (selectors, globals)
+                    })
+                })
+                .collect();
+        }
+        for (selectors, globals) in cases {
+            let rules = RuleSink {
+                common: sink,
+                agree_seen: RefCell::new(HashSet::new()),
+                interfaces: cx.interfaces,
+                case: (!selectors.is_empty()).then(|| Bool::and(&selectors)),
+                globals,
+            };
+            constrain_stmt(
+                cx.types,
+                cx.declarations,
+                &rules,
+                candidate.selected,
+                cx.function,
+                cx.names,
+                cx.return_type,
+                sink.compat_w,
+                candidate.statement,
+            );
+        }
     }
 }
 
@@ -203,12 +262,65 @@ impl CandidateAnalysis for CTypes {
 struct RuleSink<'a, 'b> {
     common: &'a ConstraintSink<'b>,
     agree_seen: RefCell<HashSet<(RTLReg, u8)>>,
+    /// Open interface choices of this solve.
+    interfaces: &'a InterfaceTerms,
+    /// For a statement naming open globals, the alternative this pass types
+    /// it under: their selectors' conjunction, which conditions every
+    /// assertion and re-pick record, and each global's declaration in it.
+    case: Option<Bool>,
+    globals: HashMap<Ident, ClightType>,
 }
 impl<'a, 'b> std::ops::Deref for RuleSink<'a, 'b> {
     type Target = ConstraintSink<'b>;
     fn deref(&self) -> &Self::Target {
         self.common
     }
+}
+impl RuleSink<'_, '_> {
+    fn within(&self, cond: &Bool) -> Bool {
+        match &self.case {
+            Some(case) => case.implies(cond),
+            None => cond.clone(),
+        }
+    }
+    fn assert_soft_tagged(&self, guard: Option<&Bool>, cond: &Bool, w: u64, tag: &'static str) {
+        self.common.assert_soft_tagged(guard, &self.within(cond), w, tag);
+    }
+    fn assert_structural(&self, guard: Option<&Bool>, cond: &Bool) {
+        self.common.assert_structural(guard, &self.within(cond));
+    }
+    fn assert_soft_raw(&self, cond: &Bool, w: u64) {
+        self.common.assert_soft_raw(&self.within(cond), w);
+    }
+    fn prefer(&self, cond: &Bool, w: u64) {
+        self.common.prefer(&self.within(cond), w);
+    }
+    fn penalize_candidate(&self, w: u64) {
+        match &self.case {
+            Some(case) => self.common.penalize_candidate_when(case, w),
+            None => self.common.penalize_candidate(w),
+        }
+    }
+    fn penalize_candidate_when(&self, cond: &Bool, w: u64) {
+        let cond = match &self.case {
+            Some(case) => Bool::and(&[case.clone(), cond.clone()]),
+            None => cond.clone(),
+        };
+        self.common.penalize_candidate_when(&cond, w);
+    }
+    /// A global's declaration in this pass, if it has one.
+    fn known_global<'f>(&'f self, known: &'f KnownGlobalTypes, e: &ClightExpr) -> Option<&'f ClightType> {
+        match e {
+            ClightExpr::Evar(id, _) => self.globals.get(id).or_else(|| known.by_ident.get(id)),
+            _ => None,
+        }
+    }
+}
+
+/// The open choice of `reg`'s own-parameter interface, if `reg` is one.
+fn own_parameter<'a>(cx: &'a DeclarationContext<'_>, reg: RTLReg) -> Option<&'a interfaces::Alternatives> {
+    let position = cx.function.param_regs.iter().position(|r| *r == reg)?;
+    cx.interfaces.param(cx.function.address as Ident, position)
 }
 
 // Variant order in the Ty datatype; indices into DatatypeSort::variants.
@@ -548,16 +660,6 @@ fn base_drives_free_var(e: &ClightExpr, tyvar: &HashMap<RTLReg, Dynamic>) -> boo
     }
 }
 
-fn direct_known_global_type<'a>(
-    known: &'a KnownGlobalTypes,
-    e: &ClightExpr,
-) -> Option<&'a ClightType> {
-    match e {
-        ClightExpr::Evar(id, _) => known.by_ident.get(id),
-        _ => None,
-    }
-}
-
 /// A typed term with freeness: Conc folds in Rust with no Z3 emission, Sym flows a free variable so obligations can steer a register type; freeness decides fold-vs-emit only.
 enum TyTerm {
     Conc(ClightType),
@@ -628,9 +730,7 @@ fn type_of(
         | ClightExpr::EconstFloat(_, ct)
         | ClightExpr::EconstSingle(_, ct) => TyTerm::Conc(ct.clone()),
         ClightExpr::Evar(id, ct) => TyTerm::Conc(
-            func.known_global_types
-                .by_ident
-                .get(id)
+            sink.known_global(func.known_global_types.as_ref(), e)
                 .cloned()
                 .unwrap_or_else(|| ct.clone()),
         ),
@@ -711,7 +811,7 @@ fn type_of(
                 let tgt = clight_to_ty(t, ct);
                 sink.prefer(&wt_cast_term(t, &itm, &tgt), 8);
                 // The weight-1 SEL-AGREE cast-level pointerness nudge was retired as subsumed; the Sset-level and Etempvar class-match preferences are not subsumed and stay.
-            } else if direct_known_global_type(func.known_global_types.as_ref(), inner).is_some() {
+            } else if sink.known_global(func.known_global_types.as_ref(), inner).is_some() {
                 // Concrete known globals carry an authoritative declaration
                 // type. Unlike ordinary concrete annotations, a mismatch here
                 // is actionable: ClightPass supplies a definition-local,
@@ -903,14 +1003,18 @@ fn constrain_stmt(
                 sink.assert_soft_tagged(guard, &t.is_ptrish(&ft.term(t)), compat_w, "callee_fun");
             }
             // Cross-function: bind each argument and the result to the callee's signature.
-            let sig = callee_ident_from_expr(f, name_to_ident)
-                .and_then(|id| func.callee_signatures.get(&id));
+            let callee = callee_ident_from_expr(f, name_to_ident);
+            let sig = callee.and_then(|id| func.callee_signatures.get(&id));
+            let open_return = callee.and_then(|id| sink.interfaces.ret(id));
             for (i, a) in args.iter().enumerate() {
                 let at = type_of(t, tyvar, sink, guard, func, a);
                 if at.is_sym() {
                     if let Some(sig) = sig {
                         if let Some(pt) = sig.param_types.get(i) {
-                            let want = xtype_to_ty(t, pt);
+                            let want = match callee.and_then(|id| sink.interfaces.param(id, i)) {
+                                Some(alternatives) => interfaces::term(t, alternatives),
+                                None => xtype_to_ty(t, pt),
+                            };
                             sink.assert_soft_tagged(
                                 guard,
                                 &wt_cast_term(t, &at.term(t), &want),
@@ -923,7 +1027,10 @@ fn constrain_stmt(
             }
             if let (Some(rid), Some(sig)) = (ret, sig) {
                 if let Some(lv) = tyvar.get(&(*rid as RTLReg)) {
-                    let want = xtype_to_ty(t, &sig.return_type);
+                    let want = match open_return {
+                        Some(alternatives) => interfaces::term(t, alternatives),
+                        None => xtype_to_ty(t, &sig.return_type),
+                    };
                     sink.assert_soft_tagged(
                         guard,
                         &wt_cast_to_reg(t, &want, lv),
@@ -934,10 +1041,21 @@ fn constrain_stmt(
             }
             // return/void agreement (caller side): capturing the result of a void callee yields "void value not ignored as it ought to be", so when this call is a refinable candidate, penalize the result-capturing form so a non-capturing candidate is chosen.
             if let (Some(_), Some(sig)) = (ret, sig) {
-                if matches!(sig.return_type, XType::Xvoid) {
-                    if let Some(g) = guard {
-                        sink.assert_soft_raw(&g.not(), compat_w);
-                        sink.penalize_candidate(compat_w);
+                match open_return {
+                    Some(alternatives) => {
+                        if let Some(g) = guard.filter(|_| alternatives.iter().any(|(x, _)| matches!(x, XType::Xvoid))) {
+                            let void = interfaces::chooses(alternatives, |x| matches!(x, XType::Xvoid));
+                            sink.assert_soft_raw(&Bool::and(&[g.clone(), void.clone()]).not(), compat_w);
+                            sink.penalize_candidate_when(&void, compat_w);
+                        }
+                    }
+                    None => {
+                        if matches!(sig.return_type, XType::Xvoid) {
+                            if let Some(g) = guard {
+                                sink.assert_soft_raw(&g.not(), compat_w);
+                                sink.penalize_candidate(compat_w);
+                            }
+                        }
                     }
                 }
             }
@@ -945,6 +1063,28 @@ fn constrain_stmt(
         ClightStmt::Sreturn(ret) => {
             // return/void agreement on the callee side: a value-return in a void function or a valueless return in a non-void one is a frontend error, so penalize the mismatching form.
             let is_void_fn = matches!(func.return_type, ClightType::Tvoid);
+            let open_return = sink.interfaces.ret(func.address as Ident);
+            // The form that mismatches the return type costs a frontend
+            // error: decided by the committed return type, or by the chosen
+            // alternative of an open one.
+            let penalize_mismatch = |valued: bool| match open_return {
+                Some(alternatives) => {
+                    let mismatching = |x: &XType| matches!(x, XType::Xvoid) == valued;
+                    if let Some(g) = guard.filter(|_| alternatives.iter().any(|(x, _)| mismatching(x))) {
+                        let mismatch = interfaces::chooses(alternatives, mismatching);
+                        sink.assert_soft_raw(&Bool::and(&[g.clone(), mismatch.clone()]).not(), compat_w);
+                        sink.penalize_candidate_when(&mismatch, compat_w);
+                    }
+                }
+                None => {
+                    if is_void_fn == valued {
+                        if let Some(g) = guard {
+                            sink.assert_soft_raw(&g.not(), compat_w);
+                            sink.penalize_candidate(compat_w);
+                        }
+                    }
+                }
+            };
             match ret {
                 Some(e) => {
                     let et = type_of(t, tyvar, sink, guard, func, e);
@@ -956,21 +1096,9 @@ fn constrain_stmt(
                             "ret_compat",
                         );
                     }
-                    if is_void_fn {
-                        if let Some(g) = guard {
-                            sink.assert_soft_raw(&g.not(), compat_w);
-                            sink.penalize_candidate(compat_w);
-                        }
-                    }
+                    penalize_mismatch(true);
                 }
-                None => {
-                    if !is_void_fn {
-                        if let Some(g) = guard {
-                            sink.assert_soft_raw(&g.not(), compat_w);
-                            sink.penalize_candidate(compat_w);
-                        }
-                    }
-                }
+                None => penalize_mismatch(false),
             }
         }
         ClightStmt::Sifthenelse(c, a, b) => {

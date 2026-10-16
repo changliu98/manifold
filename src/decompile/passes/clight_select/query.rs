@@ -408,6 +408,11 @@ pub struct FunctionData {
     /// Program-level authoritative global types shared by every per-function
     /// solve.  `Arc` avoids cloning the maps once per recovered function.
     pub known_global_types: std::sync::Arc<KnownGlobalTypes>,
+
+    /// Interface variables this function's solve chooses jointly instead of
+    /// reading the committed interface above (`syntax::interfaces`). Empty for
+    /// an ordinary solve.
+    pub(crate) free_interfaces: crate::decompile::passes::clight_select::syntax::interfaces::FreeInterfaces,
 }
 
 #[derive(Debug, Clone)]
@@ -802,6 +807,7 @@ impl FunctionData {
             cond_branch_class: HashMap::new(),
             callee_signatures: HashMap::new(),
             known_global_types: std::sync::Arc::new(KnownGlobalTypes::default()),
+            free_interfaces: Default::default(),
             class_evidence: std::sync::Arc::new(Default::default()),
             flow_anchors: Default::default(),
             flow_blocks: Vec::new(),

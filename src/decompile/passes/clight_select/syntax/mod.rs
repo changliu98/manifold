@@ -16,6 +16,7 @@ pub(crate) mod constraints;
 pub mod ctyping;
 pub(crate) mod declarations;
 pub mod interface_solve;
+pub(crate) mod interfaces;
 pub mod solve;
 pub(crate) mod type_evidence;
 pub(crate) mod type_flow;
@@ -41,6 +42,8 @@ pub(crate) struct DeclarationContext<'a> {
     pub types: &'a TypeDt,
     pub function: &'a FunctionData,
     pub pins: &'a [(RTLReg, XType)],
+    /// Open interface choices of this solve (`interfaces`); empty by default.
+    pub interfaces: &'a interfaces::InterfaceTerms,
 }
 
 #[derive(Clone, Copy)]
@@ -56,6 +59,8 @@ pub(crate) struct FunctionContext<'a> {
     pub worlds: &'a [u8],
     pub world_variables: &'a HashMap<u8, Bool>,
     pub return_type: &'a Dynamic,
+    /// Open interface choices of this solve (`interfaces`); empty by default.
+    pub interfaces: &'a interfaces::InterfaceTerms,
     /// One ordinary semantic preference, already scaled below C legality.
     pub primary_unit: u64,
     /// Objective strata; a soft clause added during refinement must join them.

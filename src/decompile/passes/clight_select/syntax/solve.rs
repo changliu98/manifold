@@ -273,6 +273,7 @@ struct BuiltFunction {
     selvar: HashMap<Node, Vec<Bool>>,
     recorded: HashMap<Node, Vec<Vec<RecordedCond>>>,
     func_ret: Dynamic,
+    interfaces: syntax::interfaces::InterfaceTerms,
     primary_unit: u64,
     soft_groups: SoftGroups,
 }
@@ -295,6 +296,7 @@ impl BuiltFunction {
             worlds: &self.structure_worlds,
             world_variables: &self.structure_world_var,
             return_type: &self.func_ret,
+            interfaces: &self.interfaces,
             primary_unit: self.primary_unit,
             soft_groups: &self.soft_groups,
         }
@@ -328,6 +330,8 @@ fn build_function_constraints_with_stack(
     stack: &Stack<'_>,
 ) -> BuiltFunction {
     {
+        // Open interface choices (none for an ordinary solve).
+        let interfaces = syntax::interfaces::InterfaceTerms::build(&func.free_interfaces, backend);
         // Free type variable per inferable register (deterministic order).
         let mut regs: Vec<RTLReg> = func.var_type_candidates.keys().copied().collect();
         regs.sort();
@@ -336,6 +340,7 @@ fn build_function_constraints_with_stack(
             types: &t,
             function: func,
             pins: interface_pins,
+            interfaces: &interfaces,
         };
         for &reg in &regs {
             let tv = t.fresh();
@@ -475,9 +480,12 @@ fn build_function_constraints_with_stack(
             }
         }
 
-        let func_ret = match &func.return_type {
-            ClightType::Tvoid => t.void(),
-            other => clight_to_ty(&t, other),
+        let func_ret = match interfaces.ret(func.address as Ident) {
+            Some(alternatives) => syntax::interfaces::own_return_term(&t, func, alternatives),
+            None => match &func.return_type {
+                ClightType::Tvoid => t.void(),
+                other => clight_to_ty(&t, other),
+            },
         };
 
         // Weight strata must remain identical to the authoritative pipeline.
@@ -513,6 +521,7 @@ fn build_function_constraints_with_stack(
             worlds: &structure_worlds,
             world_variables: &structure_world_var,
             return_type: &func_ret,
+            interfaces: &interfaces,
             primary_unit: 0, // the bound is established after all modules build
             soft_groups: &NO_SOFT_GROUPS,
         };
@@ -644,6 +653,7 @@ fn build_function_constraints_with_stack(
             selvar,
             recorded,
             func_ret,
+            interfaces,
             primary_unit: secondary_count as u64 + 1,
             soft_groups: SoftGroups::default(),
         }
@@ -985,6 +995,8 @@ pub(crate) fn solve_function_z3_with_stack(
                         return Err(SatResult::Unknown);
                     }
                     report_cost("optimize", func, &m, &softs);
+                    let interface_choices = built.interfaces.choices(&m);
+                    let cost = weighted_cost(&m, &softs);
                     let (cand_out, ty_out, ty_override, structure_world) = extract_selection(
                         &m,
                         &built,
@@ -1000,6 +1012,10 @@ pub(crate) fn solve_function_z3_with_stack(
                     syntax::type_evidence::COMMITMENTS.insert(&mut results, commitments);
                     syntax::type_evidence::ADMISSIONS
                         .insert(&mut results, built.concrete_declarations.admissions(&m));
+                    if !built.interfaces.is_empty() {
+                        syntax::interfaces::CHOICES.insert(&mut results, interface_choices);
+                    }
+                    syntax::interfaces::COST.insert(&mut results, cost);
                     audit.finish(&built, func, &opt, &softs, Some(&m), check_result);
                     return Ok((
                         cand_out,
