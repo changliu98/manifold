@@ -1266,6 +1266,11 @@ fn collect_called_names_expr(expr: &CExpr, names: &mut CallSites) {
             collect_called_names_expr(a, names);
             collect_called_names_expr(i, names);
         }
+        // A function used as a value (`&free`, a callback argument) needs its declaration in
+        // scope as much as a called one does; arities stay call-only.
+        CExpr::Var(name) => {
+            names.insert(name.clone());
+        }
         _ => {}
     }
 }

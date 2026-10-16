@@ -4367,6 +4367,13 @@ pub fn build_translation_unit_with_variable_origins(
         }
         // __builtin_overflow, the opaque marker for the x86 OF flag, is declared once on use as a static volatile object so it recompiles and the optimizer cannot collapse the guarded branch.
         let uses_overflow_marker = referenced.contains("__builtin_overflow");
+        // Imported functions (PLT stubs, GOT function-import slots) by emitted name. One used only
+        // as a value (`&free`) has no call to give it a declaration.
+        let import_functions: HashSet<String> = db
+            .rel_iter::<(Address,)>("is_external_function")
+            .filter_map(|(addr,)| id_to_name.get(&(*addr as usize)))
+            .map(|name| sanitize_c_symbol_name(name))
+            .collect();
         let mut undeclared: Vec<String> = referenced
             .into_iter()
             .filter(|n| {
@@ -4374,6 +4381,9 @@ pub fn build_translation_unit_with_variable_origins(
                     && !locals.contains(n)
                     && is_global_like_name(n)
                     && !is_libc_stdio_global(n)
+                    // A header-declared import is in scope through its header, which print.rs
+                    // includes for every referenced name.
+                    && !(import_functions.contains(n) && is_compiler_provided(n))
             })
             .collect();
         undeclared.sort();
@@ -4391,8 +4401,8 @@ pub fn build_translation_unit_with_variable_origins(
                     }
                 }
             }
-            // A skip-listed library function that is only ADDRESS-TAKEN gets an extern function declaration, or a tentative long object makes &name point at a fresh .bss slot instead of the function.
-            if db.should_skip_function(&name) {
+            // A skip-listed library function or an import that is only ADDRESS-TAKEN gets an extern function declaration, or a tentative long object makes &name point at a fresh .bss slot instead of the function.
+            if db.should_skip_function(&name) || import_functions.contains(&name) {
                 // Prefer the curated signature (void close_stdout(void), ...) over a K&R `int name()`.
                 let decl = committed_decl(&name).unwrap_or_else(|| {
                     crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(

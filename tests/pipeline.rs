@@ -12,8 +12,18 @@ struct TestOutput {
 }
 
 fn compile(name: &str, compiler: &str, src: &str, opt: &str) -> PathBuf {
+    compile_with(name, compiler, src, opt, false)
+}
+
+/// Position-independent build, the default code model of distro binaries: imported
+/// function addresses are read from GOT slots instead of PLT-stub immediates.
+fn compile_pie(name: &str, compiler: &str, src: &str, opt: &str) -> PathBuf {
+    compile_with(name, compiler, src, opt, true)
+}
+
+fn compile_with(name: &str, compiler: &str, src: &str, opt: &str, pie: bool) -> PathBuf {
     let mut h = DefaultHasher::new();
-    (name, compiler, src, opt).hash(&mut h);
+    (name, compiler, src, opt, pie).hash(&mut h);
     let dir = std::env::temp_dir().join(format!("manifold_{name}_{compiler}_{:016x}", h.finish()));
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -21,21 +31,21 @@ fn compile(name: &str, compiler: &str, src: &str, opt: &str) -> PathBuf {
     std::fs::write(&c_path, src).unwrap();
 
     let bin = dir.join(name);
-    let nopie: &[&str] = if compiler == "gcc" {
-        &["-no-pie"]
-    } else {
-        &["-Wl,-no-pie"]
+    let link: &[&str] = match (pie, compiler == "gcc") {
+        (true, _) => &["-pie"],
+        (false, true) => &["-no-pie"],
+        (false, false) => &["-Wl,-no-pie"],
     };
     let st = Command::new(compiler)
         .args([
             opt,
-            "-fno-pie",
+            if pie { "-fPIE" } else { "-fno-pie" },
             "-fno-stack-protector",
             "-o",
             bin.to_str().unwrap(),
             c_path.to_str().unwrap(),
         ])
-        .args(nopie)
+        .args(link)
         .status()
         .unwrap_or_else(|e| panic!("{compiler}: {e}"));
     assert!(st.success(), "{compiler} failed for '{name}'");
@@ -521,6 +531,38 @@ macro_rules! dual_compiler_test {
     };
 }
 
+// Same as dual_compiler_test!, built position-independent.
+macro_rules! dual_compiler_pie_test {
+    ($name:ident, $opt:expr) => {
+        mod $name {
+            mod gcc {
+                use super::super::*;
+                pub static OUTPUT: LazyLock<TestOutput> = LazyLock::new(|| {
+                    decompile(&compile_pie(
+                        stringify!($name),
+                        "gcc",
+                        include_str!(concat!("source/", stringify!($name), "/input.c")),
+                        $opt,
+                    ))
+                });
+                include!(concat!("source/", stringify!($name), "/test.rs"));
+            }
+            mod clang {
+                use super::super::*;
+                pub static OUTPUT: LazyLock<TestOutput> = LazyLock::new(|| {
+                    decompile(&compile_pie(
+                        stringify!($name),
+                        "clang",
+                        include_str!(concat!("source/", stringify!($name), "/input.c")),
+                        $opt,
+                    ))
+                });
+                include!(concat!("source/", stringify!($name), "/test.rs"));
+            }
+        }
+    };
+}
+
 // Test modules
 
 dual_compiler_test!(smoke, "-O0");
@@ -583,3 +625,7 @@ dual_compiler_test!(slot_flag_branch, "-O0");
 // A float return reached by a stale call result in the integer return register
 
 dual_compiler_test!(float_return_stale_call, "-O2");
+
+// Imported functions used as values: in a PIE their addresses come from GOT slots
+
+dual_compiler_pie_test!(got_function_import, "-O2");

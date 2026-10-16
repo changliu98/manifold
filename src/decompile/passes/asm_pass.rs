@@ -1425,6 +1425,8 @@ ascent_par! {
     // Read-only addresses holding an IEEE-754 sign-clear mask with its width, the positive evidence that lets the reg-reg andps/andpd form lower to Oabsfs/Oabsf.
     relation fp_sign_clear_mask(Address, usize);
     relation pointer_to_external_symbol(Address, Symbol);
+    // A GOT slot the dynamic linker fills with an imported function's address (R_X86_64_GLOB_DAT); see symbol.rs.
+    relation got_function_import(Address, Symbol);
     relation global_symbol(Address, Symbol);
     // A global_symbol row that is a synthesized placeholder (SUB_/TABLE_), used to keep a rip-relative indirect call through a mutable function-pointer slot from resolving to a bogus direct call.
     relation synthesized_global_symbol(Address);
@@ -1951,6 +1953,7 @@ ascent_par! {
 
     is_external_function(addr) <-- plt_entry(addr, _);
     is_external_function(addr) <-- plt_block(addr, _);
+    is_external_function(addr) <-- got_function_import(addr, _);
 
     is_external_function(addr) <--
         symbol_table(addr, _, sym_type, _, _, _, section_name, _, _),
@@ -1982,6 +1985,8 @@ ascent_par! {
         !function_symbol(target_addr, _),
         !plt_entry(target_addr, _),
         !func_entry(_, target_addr),
+        // An imported function's GOT slot is named by its import (rtl_pass), not a placeholder.
+        !got_function_import(target_addr, _),
         let name_string = format!("SUB_{:x}", target_addr),
         let name_sym = Box::leak(name_string.into_boxed_str()) as &'static str;
 
@@ -8376,10 +8381,33 @@ ascent_par! {
         reg_ip(*base_str),
         rip_target_addr(addr, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset),
+        !got_import_address_load(addr),
         ireg_hold_type(dst_str.to_string(), typ),
         type_to_memchunk(typ, destination_chunk),
         instruction(addr, _, _, mnem, _, _, _, _, _, _),
         let mc = refine_direct_load_chunk(mnem, *destination_chunk, *source_width);
+
+    // `mov sym@GOTPCREL(%rip), %reg`: a full-width read of an imported function's GOT slot yields
+    // the import's address. The slot is zero in the file, so lowering this as a load would hand the
+    // recovered program a null function pointer; it is the address of the import itself.
+    #[local] relation got_import_address_load(Address);
+    got_import_address_load(*addr) <--
+        pmov(addr, dst_sym, src),
+        op_register(dst_sym, dst_str),
+        reg_64(dst_str),
+        op_indirect(src, _, base_str, idx_str, _, _, 8),
+        reg_ip(*base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        rip_target_addr(addr, target_addr),
+        got_function_import(target_addr, _);
+
+    mach_inst(addr, MachInst::Mop(Operation::Oindirectsymbol(*target_addr as usize), Arc::new(vec![]), dst)) <--
+        got_import_address_load(addr),
+        pmov(addr, dst_sym, _),
+        op_register(dst_sym, dst_str),
+        let dst = Mreg::x86(dst_str),
+        rip_target_addr(addr, target_addr),
+        got_function_import(target_addr, _);
 
     mach_inst(addr, MachInst::Mstore(mc, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), src)) <--
         pmov(addr, dst, src_sym),

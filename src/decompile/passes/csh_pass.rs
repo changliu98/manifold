@@ -32,6 +32,7 @@ ascent_par! {
     relation cminorsel_stmt(Node, CminorStmt);
     relation plt_entry(Address, Symbol);
     relation plt_block(Address, Symbol);
+    relation got_function_import(Address, Symbol);
     relation block_boundaries(Address, Address, Address);
 
     relation addr_to_func_ident(Address, Ident);
@@ -52,6 +53,11 @@ ascent_par! {
         plt_block(addr, _),
         let ident = *addr as Ident;
 
+    // An imported function's GOT slot denotes the import (see asm_pass), like its PLT stub would.
+    addr_to_func_ident(addr, ident) <--
+        got_function_import(addr, _),
+        let ident = *addr as Ident;
+
     ident_to_symbol(ident, *name) <-- base_ident_to_symbol(ident, name);
 
     base_ident_to_symbol(ident, clean_name) <--
@@ -62,6 +68,11 @@ ascent_par! {
     base_ident_to_symbol(ident, clean_name) <--
         addr_to_func_ident(addr, ident),
         plt_block(addr, sym),
+        let clean_name = strip_version_suffix(sym);
+
+    base_ident_to_symbol(ident, clean_name) <--
+        addr_to_func_ident(addr, ident),
+        got_function_import(addr, sym),
         let clean_name = strip_version_suffix(sym);
 
     // A generated L_<hex> entry is a fragment of another function only when

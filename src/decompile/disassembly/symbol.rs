@@ -870,6 +870,12 @@ fn load_data_pointers(db: &mut DecompileDB, obj: &object::File) {
                             let leaked: &'static str =
                                 Box::leak(clean_name.to_string().into_boxed_str());
                             db.rel_push("pointer_to_external_symbol", (offset, leaked));
+                            // The slot holds an imported FUNCTION's address once the dynamic
+                            // linker fills it; in the file it is zero, so the slot itself
+                            // names that import wherever its value is used.
+                            if sym.is_undefined() && sym.kind() == SymbolKind::Text {
+                                db.rel_push("got_function_import", (offset, leaked));
+                            }
                         }
                     }
                 }
@@ -1233,6 +1239,12 @@ pub fn compute_labeled_addresses(db: &mut DecompileDB, obj: &object::File) {
                 }
             }
         }
+    }
+
+    // An imported function's GOT slot is not program data: rtl_pass names it by its import, and
+    // an `L_` label here would compete with that name.
+    for (slot, _) in db.rel_iter::<(Address, Symbol)>("got_function_import") {
+        labeled.remove(slot);
     }
 
     // Create .L_ entries for addresses without existing symbols

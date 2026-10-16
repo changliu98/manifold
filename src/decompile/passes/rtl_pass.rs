@@ -1073,6 +1073,7 @@ ascent_par! {
 
     relation plt_block(Address, Symbol);
     relation plt_entry(Address, Symbol);
+    relation got_function_import(Address, Symbol);
     relation func_stacksz(Address, Address, Symbol, u64);
     relation call_has_known_signature(Node, Symbol, usize, XType);
     relation rtl_inst_candidate(Node, RTLInst);
@@ -1681,7 +1682,14 @@ ascent_par! {
         symbols(addr, name, _),
         !plt_block(addr, _),
         !plt_entry(addr, _),
+        !got_function_import(addr, _),
         let ident = *addr as Ident;
+
+    // An imported function's GOT slot stands for the import itself (asm_pass lowers a read of it to the import's address), so it carries the import's name, not a data label.
+    base_ident_to_symbol(ident, clean_name) <--
+        got_function_import(addr, sym),
+        let ident = *addr as Ident,
+        let clean_name = strip_version_suffix(sym);
 
     base_ident_to_symbol(ident, clean_name) <--
         plt_entry(addr, sym),
@@ -8749,6 +8757,8 @@ ascent_par! {
         !symbol_table(target_addr, _, _, _, _, _, _, _, _),
         !plt_entry(target_addr, _),
         !func_span(_, target_addr, _),
+        // An imported function's GOT slot is named by its import, not a placeholder.
+        !got_function_import(target_addr, _),
         let name_string = format!("SUB_{:x}", target_addr),
         let name_sym = Box::leak(name_string.into_boxed_str()) as &'static str;
 
@@ -11831,6 +11841,12 @@ ascent_par! {
 
     plt_function(addr, clean_name_sym) <--
         plt_block(addr, raw_name),
+        let clean_name = raw_name.split('@').next().unwrap_or(raw_name),
+        let clean_name_sym = Box::leak(clean_name.to_string().into_boxed_str()) as Symbol;
+
+    // An import reached only through its GOT slot is the same external function as one reached through a PLT stub, so it gets the same declaration.
+    plt_function(addr, clean_name_sym) <--
+        got_function_import(addr, raw_name),
         let clean_name = raw_name.split('@').next().unwrap_or(raw_name),
         let clean_name_sym = Box::leak(clean_name.to_string().into_boxed_str()) as Symbol;
 
