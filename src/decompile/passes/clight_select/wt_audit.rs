@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::decompile::passes::clight_select::candtype::{CandType, Sign as CandSign};
-use crate::decompile::passes::clight_select::ctyping::{self, Severity, WtEnv, WtError};
+use crate::decompile::passes::clight_select::syntax::ctyping::{self, Severity, WtEnv, WtError};
 use crate::decompile::passes::clight_select::query::{FunctionData, KnownGlobalTypes};
 use crate::decompile::passes::clight_select::select::{callee_ident_from_expr, SelectedFunction};
 use crate::x86::types::{
@@ -350,7 +350,7 @@ pub(crate) fn wt_audit(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::decompile::passes::clight_select::wt_audit::*;
     use crate::x86::types::ClightStmt;
 
     #[test]

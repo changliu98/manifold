@@ -1872,7 +1872,7 @@ impl IRPass for ClightSelectPass {
                 db.clight_selected_functions = Vec::new();
             }
         }
-        crate::decompile::passes::clight_select::analysis::Stack::production().audit_selection(db);
+        crate::decompile::passes::clight_select::syntax::Stack::production().audit_selection(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
@@ -1882,7 +1882,7 @@ impl IRPass for ClightSelectPass {
     fn outputs(&self) -> &'static [&'static str] {
         static OUTPUTS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
             let mut outputs = vec!["clight_selected_functions", "committed_interfaces", "interface_vars"];
-            outputs.extend(crate::decompile::passes::clight_select::analysis::Stack::production().writes());
+            outputs.extend(crate::decompile::passes::clight_select::syntax::Stack::production().writes());
             outputs.sort_unstable();
             outputs.dedup();
             outputs
@@ -1893,7 +1893,7 @@ impl IRPass for ClightSelectPass {
     fn extra_reads(&self) -> &'static [&'static str] {
         static READS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
             let mut reads = CLIGHT_EMIT_EXTRA_READS.to_vec();
-            reads.extend(crate::decompile::passes::clight_select::analysis::Stack::production().reads());
+            reads.extend(crate::decompile::passes::clight_select::syntax::Stack::production().reads());
             reads.sort_unstable();
             reads.dedup();
             reads

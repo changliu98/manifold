@@ -2485,7 +2485,7 @@ mod tests {
 
     #[test]
     fn binding_transport_names_do_not_become_native_definition_addresses() {
-        use crate::decompile::passes::clight_select::analysis::bindings::Binding;
+        use crate::decompile::passes::clight_select::syntax::bindings::Binding;
         let native = 0x8000_0000_0010_0000;
         let binding = u64::MAX;
         let mut function = selected_func(vec![(0x1000,ClightStmt::Sset(binding as Ident,

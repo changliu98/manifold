@@ -1,25 +1,14 @@
 pub mod adequacy;
-pub(crate) mod analysis;
-pub mod branch_theory;
 pub mod candtype;
 pub mod type_graph;
-pub mod class_theory;
-pub mod ctyping;
 pub mod decl_solve;
-pub mod flow;
-pub mod flow_theory;
-pub mod interface_solve;
-pub mod integer_semantics;
-pub mod propagator;
 pub mod query;
 pub mod select;
-pub mod solve;
-pub(crate) mod storage_theory;
-pub(crate) mod memory_theory;
-pub(crate) mod obligations;
-pub(crate) mod producer_values;
-pub(crate) mod word_views;
-pub(crate) mod word_inputs;
+/// The syntax check: candidate structure, C legality, declarations,
+/// preferences, and the selection solves.
+pub mod syntax;
+/// Solvers layered on the syntax check: they check its answer.
+pub mod solvers;
 pub mod wt_audit;
 
 pub fn derive_canonical_path(path_str: &str) -> String {

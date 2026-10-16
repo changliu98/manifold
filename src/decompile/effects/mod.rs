@@ -85,7 +85,7 @@ pub(crate) fn builtin_inputs<'a>(
 /// Final admission sees actual occurrence identities, including no-model
 /// defaults and postselection output. A scope failure never emits fake C.
 pub(crate) fn finalize(db: &mut crate::decompile::elevator::DecompileDB) {
-    crate::decompile::passes::clight_select::analysis::Stack::production().audit_emission(db);
+    crate::decompile::passes::clight_select::syntax::Stack::production().audit_emission(db);
     if db.unresolved_effect_count() > 0 {
         // Keep IR diagnostics, but never advertise unresolved output as
         // executable C. Each analysis owns its own admission obligations.

@@ -980,7 +980,7 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::decompile::passes::clight_select::decl_solve::*;
     use crate::decompile::passes::clight_select::query::CalleeSignature;
     use crate::x86::types::{ClightAttr, ClightIntSize, ClightSignedness, ParamType};
     use std::sync::Arc;

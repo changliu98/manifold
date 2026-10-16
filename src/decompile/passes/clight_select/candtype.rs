@@ -271,7 +271,7 @@ pub fn all_variants() -> Vec<CandType> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::decompile::passes::clight_select::candtype::*;
 
     #[test]
     fn label_parse_roundtrip() {

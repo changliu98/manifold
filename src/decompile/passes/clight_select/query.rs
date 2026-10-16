@@ -372,7 +372,7 @@ pub struct FunctionData {
     /// by real address (node ids masked of their synthetic bits). Behavioral
     /// evidence for the propagator engine; empty otherwise.
     pub cond_branch_class:
-        HashMap<Address, crate::decompile::passes::clight_select::branch_theory::CmpClass>,
+        HashMap<Address, crate::decompile::passes::clight_select::solvers::in_search::branch_theory::CmpClass>,
 
     /// Machine register-class evidence for the whole program, shared by every
     /// per-function solve. `Arc` keeps the two sets allocated once rather than
@@ -382,21 +382,21 @@ pub struct FunctionData {
 
     /// Machine anchors the flow theory checks this function's selection
     /// against, and the straight-line blocks it folds.
-    pub flow_anchors: crate::decompile::passes::clight_select::flow::FlowAnchors,
-    pub flow_blocks: Vec<crate::decompile::passes::clight_select::flow::Block>,
+    pub flow_anchors: crate::decompile::passes::clight_select::solvers::flow::FlowAnchors,
+    pub flow_blocks: Vec<crate::decompile::passes::clight_select::solvers::flow::Block>,
 
     /// Unique finalized RTL instructions for local integer validation. Exact
     /// node identity is required; synthetic siblings are distinct effects.
     pub integer_anchors: HashMap<Node, RTLInst>,
     /// Immutable module-owned evidence, prepared before the per-function
     /// solve. A new analysis need not add fields to this shared query record.
-    pub(crate) analysis_facts: super::analysis::Artifacts,
-    pub(crate) storage_writes: Vec<super::memory_theory::WriteContract>,
-    pub(crate) storage_reads: Vec<super::memory_theory::ReadContract>,
+    pub(crate) analysis_facts: crate::decompile::passes::clight_select::syntax::Artifacts,
+    pub(crate) storage_writes: Vec<crate::decompile::passes::clight_select::solvers::memory_theory::WriteContract>,
+    pub(crate) storage_reads: Vec<crate::decompile::passes::clight_select::solvers::memory_theory::ReadContract>,
     /// Unique finalized operations at physical frame accesses. Unlike an
     /// expression candidate, these are independent payload/extension anchors.
     pub(crate) memory_anchors: HashMap<Node, RTLInst>,
-    pub(crate) value_producers: BTreeMap<(Node, RTLReg), super::producer_values::Producer>,
+    pub(crate) value_producers: BTreeMap<(Node, RTLReg), crate::decompile::passes::clight_select::solvers::producer_values::Producer>,
     /// Supplemental hypotheses proposed by selection analyses. They retain
     /// world provenance, but do not replace the ordinary no-model fallback.
     pub(crate) analysis_candidates: HashMap<Node, HashSet<ClightStmt>>,
@@ -806,7 +806,7 @@ impl FunctionData {
             flow_anchors: Default::default(),
             flow_blocks: Vec::new(),
             integer_anchors: HashMap::new(),
-            analysis_facts: super::analysis::Artifacts::default(),
+            analysis_facts: crate::decompile::passes::clight_select::syntax::Artifacts::default(),
             storage_writes: Vec::new(),
             storage_reads: Vec::new(),
             memory_anchors: HashMap::new(),
@@ -828,7 +828,7 @@ impl FunctionData {
 /// per-node register-file class is deliberately NOT used -- at web level it is
 /// already consumed upstream, and per node it is unsound for bit-copies.
 fn build_flow_anchors(db: &DecompileDB, func_map: &mut HashMap<Address, FunctionData>) {
-    use crate::decompile::passes::clight_select::flow;
+    use crate::decompile::passes::clight_select::solvers::flow;
 
     let mut integer_anchors: HashMap<Node, Option<RTLInst>> = HashMap::new();
     for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
@@ -2104,7 +2104,7 @@ fn structure_world_candidate_is_owned(
 
 #[cfg(test)]
 mod structure_world_ownership_tests {
-    use super::structure_world_candidate_is_owned;
+    use crate::decompile::passes::clight_select::query::structure_world_candidate_is_owned;
 
     #[test]
     fn authoritative_world_rejects_shared_implementation_rows_without_final_ownership() {
@@ -2142,7 +2142,7 @@ fn label_target_candidates(stmts: &mut [ClightStmt], label: Ident) {
 
 #[cfg(test)]
 mod goto_target_candidate_tests {
-    use super::*;
+    use crate::decompile::passes::clight_select::query::*;
 
     #[test]
     fn mixed_candidates_are_labeled_individually() {
@@ -2855,7 +2855,7 @@ pub fn extract_functions(
     // selects the propagator; the fixed production policy uses Optimize and no
     // other consumer wants the scan.
     if db.ablate_flow_max_certification {
-        use crate::decompile::passes::clight_select::branch_theory::{
+        use crate::decompile::passes::clight_select::solvers::in_search::branch_theory::{
             condition_cmp_class, node_address, CmpClass,
         };
         let mut cond_class: HashMap<Address, CmpClass> = HashMap::new();
@@ -4055,7 +4055,7 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
 
 #[cfg(test)]
 mod rodata_scalar_tests {
-    use super::*;
+    use crate::decompile::passes::clight_select::query::*;
 
     fn resolve(chunk: MemoryChunk, bytes: Vec<u8>) -> Option<(ScalarConstant, bool)> {
         let addr = 0x1000;
@@ -4234,7 +4234,7 @@ fn is_fabricated_operand(reg: RTLReg) -> bool {
 
 #[cfg(test)]
 mod fabricated_call_input_tests {
-    use super::is_fabricated_operand;
+    use crate::decompile::passes::clight_select::query::is_fabricated_operand;
     use crate::decompile::passes::rtl_pass::{fresh_call_input_reg, fresh_xtl_reg};
     use crate::mreg::Mreg;
 
@@ -5107,7 +5107,7 @@ fn build_fields_with_padding(
 
 #[cfg(test)]
 mod recovered_struct_layout_tests {
-    use super::*;
+    use crate::decompile::passes::clight_select::query::*;
     use crate::decompile::passes::c_pass::print::Printer;
 
     #[test]
@@ -6112,7 +6112,7 @@ pub fn collect_stmt_regs(stmt: &ClightStmt) -> Vec<RTLReg> {
 
 #[cfg(test)]
 mod sseq_tests {
-    use super::*;
+    use crate::decompile::passes::clight_select::query::*;
 
     #[test]
     fn reconstructs_nonmonotonic_ids_from_direct_edges() {
@@ -6156,7 +6156,7 @@ mod sseq_tests {
 
 #[cfg(test)]
 mod relocated_pointer_tests {
-    use super::*;
+    use crate::decompile::passes::clight_select::query::*;
 
     #[test]
     fn pointer_initializer_targets_precede_sources_without_losing_globals() {
@@ -6478,7 +6478,7 @@ mod relocated_pointer_tests {
 
 #[cfg(test)]
 mod loop_info_tests {
-    use super::*;
+    use crate::decompile::passes::clight_select::query::*;
     use crate::x86::op::Comparison;
 
     const FUNC: Address = 0x1000;
@@ -6598,7 +6598,7 @@ mod loop_info_tests {
 
 #[cfg(test)]
 mod tr3_tests {
-    use super::*;
+    use crate::decompile::passes::clight_select::query::*;
 
     fn tlong() -> ClightType {
         ClightType::Tlong(ClightSignedness::Signed, ClightAttr::default())
@@ -6763,7 +6763,7 @@ mod tr3_tests {
 
 #[cfg(test)]
 mod known_global_tests {
-    use super::*;
+    use crate::decompile::passes::clight_select::query::*;
 
     #[test]
     fn joins_authoritative_global_types_to_clight_idents() {

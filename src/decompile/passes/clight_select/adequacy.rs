@@ -279,7 +279,7 @@ fn audit_function(func: &FunctionData, evidence: &ClassEvidence) -> AdequacyRepo
 /// 0, because a contradiction that depends on a guess is a selection question,
 /// not an adequacy one.
 fn audit_flow_gaps(func: &FunctionData, rep: &mut AdequacyReport) {
-    use crate::decompile::passes::clight_select::flow;
+    use crate::decompile::passes::clight_select::solvers::flow;
 
     if func.flow_blocks.is_empty() || func.flow_anchors.is_empty() {
         return;
@@ -392,7 +392,7 @@ pub(crate) fn collect_class_evidence(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::decompile::passes::clight_select::adequacy::*;
     use crate::x86::types::{ClightAttr, ClightIntSize, ClightSignedness};
 
     fn int_ty() -> ClightType {

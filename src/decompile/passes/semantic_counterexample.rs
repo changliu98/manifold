@@ -703,10 +703,10 @@ pub(crate) fn record_materialization(db: &mut DecompileDB) -> bool {
 pub(crate) fn publish_selection(
     db: &mut DecompileDB,
     mut refinement: Refinement,
-    decisions: &[crate::decompile::passes::clight_select::storage_theory::Decision],
+    decisions: &[crate::decompile::passes::clight_select::solvers::storage_theory::Decision],
 ) {
     use ledger::{Event, Outcome, Stage};
-    let requests = crate::decompile::passes::clight_select::storage_theory::requests(decisions);
+    let requests = crate::decompile::passes::clight_select::solvers::storage_theory::requests(decisions);
     for decision in decisions {
         let p = &decision.prepared.problem;
         let mut event = Event::new(p.function, p.lea, p.base);
@@ -1177,15 +1177,15 @@ mod tests {
                 p.lea,
                 true,
             );
-            crate::decompile::passes::clight_select::analysis::storage::PROBLEMS
+            crate::decompile::passes::clight_select::solvers::storage::PROBLEMS
                 .insert(&mut function.analysis_facts, vec![prepared.clone()]);
-            let outcome = crate::decompile::passes::clight_select::solve::solve_function_z3(
+            let outcome = crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(
                 &function,
                 &std::collections::HashMap::new(),
                 &[],
             )
             .unwrap();
-            for decision in crate::decompile::passes::clight_select::analysis::storage::DECISIONS
+            for decision in crate::decompile::passes::clight_select::solvers::storage::DECISIONS
                 .get(&outcome.5).into_iter().flatten().cloned() {
                 if let Some(witness) = decision.steps.iter().find_map(|s| s.witness.clone()) {
                     result.counterexamples.push(witness);

@@ -63,7 +63,7 @@ fn superset_provenance_priority(
 
 #[derive(Clone, Default)]
 pub(crate) struct ProgramSelectionState {
-    pub(crate) analysis_results: BTreeMap<Address, super::analysis::Artifacts>,
+    pub(crate) analysis_results: BTreeMap<Address, crate::decompile::passes::clight_select::syntax::Artifacts>,
     /// (func_addr, node) -> candidate index
     pub(crate) candidate_idx: HashMap<(Address, Node), Option<usize>>,
     /// One atomic CFG/structure interpretation per function.
@@ -112,9 +112,9 @@ pub struct SelectedFunction {
     pub var_decl_idx: HashMap<RTLReg, usize>,
     /// Exact selection-owned declarations; legacy candidate indices are only
     /// compatibility projections for types outside the old finite vocabulary.
-    pub concrete_declarations: BTreeMap<RTLReg, super::type_graph::TypeTerm>,
+    pub concrete_declarations: BTreeMap<RTLReg, crate::decompile::passes::clight_select::type_graph::TypeTerm>,
     /// CFG-certified native definition webs behind the selected C bindings.
-    pub(crate) binding_plan: super::analysis::bindings::BindingPlan,
+    pub(crate) binding_plan: crate::decompile::passes::clight_select::syntax::bindings::BindingPlan,
 
     pub loop_headers: HashSet<Node>,
     pub switch_heads: HashSet<Node>,
@@ -128,7 +128,7 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
     let data_model = db.data_model();
     let (mut functions, id_to_name, mut committed_interfaces, interface_vars) =
         extract_functions(db)?;
-    let mut analyses = super::analysis::Stack::production().prepare(db, &mut functions);
+    let mut analyses = crate::decompile::passes::clight_select::syntax::Stack::production().prepare(db, &mut functions);
     // Reversing Stacking turns a physical frame-cell write into `Sset` of the
     // cell's canonical local.  Retain that structural identity for the width
     // audit; an arbitrary SSA temporary at the same node is not memory-write
@@ -350,7 +350,7 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
     }
 
     // Statement-form + type selection is done entirely by the Z3/SMT inference model; the clang-in-the-loop greedy search has been removed (full migration to Z3).
-    let mut best_state = crate::decompile::passes::clight_select::solve::infer_select_program(
+    let mut best_state = crate::decompile::passes::clight_select::syntax::solve::infer_select_program(
         &functions,
         &name_to_ident,
         db.ablate_flow_max_certification,
@@ -358,7 +358,7 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
 
     if !db.ablate_scope_function {
         let stage_b_input_globals = committed_interfaces.globals.clone();
-        let outcome = crate::decompile::passes::clight_select::interface_solve::solve(
+        let outcome = crate::decompile::passes::clight_select::syntax::interface_solve::solve(
             &functions,
             &best_state,
             &interface_vars,
@@ -395,7 +395,7 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
                 })
                 .collect();
             stage_c_dirty.extend(
-                crate::decompile::passes::clight_select::interface_solve::functions_referencing_globals(
+                crate::decompile::passes::clight_select::syntax::interface_solve::functions_referencing_globals(
                     &functions,
                     &changed_globals,
                 ),
@@ -404,7 +404,7 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
         committed_interfaces = outcome.committed;
         db.interface_instance_dump = outcome.instance_dump;
         let (resolved_state, dirty_stats) =
-            crate::decompile::passes::clight_select::solve::resolve_dirty_functions(
+            crate::decompile::passes::clight_select::syntax::solve::resolve_dirty_functions(
                 &mut functions,
                 &name_to_ident,
                 &best_state,
@@ -431,7 +431,7 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
                 );
             } else {
                 let prior_globals = committed_interfaces.globals.clone();
-                let reopened = crate::decompile::passes::clight_select::interface_solve::solve_with_global_feedback(
+                let reopened = crate::decompile::passes::clight_select::syntax::interface_solve::solve_with_global_feedback(
                     &functions,
                     &best_state,
                     &interface_vars,
@@ -450,7 +450,7 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
                         prior_globals.get(&symbol) != reopened.committed.globals.get(&symbol)
                     })
                     .collect();
-                let reopen_dirty = crate::decompile::passes::clight_select::interface_solve::functions_referencing_globals(
+                let reopen_dirty = crate::decompile::passes::clight_select::syntax::interface_solve::functions_referencing_globals(
                     &functions,
                     &changed_symbols,
                 );
@@ -475,7 +475,7 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
                 db.interface_instance_dump = reopened.instance_dump;
                 if !reopen_dirty.is_empty() {
                     let (resolved_state, reopen_stats) =
-                        crate::decompile::passes::clight_select::solve::resolve_dirty_functions(
+                        crate::decompile::passes::clight_select::syntax::solve::resolve_dirty_functions(
                             &mut functions,
                             &name_to_ident,
                             &best_state,
@@ -691,8 +691,8 @@ fn selected_flow_statements(
 fn committed_global_flow_feedback(
     functions: &[FunctionData],
     state: &ProgramSelectionState,
-) -> Vec<crate::decompile::passes::clight_select::interface_solve::GlobalFlowDisagreement> {
-    use crate::decompile::passes::clight_select::{flow, flow_theory, interface_solve};
+) -> Vec<crate::decompile::passes::clight_select::syntax::interface_solve::GlobalFlowDisagreement> {
+    use crate::decompile::passes::clight_select::{solvers::flow, solvers::in_search::flow_theory, syntax::interface_solve};
 
     let mut feedback = BTreeSet::new();
     for func in functions {
@@ -745,13 +745,13 @@ fn committed_global_flow_feedback(
 /// domain is tiny, the analysis is intra-block, and a certified block can still
 /// be wrong in every way the domain cannot see.
 fn flow_certificate(functions: &[FunctionData], selected: &[SelectedFunction]) {
-    use crate::decompile::passes::clight_select::flow_theory;
+    use crate::decompile::passes::clight_select::solvers::in_search::flow_theory;
     use std::collections::{BTreeMap, BTreeSet};
 
     // Two different measurements share the line: what the search did while
     // solving, and what the final selection looks like now. Keep them apart.
-    let in_solve = crate::decompile::passes::clight_select::solve::flow_stats_snapshot();
-    let mut total = crate::decompile::passes::clight_select::flow::FlowStats::default();
+    let in_solve = crate::decompile::passes::clight_select::syntax::solve::flow_stats_snapshot();
+    let mut total = crate::decompile::passes::clight_select::solvers::flow::FlowStats::default();
     let detail = std::env::var("MANIFOLD_FLOW").unwrap_or_default();
     let want_detail = |name: &str| match detail.as_str() {
         "" => false,
@@ -1013,10 +1013,10 @@ fn build_selected_function_from_program_state(
     }
 
     let concrete_declarations = program_state.analysis_results.get(&addr)
-        .and_then(|results| super::analysis::type_evidence::COMMITMENTS.get(results))
+        .and_then(|results| crate::decompile::passes::clight_select::syntax::type_evidence::COMMITMENTS.get(results))
         .cloned().unwrap_or_default();
     let mut stack_var_types = HashMap::new();
-    let binding_plan = super::analysis::bindings::PLAN.get(&func.analysis_facts).cloned().unwrap_or_default();
+    let binding_plan = crate::decompile::passes::clight_select::syntax::bindings::PLAN.get(&func.analysis_facts).cloned().unwrap_or_default();
     let storage_registers: HashSet<_> = stack_vars.into_iter().flatten().copied()
         .chain(binding_plan.storage.iter().map(|(_, _, binding)| *binding)).collect();
     for reg in storage_registers {
@@ -1055,9 +1055,11 @@ fn build_selected_function_from_program_state(
             (width > 0).then_some((*node, width))
         })
         .collect();
-    for analysis in super::analysis::Stack::production().modules() {
-        analysis.retain_origins(func, &per_func_state.candidate_idx, &mut statements);
-    }
+    crate::decompile::passes::clight_select::syntax::Stack::production().retain_origins(
+        func,
+        &per_func_state.candidate_idx,
+        &mut statements,
+    );
     det_fp_stage(func.address, "S1mat", &statements);
     redirect_gotos_through_selected_away_nodes(&mut statements, successors);
     if structured_world {
@@ -4249,7 +4251,7 @@ fn ensure_goto_labels(statements: &mut HashMap<Node, ClightStmt>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::decompile::passes::clight_select::select::*;
     use std::sync::Arc;
 
     fn synthetic_ids<const N: usize>() -> [u64; N] {
@@ -4384,7 +4386,7 @@ mod tests {
         func.flow_blocks = vec![vec![load, use_]];
         func.flow_anchors.global.insert(
             symbol,
-            crate::decompile::passes::clight_select::flow::claim_of_type(&int_ty, true),
+            crate::decompile::passes::clight_select::solvers::flow::claim_of_type(&int_ty, true),
         );
         let state = ProgramSelectionState {
             candidate_idx: HashMap::new(),
@@ -4400,7 +4402,7 @@ mod tests {
         assert_eq!(feedback[0].symbol, symbol);
         assert_eq!(
             feedback[0].claimed,
-            crate::decompile::passes::clight_select::flow::claim_of_type(&float_ty, true)
+            crate::decompile::passes::clight_select::solvers::flow::claim_of_type(&float_ty, true)
         );
     }
 

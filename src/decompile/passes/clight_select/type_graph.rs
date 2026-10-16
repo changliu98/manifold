@@ -2,7 +2,7 @@
 //! labels and candidate-ranking policy. A storage access is not an allocation
 //! extent, and a register carrier is not a source-language declaration.
 
-use super::candtype::{CandType, Sign};
+use crate::decompile::passes::clight_select::candtype::{CandType, Sign};
 use crate::abi::DataModel;
 use crate::decompile::passes::c_pass::types::{
     CType, FloatSize, IntSize, Signedness, TypeQualifiers,
@@ -331,7 +331,7 @@ pub struct EvidenceGraph {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::decompile::passes::clight_select::type_graph::*;
     #[test]
     fn recursive_pointer_and_array_terms_do_not_need_spelling_variants() {
         let term = TypeTerm::Array(
