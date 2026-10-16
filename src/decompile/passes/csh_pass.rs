@@ -3,7 +3,6 @@ use crate::decompile::passes::pass::IRPass;
 use crate::{declare_io_from, run_pass};
 
 use crate::decompile::passes::cminor_pass::*;
-use crate::x86::op::Addressing;
 use crate::x86::types::*;
 use ascent::ascent_par;
 use log::warn;
@@ -29,7 +28,6 @@ ascent_par! {
     relation func_stacksz(Address, Address, Symbol, u64);
     relation rtl_inst(Node, RTLInst);
     relation call_return_reg(Node, RTLReg);
-    relation cminorsel_stmt(Node, CminorStmt);
     relation plt_entry(Address, Symbol);
     relation plt_block(Address, Symbol);
     relation block_boundaries(Address, Address, Address);
@@ -37,7 +35,6 @@ ascent_par! {
     relation addr_to_func_ident(Address, Ident);
     relation ident_to_symbol(Ident, Symbol);
     relation base_ident_to_symbol(Ident, Symbol);
-    relation base_addr_usage(Node, RTLReg, i64);
 
 
     addr_to_func_ident(addr, ident) <--
@@ -100,17 +97,6 @@ ascent_par! {
     ident_to_symbol(ident, absorber_name) <--
         addr_to_func_ident(addr, ident),
         absorbed_fragment_to_func(addr, absorber_name);
-
-    base_addr_usage(node, *reg, 0) <--
-        cminorsel_stmt(node, ?CminorStmt::Sassign(_, expr)),
-        if let CminorExpr::Eload(_, addr, args) = expr,
-        if !matches!(addr, Addressing::Aglobal(_, _)),
-        if let Some(reg) = args.first();
-
-    base_addr_usage(node, *reg, 0) <--
-        cminorsel_stmt(node, ?CminorStmt::Sstore(_, addr, args, _)),
-        if !matches!(addr, Addressing::Aglobal(_, _)),
-        if let Some(reg) = args.first();
 }
 
 pub struct CshPass;

@@ -1040,7 +1040,6 @@ ascent_par! {
     relation sp_window_depth(Address, i64);
     relation symbols(Address, Symbol, Symbol);
 
-    relation base_addr_usage(Node, RTLReg, i64);
     relation op_produces_int(Node, RTLReg);
     relation op_produces_long(Node, RTLReg);
     relation op_produces_float(Node, RTLReg);
@@ -14561,18 +14560,7 @@ ascent_par! {
         if !args.is_empty(),
         reg_rtl(addr, args[0], canon);
 
-    // Value-web address-arithmetic evidence: the param is the base of a lea/add whose RESULT is itself a memory base, requiring base_addr_usage so a cmov/clamp lea does not over-pointerize a scalar.
-    param_used_in_deref(func_start, *arg_reg) <--
-        param_value_canon(func_start, arg_reg, canon),
-        instr_in_function(lea_addr, func_start),
-        ltl_inst(lea_addr, ?LTLInst::Lop(op, srcs, dst)),
-        if matches!(op, Operation::Olea(_) | Operation::Oleal(_)),
-        if !srcs.is_empty(),
-        reg_rtl(lea_addr, srcs[0], canon),
-        reg_rtl(lea_addr, *dst, result_canon),
-        base_addr_usage(_, result_canon, _);
-
-    // param_used_in_lea removed: a bare LEA base is not pointer evidence; the genuine LEA-base-then-deref case is covered by param_used_in_deref, gated on base_addr_usage of the result.
+    // A bare LEA base is not pointer evidence: LEA also computes scalar arithmetic (e.g. a cmov/clamp sequence), so treating its base as a pointer over-pointerizes scalars.
 
     relation param_used_in_null_check(Address, Mreg);
 
@@ -15005,7 +14993,6 @@ ascent_par! {
 
 
     is_ptr(reg) <-- op_produces_ptr(_, reg);
-    is_ptr(reg) <-- base_addr_usage(_, reg, _);
     is_not_ptr(reg) <-- op_produces_data(_, reg);
 
     is_not_ptr(reg) <--

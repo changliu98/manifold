@@ -969,10 +969,8 @@ ascent_par! {
     // Pointer-producing operations
     relation op_produces_ptr(Node, RTLReg);
     relation canonical_exact_stack_addr_ptr_result(Node, RTLReg);
-    relation base_addr_usage(Node, RTLReg, i64);
 
     is_ptr(reg) <-- op_produces_ptr(_, reg);
-    is_ptr(reg) <-- base_addr_usage(_, reg, _);
 
     must_be_ptr(reg) <--
         call_site(node, func_name),
