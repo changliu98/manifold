@@ -53,6 +53,9 @@ ascent_par! {
     relation struct_id_to_canonical(usize, usize);
     relation symbol_resolved_addr(Symbol, Address);
 
+    // x86 keeps a switch dispatch an indirect Lbranch; the CFG recovered its complete table, whose
+    // entries are this relation, rather than an Ljumptable.
+    relation jump_table_target(Node, usize, Node);
     relation jumptable_target_sym(Address, usize, Symbol);
     relation jumptable_target_resolved(Address, usize, Address);
     relation jumptable_has_resolved(Address);
@@ -743,6 +746,25 @@ ascent_par! {
         ltl_jumptable_target(src, dst),
         instr_in_function(dst, func);
 
+    // A recovered x86 switch dispatch transfers to its table's entries, through any entry that
+    // carries no LTL form as the branch skip above does.
+    function_ltl_internal_succ(func, src, dst) <--
+        instr_in_function(src, func),
+        ltl_inst(src, ?LTLInst::Lbranch(Either::Left(_))),
+        jump_table_target(src, _, target),
+        ltl_canonical_node(*target, dst),
+        ltl_inst(dst, _),
+        instr_in_function(dst, func);
+    function_ltl_internal_succ(func, src, dst) <--
+        instr_in_function(src, func),
+        ltl_inst(src, ?LTLInst::Lbranch(Either::Left(_))),
+        jump_table_target(src, _, target),
+        !ltl_inst(*target, _),
+        ltl_fallthrough_skip(func, target, mid),
+        ltl_canonical_node(*mid, dst),
+        ltl_inst(dst, _),
+        instr_in_function(dst, func);
+
     // Reachable code only. Alignment padding sitting after a call that never
     // returns is not control flow the analysis failed to explain, it is dead
     // bytes inside the function span, and letting it veto the classification
@@ -785,9 +807,11 @@ ascent_par! {
         !intrinsic_noreturn_call_site(node),
         !function_has_ltl_entry(func);
 
+    // An indirect branch is unresolved unless it is a recovered switch dispatch.
     function_unresolved_control(func, node) <--
         instr_in_function(node, func),
-        ltl_inst(node, ?LTLInst::Lbranch(Either::Left(_)));
+        ltl_inst(node, ?LTLInst::Lbranch(Either::Left(_))),
+        !jump_table_target(node, _, _);
 
     function_unresolved_control(func, node) <--
         instr_in_function(node, func),

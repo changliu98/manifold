@@ -54,6 +54,20 @@ fn x86_gpr_view_width(reg: &str) -> Option<i64> {
     }
 }
 
+/// The quotient and remainder operations of a one-operand DIV (`signed` false) or IDIV whose
+/// divisor is `width` bytes wide.  The 32- and 64-bit forms divide EDX:EAX (RDX:RAX) into a
+/// quotient in EAX (RAX) and a remainder in EDX (RDX).  The 8- and 16-bit forms divide AX (DX:AX)
+/// into AL and AH (AX and DX), which no Operation spells, so they have none.
+pub(crate) fn division_operations(signed: bool, width: i64) -> Option<(Operation, Operation)> {
+    Some(match (signed, width) {
+        (true, 4) => (Operation::Odiv, Operation::Omod),
+        (true, 8) => (Operation::Odivl, Operation::Omodl),
+        (false, 4) => (Operation::Odivu, Operation::Omodu),
+        (false, 8) => (Operation::Odivlu, Operation::Omodlu),
+        _ => return None,
+    })
+}
+
 /// Exact TEST-result predicate named by the SETcc mnemonic.  Keep this
 /// separate from TestCond: SETS tests SF itself (not SF xor OF), and parity is
 /// a low-byte property that cannot be represented by the existing Cmask
@@ -9958,101 +9972,30 @@ ascent_par! {
         preg_of(a2, preg_of_r2),
         let args = vec![Mreg::AX, *a2];
 
-    // 32-bit signed div: CDQ before IDIV -> Odiv (result in AX)
-    mach_inst(address, MachInst::Mop(Operation::Odiv, Arc::new(args), Mreg::AX)) <--
+    // One-operand DIV/IDIV: the quotient to AX and the remainder to DX, at the width of the register
+    // divisor.  The CDQ/CQO or `xor %edx,%edx` usually placed before it only prepares the high half,
+    // and gcc clears RDX with the 32-bit xor for a 64-bit DIV as well, so keying the width on that
+    // instruction gave one DIV both widths.
+    #[local] relation register_division(Address, Mreg, Operation, Operation);
+    register_division(*address, *a2, quotient, remainder) <--
         pidiv(address, r2, _),
-        prev_instr(address, prevaddr),
-        pcast(prevaddr, _, _),
-        instruction(prevaddr, _, _, "CDQ", _, _, _, _, _, _),
         op_register(r2, r2_str),
         ireg_of(preg_of_r2, Ireg::from(r2_str)),
         preg_of(a2, preg_of_r2),
-        let args = vec![Mreg::AX, *a2];
-
-    // 32-bit unsigned div: xor EDX,EDX before DIV -> Odivu (result in AX)
-    mach_inst(address, MachInst::Mop(Operation::Odivu, Arc::new(args), Mreg::AX)) <--
+        if let Some((quotient, remainder)) =
+            x86_gpr_view_width(r2_str).and_then(|width| division_operations(true, width));
+    register_division(*address, *a2, quotient, remainder) <--
         pudiv(address, r2, _),
-        prev_instr(address, prevaddr),
-        pxor(prevaddr, rd, rs),
-        op_register(rd, rd_str),
-        op_register(rs, rs_str),
-        if *rd_str == *rs_str,
-        if *rd_str == "EDX" || *rd_str == "RDX",
         op_register(r2, r2_str),
         ireg_of(preg_of_r2, Ireg::from(r2_str)),
         preg_of(a2, preg_of_r2),
-        let args = vec![Mreg::AX, *a2];
+        if let Some((quotient, remainder)) =
+            x86_gpr_view_width(r2_str).and_then(|width| division_operations(false, width));
 
-    // 32-bit signed mod: CDQ before IDIV -> Omod (result in DX)
-    mach_inst(address, MachInst::Mop(Operation::Omod, Arc::new(args), Mreg::DX)) <--
-        pidiv(address, r2, _),
-        prev_instr(address, prevaddr),
-        pcast(prevaddr, _, _),
-        instruction(prevaddr, _, _, "CDQ", _, _, _, _, _, _),
-        op_register(r2, r2_str),
-        ireg_of(preg_of_r2, Ireg::from(r2_str)),
-        preg_of(a2, preg_of_r2),
-        let args = vec![Mreg::AX, *a2];
-
-    // 32-bit unsigned mod: xor EDX,EDX before DIV -> Omodu (result in DX)
-    mach_inst(address, MachInst::Mop(Operation::Omodu, Arc::new(args), Mreg::DX)) <--
-        pudiv(address, r2, _),
-        prev_instr(address, prevaddr),
-        pxor(prevaddr, rd, rs),
-        op_register(rd, rd_str),
-        op_register(rs, rs_str),
-        if *rd_str == *rs_str,
-        if *rd_str == "EDX" || *rd_str == "RDX",
-        op_register(r2, r2_str),
-        ireg_of(preg_of_r2, Ireg::from(r2_str)),
-        preg_of(a2, preg_of_r2),
-        let args = vec![Mreg::AX, *a2];
-
-    // Fallback: IDIV without CDQ predecessor, treat as signed 32-bit
-    mach_inst(address, MachInst::Mop(Operation::Odiv, Arc::new(args), Mreg::AX)) <--
-        pidiv(address, r2, _),
-        prev_instr(address, prevaddr),
-        !pcast(prevaddr, _, _),
-        op_register(r2, r2_str),
-        ireg_hold_type(r2_str.to_string(), typ),
-        if *typ == Typ::Tint,
-        ireg_of(preg_of_r2, Ireg::from(r2_str)),
-        preg_of(a2, preg_of_r2),
-        let args = vec![Mreg::AX, *a2];
-
-    mach_inst(address, MachInst::Mop(Operation::Omod, Arc::new(args), Mreg::DX)) <--
-        pidiv(address, r2, _),
-        prev_instr(address, prevaddr),
-        !pcast(prevaddr, _, _),
-        op_register(r2, r2_str),
-        ireg_hold_type(r2_str.to_string(), typ),
-        if *typ == Typ::Tint,
-        ireg_of(preg_of_r2, Ireg::from(r2_str)),
-        preg_of(a2, preg_of_r2),
-        let args = vec![Mreg::AX, *a2];
-
-    // Fallback: DIV without xor RDX predecessor, treat as unsigned 32-bit
-    mach_inst(address, MachInst::Mop(Operation::Odivu, Arc::new(args), Mreg::AX)) <--
-        pudiv(address, r2, _),
-        prev_instr(address, prevaddr),
-        !pxor(prevaddr, _, _),
-        op_register(r2, r2_str),
-        ireg_hold_type(r2_str.to_string(), typ),
-        if *typ == Typ::Tint,
-        ireg_of(preg_of_r2, Ireg::from(r2_str)),
-        preg_of(a2, preg_of_r2),
-        let args = vec![Mreg::AX, *a2];
-
-    mach_inst(address, MachInst::Mop(Operation::Omodu, Arc::new(args), Mreg::DX)) <--
-        pudiv(address, r2, _),
-        prev_instr(address, prevaddr),
-        !pxor(prevaddr, _, _),
-        op_register(r2, r2_str),
-        ireg_hold_type(r2_str.to_string(), typ),
-        if *typ == Typ::Tint,
-        ireg_of(preg_of_r2, Ireg::from(r2_str)),
-        preg_of(a2, preg_of_r2),
-        let args = vec![Mreg::AX, *a2];
+    mach_inst(address, MachInst::Mop(quotient.clone(), Arc::new(vec![Mreg::AX, *a2]), Mreg::AX)) <--
+        register_division(address, a2, quotient, _);
+    mach_inst(address, MachInst::Mop(remainder.clone(), Arc::new(vec![Mreg::AX, *a2]), Mreg::DX)) <--
+        register_division(address, a2, _, remainder);
 
     // Standalone CDQ/CQO sign-extension is a real definition of DX when no IDIV consumes it (the manual signed modulo-by-power-of-two idiom), so emit the arithmetic-shift sign replication.
     mach_inst(addr, MachInst::Mop(Operation::Oshrimm(31), Arc::new(vec![Mreg::AX]), Mreg::DX)) <--
@@ -10529,102 +10472,6 @@ ascent_par! {
         ireg_of(preg_of_r2, Ireg::from(r2_str)),
         preg_of(a2, preg_of_r2),
         let args = vec![Mreg::AX ,*a2];
-
-    // 64-bit signed div: CQO before IDIV -> Odivl (result in AX)
-    mach_inst(address, MachInst::Mop(Operation::Odivl, Arc::new(args), Mreg::AX)) <--
-        pidiv(address, r2, _),
-        prev_instr(address, prevaddr),
-        pcast(prevaddr, _, _),
-        instruction(prevaddr, _, _, "CQO", _, _, _, _, _, _),
-        op_register(r2, r2_str),
-        ireg_of(preg_of_r2, Ireg::from(r2_str)),
-        preg_of(a2, preg_of_r2),
-        let args = vec![Mreg::AX, *a2];
-
-    // 64-bit unsigned div: xor RDX,RDX before DIV -> Odivlu (result in AX)
-    mach_inst(address, MachInst::Mop(Operation::Odivlu, Arc::new(args), Mreg::AX)) <--
-        pudiv(address, r2, _),
-        prev_instr(address, prevaddr),
-        pxor(prevaddr, rd, rs),
-        op_register(rd, rd_str),
-        op_register(rs, rs_str),
-        if *rd_str == *rs_str,
-        if *rd_str == "EDX" || *rd_str == "RDX",
-        op_register(r2, r2_str),
-        ireg_of(preg_of_r2, Ireg::from(r2_str)),
-        preg_of(a2, preg_of_r2),
-        let args = vec![Mreg::AX, *a2];
-
-    // 64-bit signed mod: CQO before IDIV -> Omodl (result in DX)
-    mach_inst(address, MachInst::Mop(Operation::Omodl, Arc::new(args), Mreg::DX)) <--
-        pidiv(address, r2, _),
-        prev_instr(address, prevaddr),
-        pcast(prevaddr, _, _),
-        instruction(prevaddr, _, _, "CQO", _, _, _, _, _, _),
-        op_register(r2, r2_str),
-        ireg_of(preg_of_r2, Ireg::from(r2_str)),
-        preg_of(a2, preg_of_r2),
-        let args = vec![Mreg::AX, *a2];
-
-    // 64-bit unsigned mod: xor RDX,RDX before DIV -> Omodlu (result in DX)
-    mach_inst(address, MachInst::Mop(Operation::Omodlu, Arc::new(args), Mreg::DX)) <--
-        pudiv(address, r2, _),
-        prev_instr(address, prevaddr),
-        pxor(prevaddr, rd, rs),
-        op_register(rd, rd_str),
-        op_register(rs, rs_str),
-        if *rd_str == *rs_str,
-        if *rd_str == "EDX" || *rd_str == "RDX",
-        op_register(r2, r2_str),
-        ireg_of(preg_of_r2, Ireg::from(r2_str)),
-        preg_of(a2, preg_of_r2),
-        let args = vec![Mreg::AX, *a2];
-
-    // Fallback: IDIV without CQO predecessor, treat as signed 64-bit
-    mach_inst(address, MachInst::Mop(Operation::Odivl, Arc::new(args), Mreg::AX)) <--
-        pidiv(address, r2, _),
-        prev_instr(address, prevaddr),
-        !pcast(prevaddr, _, _),
-        op_register(r2, r2_str),
-        ireg_hold_type(r2_str.to_string(), typ),
-        if *typ == Typ::Tlong || *typ == Typ::Tany64,
-        ireg_of(preg_of_r2, Ireg::from(r2_str)),
-        preg_of(a2, preg_of_r2),
-        let args = vec![Mreg::AX, *a2];
-
-    mach_inst(address, MachInst::Mop(Operation::Omodl, Arc::new(args), Mreg::DX)) <--
-        pidiv(address, r2, _),
-        prev_instr(address, prevaddr),
-        !pcast(prevaddr, _, _),
-        op_register(r2, r2_str),
-        ireg_hold_type(r2_str.to_string(), typ),
-        if *typ == Typ::Tlong || *typ == Typ::Tany64,
-        ireg_of(preg_of_r2, Ireg::from(r2_str)),
-        preg_of(a2, preg_of_r2),
-        let args = vec![Mreg::AX, *a2];
-
-    // Fallback: DIV without xor RDX predecessor, treat as unsigned 64-bit
-    mach_inst(address, MachInst::Mop(Operation::Odivlu, Arc::new(args), Mreg::AX)) <--
-        pudiv(address, r2, _),
-        prev_instr(address, prevaddr),
-        !pxor(prevaddr, _, _),
-        op_register(r2, r2_str),
-        ireg_hold_type(r2_str.to_string(), typ),
-        if *typ == Typ::Tlong || *typ == Typ::Tany64,
-        ireg_of(preg_of_r2, Ireg::from(r2_str)),
-        preg_of(a2, preg_of_r2),
-        let args = vec![Mreg::AX, *a2];
-
-    mach_inst(address, MachInst::Mop(Operation::Omodlu, Arc::new(args), Mreg::DX)) <--
-        pudiv(address, r2, _),
-        prev_instr(address, prevaddr),
-        !pxor(prevaddr, _, _),
-        op_register(r2, r2_str),
-        ireg_hold_type(r2_str.to_string(), typ),
-        if *typ == Typ::Tlong || *typ == Typ::Tany64,
-        ireg_of(preg_of_r2, Ireg::from(r2_str)),
-        preg_of(a2, preg_of_r2),
-        let args = vec![Mreg::AX, *a2];
 
     mach_inst(address, MachInst::Mop(Operation::Oandl, Arc::new(args), *res)) <--
         pand(address, r, r2),
@@ -12399,30 +12246,32 @@ ascent_par! {
         reg_sp(rsp_str),
         op_immediate(sz_sym, sz, _);
 
-    // Clang stack alignment: push of scratch register at function entry instead of sub $8, %rsp
+    // Clang allocates an 8-byte frame, or realigns the stack, by pushing a scratch register instead
+    // of `sub $8, %rsp`, after whatever callee-saved registers it pushes first.  The prologue is
+    // the leading run of ENDBR64, PUSH and the frame-pointer move from the entry, however long;
+    // counting only its first three instructions missed the allocation after more saves, leaving
+    // a frame that holds a local with no size.
+    #[local] relation prologue_step(Address);
+    prologue_step(addr) <-- ppush(addr, _);
+    prologue_step(addr) <-- instruction(addr, _, _, "ENDBR64", _, _, _, _, _, _);
+    prologue_step(addr) <--
+        instruction(addr, _, _, "MOV", src, dst, _, _, _, _),
+        op_register(src, "RSP"),
+        op_register(dst, "RBP");
+
+    #[local] relation prologue_instruction(Symbol, Address, Address);
+    prologue_instruction(func_name, start_addr, start_addr) <--
+        func_span(func_name, start_addr, _);
+    prologue_instruction(func_name, start_addr, next_addr) <--
+        prologue_instruction(func_name, start_addr, addr),
+        prologue_step(addr),
+        next(addr, next_addr),
+        func_span(func_name, start_addr, end_addr),
+        if next_addr < end_addr;
+
     #[local] relation push_align_alloc(Symbol, Address, i64);
-
-    push_align_alloc(func_name, start_addr, 8) <--
-        func_span(func_name, start_addr, end_addr),
-        ppush(start_addr, sym),
-        op_register(sym, reg_str),
-        !is_callee_saved(Mreg::x86(*reg_str)),
-        !reg_sp(reg_str);
-
     push_align_alloc(func_name, push_addr, 8) <--
-        func_span(func_name, start_addr, end_addr),
-        next(start_addr, push_addr),
-        if push_addr < end_addr,
-        ppush(push_addr, sym),
-        op_register(sym, reg_str),
-        !is_callee_saved(Mreg::x86(*reg_str)),
-        !reg_sp(reg_str);
-
-    push_align_alloc(func_name, push_addr, 8) <--
-        func_span(func_name, start_addr, end_addr),
-        next(start_addr, mid_addr),
-        next(mid_addr, push_addr),
-        if push_addr < end_addr,
+        prologue_instruction(func_name, _, push_addr),
         ppush(push_addr, sym),
         op_register(sym, reg_str),
         !is_callee_saved(Mreg::x86(*reg_str)),

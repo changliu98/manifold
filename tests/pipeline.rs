@@ -629,3 +629,15 @@ dual_compiler_test!(float_return_stale_call, "-O2");
 // Imported functions used as values: in a PIE their addresses come from GOT slots
 
 dual_compiler_pie_test!(got_function_import, "-O2");
+
+// The quotient and the remainder of one DIV/IDIV, both used
+
+dual_compiler_test!(division_results, "-O2");
+
+// An out-parameter local in a function whose switch dispatches through a PIE jump table
+
+dual_compiler_pie_test!(switch_frame_escape, "-O2");
+
+// A local buffer whose address reaches a callee only through a join with heap storage
+
+dual_compiler_test!(may_escape_buffer, "-O2");

@@ -993,15 +993,27 @@ ascent_par! {
             CsharpminorExpr::Eload(*chunk, Box::new(addr_expr)),
         );
 
-    // Resolve an untracked stack Eload to the function's local for that offset; an address-escaped slot uses rtl_pass's single slot_escaped_canonical, not the multi-valued fallback.
+    // Resolve an untracked stack Eload to the function's local for that offset; an address-escaped
+    // slot uses rtl_pass's single slot_escaped_canonical, not the multi-valued fallback.  That slot
+    // is memory a callee may have written, so it is read through its address, the way Csharpminor
+    // reads every stack-allocated variable.  Reading it as Evar(owner) holds only while the owner
+    // stays a scalar of this width, and Clight may back it wider (an opaque escaped buffer sized
+    // to its frame gap, an ABI out-parameter object): Evar then names the array, which decays to
+    // its address, and `strip(base)` received `&base`.
     csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
-        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Eload(_chunk, addr, args))),
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Eload(chunk, addr, args))),
         if let Addressing::Ainstack(ofs) = addr,
         if args.is_empty(),
         instr_in_function(node, func_start),
         slot_escaped_canonical(func_start, *ofs, stack_rtl),
         !frame_read_has_storage_access_owner(node),
-        let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Evar(*stack_rtl));
+        let stmt = CsharpminorStmt::Sset(
+            *dst,
+            CsharpminorExpr::Eload(
+                *chunk,
+                Box::new(CsharpminorExpr::Eaddrof(ident_from_reg(*stack_rtl))),
+            ),
+        );
 
     csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Eload(_chunk, addr, args))),
@@ -3394,6 +3406,26 @@ mod tests {
         prog.instr_in_function.push((node, FUNC));
         prog.stack_var.push((FUNC, node, 8, owner));
         prog.frame_read_storage_access_owner.push((FUNC, node, 8, 8, owner));
+        prog.run();
+        let reads: Vec<_> = prog.csharp_stmt_candidate.iter()
+            .filter(|(candidate, _)| *candidate == node).collect();
+        assert_eq!(reads.len(), 1);
+        assert!(matches!(&reads[0].1,
+            CsharpminorStmt::Sset(value, CsharpminorExpr::Eload(MemoryChunk::MAny64, address))
+                if *value == dst && matches!(address.as_ref(), CsharpminorExpr::Eaddrof(id)
+                    if *id == ident_from_reg(owner))));
+    }
+
+    #[test]
+    fn escaped_slot_read_goes_through_the_owner_address() {
+        // A callee may have written the escaped slot, and Clight may back its owner wider than
+        // this read, where Evar(owner) would name the array instead of loading the value.
+        let [node, dst, owner] = synthetic_ids();
+        let mut prog = CshminorPassProgram::default();
+        prog.cminor_stmt.push((node, CminorStmt::Sassign(dst,
+            CminorExpr::Eload(MemoryChunk::MAny64, Addressing::Ainstack(0), Arc::new(vec![])))));
+        prog.instr_in_function.push((node, FUNC));
+        prog.slot_escaped_canonical.push((FUNC, 0, owner));
         prog.run();
         let reads: Vec<_> = prog.csharp_stmt_candidate.iter()
             .filter(|(candidate, _)| *candidate == node).collect();

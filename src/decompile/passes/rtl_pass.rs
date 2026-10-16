@@ -1,7 +1,7 @@
 use crate::decompile::elevator::DecompileDB;
 use crate::run_pass;
 
-use crate::decompile::passes::asm_pass::{is_reg_high8, transl_addressing_rev};
+use crate::decompile::passes::asm_pass::{division_operations, is_reg_high8, transl_addressing_rev};
 use crate::decompile::passes::cminor_pass::*;
 use crate::decompile::passes::csh_pass::*;
 use crate::decompile::passes::frame_write_pass::{
@@ -1815,7 +1815,7 @@ ascent_par! {
         for mreg in mregs.iter(),
         reg_def_used(defaddr, *mreg, *head_addr),
         !lop_overwrites_input(head_addr, mreg),
-        !load_overwrites_base(defaddr, mreg),
+        !def_splits_input(defaddr, mreg),
         reg_xtl(defaddr, *mreg, arg_id);
 
     reg_xtl(head_addr, mreg, arg_id) <--
@@ -1823,7 +1823,7 @@ ascent_par! {
         for mreg in mregs.iter(),
         reg_def_used(defaddr, *mreg, *head_addr),
         !lop_overwrites_input(head_addr, mreg),
-        load_overwrites_base(defaddr, mreg),
+        def_splits_input(defaddr, mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *mreg, arg_id);
 
@@ -1832,7 +1832,7 @@ ascent_par! {
         for builtin_arg in args,
         if let BuiltinArg::BA(mreg) = builtin_arg,
         reg_def_used(defaddr, *mreg, *head_addr),
-        !load_overwrites_base(defaddr, mreg),
+        !def_splits_input(defaddr, mreg),
         reg_xtl(defaddr, *mreg, id);
 
     reg_xtl(head_addr, mreg, id) <--
@@ -1840,7 +1840,7 @@ ascent_par! {
         for builtin_arg in args,
         if let BuiltinArg::BA(mreg) = builtin_arg,
         reg_def_used(defaddr, *mreg, *head_addr),
-        load_overwrites_base(defaddr, mreg),
+        def_splits_input(defaddr, mreg),
         is_def(defaddr, id),
         reg_xtl(defaddr, *mreg, id);
 
@@ -1849,7 +1849,7 @@ ascent_par! {
         for mreg in mregs.iter(),
         reg_def_used(defaddr, *mreg, *head_addr),
         !load_overwrites_base(head_addr, mreg),
-        !load_overwrites_base(defaddr, mreg),
+        !def_splits_input(defaddr, mreg),
         reg_xtl(defaddr, *mreg, arg_id);
 
     reg_xtl(head_addr, mreg, arg_id) <--
@@ -1857,7 +1857,7 @@ ascent_par! {
         for mreg in mregs.iter(),
         reg_def_used(defaddr, *mreg, *head_addr),
         !load_overwrites_base(head_addr, mreg),
-        load_overwrites_base(defaddr, mreg),
+        def_splits_input(defaddr, mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *mreg, arg_id);
 
@@ -1876,26 +1876,26 @@ ascent_par! {
     reg_xtl(head_addr, *src, srcid) <--
         ltl_inst(head_addr, ?LTLInst::Lstore(mc, adrs, args, src)),
         reg_def_used(defaddr, *src, *head_addr),
-        !load_overwrites_base(defaddr, src),
+        !def_splits_input(defaddr, src),
         reg_xtl(defaddr, *src, srcid);
 
     reg_xtl(head_addr, *src, srcid) <--
         ltl_inst(head_addr, ?LTLInst::Lstore(mc, adrs, args, src)),
         reg_def_used(defaddr, *src, *head_addr),
-        load_overwrites_base(defaddr, src),
+        def_splits_input(defaddr, src),
         is_def(defaddr, srcid),
         reg_xtl(defaddr, *src, srcid);
 
     reg_xtl(head_addr, *src, srcid) <--
         ltl_inst(head_addr, ?LTLInst::Lsetstack(src, _, _, _)),
         reg_def_used(defaddr, *src, *head_addr),
-        !load_overwrites_base(defaddr, src),
+        !def_splits_input(defaddr, src),
         reg_xtl(defaddr, *src, srcid);
 
     reg_xtl(head_addr, *src, srcid) <--
         ltl_inst(head_addr, ?LTLInst::Lsetstack(src, _, _, _)),
         reg_def_used(defaddr, *src, *head_addr),
-        load_overwrites_base(defaddr, src),
+        def_splits_input(defaddr, src),
         is_def(defaddr, srcid),
         reg_xtl(defaddr, *src, srcid);
 
@@ -1904,27 +1904,27 @@ ascent_par! {
         ltl_inst(head_addr, ?LTLInst::Lcond(_, args, _, _)),
         for mreg in args.iter(),
         reg_def_used(defaddr, *mreg, *head_addr),
-        !load_overwrites_base(defaddr, mreg),
+        !def_splits_input(defaddr, mreg),
         reg_xtl(defaddr, *mreg, arg_id);
 
     reg_xtl(head_addr, mreg, arg_id) <--
         ltl_inst(head_addr, ?LTLInst::Lcond(_, args, _, _)),
         for mreg in args.iter(),
         reg_def_used(defaddr, *mreg, *head_addr),
-        load_overwrites_base(defaddr, mreg),
+        def_splits_input(defaddr, mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *mreg, arg_id);
 
     reg_xtl(addr, arg, arg_id) <--
         ltl_inst(addr, ?LTLInst::Ljumptable(arg, _)),
         reg_def_used(defaddr, *arg, *addr),
-        !load_overwrites_base(defaddr, arg),
+        !def_splits_input(defaddr, arg),
         reg_xtl(defaddr, *arg, arg_id);
 
     reg_xtl(addr, arg, arg_id) <--
         ltl_inst(addr, ?LTLInst::Ljumptable(arg, _)),
         reg_def_used(defaddr, *arg, *addr),
-        load_overwrites_base(defaddr, arg),
+        def_splits_input(defaddr, arg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *arg, arg_id);
 
@@ -1932,26 +1932,26 @@ ascent_par! {
     reg_xtl(addr, mreg, callee_id) <--
         ltl_inst(addr, ?LTLInst::Lcall(Either::Left(mreg))),
         reg_def_used(defaddr, *mreg, *addr),
-        !load_overwrites_base(defaddr, mreg),
+        !def_splits_input(defaddr, mreg),
         reg_xtl(defaddr, *mreg, callee_id);
 
     reg_xtl(addr, mreg, callee_id) <--
         ltl_inst(addr, ?LTLInst::Lcall(Either::Left(mreg))),
         reg_def_used(defaddr, *mreg, *addr),
-        load_overwrites_base(defaddr, mreg),
+        def_splits_input(defaddr, mreg),
         is_def(defaddr, callee_id),
         reg_xtl(defaddr, *mreg, callee_id);
 
     reg_xtl(addr, mreg, callee_id) <--
         ltl_inst(addr, ?LTLInst::Ltailcall(Either::Left(mreg))),
         reg_def_used(defaddr, *mreg, *addr),
-        !load_overwrites_base(defaddr, mreg),
+        !def_splits_input(defaddr, mreg),
         reg_xtl(defaddr, *mreg, callee_id);
 
     reg_xtl(addr, mreg, callee_id) <--
         ltl_inst(addr, ?LTLInst::Ltailcall(Either::Left(mreg))),
         reg_def_used(defaddr, *mreg, *addr),
-        load_overwrites_base(defaddr, mreg),
+        def_splits_input(defaddr, mreg),
         is_def(defaddr, callee_id),
         reg_xtl(defaddr, *mreg, callee_id);
 
@@ -2053,13 +2053,13 @@ ascent_par! {
     reg_xtl(addr, base_mreg, arg_id) <--
         mach_imm_indirect_store(addr, _, _, base_mreg, _),
         reg_def_used(defaddr, *base_mreg, *addr),
-        !load_overwrites_base(defaddr, base_mreg),
+        !def_splits_input(defaddr, base_mreg),
         reg_xtl(defaddr, *base_mreg, arg_id);
 
     reg_xtl(addr, base_mreg, arg_id) <--
         mach_imm_indirect_store(addr, _, _, base_mreg, _),
         reg_def_used(defaddr, *base_mreg, *addr),
-        load_overwrites_base(defaddr, base_mreg),
+        def_splits_input(defaddr, base_mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *base_mreg, arg_id);
 
@@ -2241,7 +2241,15 @@ ascent_par! {
         imm_indirect_store_indexed(addr, _, _, _, idx_str, _, _),
         let idx_mreg = Mreg::x86(*idx_str),
         reg_def_used(defaddr, idx_mreg, *addr),
-        !load_overwrites_base(defaddr, &idx_mreg),
+        !def_splits_input(defaddr, &idx_mreg),
+        reg_xtl(defaddr, idx_mreg, arg_id);
+
+    reg_xtl(addr, idx_mreg, arg_id) <--
+        imm_indirect_store_indexed(addr, _, _, _, idx_str, _, _),
+        let idx_mreg = Mreg::x86(*idx_str),
+        reg_def_used(defaddr, idx_mreg, *addr),
+        def_splits_input(defaddr, idx_mreg),
+        is_def(defaddr, arg_id),
         reg_xtl(defaddr, idx_mreg, arg_id);
 
     rtl_edge_negated(addr, next) <--
@@ -2338,14 +2346,14 @@ ascent_par! {
         arith_load_op(addr, _, _, base_mreg, _, _),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *base_mreg, *addr),
-        !load_overwrites_base(defaddr, base_mreg),
+        !def_splits_input(defaddr, base_mreg),
         reg_xtl(defaddr, *base_mreg, arg_id);
 
     reg_xtl(*addr, *base_mreg, arg_id) <--
         arith_load_op(addr, _, _, base_mreg, _, _),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *base_mreg, *addr),
-        load_overwrites_base(defaddr, base_mreg),
+        def_splits_input(defaddr, base_mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *base_mreg, arg_id);
 
@@ -2353,14 +2361,14 @@ ascent_par! {
         arith_load_op(addr, _, _, _, _, dst_mreg),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *dst_mreg, *addr),
-        !load_overwrites_base(defaddr, dst_mreg),
+        !def_splits_input(defaddr, dst_mreg),
         reg_xtl(defaddr, *dst_mreg, arg_id);
 
     reg_xtl(*addr, *dst_mreg, arg_id) <--
         arith_load_op(addr, _, _, _, _, dst_mreg),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *dst_mreg, *addr),
-        load_overwrites_base(defaddr, dst_mreg),
+        def_splits_input(defaddr, dst_mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *dst_mreg, arg_id);
 
@@ -2372,7 +2380,7 @@ ascent_par! {
         !has_ltl_op(addr),
         for address_mreg in address_mregs.iter(),
         reg_def_used(defaddr, *address_mreg, *addr),
-        !load_overwrites_base(defaddr, address_mreg),
+        !def_splits_input(defaddr, address_mreg),
         reg_xtl(defaddr, *address_mreg, arg_id);
 
     reg_xtl(*addr, *address_mreg, arg_id) <--
@@ -2380,7 +2388,7 @@ ascent_par! {
         !has_ltl_op(addr),
         for address_mreg in address_mregs.iter(),
         reg_def_used(defaddr, *address_mreg, *addr),
-        load_overwrites_base(defaddr, address_mreg),
+        def_splits_input(defaddr, address_mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *address_mreg, arg_id);
 
@@ -2388,14 +2396,14 @@ ascent_par! {
         arith_store_reg(addr, _, _, base_mreg, _, _),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *base_mreg, *addr),
-        !load_overwrites_base(defaddr, base_mreg),
+        !def_splits_input(defaddr, base_mreg),
         reg_xtl(defaddr, *base_mreg, arg_id);
 
     reg_xtl(*addr, *base_mreg, arg_id) <--
         arith_store_reg(addr, _, _, base_mreg, _, _),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *base_mreg, *addr),
-        load_overwrites_base(defaddr, base_mreg),
+        def_splits_input(defaddr, base_mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *base_mreg, arg_id);
 
@@ -2403,14 +2411,14 @@ ascent_par! {
         arith_store_reg(addr, _, _, _, _, src_mreg),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *src_mreg, *addr),
-        !load_overwrites_base(defaddr, src_mreg),
+        !def_splits_input(defaddr, src_mreg),
         reg_xtl(defaddr, *src_mreg, arg_id);
 
     reg_xtl(*addr, *src_mreg, arg_id) <--
         arith_store_reg(addr, _, _, _, _, src_mreg),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *src_mreg, *addr),
-        load_overwrites_base(defaddr, src_mreg),
+        def_splits_input(defaddr, src_mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *src_mreg, arg_id);
 
@@ -2418,14 +2426,14 @@ ascent_par! {
         arith_store_imm(addr, _, _, base_mreg, _),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *base_mreg, *addr),
-        !load_overwrites_base(defaddr, base_mreg),
+        !def_splits_input(defaddr, base_mreg),
         reg_xtl(defaddr, *base_mreg, arg_id);
 
     reg_xtl(*addr, *base_mreg, arg_id) <--
         arith_store_imm(addr, _, _, base_mreg, _),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *base_mreg, *addr),
-        load_overwrites_base(defaddr, base_mreg),
+        def_splits_input(defaddr, base_mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *base_mreg, arg_id);
 
@@ -2433,14 +2441,14 @@ ascent_par! {
         arith_store_abs_reg(addr, _, _, _, _, src_mreg),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *src_mreg, *addr),
-        !load_overwrites_base(defaddr, src_mreg),
+        !def_splits_input(defaddr, src_mreg),
         reg_xtl(defaddr, *src_mreg, arg_id);
 
     reg_xtl(*addr, *src_mreg, arg_id) <--
         arith_store_abs_reg(addr, _, _, _, _, src_mreg),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *src_mreg, *addr),
-        load_overwrites_base(defaddr, src_mreg),
+        def_splits_input(defaddr, src_mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *src_mreg, arg_id);
 
@@ -2448,13 +2456,13 @@ ascent_par! {
     reg_xtl(*addr, *m, arg_id) <--
         float_load_arg(addr, _, m),
         reg_def_used(defaddr, *m, *addr),
-        !load_overwrites_base(defaddr, m),
+        !def_splits_input(defaddr, m),
         reg_xtl(defaddr, *m, arg_id);
 
     reg_xtl(*addr, *m, arg_id) <--
         float_load_arg(addr, _, m),
         reg_def_used(defaddr, *m, *addr),
-        load_overwrites_base(defaddr, m),
+        def_splits_input(defaddr, m),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *m, arg_id);
 
@@ -2463,14 +2471,14 @@ ascent_par! {
         float_load_op(addr, _, _, _, _, dst_mreg, false),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *dst_mreg, *addr),
-        !load_overwrites_base(defaddr, dst_mreg),
+        !def_splits_input(defaddr, dst_mreg),
         reg_xtl(defaddr, *dst_mreg, arg_id);
 
     reg_xtl(*addr, *dst_mreg, arg_id) <--
         float_load_op(addr, _, _, _, _, dst_mreg, false),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *dst_mreg, *addr),
-        load_overwrites_base(defaddr, dst_mreg),
+        def_splits_input(defaddr, dst_mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *dst_mreg, arg_id);
 
@@ -2888,14 +2896,14 @@ ascent_par! {
         float_arith_stack_op(addr, _, _, _, dst_mreg),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *dst_mreg, *addr),
-        !load_overwrites_base(defaddr, dst_mreg),
+        !def_splits_input(defaddr, dst_mreg),
         reg_xtl(defaddr, *dst_mreg, arg_id);
 
     reg_xtl(*addr, *dst_mreg, arg_id) <--
         float_arith_stack_op(addr, _, _, _, dst_mreg),
         !has_ltl_op(addr),
         reg_def_used(defaddr, *dst_mreg, *addr),
-        load_overwrites_base(defaddr, dst_mreg),
+        def_splits_input(defaddr, dst_mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *dst_mreg, arg_id);
 
@@ -3831,7 +3839,7 @@ ascent_par! {
         !setcc_compare_site(addr, _),
         !osel_rip_condition(addr, _, _),
         !lop_overwrites_input(addr, dst_reg),
-        !div_result_dead(addr, dst_reg),
+        !pdiv(addr, _, _),
         reg_rtl(addr, *dst_reg, dst_rtl),
         op_args_collected(addr, args),
         let inst = RTLInst::Iop(op.clone(), args.clone(), *dst_rtl);
@@ -3844,6 +3852,7 @@ ascent_par! {
         !setcc_compare_site(addr, _),
         !osel_rip_condition(addr, _, _),
         !reg_xtl(addr, *dst_reg, _),
+        !pdiv(addr, _, _),
         let dst_rtl = fresh_xtl_reg(*addr, *dst_reg),
         op_args_collected(addr, args),
         let inst = RTLInst::Iop(op.clone(), args.clone(), dst_rtl);
@@ -3855,6 +3864,7 @@ ascent_par! {
         !sp_indexed_lea(addr),
         !osel_rip_condition(addr, _, _),
         lop_overwrites_input(addr, dst_reg),
+        !pdiv(addr, _, _),
         is_def(addr, def_xtl),
         reg_xtl(addr, *dst_reg, def_xtl),
         xtl_canonical(def_xtl, dst_rtl),
@@ -3984,153 +3994,91 @@ ascent_par! {
     reg_def_site(addr, Mreg::DX) <--
         pdiv(addr, _, _);
 
-    // A div defines both AX and DX but the two Mops collide at one address, so mark the never-consumed output dead; only when the OTHER is consumed, so a div with both or neither used keeps both.
-    relation div_result_dead(Node, Mreg);
-    div_result_dead(addr, Mreg::AX) <--
-        pdiv(addr, _, _),
-        !reg_def_used(addr, Mreg::AX, _),
-        reg_def_used(addr, Mreg::DX, _);
-    div_result_dead(addr, Mreg::DX) <--
-        pdiv(addr, _, _),
-        !reg_def_used(addr, Mreg::DX, _),
-        reg_def_used(addr, Mreg::AX, _);
-
     func_has_div_instr(func_start) <--
         instr_in_function(addr, func_start),
         pdiv(addr, _, _);
 
-    #[local] relation division_ax_output(Node, RTLReg);
-    division_ax_output(*addr, *canonical) <--
+    // A one-operand DIV/IDIV produces two values from one dividend, so each gets its own node: the
+    // quotient (AX) stays at the instruction and the remainder (DX) moves to the synthetic node
+    // after it.  Mach carries the two as Lops of the one address, which the generic Lop lowering
+    // above would put on a single node, where only one of them can be kept; it stays off these
+    // nodes.  The operation's width is its divisor's (division_operations): a 32- or 64-bit
+    // register, or a 32- or 64-bit frame slot.
+    #[local] relation division_signedness(Node, Symbol, bool);
+    division_signedness(addr, *divisor_sym, true) <-- pidiv(addr, divisor_sym, _);
+    division_signedness(addr, *divisor_sym, false) <-- pudiv(addr, divisor_sym, _);
+
+    #[local] relation lifted_division(Node, Symbol, Operation, Operation);
+    lifted_division(*addr, *divisor_sym, quotient, remainder) <--
+        division_signedness(addr, divisor_sym, signed),
+        op_register(divisor_sym, divisor_name),
+        if let Some((quotient, remainder)) =
+            x86_gpr_view_width(divisor_name).and_then(|width| division_operations(*signed, width));
+    lifted_division(*addr, *divisor_sym, quotient, remainder) <--
+        division_signedness(addr, divisor_sym, signed),
+        op_indirect(divisor_sym, _, base_name, index_name, _, _, size),
+        if *index_name == "NONE" || index_name.is_empty(),
+        if Mreg::x86(*base_name) == Mreg::BP || Mreg::x86(*base_name) == Mreg::SP,
+        if let Some((quotient, remainder)) = division_operations(*signed, *size as i64);
+
+    // Both results read AX's value entering the instruction, the shadow use split off the
+    // quotient's definition, and the divisor's.
+    #[local] relation division_dividend(Node, RTLReg);
+    division_dividend(addr, *dividend) <--
         pdiv(addr, _, _),
-        reg_xtl(addr, Mreg::AX, raw),
-        is_def(addr, raw),
-        xtl_canonical(raw, canonical);
+        lop_overwrite_use_id(addr, Mreg::AX, dividend_xtl),
+        xtl_canonical(dividend_xtl, dividend);
 
+    #[local] relation division_operands(Node, Operation, Operation, Args);
+    division_operands(*addr, quotient.clone(), remainder.clone(), Arc::new(vec![*dividend, *divisor])) <--
+        lifted_division(addr, divisor_sym, quotient, remainder),
+        op_register(divisor_sym, divisor_name),
+        let divisor_mreg = Mreg::x86(*divisor_name),
+        if divisor_mreg != Mreg::AX && divisor_mreg != Mreg::DX,
+        division_dividend(addr, dividend),
+        reg_rtl(addr, divisor_mreg, divisor);
 
-    // Signed division (IDIV): quotient in AX, remainder in DX
-    rtl_inst_candidate(addr, RTLInst::Iop(Operation::Odiv, args.clone(), *quot_rtl)) <--
-        pidiv(addr, divisor_sym, _),
-        op_register(divisor_sym, divisor_reg_str),
-        let divisor_mreg = Mreg::x86(divisor_reg_str.to_string()),
-        reg_def_used(ax_def_addr, Mreg::AX, addr),
-        if ax_def_addr != addr,
-        reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
-        reg_def_used(div_def_addr, divisor_mreg, addr),
-        reg_rtl(div_def_addr, divisor_mreg, divisor_rtl),
-        division_ax_output(addr, quot_rtl),
-        let args = Arc::new(vec![*ax_rtl, *divisor_rtl]);
+    // A frame-slot divisor reads the slot's local, as arith_load_slot does; an SP displacement
+    // naming an incoming stack argument is the parameter's, which this does not resolve.
+    division_operands(*addr, quotient.clone(), remainder.clone(), Arc::new(vec![*dividend, *divisor])) <--
+        lifted_division(addr, divisor_sym, quotient, remainder),
+        op_indirect(divisor_sym, _, base_name, _, _, disp, _),
+        if Mreg::x86(*base_name) == Mreg::BP,
+        instr_in_function(addr, func_start),
+        stack_var(func_start, addr, disp, divisor),
+        division_dividend(addr, dividend);
+    division_operands(*addr, quotient.clone(), remainder.clone(), Arc::new(vec![*dividend, *divisor])) <--
+        lifted_division(addr, divisor_sym, quotient, remainder),
+        op_indirect(divisor_sym, _, base_name, _, _, disp, _),
+        if Mreg::x86(*base_name) == Mreg::SP,
+        instr_in_function(addr, func_start),
+        !stack_param_idx(func_start, disp, _),
+        stack_var(func_start, addr, disp, divisor),
+        division_dividend(addr, dividend);
 
-    rtl_inst_candidate(synthetic_addr, RTLInst::Iop(Operation::Omod, args.clone(), *rem_rtl)) <--
-        pidiv(addr, divisor_sym, _),
-        op_register(divisor_sym, divisor_reg_str),
-        let divisor_mreg = Mreg::x86(divisor_reg_str.to_string()),
-        reg_def_used(ax_def_addr, Mreg::AX, addr),
-        if ax_def_addr != addr,
-        reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
-        reg_def_used(div_def_addr, divisor_mreg, addr),
-        reg_rtl(div_def_addr, divisor_mreg, divisor_rtl),
-        reg_rtl(addr, Mreg::DX, rem_rtl),
-        let synthetic_addr = *addr | (1u64 << 62),
-        let args = Arc::new(vec![*ax_rtl, *divisor_rtl]);
+    rtl_inst_candidate(addr, RTLInst::Iop(quotient.clone(), args.clone(), *quotient_rtl)) <--
+        division_operands(addr, quotient, _, args),
+        def_value_rtl(addr, Mreg::AX, quotient_rtl);
 
-    // Unsigned division (DIV): quotient in AX, remainder in DX
-    rtl_inst_candidate(addr, RTLInst::Iop(Operation::Odivu, args.clone(), *quot_rtl)) <--
-        pudiv(addr, divisor_sym, _),
-        op_register(divisor_sym, divisor_reg_str),
-        let divisor_mreg = Mreg::x86(divisor_reg_str.to_string()),
-        reg_def_used(ax_def_addr, Mreg::AX, addr),
-        if ax_def_addr != addr,
-        reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
-        reg_def_used(div_def_addr, divisor_mreg, addr),
-        reg_rtl(div_def_addr, divisor_mreg, divisor_rtl),
-        division_ax_output(addr, quot_rtl),
-        let args = Arc::new(vec![*ax_rtl, *divisor_rtl]);
-
-    rtl_inst_candidate(synthetic_addr, RTLInst::Iop(Operation::Omodu, args.clone(), *rem_rtl)) <--
-        pudiv(addr, divisor_sym, _),
-        op_register(divisor_sym, divisor_reg_str),
-        let divisor_mreg = Mreg::x86(divisor_reg_str.to_string()),
-        reg_def_used(ax_def_addr, Mreg::AX, addr),
-        if ax_def_addr != addr,
-        reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
-        reg_def_used(div_def_addr, divisor_mreg, addr),
-        reg_rtl(div_def_addr, divisor_mreg, divisor_rtl),
-        reg_rtl(addr, Mreg::DX, rem_rtl),
-        let synthetic_addr = *addr | (1u64 << 62),
-        let args = Arc::new(vec![*ax_rtl, *divisor_rtl]);
+    rtl_inst_candidate(remainder_node, RTLInst::Iop(remainder.clone(), args.clone(), *remainder_rtl)) <--
+        division_operands(addr, _, remainder, args),
+        def_value_rtl(addr, Mreg::DX, remainder_rtl),
+        let remainder_node = *addr | (1u64 << 62);
 
     rtl_edge_negated(addr, next_addr) <--
-        pdiv(addr, divisor_sym, _),
-        op_register(divisor_sym, _),
+        lifted_division(addr, _, _, _),
         next(addr, next_addr);
 
-    rtl_succ_candidate(addr, synthetic_addr), instr_in_function(synthetic_addr, func_start) <--
-        pdiv(addr, divisor_sym, _),
-        op_register(divisor_sym, _),
+    rtl_succ_candidate(addr, remainder_node), instr_in_function(remainder_node, func_start) <--
+        lifted_division(addr, _, _, _),
         instr_in_function(addr, func_start),
-        let synthetic_addr = *addr | (1u64 << 62);
+        let remainder_node = *addr | (1u64 << 62);
 
-    rtl_succ_candidate(synthetic_addr, next_addr), instr_in_function(synthetic_addr, func_start) <--
-        pdiv(addr, divisor_sym, _),
-        op_register(divisor_sym, _),
+    rtl_succ_candidate(remainder_node, next_addr), instr_in_function(remainder_node, func_start) <--
+        lifted_division(addr, _, _, _),
         instr_in_function(addr, func_start),
-        let synthetic_addr = *addr | (1u64 << 62),
+        let remainder_node = *addr | (1u64 << 62),
         next(addr, next_addr);
-
-    // A memory-divisor div has no ltl_inst and thus no reg_use(AX), so synthesize the AX dividend-use; the divisor is the SRC field of pidiv/pudiv, the same field the mach div rules read.
-    reg_use(addr, Mreg::AX) <--
-        pdiv(addr, divisor_sym, _),
-        op_indirect(divisor_sym, _, reg2, _, _, _, _),
-        if reg2.ends_with("BP");
-
-    // Stack-divisor div emits quotient and remainder as COMPETING candidates at the SAME node, so selection keeps only the used result and a dead quotient cannot overwrite the dividend AX.
-    rtl_inst_candidate(addr, RTLInst::Iop(Operation::Odiv, args.clone(), *quot_rtl)) <--
-        pidiv(addr, divisor_sym, _),
-        op_indirect(divisor_sym, reg1, reg2, reg3, mult, disp, sz),
-        if reg2.ends_with("BP"),
-        instr_in_function(addr, func_start),
-        reg_def_used(ax_def_addr, Mreg::AX, addr),
-        if ax_def_addr != addr,
-        reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
-        stack_var(func_start, addr, disp, divisor_rtl),
-        division_ax_output(addr, quot_rtl),
-        let args = Arc::new(vec![*ax_rtl, *divisor_rtl]);
-
-    rtl_inst_candidate(addr, RTLInst::Iop(Operation::Omod, args.clone(), *rem_rtl)) <--
-        pidiv(addr, divisor_sym, _),
-        op_indirect(divisor_sym, reg1, reg2, reg3, mult, disp, sz),
-        if reg2.ends_with("BP"),
-        instr_in_function(addr, func_start),
-        reg_def_used(ax_def_addr, Mreg::AX, addr),
-        if ax_def_addr != addr,
-        reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
-        stack_var(func_start, addr, disp, divisor_rtl),
-        reg_rtl(addr, Mreg::DX, rem_rtl),
-        let args = Arc::new(vec![*ax_rtl, *divisor_rtl]);
-
-    rtl_inst_candidate(addr, RTLInst::Iop(Operation::Odivu, args.clone(), *quot_rtl)) <--
-        pudiv(addr, divisor_sym, _),
-        op_indirect(divisor_sym, reg1, reg2, reg3, mult, disp, sz),
-        if reg2.ends_with("BP"),
-        instr_in_function(addr, func_start),
-        reg_def_used(ax_def_addr, Mreg::AX, addr),
-        if ax_def_addr != addr,
-        reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
-        stack_var(func_start, addr, disp, divisor_rtl),
-        division_ax_output(addr, quot_rtl),
-        let args = Arc::new(vec![*ax_rtl, *divisor_rtl]);
-
-    rtl_inst_candidate(addr, RTLInst::Iop(Operation::Omodu, args.clone(), *rem_rtl)) <--
-        pudiv(addr, divisor_sym, _),
-        op_indirect(divisor_sym, reg1, reg2, reg3, mult, disp, sz),
-        if reg2.ends_with("BP"),
-        instr_in_function(addr, func_start),
-        reg_def_used(ax_def_addr, Mreg::AX, addr),
-        if ax_def_addr != addr,
-        reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
-        stack_var(func_start, addr, disp, divisor_rtl),
-        reg_rtl(addr, Mreg::DX, rem_rtl),
-        let args = Arc::new(vec![*ax_rtl, *divisor_rtl]);
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
@@ -4903,13 +4851,13 @@ ascent_par! {
     reg_xtl(test_addr, mreg, arg_id) <--
         temp_test_mem_mreg_args(test_addr, _, mreg),
         reg_def_used(defaddr, mreg, test_addr),
-        !load_overwrites_base(defaddr, mreg),
+        !def_splits_input(defaddr, mreg),
         reg_xtl(defaddr, mreg, arg_id);
 
     reg_xtl(test_addr, mreg, arg_id) <--
         temp_test_mem_mreg_args(test_addr, _, mreg),
         reg_def_used(defaddr, mreg, test_addr),
-        load_overwrites_base(defaddr, mreg),
+        def_splits_input(defaddr, mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, mreg, arg_id);
 
@@ -4919,13 +4867,13 @@ ascent_par! {
     reg_xtl(test_addr, mreg, arg_id) <--
         temp_test_mem_mask(test_addr, mreg, _),
         reg_def_used(defaddr, mreg, test_addr),
-        !load_overwrites_base(defaddr, mreg),
+        !def_splits_input(defaddr, mreg),
         reg_xtl(defaddr, mreg, arg_id);
 
     reg_xtl(test_addr, mreg, arg_id) <--
         temp_test_mem_mask(test_addr, mreg, _),
         reg_def_used(defaddr, mreg, test_addr),
-        load_overwrites_base(defaddr, mreg),
+        def_splits_input(defaddr, mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, mreg, arg_id);
 
@@ -5109,13 +5057,13 @@ ascent_par! {
     reg_xtl(cmp_addr, mreg, arg_id) <--
         temp_cmp_mreg_args(cmp_addr, _, mreg),
         reg_def_used(defaddr, mreg, cmp_addr),
-        !load_overwrites_base(defaddr, mreg),
+        !def_splits_input(defaddr, mreg),
         reg_xtl(defaddr, mreg, arg_id);
 
     reg_xtl(cmp_addr, mreg, arg_id) <--
         temp_cmp_mreg_args(cmp_addr, _, mreg),
         reg_def_used(defaddr, mreg, cmp_addr),
-        load_overwrites_base(defaddr, mreg),
+        def_splits_input(defaddr, mreg),
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, mreg, arg_id);
 
@@ -8803,6 +8751,15 @@ ascent_par! {
         load_overwrites_base(addr, src),
         let use_id = fresh_xtl_reg(*addr, *src) | (1u64 << 62);
 
+    // A node that reads the old value of a register through a split shadow use and defines its new
+    // value: a load overwriting its base, or an Lop overwriting its input.  A later use the node's
+    // definition reaches takes only the definition id.  The shadow is the node's input; threading
+    // it to the use joins the two values the split keeps apart, and a DIV, whose remainder reads
+    // the dividend after the quotient is defined, then divides the quotient.
+    #[local] relation def_splits_input(Node, Mreg);
+    def_splits_input(addr, *mreg) <-- load_overwrites_base(addr, mreg);
+    def_splits_input(addr, *mreg) <-- lop_overwrites_input(addr, mreg);
+
     reg_xtl(addr, *src, use_id) <--
         load_overwrite_use_id(addr, src, use_id);
 
@@ -9848,6 +9805,28 @@ ascent_par! {
     slot_escaped_canonical(func, ofs, m) <--
         slot_escaped_canonical_raw(func, ofs, _),
         agg m = ascent::aggregators::min(c) in slot_escaped_canonical_raw(func, ofs, c);
+
+    // Sizing the slot needs less: only that its address may reach a call argument.  Whenever that
+    // arm is taken the callee may write the slot's whole storage, so the frame object must be
+    // backed to its extent.  This licenses no aliasing; a join of the address with another value
+    // (`p = n <= sizeof buf ? buf : malloc (n)`) does not let the slot's reads name the callee's
+    // writes.
+    #[local] relation slot_addr_may_escape(Address, Address, i64);
+    slot_addr_may_escape(func_start, lea_addr, *ofs) <--
+        exact_local_stack_addr_lea_def(func_start, lea_addr, _, ofs, width),
+        abi_pointer_size(width),
+        reg_may_hold_slot_addr(func_start, def_addr, *ofs, dst_reg),
+        arg_setup_candidate(def_addr, dst_reg, _);
+
+    #[local] relation slot_may_escape_canonical_raw(Address, i64, RTLReg);
+    slot_may_escape_canonical_raw(func_start, ofs, canonical) <--
+        slot_addr_may_escape(func_start, lea_addr, ofs),
+        stack_var(func_start, lea_addr, ofs, canonical);
+
+    relation slot_may_escape_canonical(Address, i64, RTLReg);
+    slot_may_escape_canonical(func, ofs, m) <--
+        slot_may_escape_canonical_raw(func, ofs, _),
+        agg m = ascent::aggregators::min(c) in slot_may_escape_canonical_raw(func, ofs, c);
 
     // A pointer to a stack slot can expose a whole constant-offset region, not
     // just the first scalar cell.  Match the caller's proven address argument
@@ -19168,51 +19147,57 @@ mod tests {
             let next = 0x1240;
             let dividend = 0x9100;
             let divisor = 0x9200;
-            let quotient = 0x9300;
-            let remainder = 0x9400;
 
+            // `div %r8`: Mach carries the quotient and the remainder as two Lops of the one
+            // address, at the 64-bit width of the divisor.
             prog.pudiv.push((divide, "divisor", "0"));
             prog.pdiv.push((divide, "divisor", "0"));
             prog.op_register.push(("divisor", "R8"));
+            for (operation, result) in [(Operation::Odivlu, Mreg::AX), (Operation::Omodlu, Mreg::DX)] {
+                prog.ltl_inst.push((
+                    divide,
+                    LTLInst::Lop(operation, Arc::new(vec![Mreg::AX, Mreg::R8]), result),
+                ));
+            }
+            // The decoder reports both architectural writes of the instruction.
+            prog.reg_def.push((divide, Mreg::AX));
+            prog.reg_def.push((divide, Mreg::DX));
             prog.reg_def_used.push((dividend_def, Mreg::AX, divide));
-            // DIV also writes AX; this same-node definition must not be
-            // selected as its own dividend input.
-            prog.reg_def_used.push((divide, Mreg::AX, divide));
             prog.reg_def_used.push((divisor_def, Mreg::R8, divide));
-            prog.reg_rtl.push((dividend_def, Mreg::AX, dividend));
-            prog.reg_rtl.push((divisor_def, Mreg::R8, divisor));
-            prog.reg_rtl.push((divide, Mreg::AX, quotient));
-            prog.reg_rtl.push((divide, Mreg::DX, remainder));
             prog.reg_xtl.push((dividend_def, Mreg::AX, dividend));
             prog.is_def.push((dividend_def, dividend));
-            prog.reg_xtl.push((divide, Mreg::AX, quotient));
-            prog.is_def.push((divide, quotient));
+            prog.reg_xtl.push((divisor_def, Mreg::R8, divisor));
+            prog.is_def.push((divisor_def, divisor));
             prog.next.push((divide, next));
-            for node in [divide, next] {
+            for node in [dividend_def, divisor_def, divide, next] {
                 prog.instr_in_function.push((node, func));
             }
 
             prog.run();
 
-            assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
-                *node == divide
-                    && matches!(
-                        inst,
-                        RTLInst::Iop(Operation::Odivu, args, destination)
-                            if args.as_slice() == [dividend, divisor]
-                                && *destination == quotient
-                    )
-            }));
+            let at = |node: Node| -> Vec<RTLInst> {
+                prog.rtl_inst_candidate
+                    .iter()
+                    .filter(|(candidate, _)| *candidate == node)
+                    .map(|(_, inst)| inst.clone())
+                    .collect()
+            };
+            // One node keeps one candidate downstream, so each result needs its own node: the
+            // quotient alone at the instruction, the remainder alone at the synthetic node.
+            let quotient = match at(divide).as_slice() {
+                [RTLInst::Iop(Operation::Odivlu, args, quotient)]
+                    if args.as_slice() == [dividend, divisor] => *quotient,
+                other => panic!("the instruction's node must hold just the quotient: {other:?}"),
+            };
             let synthetic = divide | (1_u64 << 62);
-            assert!(prog.rtl_inst_candidate.iter().any(|(node, inst)| {
-                *node == synthetic
-                    && matches!(
-                        inst,
-                        RTLInst::Iop(Operation::Omodu, args, destination)
-                            if args.as_slice() == [dividend, divisor]
-                                && *destination == remainder
-                    )
-            }));
+            let remainder = match at(synthetic).as_slice() {
+                [RTLInst::Iop(Operation::Omodlu, args, remainder)]
+                    if args.as_slice() == [dividend, divisor] => *remainder,
+                other => panic!("the synthetic node must hold just the remainder: {other:?}"),
+            };
+            // The remainder still reads the dividend after the quotient is defined, so the
+            // three values must stay distinct.
+            assert!(quotient != dividend && remainder != dividend && quotient != remainder);
             assert!(prog
                 .rtl_succ_candidate
                 .iter()

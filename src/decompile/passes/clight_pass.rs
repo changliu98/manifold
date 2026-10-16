@@ -4163,6 +4163,7 @@ impl IRPass for ClightFieldPass {
             "xtl_canonical",
             "frame_read_reaching_storage",
             "slot_escaped_canonical",
+            "slot_may_escape_canonical",
             "escaped_stack_region_field",
             // Both were read by the escaped-region sizing below without being
             // declared, which leaves them empty in a parallel sub-db and sizes
@@ -9116,6 +9117,12 @@ fn size_opaque_escaped_frame_buffers(db: &mut DecompileDB) {
         .rel_iter::<(Address, i64, RTLReg)>("slot_escaped_canonical")
         .copied()
         .collect();
+    // A slot whose address only may reach a call needs the same backing: the callee writes it
+    // whenever that arm is taken.
+    escaped.extend(
+        db.rel_iter::<(Address, i64, RTLReg)>("slot_may_escape_canonical")
+            .copied(),
+    );
     escaped.extend(
         db.rel_iter::<(Address, i64, RTLReg)>("slot_escaped_region_canonical")
             .filter(|(func, ofs, _)| external_capacity_extent.contains_key(&(*func, *ofs)))
