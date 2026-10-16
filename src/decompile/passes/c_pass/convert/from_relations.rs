@@ -9418,7 +9418,7 @@ fn order_nodes_dfs(
 
     let mut result: Vec<_> = post_order.into_iter().rev().collect();
 
-    // Disconnected members (edges lost to bundling or genuinely dead) are inserted BEFORE the trailing exit run, not after it -- placing them after would let the consumer's dead-statement trim silently drop them.
+    // Disconnected members (edges lost to bundling or genuinely dead) must never run on another statement's path: a loop header goes right after the node edging into its body, a node with a unique frontier right before it, and the rest after the last unconditional exit, where the consumer's dead-statement trim keeps exactly the ones a goto reaches (selection labels every goto target).
     let result_set: HashSet<_> = result.iter().copied().collect();
     let all_remaining: Vec<_> = nodes.difference(&result_set).copied().collect();
     // A disconnected node that is itself a LOOP HEADER is placed right after the reachable node edging into its body, or its Sloop floats to the wrong place and becomes unreachable.
@@ -9509,10 +9509,14 @@ fn order_nodes_dfs(
             result.splice(position..position, nodes);
         }
 
-        let mut insert_at = result.len();
-        while insert_at > 0 && is_exit(result[insert_at - 1]) {
-            insert_at -= 1;
-        }
+        // An unanchored node is entered only through its label, so it must follow a statement
+        // that never falls through: after a fall-through statement it would run on that
+        // statement's path, and at index 0 it would run before the entry. Selection turns every
+        // fall-through into an explicit goto, so this is normally the end of the body.
+        let insert_at = result
+            .iter()
+            .rposition(|node| is_exit(*node))
+            .map_or(result.len(), |last_exit| last_exit + 1);
         result.splice(insert_at..insert_at, unanchored);
     }
 
@@ -11215,9 +11219,11 @@ mod ordering_tests {
             &HashMap::new(),
             |node| node,
         );
-        assert!(
-            position(&without_structural_edges, target_low)
-                < position(&without_structural_edges, loop_header)
+        // Unreached targets follow the last statement that cannot fall into them, never the
+        // entry; only the goto edges below order them among themselves.
+        assert_eq!(
+            without_structural_edges,
+            vec![entry, loop_header, target_low, target_high]
         );
 
         let goto_edges = structured_goto_order_edges(&statements, &surviving_nodes);
