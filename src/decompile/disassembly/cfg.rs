@@ -566,6 +566,7 @@ fn build_rip_target_map(
     let addr_set: std::collections::HashSet<u64> = insns.iter().map(|d| d.address).collect();
 
     let got_to_plt = build_got_to_plt_map(db, obj);
+    let relocated_slots = dynamically_relocated_slots(obj);
 
     let section_data: Vec<(u64, u64, Vec<u8>)> = obj
         .sections()
@@ -636,10 +637,15 @@ fn build_rip_target_map(
         if let Some(&disp) = rip_op_info.get(op1) {
             let got_addr = (*addr as i64 + *size as i64 + disp) as u64;
 
-            if let Some(target) = read_u64_at(&section_data, got_addr) {
-                if target > 0 && addr_set.contains(&target) {
-                    result.insert(*addr, target);
-                    continue;
+            // A slot the dynamic linker writes holds its runtime value only after loading: a
+            // lazily bound JUMP_SLOT's file bytes point at the PLT's own resolver stub, and
+            // following them routes the call into PLT internals.
+            if !relocated_slots.contains(&got_addr) {
+                if let Some(target) = read_u64_at(&section_data, got_addr) {
+                    if target > 0 && addr_set.contains(&target) {
+                        result.insert(*addr, target);
+                        continue;
+                    }
                 }
             }
 
@@ -2091,6 +2097,45 @@ pub fn analyze_data_lookup_tables(
     }
 
     results
+}
+
+// Slots whose runtime value the dynamic linker computes from something other than the file:
+// symbol-bound relocations in `.rela.dyn` (GLOB_DAT, R_X86_64_64 to a symbol), IRELATIVE ifunc
+// results, and every PLT entry (JUMP_SLOT / IRELATIVE in `.rela.plt`, which
+// `dynamic_relocations()` does not list). A RELATIVE slot is excluded: its value is its addend,
+// which the file bytes already hold. Only r_offset is read from the PLT tables: the first word of
+// each RELA (24-byte) or REL (8-byte, 32-bit) entry.
+fn dynamically_relocated_slots(obj: &object::File) -> HashSet<u64> {
+    let mut slots: HashSet<u64> = HashSet::new();
+    if let Some(dyn_relocs) = obj.dynamic_relocations() {
+        for (offset, reloc) in dyn_relocs {
+            let symbol_bound =
+                matches!(reloc.target(), object::RelocationTarget::Symbol(index) if index.0 != 0);
+            let ifunc = matches!(
+                reloc.flags(),
+                object::RelocationFlags::Elf { r_type } if r_type == object::elf::R_X86_64_IRELATIVE
+            );
+            if symbol_bound || ifunc {
+                slots.insert(offset);
+            }
+        }
+    }
+    for section in obj.sections() {
+        let (entry, word) = match section.name().unwrap_or("") {
+            ".rela.plt" => (24usize, 8usize),
+            ".rel.plt" => (8, 4),
+            _ => continue,
+        };
+        let Ok(data) = section.data() else { continue };
+        for chunk in data.chunks_exact(entry) {
+            let offset = match word {
+                8 => u64::from_le_bytes(chunk[..8].try_into().unwrap()),
+                _ => u64::from(u32::from_le_bytes(chunk[..4].try_into().unwrap())),
+            };
+            slots.insert(offset);
+        }
+    }
+    slots
 }
 
 // Map GOT slot addresses to PLT stub addresses via dynamic relocations.
