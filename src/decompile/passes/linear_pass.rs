@@ -101,6 +101,7 @@ ascent_par! {
     relation call_to_callee(Node, Address);
     relation call_to_external(Node, Symbol);
     relation known_noreturn_call_site(Node);
+    relation trim_instruction(Address);
     relation intrinsic_noreturn_call_site(Node);
     relation call_targets_noreturn(Node);
     relation indirect_call_target(Node, Address);
@@ -644,9 +645,21 @@ ascent_par! {
         code_in_block(node, block),
         ltl_inst(node, _);
 
+    // A block every instruction of which an explained recovery removed is covered too: the
+    // canary-failure `call __stack_chk_fail` block, canary bookkeeping, VLA size arithmetic.
+    // What those instructions did is accounted for, and the canary path never returns. Counting
+    // that block as unknown code made every stack-protected function open, so no frame-escape
+    // or callee summary ever applied to one.
+    #[local] relation block_has_unexplained_code(Address, Address);
+    block_has_unexplained_code(func, block) <--
+        block_in_function(block, func),
+        code_in_block(node, block),
+        !trim_instruction(node);
+
     function_has_uncovered_block(func) <--
         block_in_function(block, func),
-        !function_block_has_ltl(func, block);
+        !function_block_has_ltl(func, block),
+        block_has_unexplained_code(func, block);
 
     // Function-bounded skip walk over instructions that carry no LTL form.
     // Such an instruction has no control-flow effect of its own -- a prologue

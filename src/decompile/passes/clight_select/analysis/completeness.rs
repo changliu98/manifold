@@ -141,6 +141,32 @@ fn carries_read(
     };
     matches!(primitive(stmt),ClightStmt::Sset(id,rhs) if args.get(2)==Some(&(*id as RTLReg)) && (read_count(rhs)==1 || scalar(rhs)))
 }
+/// The temporaries a frame-slot capture at `offset` is read through: the read's point-local
+/// stack_var and, for an address-escaped slot, rtl_pass's single slot_escaped_canonical local,
+/// the one cshminor reads that slot through. Each comes with its xtl_canonical image.
+fn frame_capture_views(
+    db: &DecompileDB,
+    function: Address,
+    capture: Node,
+    offset: i64,
+) -> BTreeSet<RTLReg> {
+    let point = db
+        .rel_iter::<(Address, Node, i64, RTLReg)>("stack_var")
+        .filter(|&&(f, n, o, _)| f == function && n == capture && o == offset)
+        .map(|&(.., reg)| reg);
+    let escaped = db
+        .rel_iter::<(Address, i64, RTLReg)>("slot_escaped_canonical")
+        .filter(|&&(f, o, _)| f == function && o == offset)
+        .map(|&(.., reg)| reg);
+    let roots: BTreeSet<RTLReg> = point.chain(escaped).collect();
+    let mut views = roots.clone();
+    views.extend(
+        db.rel_iter::<(RTLReg, RTLReg)>("xtl_canonical")
+            .filter(|(from, _)| roots.contains(from))
+            .map(|&(_, to)| to),
+    );
+    views
+}
 fn opaque(stmt: &ClightStmt) -> bool {
     matches!(primitive(stmt),ClightStmt::Scall(_,ClightExpr::EvarSymbol(name,_),_) if effects::is_opaque(name))
 }
@@ -315,6 +341,7 @@ impl Analysis for Completeness {
                 "instr_in_function",
                 "effect_selected_contract",
                 "stack_var",
+                "slot_escaped_canonical",
                 "xtl_canonical",
             ];
             inputs.extend_from_slice(effects::capture::INPUTS);
@@ -405,21 +432,12 @@ impl Analysis for Completeness {
                 };
                 let captured = matches!(instructions.get(&spec.capture), Some(Some(inst @ RTLInst::Iload(_, _, _, dst)))
                     if Some(*dst) == loaded && effects::capture::matches(db,function.address,spec.capture,spec.width,inst));
-                let mut scalar_views = BTreeSet::new();
-                if let Some(Some(RTLInst::Iload(_, Addressing::Ainstack(offset), _, _))) =
-                    instructions.get(&spec.capture)
-                {
-                    for &(f, n, o, reg) in db.rel_iter::<(Address, Node, i64, RTLReg)>("stack_var")
-                    {
-                        if f == function.address && n == spec.capture && o == *offset {
-                            scalar_views.insert(reg);
-                            scalar_views.extend(
-                                db.rel_iter::<(RTLReg, RTLReg)>("xtl_canonical")
-                                    .filter_map(|&(a, b)| (a == reg).then_some(b)),
-                            );
-                        }
+                let scalar_views = match instructions.get(&spec.capture) {
+                    Some(Some(RTLInst::Iload(_, Addressing::Ainstack(offset), _, _))) => {
+                        frame_capture_views(db, function.address, spec.capture, *offset)
                     }
-                }
+                    _ => BTreeSet::new(),
+                };
                 let global_view = match instructions.get(&spec.capture) {
                     Some(Some(RTLInst::Iload(_, Addressing::Aglobal(symbol, 0), args, _)))
                         if args.is_empty() =>
@@ -636,6 +654,22 @@ struct Rules(BTreeMap<(Node, usize), Bool>);
 #[cfg(test)]
 mod read_tests {
     use super::*;
+    /// base32's proper_name_lite compares mbrtoc32's char32_t out-parameter in memory
+    /// (`cmpl $0x7ff,0xc(%rsp); cmove`); once that slot's address escapes, cshminor reads it
+    /// through the slot's canonical local, which must count as the capture's read.
+    #[test]
+    fn escaped_slot_capture_is_read_through_its_canonical_local() {
+        let mut db = DecompileDB::default();
+        db.rel_push("stack_var", (1_u64, 10_u64, 12_i64, 5_u64));
+        db.rel_push("stack_var", (1_u64, 11_u64, 12_i64, 6_u64));
+        db.rel_push("slot_escaped_canonical", (1_u64, 12_i64, 7_u64));
+        db.rel_push("slot_escaped_canonical", (1_u64, 16_i64, 8_u64));
+        db.rel_push("slot_escaped_canonical", (2_u64, 12_i64, 9_u64));
+        db.rel_push("xtl_canonical", (7_u64, 17_u64));
+        db.rel_push("xtl_canonical", (8_u64, 18_u64));
+        assert_eq!(frame_capture_views(&db, 1, 10, 12), BTreeSet::from([5, 7, 17]));
+        assert_eq!(frame_capture_views(&db, 1, 10, 4), BTreeSet::new());
+    }
     #[test]
     fn effect_contract_and_candidates_share_binding_projection() {
         use super::super::{bindings::BindingPlan, c_types::CTypes, Stack};
