@@ -1282,7 +1282,7 @@ fn collect_needed_includes(tu: &TranslationUnit) -> Vec<&'static str> {
     // A library record's typedef name needs its declaring header even when
     // no function from that header is called in this translation unit.
     let text = format!("{tu:?}");
-    for id in [crate::x86::types::LIBC_FILE_RECORD, crate::x86::types::LIBC_DIR_RECORD] {
+    for id in crate::x86::types::LIBC_RECORDS {
         if let Some((typedef, header)) = crate::x86::types::libc_record(id) {
             if text.contains(&format!("TypedefName(\"{typedef}\")")) {
                 includes.insert(header);

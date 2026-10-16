@@ -120,6 +120,9 @@ pub type StructId = usize;
 pub const LIBC_FILE_RECORD: StructId = 0x6c69_6263_4649_4c45; // "libcFILE"
 pub const LIBC_DIR_RECORD: StructId = 0x6c69_6263_0044_4952; // "libc\0DIR"
 
+/// Every library record identity `libc_record` names.
+pub const LIBC_RECORDS: [StructId; 2] = [LIBC_FILE_RECORD, LIBC_DIR_RECORD];
+
 /// (typedef name, declaring header) of a library record identity.
 pub fn libc_record(id: StructId) -> Option<(&'static str, &'static str)> {
     match id {

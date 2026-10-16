@@ -2957,10 +2957,7 @@ impl IRPass for ClightEmitPass {
         // Identify opaque libc structs (FILE, DIR) via C AST scan and RTL-level analysis.
         let t = std::time::Instant::now();
         let mut opaque_map = identify_opaque_libc_structs_from_tu(&tu);
-        for id in [
-            crate::x86::types::LIBC_FILE_RECORD,
-            crate::x86::types::LIBC_DIR_RECORD,
-        ] {
+        for id in crate::x86::types::LIBC_RECORDS {
             if let Some((typedef, _)) = crate::x86::types::libc_record(id) {
                 opaque_map.insert(format!("struct_{id:x}"), typedef.to_string());
             }

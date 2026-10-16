@@ -83,6 +83,10 @@
       "header": "<sys/stat.h>",
       "names": ["stat", "fstat", "lstat", "mkdir", "chmod", "fchmod", "lchmod", "fstatat", "umask", "mkdirat", "fchmodat", "mknod", "mknodat", "mkfifo", "mkfifoat", "futimens", "utimensat"]
     },
+    "dirent": {
+      "header": "<dirent.h>",
+      "names": ["opendir", "fdopendir", "closedir", "readdir", "readdir_r", "rewinddir", "seekdir", "telldir", "dirfd", "scandir", "alphasort", "getdirentries"]
+    },
     "sys_ioctl": {
       "header": "<sys/ioctl.h>",
       "names": ["ioctl"]

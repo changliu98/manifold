@@ -199,6 +199,23 @@ mod tests {
     use super::canonical_variable_clight_type;
     use crate::x86::types::{ClightSignedness, ClightType};
 
+    /// A library record's typedef pulls in its declaring header, so that
+    /// header's names must be suppressible: otherwise the emitter's own
+    /// prototypes collide with the header's ("conflicting types").
+    #[test]
+    fn every_library_record_header_has_a_function_group() {
+        for id in crate::x86::types::LIBC_RECORDS {
+            let (typedef, header) = crate::x86::types::libc_record(id).expect("named record");
+            assert!(
+                super::header_db()
+                    .includes
+                    .iter()
+                    .any(|(h, names)| *h == header && !names.is_empty()),
+                "{typedef} includes {header}, which no header_functions.json group declares"
+            );
+        }
+    }
+
     #[test]
     fn canonical_header_global_preserves_unsigned_long() {
         assert!(matches!(
