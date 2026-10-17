@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use z3::ast::{Bool, Dynamic};
 
 use super::c_types::{clight_to_ty, xtype_to_ty, TypeDt};
-use super::constraints::{ModelView, SolveBackend};
+use super::constraints::{ModelView, SolveBackend, TierCost};
 use super::ArtifactKey;
 use crate::decompile::passes::clight_select::query::{
     representative_xtype_for_clight, FunctionData, InterfaceAlternative, InterfaceClass,
@@ -39,10 +39,8 @@ pub(crate) struct FreeInterfaces(
 pub(crate) const CHOICES: ArtifactKey<BTreeMap<InterfaceVarId, usize>> =
     ArtifactKey::new("interface-choices");
 
-/// The objective cost of a solve's model: the total weight of the soft clauses
-/// it violates, and the number violated per weight.
-pub(crate) const COST: ArtifactKey<(u64, BTreeMap<u64, usize>)> =
-    ArtifactKey::new("objective-cost");
+/// The objective cost of a solve's model, level by level.
+pub(crate) const COST: ArtifactKey<TierCost> = ArtifactKey::new("objective-cost");
 
 /// One open variable's alternatives, each with its selector.
 pub(crate) type Alternatives = [(XType, Bool)];
@@ -94,6 +92,11 @@ impl InterfaceTerms {
         self.0.get(id).map(Vec::as_slice)
     }
 
+    /// Each open variable's rank-zero selector: its reconciled choice.
+    pub(crate) fn rank_zero(&self) -> impl Iterator<Item = &Bool> {
+        self.0.values().map(|alternatives| &alternatives[0].1)
+    }
+
     pub(crate) fn choices(&self, model: &dyn ModelView) -> BTreeMap<InterfaceVarId, usize> {
         self.0
             .iter()
@@ -124,14 +127,16 @@ fn term_of(alternatives: &Alternatives, of: impl Fn(usize, &XType) -> Dynamic) -
 /// The alternative `FunctionData` already commits: the one of `committed`'s
 /// class, or rank zero when there is none.
 fn committed_index(alternatives: &Alternatives, committed: Option<&ClightType>) -> usize {
-    committed
-        .map(|ty| InterfaceClass::from_xtype(&representative_xtype_for_clight(ty)))
-        .and_then(|class| {
-            alternatives
-                .iter()
-                .position(|(xtype, _)| InterfaceClass::from_xtype(xtype) == class)
-        })
-        .unwrap_or(0)
+    committed_in(alternatives.iter().map(|(xtype, _)| xtype), committed).unwrap_or(0)
+}
+
+/// The position of `committed`'s class among a domain's alternatives.
+pub(crate) fn committed_in<'a>(
+    mut xtypes: impl Iterator<Item = &'a XType>,
+    committed: Option<&ClightType>,
+) -> Option<usize> {
+    let class = InterfaceClass::from_xtype(&representative_xtype_for_clight(committed?));
+    xtypes.position(|xtype| InterfaceClass::from_xtype(xtype) == class)
 }
 
 /// The function's own return type. The committed alternative keeps
@@ -152,16 +157,19 @@ pub(crate) fn own_return_term(
 }
 
 /// The declaration an open global's accesses take under alternative `index`.
-/// None keeps `FunctionData`'s typing, its known type or, when it has none,
-/// each access's own annotation: that is what the committed alternative means.
+/// None keeps the known type the global already has, for its committed
+/// alternative. A global without a known type is declared by whichever
+/// alternative is chosen, as the interface the program commits declares it.
 pub(crate) fn global_declaration(
     func: &FunctionData,
     symbol: Ident,
     alternatives: &Alternatives,
     index: usize,
 ) -> Option<ClightType> {
-    let known = func.known_global_types.by_ident.get(&symbol);
-    (index != committed_index(alternatives, known)).then(|| xtype_to_clight(&alternatives[index].0))
+    match func.known_global_types.by_ident.get(&symbol) {
+        Some(known) if index == committed_index(alternatives, Some(known)) => None,
+        _ => Some(xtype_to_clight(&alternatives[index].0)),
+    }
 }
 
 /// The globals `stmt` names, in any expression of it.
@@ -317,13 +325,13 @@ mod tests {
     }
 
     /// The open choices, the objective cost and the selected candidate at node 20.
-    fn solve(f: &FunctionData) -> (BTreeMap<InterfaceVarId, usize>, u64, Option<usize>) {
+    fn solve(f: &FunctionData) -> (BTreeMap<InterfaceVarId, usize>, TierCost, Option<usize>) {
         let (candidates, _, _, _, _, results) =
             solve_function_z3(f, &HashMap::new(), &[]).expect("a model");
         let choices = CHOICES.get(&results).cloned().unwrap_or_default();
         (
             choices,
-            COST.get(&results).expect("a cost").0,
+            *COST.get(&results).expect("a cost"),
             candidates.get(&20).copied().flatten(),
         )
     }
@@ -338,7 +346,7 @@ mod tests {
         let (_, attained, _) = solve(&open(f, &id, domain, Some(expected)));
         assert_eq!(committed, ordinary, "pinned at the committed alternative");
         assert_eq!(choices[&id], expected);
-        assert!(free < committed, "open {free} vs committed {committed}");
+        assert!(free < committed, "open {free:?} vs committed {committed:?}");
         assert_eq!(attained, free);
     }
 

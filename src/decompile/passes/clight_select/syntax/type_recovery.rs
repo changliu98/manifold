@@ -8,7 +8,7 @@ use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::clight_select::syntax::constraints::ConstraintSink;
 use crate::decompile::passes::clight_select::syntax::type_evidence::{self, COMMITMENTS, GRAPH};
 use crate::decompile::passes::clight_select::syntax::{
-    Candidate, CandidateAnalysis, Component, DeclarationContext, FunctionContext, PreparedAnalysis,
+    Candidate, CandidateAnalysis, DeclarationContext, FunctionContext, PreparedAnalysis,
 };
 use crate::decompile::passes::clight_select::{
     query::FunctionData, select::ProgramSelectionState, type_graph::TypeTerm,
@@ -447,7 +447,7 @@ mod tests {
     };
     use crate::decompile::passes::clight_select::{
         solvers::semantics::Semantics,
-        syntax::{c_types::CTypes, Stack},
+        syntax::{c_types::CTypes, Component, Stack},
     };
     use crate::x86::op::Operation;
     use crate::x86::types::*;

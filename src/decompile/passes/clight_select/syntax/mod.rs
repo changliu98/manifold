@@ -1,9 +1,11 @@
 //! The syntax check: the selection problem itself.
 //!
 //! Candidate structure and worlds, the concrete declaration domain, C
-//! legality and the selection objective are built here, by the solves in
-//! `solve` and `interface_solve` and the `Component`s below. Solvers layered
-//! on top (`solvers`) state obligations and check answers. A `Stack` holds
+//! legality and the selection objective are built here. `program` solves
+//! the whole program as one problem through the per-function solve of
+//! `solve`; `interface_solve` is the staged interface solve the stage
+//! ablations keep. Solvers layered on top (`solvers`) state obligations and
+//! check answers. A `Stack` holds
 //! both and runs every solver before every component, in registration order:
 //! the order is part of the deterministic selection policy. Candidate
 //! indices become stable only at `bind`; all checkers share the selector's
@@ -17,6 +19,7 @@ pub mod ctyping;
 pub(crate) mod declarations;
 pub mod interface_solve;
 pub(crate) mod interfaces;
+pub(crate) mod program;
 pub mod solve;
 pub(crate) mod type_evidence;
 pub(crate) mod type_flow;
@@ -194,6 +197,10 @@ pub(crate) trait CandidateAnalysis {
 pub(crate) struct Stack<'a> {
     solvers: &'a [&'a dyn Solver],
     components: &'a [&'a dyn Component],
+    /// Whether solvers check answers. Without checks a solve optimizes the
+    /// problem's own constraints, a lower bound on the checked optimum:
+    /// checks only add constraints.
+    checks: bool,
 }
 
 // Solvers (`solvers::PRODUCTION`) run first: storage evidence before
@@ -225,11 +232,19 @@ impl<'a> Stack<'a> {
         Self {
             solvers,
             components,
+            checks: true,
         }
     }
 
     pub(crate) fn production() -> Stack<'static> {
         Stack::new(solvers::PRODUCTION, COMPONENTS)
+    }
+    pub(crate) fn without_checks(&self) -> Stack<'a> {
+        Stack {
+            solvers: self.solvers,
+            components: self.components,
+            checks: false,
+        }
     }
     pub(crate) fn solvers(&self) -> impl Iterator<Item = &dyn Solver> {
         self.solvers.iter().copied()
@@ -302,6 +317,9 @@ impl<'a> Stack<'a> {
         opt: &'f Optimize,
     ) -> Vec<(&'static str, Box<dyn Checker + 'f>)> {
         let mut result = Vec::new();
+        if !self.checks {
+            return result;
+        }
         // Declaration transfers are validator-backed admission as well.
         let transfers = (!semantic_admission_ablated(cx.function))
             .then(|| solvers::profiles::Profiles::start(cx, self.obligations(cx.function), opt))

@@ -12,7 +12,6 @@ use z3::{Optimize, SatResult};
 
 use crate::decompile::elevator::config;
 use crate::decompile::passes::c_pass::types::{CType, TypeQualifiers};
-use crate::decompile::passes::clight_select::candtype::{CandType, Sign};
 use crate::decompile::passes::clight_select::query::{
     CalleeSignature, CommittedInterfaces, FunctionData, InterfaceAuthority, InterfaceClass,
     InterfaceVar, InterfaceVarId, InterfaceVars, KnownGlobalTypes,
@@ -1080,6 +1079,66 @@ fn stage_a_preferences(
         .collect()
 }
 
+/// The committed interfaces of one choice for every interface variable
+/// (rank zero where `choices` has none), the way the interface solve commits
+/// its own: signatures by ident and by name, globals, and the declarations of
+/// called globals from the selected call sites.
+pub(crate) fn commit_choices(
+    vars: &InterfaceVars,
+    choices: &BTreeMap<InterfaceVarId, usize>,
+    initial: &CommittedInterfaces,
+    functions: &[FunctionData],
+    state: &ProgramSelectionState,
+    name_to_ident: &HashMap<String, Ident>,
+    model: crate::abi::DataModel,
+) -> CommittedInterfaces {
+    let edges = call_edges(functions, state, name_to_ident);
+    commit(vars, choices, initial, &edges, name_to_ident, model)
+}
+
+fn commit(
+    vars: &InterfaceVars,
+    choices: &BTreeMap<InterfaceVarId, usize>,
+    initial: &CommittedInterfaces,
+    edges: &[CallEdge],
+    name_to_ident: &HashMap<String, Ident>,
+    model: crate::abi::DataModel,
+) -> CommittedInterfaces {
+    let mut committed = initial.clone();
+    let mut assignments = BTreeMap::new();
+    for var in &vars.vars {
+        let alternative = &var.domain[choices.get(&var.id).copied().unwrap_or(0)];
+        assignments.insert(var.id.clone(), alternative.class);
+        match var.id {
+            InterfaceVarId::Param { function, position } => {
+                if let Some(interface) = committed.functions.get_mut(&function) {
+                    if position < interface.signature.param_types.len() {
+                        interface.signature.param_types[position] = alternative.xtype;
+                    }
+                }
+            }
+            InterfaceVarId::Return { function } => {
+                if let Some(interface) = committed.functions.get_mut(&function) {
+                    interface.signature.return_type = alternative.xtype;
+                }
+            }
+            InterfaceVarId::Global { symbol } => {
+                committed.globals.insert(symbol, alternative.xtype);
+            }
+        }
+    }
+    for (name, interface) in committed.by_name.iter_mut() {
+        if let Some(ident) = name_to_ident.get(name) {
+            if let Some(committed_function) = committed.functions.get(ident) {
+                interface.signature = committed_function.signature.clone();
+            }
+        }
+    }
+    committed.global_decl_types =
+        called_global_decl_types(vars, &assignments, edges, initial, model);
+    committed
+}
+
 pub(crate) fn solve(
     functions: &[FunctionData],
     state: &ProgramSelectionState,
@@ -1441,42 +1500,15 @@ pub(crate) fn solve_with_global_feedback(
         );
     }
 
-    let mut committed = initial.clone();
     let mut assignments = BTreeMap::new();
     let mut choice_ranks = BTreeMap::new();
     let mut changed_from_rank0 = 0usize;
     for (var, choice) in vars.vars.iter().zip(&choices) {
-        let alternative = &var.domain[*choice];
-        assignments.insert(var.id.clone(), alternative.class);
+        assignments.insert(var.id.clone(), var.domain[*choice].class);
         choice_ranks.insert(var.id.clone(), *choice);
         changed_from_rank0 += usize::from(*choice != 0);
-        match var.id {
-            InterfaceVarId::Param { function, position } => {
-                if let Some(interface) = committed.functions.get_mut(&function) {
-                    if position < interface.signature.param_types.len() {
-                        interface.signature.param_types[position] = alternative.xtype;
-                    }
-                }
-            }
-            InterfaceVarId::Return { function } => {
-                if let Some(interface) = committed.functions.get_mut(&function) {
-                    interface.signature.return_type = alternative.xtype;
-                }
-            }
-            InterfaceVarId::Global { symbol } => {
-                committed.globals.insert(symbol, alternative.xtype);
-            }
-        }
     }
-    for (name, interface) in committed.by_name.iter_mut() {
-        if let Some(ident) = name_to_ident.get(name) {
-            if let Some(committed_function) = committed.functions.get(ident) {
-                interface.signature = committed_function.signature.clone();
-            }
-        }
-    }
-    committed.global_decl_types =
-        called_global_decl_types(vars, &assignments, &edges, initial, model);
+    let committed = commit(vars, &choice_ranks, initial, &edges, name_to_ident, model);
 
     let mut dirty_functions = BTreeSet::new();
     for (id, chosen) in &assignments {
@@ -1625,6 +1657,7 @@ pub(crate) fn solve_with_global_feedback(
 
 #[cfg(test)]
 mod tests {
+    use crate::decompile::passes::clight_select::candtype::{CandType, Sign};
     use crate::decompile::passes::clight_select::query::{
         CommittedFunctionInterface, InterfaceAlternative, InterfaceAuthority,
     };

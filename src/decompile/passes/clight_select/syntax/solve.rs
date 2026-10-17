@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::decompile::passes::clight_select::syntax::c_types::*;
 use crate::decompile::passes::clight_select::syntax::constraints::{
-    ConstraintSink, ModelView, RecordedCond, SolveBackend, SOFT_CLAUSES, SOFT_TAGS,
+    ConstraintSink, ModelView, RecordedCond, SolveBackend, Tier, TierCost, SOFT_CLAUSES, SOFT_TAGS,
 };
 use crate::decompile::passes::clight_select::syntax::{
     self, Artifacts, Candidate, DeclarationContext, FunctionContext, Stack,
@@ -19,11 +19,11 @@ mod audit;
 use crate::decompile::elevator::config::CONFIG;
 use crate::decompile::passes::clight_select::candtype::{CandType, Sign};
 use crate::decompile::passes::clight_select::query::{
-    CalleeSignature, CommittedInterfaces, FunctionData, InterfaceClass,
+    CommittedInterfaces, FunctionData, InterfaceClass,
 };
 use crate::decompile::passes::clight_select::select::ProgramSelectionState;
 use crate::decompile::passes::clight_select::solvers::in_search::propagator::{
-    RawSolver, Theory, VetoTheory,
+    RawSolver, VetoTheory,
 };
 use crate::x86::types::{
     Address, ClightBinaryOp, ClightExpr, ClightIntSize, ClightStmt, ClightType, Ident, Node,
@@ -34,6 +34,8 @@ struct OptimizeBackend<'a> {
     opt: &'a Optimize,
     // Asserted by `flush` once every weight is known; also prices the model for the engine A/B.
     softs: RefCell<Vec<(Bool, u64)>>,
+    // Each soft clause's objective level, which prices a model across functions.
+    levels: RefCell<Vec<(Bool, Tier, u64)>>,
 }
 
 impl<'a> OptimizeBackend<'a> {
@@ -41,11 +43,12 @@ impl<'a> OptimizeBackend<'a> {
         OptimizeBackend {
             opt,
             softs: RefCell::new(Vec::new()),
+            levels: RefCell::new(Vec::new()),
         }
     }
 
-    fn into_softs(self) -> Vec<(Bool, u64)> {
-        self.softs.into_inner()
+    fn into_softs(self) -> (Vec<(Bool, u64)>, Vec<(Bool, Tier, u64)>) {
+        (self.softs.into_inner(), self.levels.into_inner())
     }
 }
 
@@ -56,6 +59,10 @@ impl SolveBackend for OptimizeBackend<'_> {
     // Deferred to `flush`: the strata are known only once every weight is.
     fn assert_soft(&self, cond: &Bool, weight: u64) {
         self.softs.borrow_mut().push((cond.clone(), weight));
+    }
+    fn assert_soft_at(&self, cond: &Bool, weight: u64, tier: Tier, units: u64) {
+        self.levels.borrow_mut().push((cond.clone(), tier, units));
+        self.assert_soft(cond, weight);
     }
 }
 
@@ -109,12 +116,13 @@ impl OptimizeBackend<'_> {
                 self.opt.assert_soft(*cond, *weight, Some(group.clone()));
             }
         }
-        SoftGroups(
-            stratum_of
+        SoftGroups {
+            groups: stratum_of
                 .into_iter()
                 .map(|(weight, k)| (weight, groups[k].clone()))
                 .collect(),
-        )
+            added: RefCell::new(Vec::new()),
+        }
     }
 }
 
@@ -128,19 +136,44 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 /// One function's objective strata by weight class, so a soft clause that
 /// refinement adds joins the stratum `flush` reserved for its weight.
 #[derive(Default)]
-pub(crate) struct SoftGroups(BTreeMap<u64, z3::Symbol>);
-
-// Strata exist only after the build; the build-time context carries none.
-static NO_SOFT_GROUPS: SoftGroups = SoftGroups(BTreeMap::new());
+pub(crate) struct SoftGroups {
+    groups: BTreeMap<u64, z3::Symbol>,
+    // Clauses refinement adds, in ordinary-preference units of `assert_soft`'s weight.
+    added: RefCell<Vec<(Bool, u64)>>,
+}
 
 impl SoftGroups {
     pub(crate) fn assert_soft(&self, opt: &Optimize, cond: &Bool, weight: u64) {
         let group = self
-            .0
+            .groups
             .get(&weight)
             .unwrap_or_else(|| panic!("soft weight {weight} has no reserved objective stratum"));
         opt.assert_soft(cond, weight, Some(group.clone()));
+        self.added.borrow_mut().push((cond.clone(), weight));
     }
+}
+
+/// A model's cost level by level: the built clauses at their recorded
+/// levels, and the clauses refinement added as ordinary preferences in
+/// units of `primary_unit`.
+fn level_cost(
+    model: &dyn ModelView,
+    levels: &[(Bool, Tier, u64)],
+    groups: &SoftGroups,
+    primary_unit: u64,
+) -> TierCost {
+    let mut cost = TierCost::default();
+    for (cond, tier, units) in levels {
+        if model.truth(cond) != Some(true) {
+            cost.add(*tier, *units);
+        }
+    }
+    for (cond, weight) in groups.added.borrow().iter() {
+        if model.truth(cond) != Some(true) {
+            cost.add(Tier::Primary, weight / primary_unit.max(1));
+        }
+    }
+    cost
 }
 
 // Soft clause `c` at weight `w` becomes the hard clause `c \/ r` with a fresh relaxation literal `r`; `r` true means `c` is violated, so minimizing the r's minimizes the MaxSAT cost.
@@ -411,6 +444,7 @@ fn build_function_constraints_with_stack(
         } else {
             structure_worlds.insert(0, func.authoritative_structure_world);
         }
+        let no_soft_groups = SoftGroups::default();
         let mut structure_world_var: HashMap<u8, Bool> = HashMap::new();
         if structure_worlds.len() > 1 {
             let vars: Vec<Bool> = structure_worlds
@@ -522,7 +556,8 @@ fn build_function_constraints_with_stack(
             return_type: &func_ret,
             interfaces: &interfaces,
             primary_unit: 0, // the bound is established after all modules build
-            soft_groups: &NO_SOFT_GROUPS,
+            // Strata exist only after the build; the build-time context carries none.
+            soft_groups: &no_soft_groups,
         };
         let analyses = stack.build(&cx);
         let extra_priors: usize = analyses.iter().map(|a| a.prior_count()).sum();
@@ -872,7 +907,7 @@ fn extract_selection(
 }
 
 // The per-function selection a solve produces, plus the SatResult that yielded it.
-type SolveOutcome = (
+pub(crate) type SolveOutcome = (
     HashMap<Node, Option<usize>>,
     HashMap<RTLReg, usize>,
     HashMap<RTLReg, CandType>,
@@ -896,103 +931,148 @@ pub(crate) fn solve_function_z3_with_stack(
     interface_pins: &[(RTLReg, XType)],
     stack: &Stack<'_>,
 ) -> Result<SolveOutcome, SatResult> {
+    solve_function_counted(func, name_to_ident, interface_pins, stack).0
+}
+
+/// The solve of `solve_function_z3_with_stack`, and the Z3 work it spent in
+/// rlimit units: deterministic, unlike its time.
+pub(crate) fn solve_function_counted(
+    func: &FunctionData,
+    name_to_ident: &HashMap<String, Ident>,
+    interface_pins: &[(RTLReg, XType)],
+    stack: &Stack<'_>,
+) -> (Result<SolveOutcome, SatResult>, u64) {
     // Fresh Z3 context per function: reusing one leaks MaxSMT state across functions and makes tie-breaking depend on rayon order. Do not set random_seed -- Optimize rejects it, and with it the whole parameter set.
     let cfg = z3::Config::new();
     z3::with_z3_config(&cfg, || {
         let build_t0 = std::time::Instant::now();
         let t = TypeDt::build();
         let opt = Optimize::new();
-        // Bounds every check on its own, including each refinement round.
-        opt.set_params(
-            &crate::decompile::passes::clight_select::solvers::refinement::work_allowance(
-                CONFIG.solve.rlimit,
-            ),
+        let outcome = solve_in(
+            &opt,
+            t,
+            build_t0,
+            func,
+            name_to_ident,
+            interface_pins,
+            stack,
         );
+        let work =
+            crate::decompile::passes::clight_select::solvers::refinement::resource_count(&opt);
+        (outcome, work)
+    })
+}
 
-        let (mut built, softs) = {
-            let backend = OptimizeBackend::new(&opt);
-            let mut built = build_function_constraints_with_stack(
-                t,
-                func,
-                name_to_ident,
-                interface_pins,
-                &backend,
-                stack,
-            );
-            // Refinement may add one repair preference per selectable node.
-            built.soft_groups = backend.flush(
-                built.primary_unit,
-                (built.selvar.len() as u64)
-                    .checked_mul(built.primary_unit)
-                    .expect("selection repair bound"),
-            );
-            (built, backend.into_softs())
-        };
+fn solve_in(
+    opt: &Optimize,
+    t: TypeDt,
+    build_t0: std::time::Instant,
+    func: &FunctionData,
+    name_to_ident: &HashMap<String, Ident>,
+    interface_pins: &[(RTLReg, XType)],
+    stack: &Stack<'_>,
+) -> Result<SolveOutcome, SatResult> {
+    // Bounds every check on its own, including each refinement round.
+    opt.set_params(
+        &crate::decompile::passes::clight_select::solvers::refinement::work_allowance(
+            CONFIG.solve.rlimit,
+        ),
+    );
 
-        let audit = audit::Snapshot::start(func, &opt);
-
-        BUILD_NS.fetch_add(
-            build_t0.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
+    let (built, (softs, levels)) = {
+        let backend = OptimizeBackend::new(&opt);
+        let mut built = build_function_constraints_with_stack(
+            t,
+            func,
+            name_to_ident,
+            interface_pins,
+            &backend,
+            stack,
         );
-        let mut refinements =
-            crate::decompile::passes::clight_select::solvers::refinement::Session::start(
-                stack,
-                &built.context(func, name_to_ident),
-                &opt,
+        // Refinement may add one repair preference per selectable node.
+        built.soft_groups = backend.flush(
+            built.primary_unit,
+            (built.selvar.len() as u64)
+                .checked_mul(built.primary_unit)
+                .expect("selection repair bound"),
+        );
+        // An open interface prefers its reconciled (rank-zero) choice. The
+        // group is declared after every stratum, so it only breaks ties of
+        // the function's own objective and never enters its cost.
+        for selected in built.interfaces.rank_zero() {
+            opt.assert_soft(
+                selected,
+                1,
+                Some(z3::Symbol::String("interface-prior".into())),
             );
-        loop {
-            if refinements.spent_work(&opt, CONFIG.solve.refinement_rlimit) {
-                eprintln!(
-                    "[selection-analysis] fn={:#x} shared refinement work budget exhausted",
-                    func.address
-                );
-                if refinements.advance(None, SatResult::Unknown, &opt) {
-                    continue;
-                }
-            }
-            let work_before =
-                crate::decompile::passes::clight_select::solvers::refinement::resource_count(&opt);
-            let check_t0 = std::time::Instant::now();
-            let check_result = opt.check(&[]);
-            CHECK_NS.fetch_add(
-                check_t0.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
+        }
+        (built, backend.into_softs())
+    };
+
+    let audit = audit::Snapshot::start(func, &opt);
+
+    BUILD_NS.fetch_add(
+        build_t0.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let mut refinements =
+        crate::decompile::passes::clight_select::solvers::refinement::Session::start(
+            stack,
+            &built.context(func, name_to_ident),
+            &opt,
+        );
+    loop {
+        if refinements.spent_work(&opt, CONFIG.solve.refinement_rlimit) {
+            eprintln!(
+                "[selection-analysis] fn={:#x} shared refinement work budget exhausted",
+                func.address
             );
-            let model = match check_result {
-                SatResult::Sat => opt.get_model(),
-                // Only reuse a partial model that the work allowance cut off
-                // (deterministic), and only outside an uncertified analysis
-                // extension.
-                SatResult::Unknown
-                    if !refinements.active()
-                        && crate::decompile::passes::clight_select::solvers::refinement::exhausted(
-                            &opt,
-                            work_before,
-                            CONFIG.solve.rlimit,
-                        ) =>
-                {
-                    opt.get_model()
-                }
-                SatResult::Unknown | SatResult::Unsat => None,
-            };
-            if refinements.advance(model.as_ref(), check_result, &opt) {
+            if refinements.advance(None, SatResult::Unknown, &opt) {
                 continue;
             }
-            match model {
-                Some(m) => {
-                    if !built
-                        .concrete_declarations
-                        .0
-                        .keys()
-                        .all(|&reg| built.concrete_declarations.selected(&m, reg).is_some())
-                    {
-                        audit.finish(&built, func, &opt, &softs, None, SatResult::Unknown);
-                        return Err(SatResult::Unknown);
-                    }
-                    // A resource-limited partial model may retain the legacy
-                    // path, but cannot authorize a new concrete representation.
-                    if check_result != SatResult::Sat
+        }
+        let work_before =
+            crate::decompile::passes::clight_select::solvers::refinement::resource_count(&opt);
+        let check_t0 = std::time::Instant::now();
+        let check_result = opt.check(&[]);
+        CHECK_NS.fetch_add(
+            check_t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let model = match check_result {
+            SatResult::Sat => opt.get_model(),
+            // Only reuse a partial model that the work allowance cut off
+            // (deterministic), and only outside an uncertified analysis
+            // extension.
+            SatResult::Unknown
+                if !refinements.active()
+                    && crate::decompile::passes::clight_select::solvers::refinement::exhausted(
+                        &opt,
+                        work_before,
+                        CONFIG.solve.rlimit,
+                    ) =>
+            {
+                opt.get_model()
+            }
+            SatResult::Unknown | SatResult::Unsat => None,
+        };
+        if refinements.advance(model.as_ref(), check_result, &opt) {
+            continue;
+        }
+        match model {
+            Some(m) => {
+                if !built
+                    .concrete_declarations
+                    .0
+                    .keys()
+                    .all(|&reg| built.concrete_declarations.selected(&m, reg).is_some())
+                {
+                    audit.finish(&built, func, &opt, &softs, None, SatResult::Unknown);
+                    return Err(SatResult::Unknown);
+                }
+                // A resource-limited partial model may retain the legacy
+                // path, but cannot authorize a new concrete representation.
+                if check_result != SatResult::Sat
                         && built
                             .concrete_declarations
                             .admissions(&m)
@@ -1002,45 +1082,44 @@ pub(crate) fn solve_function_z3_with_stack(
                         audit.finish(&built, func, &opt, &softs, None, SatResult::Unknown);
                         return Err(SatResult::Unknown);
                     }
-                    report_cost("optimize", func, &m, &softs);
-                    let interface_choices = built.interfaces.choices(&m);
-                    let cost = weighted_cost(&m, &softs);
-                    let (cand_out, ty_out, ty_override, structure_world) = extract_selection(
-                        &m,
-                        &built,
-                        func,
-                        name_to_ident,
-                        true,
-                        refinements.coupled_nodes(),
-                    );
-                    let mut results = refinements.into_results();
-                    let commitments = built
-                        .concrete_declarations
-                        .commitments(&m, &cand_out, &results);
-                    syntax::type_evidence::COMMITMENTS.insert(&mut results, commitments);
-                    syntax::type_evidence::ADMISSIONS
-                        .insert(&mut results, built.concrete_declarations.admissions(&m));
-                    if !built.interfaces.is_empty() {
-                        syntax::interfaces::CHOICES.insert(&mut results, interface_choices);
-                    }
-                    syntax::interfaces::COST.insert(&mut results, cost);
-                    audit.finish(&built, func, &opt, &softs, Some(&m), check_result);
-                    return Ok((
-                        cand_out,
-                        ty_out,
-                        ty_override,
-                        structure_world,
-                        check_result,
-                        results,
-                    ));
+                report_cost("optimize", func, &m, &softs);
+                let interface_choices = built.interfaces.choices(&m);
+                let cost = level_cost(&m, &levels, &built.soft_groups, built.primary_unit);
+                let (cand_out, ty_out, ty_override, structure_world) = extract_selection(
+                    &m,
+                    &built,
+                    func,
+                    name_to_ident,
+                    true,
+                    refinements.coupled_nodes(),
+                );
+                let mut results = refinements.into_results();
+                let commitments = built
+                    .concrete_declarations
+                    .commitments(&m, &cand_out, &results);
+                syntax::type_evidence::COMMITMENTS.insert(&mut results, commitments);
+                syntax::type_evidence::ADMISSIONS
+                    .insert(&mut results, built.concrete_declarations.admissions(&m));
+                if !built.interfaces.is_empty() {
+                    syntax::interfaces::CHOICES.insert(&mut results, interface_choices);
                 }
-                None => {
-                    audit.finish(&built, func, &opt, &softs, None, check_result);
-                    return Err(check_result);
-                }
+                syntax::interfaces::COST.insert(&mut results, cost);
+                audit.finish(&built, func, &opt, &softs, Some(&m), check_result);
+                return Ok((
+                    cand_out,
+                    ty_out,
+                    ty_override,
+                    structure_world,
+                    check_result,
+                    results,
+                ));
+            }
+            None => {
+                audit.finish(&built, func, &opt, &softs, None, check_result);
+                return Err(check_result);
             }
         }
-    })
+    }
 }
 
 // Minimum violated soft count found for one weight class.
@@ -1948,7 +2027,7 @@ pub(crate) struct DirtyResolveStats {
     pub elapsed_ms: u128,
 }
 
-fn committed_param_type(xtype: XType) -> ParamType {
+pub(crate) fn committed_param_type(xtype: XType) -> ParamType {
     match xtype {
         XType::XstructPtr(sid) => ParamType::StructPointer(sid),
         other => ParamType::Typed(other),

@@ -8,10 +8,53 @@ use z3::ast::{Ast, Bool, Dynamic};
 /// One recorded condition for the post-solve per-node re-pick: the raw (unguarded) condition (None = an unconditional penalty for this candidate) and its weight; weight u64::MAX marks a structural requirement (validity, not preference).
 pub(crate) type RecordedCond = (Option<Bool>, u64);
 
+/// The level of the selection objective a soft clause belongs to, highest
+/// first. A function's weights make every level outweigh all levels below
+/// it, so costs of different functions add level by level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Tier {
+    /// A C legality requirement.
+    Compat,
+    /// A type shape supported by the candidate domain.
+    Support,
+    /// Grounded type evidence.
+    Evidence,
+    /// An ordinary selection preference: priors, cast preferences, repairs.
+    Primary,
+    /// Representation preferences below every ordinary one.
+    Secondary,
+}
+
+/// A model's objective cost: the weight of the violated soft clauses at each
+/// level, highest level first, compared lexicographically.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct TierCost(pub(crate) [u64; 5]);
+
+impl TierCost {
+    pub(crate) fn add(&mut self, tier: Tier, units: u64) {
+        self.0[tier as usize] += units;
+    }
+}
+
+impl std::ops::Add for TierCost {
+    type Output = TierCost;
+    fn add(mut self, other: TierCost) -> TierCost {
+        for (mine, theirs) in self.0.iter_mut().zip(other.0) {
+            *mine += theirs;
+        }
+        self
+    }
+}
+
 // Where a built constraint lands. Both engines build the SAME formula through this: the Optimize engine hands softs to MaxSMT, the propagator engine attaches a relaxation literal per soft and minimizes them itself.
 pub(crate) trait SolveBackend {
     fn assert_hard(&self, cond: &Bool);
     fn assert_soft(&self, cond: &Bool, weight: u64);
+    /// A soft clause with its objective level and its weight within the
+    /// level; `weight` is its weight in this function's objective.
+    fn assert_soft_at(&self, cond: &Bool, weight: u64, _tier: Tier, _units: u64) {
+        self.assert_soft(cond, weight);
+    }
 }
 
 // The model reads the selection needs, over either engine's model representation.
@@ -189,16 +232,31 @@ impl<'a> ConstraintSink<'a> {
         }
         SOFT_CLAUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         soft_tag_count(tag);
+        let (tier, units) = self.primary_level(w / self.soft_scale);
         match guard {
-            Some(g) => self.backend.assert_soft(&g.implies(cond.clone()), w),
-            None => self.backend.assert_soft(cond, w),
+            Some(g) => self
+                .backend
+                .assert_soft_at(&g.implies(cond.clone()), w, tier, units),
+            None => self.backend.assert_soft_at(cond, w, tier, units),
         }
     }
 
     // Soft assertion on a raw Bool (the candidate-penalty `!guard` forms and the priors).
     pub(crate) fn assert_soft_raw(&self, cond: &Bool, w: u64) {
         SOFT_CLAUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.backend.assert_soft(cond, w * self.soft_scale);
+        let (tier, units) = self.primary_level(w);
+        self.backend
+            .assert_soft_at(cond, w * self.soft_scale, tier, units);
+    }
+
+    /// A weight given in ordinary units: the dominant C-compatibility weight
+    /// is one C legality violation, any other is an ordinary preference.
+    fn primary_level(&self, w: u64) -> (Tier, u64) {
+        if w == self.compat_w {
+            (Tier::Compat, 1)
+        } else {
+            (Tier::Primary, w)
+        }
     }
 
     /// Weight-one secondary objective. Even all its violations together
@@ -215,12 +273,14 @@ impl<'a> ConstraintSink<'a> {
         }
         SOFT_CLAUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         soft_tag_count(tag);
-        self.backend.assert_soft(cond, weight);
+        self.backend
+            .assert_soft_at(cond, weight, Tier::Secondary, weight);
     }
 
     /// A module must account for every unit in evidence_count(). Exact
     /// structural constraints and learned refutations remain hard.
     pub(crate) fn assert_evidence_weighted(&self, cond: &Bool, weight: u64, tag: &'static str) {
+        let units = weight;
         let weight = weight
             .checked_mul(self.evidence_scale)
             .expect("selection evidence weight");
@@ -230,7 +290,8 @@ impl<'a> ConstraintSink<'a> {
         }
         SOFT_CLAUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         soft_tag_count(tag);
-        self.backend.assert_soft(cond, weight);
+        self.backend
+            .assert_soft_at(cond, weight, Tier::Evidence, units);
     }
 
     pub(crate) fn assert_type_support(&self, cond: &Bool) {
@@ -240,7 +301,8 @@ impl<'a> ConstraintSink<'a> {
         }
         SOFT_CLAUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         soft_tag_count("type_shape_support");
-        self.backend.assert_soft(cond, self.support_scale);
+        self.backend
+            .assert_soft_at(cond, self.support_scale, Tier::Support, 1);
     }
 
     /// A formula involving another statement choice is not conditionally

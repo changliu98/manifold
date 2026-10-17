@@ -9,7 +9,6 @@ use super::{Checker, Verdict};
 use crate::decompile::passes::clight_select::syntax::{Artifacts, FunctionContext, Stack};
 use crate::x86::types::Node;
 use std::collections::BTreeSet;
-use z3::ast::Bool;
 use z3::{Model, Optimize, SatResult};
 
 struct Entry<'a> {

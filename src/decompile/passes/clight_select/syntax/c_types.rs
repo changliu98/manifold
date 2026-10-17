@@ -761,7 +761,7 @@ fn type_of(
         | ClightExpr::EconstLong(_, ct)
         | ClightExpr::EconstFloat(_, ct)
         | ClightExpr::EconstSingle(_, ct) => TyTerm::Conc(ct.clone()),
-        ClightExpr::Evar(id, ct) => TyTerm::Conc(
+        ClightExpr::Evar(_, ct) => TyTerm::Conc(
             sink.known_global(func.known_global_types.as_ref(), e)
                 .cloned()
                 .unwrap_or_else(|| ct.clone()),

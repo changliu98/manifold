@@ -133,6 +133,12 @@ pub mod config {
     pub struct InterfaceConfig {
         /// Maximum number of class-distinct alternatives carried by one program-level interface variable. Rank zero is always retained.
         pub alt_cap: usize,
+        /// Master rounds of the program selection solve (`syntax::program`). Each round evaluates every function whose interface choice is new; at the cap the best fully evaluated choice is kept.
+        pub max_rounds: usize,
+        /// The most Z3 work (rlimit units) those rounds spend, as a multiple of the work of the open solves that bound each function. Each solve is predicted to cost its function's open solve: a round runs only if its exact solves fit, and its partial solves are taken cheapest first while they fit. Work, unlike time, is deterministic.
+        pub max_round_work: u64,
+        /// Most combinations of open-global alternatives one statement is typed under; the globals of a statement beyond it stay committed program-wide.
+        pub max_global_cases: usize,
         /// Fixed, program-independent Stage-B strata. These never depend on the number of registers or selection variables in a particular function.
         pub legality_weight: u64,
         pub structural_weight: u64,
@@ -240,6 +246,9 @@ pub mod config {
     pub const CONFIG: PipelineConfig = PipelineConfig {
         interface: InterfaceConfig {
             alt_cap: 4,
+            max_rounds: 8,
+            max_round_work: 3,
+            max_global_cases: 64,
             legality_weight: 1_000_000_000_000,
             structural_weight: 1_000_000,
             agreement_weight: 10_000,

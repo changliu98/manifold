@@ -1,5 +1,5 @@
 use crate::decompile::passes::clight_select::query::{
-    CommittedFunctionInterface, InterfaceAuthority,
+    CalleeSignature, CommittedFunctionInterface, InterfaceAuthority,
 };
 use crate::decompile::passes::clight_select::syntax::ctyping;
 use crate::decompile::passes::clight_select::syntax::solve::*;

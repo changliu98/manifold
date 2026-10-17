@@ -352,155 +352,209 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
         }
     }
 
-    // Statement-form + type selection is done entirely by the Z3/SMT inference model; the clang-in-the-loop greedy search has been removed (full migration to Z3).
-    let mut best_state =
-        crate::decompile::passes::clight_select::syntax::solve::infer_select_program(
+    // Statement-form + type selection is one Z3 problem for the whole program:
+    // statements, declarations and interfaces (syntax::program). The stage
+    // ablations keep the per-function solve and its interface stages.
+    let staged = db.ablate_scope_function
+        || db.ablate_flow_max_certification
+        || db.ablate_flow_anchor_reopen;
+    let mut best_state;
+    if !staged {
+        let external: BTreeSet<Address> = db
+            .rel_iter::<(Address,)>("is_external_function")
+            .map(|&(address,)| address)
+            .collect();
+        let bodiless: BTreeSet<Address> = functions
+            .iter()
+            .filter(|f| external.contains(&f.address) || db.should_skip_function(&f.name))
+            .map(|f| f.address)
+            .collect();
+        let outcome = crate::decompile::passes::clight_select::syntax::program::solve(
+            &mut functions,
+            &interface_vars,
+            &committed_interfaces,
+            &name_to_ident,
+            &bodiless,
+            data_model,
+        );
+        let stats = &outcome.stats;
+        eprintln!(
+            "[program-solve] functions={} open-vars={} contested={} rounds={} proven={} pinned-solves={} partial-solves={} no-model={} changed-vs-rank0={} bound={:?}/{} cost={:?}/{} relaxed={}ms pinned={}ms master={}ms checked={}ms work={}/{} exhausted={}",
+            stats.functions,
+            stats.open_variables,
+            stats.contested,
+            stats.rounds,
+            stats.proven,
+            stats.pinned_solves,
+            stats.partial_solves,
+            stats.no_model,
+            stats.changed_from_rank0,
+            stats.bound.0 .0,
+            stats.bound.1,
+            stats.cost.0 .0,
+            stats.cost.1,
+            stats.relaxed_ms,
+            stats.pinned_ms,
+            stats.master_ms,
+            stats.checked_ms,
+            stats.relaxed_work,
+            stats.round_work,
+            stats.exhausted,
+        );
+        best_state = outcome.state;
+        committed_interfaces = outcome.committed;
+        db.interface_instance_dump = outcome.dump;
+    } else {
+        best_state = crate::decompile::passes::clight_select::syntax::solve::infer_select_program(
             &functions,
             &name_to_ident,
             db.ablate_flow_max_certification,
         );
 
-    if !db.ablate_scope_function {
-        let stage_b_input_globals = committed_interfaces.globals.clone();
-        let outcome = crate::decompile::passes::clight_select::syntax::interface_solve::solve(
-            &functions,
-            &best_state,
-            &interface_vars,
-            &committed_interfaces,
-            &name_to_ident,
-            data_model,
-        );
-        eprintln!(
-            "[interface-solve] vars={} decl-vars={} edges={} solve={}ms unsat={} fallback={} changed-vs-rank0={} changed-decls={}",
-            outcome.stats.variable_count,
-            outcome.stats.declaration_variable_count,
-            outcome.stats.edge_count,
-            outcome.stats.solve_ms,
-            outcome.stats.unsat_count,
-            outcome.stats.fallback_count,
-            outcome.stats.changed_from_rank0,
-            outcome.stats.changed_declarations,
-        );
-        let stage_b_choice_ranks = outcome.choice_ranks.clone();
-        let mut stage_c_dirty = outcome.dirty_functions.clone();
-        if db.ablate_flow_anchor_reopen {
-            let changed_globals: BTreeSet<Ident> = outcome
-                .choice_ranks
-                .keys()
-                .filter_map(|id| match id {
-                    crate::decompile::passes::clight_select::query::InterfaceVarId::Global {
-                        symbol,
-                    } if stage_b_input_globals.get(symbol)
-                        != outcome.committed.globals.get(symbol) =>
-                    {
-                        Some(*symbol)
-                    }
-                    _ => None,
-                })
-                .collect();
-            stage_c_dirty.extend(
-                crate::decompile::passes::clight_select::syntax::interface_solve::functions_referencing_globals(
-                    &functions,
-                    &changed_globals,
-                ),
-            );
-        }
-        committed_interfaces = outcome.committed;
-        db.interface_instance_dump = outcome.instance_dump;
-        let (resolved_state, dirty_stats) =
-            crate::decompile::passes::clight_select::syntax::solve::resolve_dirty_functions(
-                &mut functions,
-                &name_to_ident,
+        if !db.ablate_scope_function {
+            let stage_b_input_globals = committed_interfaces.globals.clone();
+            let outcome = crate::decompile::passes::clight_select::syntax::interface_solve::solve(
+                &functions,
                 &best_state,
-                &stage_c_dirty,
+                &interface_vars,
                 &committed_interfaces,
-                &outcome.declaration_assignments,
-                db.ablate_flow_max_certification,
+                &name_to_ident,
+                data_model,
             );
-        best_state = resolved_state;
-        eprintln!(
-            "[interface-solve] dirty={}/{} resolved={} fallback={} re-solve={}ms",
-            dirty_stats.dirty_count,
-            functions.len(),
-            dirty_stats.resolved_count,
-            dirty_stats.fallback_count,
-            dirty_stats.elapsed_ms,
-        );
-
-        if db.ablate_flow_anchor_reopen {
-            let feedback = committed_global_flow_feedback(&functions, &best_state);
-            if feedback.is_empty() {
-                eprintln!(
-                    "[interface-solve] flow-anchor-reopen prices=0 reopened=0 changed=0 dirty=0"
-                );
-            } else {
-                let prior_globals = committed_interfaces.globals.clone();
-                let reopened = crate::decompile::passes::clight_select::syntax::interface_solve::solve_with_global_feedback(
-                    &functions,
-                    &best_state,
-                    &interface_vars,
-                    &committed_interfaces,
-                    &name_to_ident,
-                    &feedback,
-                    Some(&stage_b_choice_ranks),
-                    data_model,
-                );
-                let requested_symbols: BTreeSet<Ident> =
-                    feedback.iter().map(|item| item.symbol).collect();
-                let changed_symbols: BTreeSet<Ident> = requested_symbols
-                    .iter()
-                    .copied()
-                    .filter(|&symbol| {
-                        prior_globals.get(&symbol) != reopened.committed.globals.get(&symbol)
+            eprintln!(
+                "[interface-solve] vars={} decl-vars={} edges={} solve={}ms unsat={} fallback={} changed-vs-rank0={} changed-decls={}",
+                outcome.stats.variable_count,
+                outcome.stats.declaration_variable_count,
+                outcome.stats.edge_count,
+                outcome.stats.solve_ms,
+                outcome.stats.unsat_count,
+                outcome.stats.fallback_count,
+                outcome.stats.changed_from_rank0,
+                outcome.stats.changed_declarations,
+            );
+            let stage_b_choice_ranks = outcome.choice_ranks.clone();
+            let mut stage_c_dirty = outcome.dirty_functions.clone();
+            if db.ablate_flow_anchor_reopen {
+                let changed_globals: BTreeSet<Ident> = outcome
+                    .choice_ranks
+                    .keys()
+                    .filter_map(|id| {
+                        match id {
+                        crate::decompile::passes::clight_select::query::InterfaceVarId::Global {
+                            symbol,
+                        } if stage_b_input_globals.get(symbol)
+                            != outcome.committed.globals.get(symbol) =>
+                        {
+                            Some(*symbol)
+                        }
+                        _ => None,
+                    }
                     })
                     .collect();
-                let reopen_dirty = crate::decompile::passes::clight_select::syntax::interface_solve::functions_referencing_globals(
-                    &functions,
-                    &changed_symbols,
+                stage_c_dirty.extend(
+                    crate::decompile::passes::clight_select::syntax::interface_solve::functions_referencing_globals(
+                        &functions,
+                        &changed_globals,
+                    ),
                 );
-                let reopened_count = requested_symbols
-                    .iter()
-                    .filter(|&&symbol| {
-                        reopened.assignments.contains_key(
-                            &crate::decompile::passes::clight_select::query::InterfaceVarId::Global {
-                                symbol,
-                            },
-                        )
-                    })
-                    .count();
-                eprintln!(
-                    "[interface-solve] flow-anchor-reopen prices={} reopened={} changed={} dirty={}",
-                    feedback.len(),
-                    reopened_count,
-                    changed_symbols.len(),
-                    reopen_dirty.len(),
+            }
+            committed_interfaces = outcome.committed;
+            db.interface_instance_dump = outcome.instance_dump;
+            let (resolved_state, dirty_stats) =
+                crate::decompile::passes::clight_select::syntax::solve::resolve_dirty_functions(
+                    &mut functions,
+                    &name_to_ident,
+                    &best_state,
+                    &stage_c_dirty,
+                    &committed_interfaces,
+                    &outcome.declaration_assignments,
+                    db.ablate_flow_max_certification,
                 );
-                committed_interfaces = reopened.committed;
-                db.interface_instance_dump = reopened.instance_dump;
-                if !reopen_dirty.is_empty() {
-                    let (resolved_state, reopen_stats) =
-                        crate::decompile::passes::clight_select::syntax::solve::resolve_dirty_functions(
-                            &mut functions,
-                            &name_to_ident,
-                            &best_state,
-                            &reopen_dirty,
-                            &committed_interfaces,
-                            &reopened.declaration_assignments,
-                            db.ablate_flow_max_certification,
-                        );
-                    best_state = resolved_state;
+            best_state = resolved_state;
+            eprintln!(
+                "[interface-solve] dirty={}/{} resolved={} fallback={} re-solve={}ms",
+                dirty_stats.dirty_count,
+                functions.len(),
+                dirty_stats.resolved_count,
+                dirty_stats.fallback_count,
+                dirty_stats.elapsed_ms,
+            );
+
+            if db.ablate_flow_anchor_reopen {
+                let feedback = committed_global_flow_feedback(&functions, &best_state);
+                if feedback.is_empty() {
                     eprintln!(
-                        "[interface-solve] flow-anchor-reopen resolved={} fallback={} re-solve={}ms",
-                        reopen_stats.resolved_count,
-                        reopen_stats.fallback_count,
-                        reopen_stats.elapsed_ms,
+                        "[interface-solve] flow-anchor-reopen prices=0 reopened=0 changed=0 dirty=0"
                     );
+                } else {
+                    let prior_globals = committed_interfaces.globals.clone();
+                    let reopened = crate::decompile::passes::clight_select::syntax::interface_solve::solve_with_global_feedback(
+                        &functions,
+                        &best_state,
+                        &interface_vars,
+                        &committed_interfaces,
+                        &name_to_ident,
+                        &feedback,
+                        Some(&stage_b_choice_ranks),
+                        data_model,
+                    );
+                    let requested_symbols: BTreeSet<Ident> =
+                        feedback.iter().map(|item| item.symbol).collect();
+                    let changed_symbols: BTreeSet<Ident> = requested_symbols
+                        .iter()
+                        .copied()
+                        .filter(|&symbol| {
+                            prior_globals.get(&symbol) != reopened.committed.globals.get(&symbol)
+                        })
+                        .collect();
+                    let reopen_dirty = crate::decompile::passes::clight_select::syntax::interface_solve::functions_referencing_globals(
+                        &functions,
+                        &changed_symbols,
+                    );
+                    let reopened_count = requested_symbols
+                        .iter()
+                        .filter(|&&symbol| {
+                            reopened.assignments.contains_key(
+                                &crate::decompile::passes::clight_select::query::InterfaceVarId::Global {
+                                    symbol,
+                                },
+                            )
+                        })
+                        .count();
+                    eprintln!(
+                        "[interface-solve] flow-anchor-reopen prices={} reopened={} changed={} dirty={}",
+                        feedback.len(),
+                        reopened_count,
+                        changed_symbols.len(),
+                        reopen_dirty.len(),
+                    );
+                    committed_interfaces = reopened.committed;
+                    db.interface_instance_dump = reopened.instance_dump;
+                    if !reopen_dirty.is_empty() {
+                        let (resolved_state, reopen_stats) =
+                            crate::decompile::passes::clight_select::syntax::solve::resolve_dirty_functions(
+                                &mut functions,
+                                &name_to_ident,
+                                &best_state,
+                                &reopen_dirty,
+                                &committed_interfaces,
+                                &reopened.declaration_assignments,
+                                db.ablate_flow_max_certification,
+                            );
+                        best_state = resolved_state;
+                        eprintln!(
+                            "[interface-solve] flow-anchor-reopen resolved={} fallback={} re-solve={}ms",
+                            reopen_stats.resolved_count,
+                            reopen_stats.fallback_count,
+                            reopen_stats.elapsed_ms,
+                        );
+                    }
                 }
             }
+        } else {
+            eprintln!("[interface-solve] disabled by --ablate-scope=function (Stage A unchanged)");
+            db.interface_instance_dump.clear();
         }
-    } else {
-        eprintln!("[interface-solve] disabled by --ablate-scope=function (Stage A unchanged)");
-        db.interface_instance_dump.clear();
     }
     db.committed_interfaces = committed_interfaces;
     db.interface_vars = interface_vars;

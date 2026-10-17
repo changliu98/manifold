@@ -196,7 +196,7 @@ mod tests {
             &backend,
             &Stack::new(&[], &[&TypeRecovery, &CTypes]),
         );
-        let softs = backend.into_softs();
+        let (softs, _) = backend.into_softs();
         let before = optimizer.to_string();
         let (_, rejected) = built
             .concrete_declarations
