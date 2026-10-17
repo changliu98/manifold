@@ -1,10 +1,18 @@
 //! Candidate value/definedness/effect obligations as a selection module.
+use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::clight_select::select::ProgramSelectionState;
-use crate::decompile::passes::clight_select::{candtype::{CandType, Sign}, solvers::memory_theory, solvers::producer_values, query::FunctionData, solvers::word_views};
 use crate::decompile::passes::clight_select::syntax::c_types::{anchor_index, TypeDt};
 use crate::decompile::passes::clight_select::syntax::constraints::ConstraintSink;
-use crate::decompile::passes::clight_select::syntax::{Candidate, CandidateAnalysis, FunctionContext, PreparedAnalysis};
-use crate::decompile::elevator::DecompileDB;
+use crate::decompile::passes::clight_select::syntax::{
+    Candidate, CandidateAnalysis, FunctionContext, PreparedAnalysis,
+};
+use crate::decompile::passes::clight_select::{
+    candtype::{CandType, Sign},
+    query::FunctionData,
+    solvers::memory_theory,
+    solvers::producer_values,
+    solvers::word_views,
+};
 use crate::x86::types::{Node, RTLReg};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use z3::ast::{Bool, Dynamic};
@@ -35,7 +43,9 @@ pub(super) fn integer_declarations(
             declarations.insert(reg, ty);
         }
     }
-    if let Some(graph) = crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH.get(&func.analysis_facts) {
+    if let Some(graph) = crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH
+        .get(&func.analysis_facts)
+    {
         declarations.retain(|reg, _| !graph.fixed_storage.contains(reg));
     }
     declarations
@@ -218,8 +228,12 @@ impl crate::decompile::passes::clight_select::solvers::Solver for Semantics {
         static READS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
             let mut reads = producer_values::INPUTS.to_vec();
             reads.extend_from_slice(&memory_theory::INPUTS);
-            reads.extend_from_slice(crate::decompile::passes::clight_select::solvers::transfers::INPUTS);
-            reads.extend_from_slice(crate::decompile::passes::clight_select::solvers::observations::INPUTS);
+            reads.extend_from_slice(
+                crate::decompile::passes::clight_select::solvers::transfers::INPUTS,
+            );
+            reads.extend_from_slice(
+                crate::decompile::passes::clight_select::solvers::observations::INPUTS,
+            );
             reads.sort_unstable();
             reads.dedup();
             reads
@@ -241,7 +255,9 @@ impl crate::decompile::passes::clight_select::solvers::Solver for Semantics {
         crate::decompile::passes::clight_select::solvers::observations::collect(db, functions);
         crate::decompile::passes::clight_select::solvers::transfers::collect(db, functions);
         for function in functions.iter_mut() {
-            crate::decompile::passes::clight_select::solvers::transfers::project_frame_views(function);
+            crate::decompile::passes::clight_select::solvers::transfers::project_frame_views(
+                function,
+            );
         }
         producer_values::collect(db, functions);
         for function in functions {

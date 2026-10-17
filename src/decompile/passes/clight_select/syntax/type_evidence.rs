@@ -2,9 +2,9 @@
 //! Evidence is attached to storage, values, views, or committed interfaces;
 //! hypotheses never become machine facts merely by being selected.
 
-use crate::decompile::passes::clight_select::syntax::ArtifactKey;
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::c_pass::types::*;
+use crate::decompile::passes::clight_select::syntax::ArtifactKey;
 use crate::decompile::passes::clight_select::{
     candtype::{CandType, Sign},
     query::FunctionData,
@@ -15,8 +15,10 @@ use crate::x86::{op::Addressing, types::*};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-pub(crate) const GRAPH: ArtifactKey<EvidenceGraph> =
-    ArtifactKey::projected("type-evidence", crate::decompile::passes::clight_select::syntax::bindings::remap_graph);
+pub(crate) const GRAPH: ArtifactKey<EvidenceGraph> = ArtifactKey::projected(
+    "type-evidence",
+    crate::decompile::passes::clight_select::syntax::bindings::remap_graph,
+);
 pub(crate) const COMMITMENTS: ArtifactKey<BTreeMap<RTLReg, TypeTerm>> =
     ArtifactKey::new("type-commitments");
 pub(crate) const ADMISSIONS: ArtifactKey<BTreeMap<RTLReg, TypeAdmission>> =
@@ -581,7 +583,9 @@ pub(super) fn finalize(db: &DecompileDB, functions: &mut [FunctionData]) {
             })
             .collect();
         let model = function.data_model;
-        crate::decompile::passes::clight_select::syntax::type_flow::apply(function, &mut graph, &nodes, &defs, &rtl);
+        crate::decompile::passes::clight_select::syntax::type_flow::apply(
+            function, &mut graph, &nodes, &defs, &rtl,
+        );
         // Gaps forbid new representation inventions, not already-supported
         // type hypotheses. Keep the distinction explicit through selection.
         let supported: BTreeMap<_, _> = graph
@@ -719,8 +723,8 @@ pub(crate) fn view_cost(
 
 #[cfg(test)]
 mod tests {
-    use crate::decompile::passes::clight_select::syntax::type_evidence::*;
     use crate::abi::DataModel;
+    use crate::decompile::passes::clight_select::syntax::type_evidence::*;
     use crate::x86::op::Operation;
 
     #[test]

@@ -371,8 +371,10 @@ pub struct FunctionData {
     /// Comparison signedness of every ordering Mcond this function owns, keyed
     /// by real address (node ids masked of their synthetic bits). Behavioral
     /// evidence for the propagator engine; empty otherwise.
-    pub cond_branch_class:
-        HashMap<Address, crate::decompile::passes::clight_select::solvers::in_search::branch_theory::CmpClass>,
+    pub cond_branch_class: HashMap<
+        Address,
+        crate::decompile::passes::clight_select::solvers::in_search::branch_theory::CmpClass,
+    >,
 
     /// Machine register-class evidence for the whole program, shared by every
     /// per-function solve. `Arc` keeps the two sets allocated once rather than
@@ -391,12 +393,17 @@ pub struct FunctionData {
     /// Immutable module-owned evidence, prepared before the per-function
     /// solve. A new analysis need not add fields to this shared query record.
     pub(crate) analysis_facts: crate::decompile::passes::clight_select::syntax::Artifacts,
-    pub(crate) storage_writes: Vec<crate::decompile::passes::clight_select::solvers::memory_theory::WriteContract>,
-    pub(crate) storage_reads: Vec<crate::decompile::passes::clight_select::solvers::memory_theory::ReadContract>,
+    pub(crate) storage_writes:
+        Vec<crate::decompile::passes::clight_select::solvers::memory_theory::WriteContract>,
+    pub(crate) storage_reads:
+        Vec<crate::decompile::passes::clight_select::solvers::memory_theory::ReadContract>,
     /// Unique finalized operations at physical frame accesses. Unlike an
     /// expression candidate, these are independent payload/extension anchors.
     pub(crate) memory_anchors: HashMap<Node, RTLInst>,
-    pub(crate) value_producers: BTreeMap<(Node, RTLReg), crate::decompile::passes::clight_select::solvers::producer_values::Producer>,
+    pub(crate) value_producers: BTreeMap<
+        (Node, RTLReg),
+        crate::decompile::passes::clight_select::solvers::producer_values::Producer,
+    >,
     /// Supplemental hypotheses proposed by selection analyses. They retain
     /// world provenance, but do not replace the ordinary no-model fallback.
     pub(crate) analysis_candidates: HashMap<Node, HashSet<ClightStmt>>,
@@ -412,7 +419,8 @@ pub struct FunctionData {
     /// Interface variables this function's solve chooses jointly instead of
     /// reading the committed interface above (`syntax::interfaces`). Empty for
     /// an ordinary solve.
-    pub(crate) free_interfaces: crate::decompile::passes::clight_select::syntax::interfaces::FreeInterfaces,
+    pub(crate) free_interfaces:
+        crate::decompile::passes::clight_select::syntax::interfaces::FreeInterfaces,
 }
 
 #[derive(Debug, Clone)]
@@ -5113,8 +5121,8 @@ fn build_fields_with_padding(
 
 #[cfg(test)]
 mod recovered_struct_layout_tests {
-    use crate::decompile::passes::clight_select::query::*;
     use crate::decompile::passes::c_pass::print::Printer;
+    use crate::decompile::passes::clight_select::query::*;
 
     #[test]
     fn misaligned_wide_field_is_packed_without_packing_the_struct() {

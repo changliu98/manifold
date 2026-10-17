@@ -29,14 +29,14 @@ use std::sync::Arc;
 use z3::ast::{Bool, Dynamic};
 use z3::Optimize;
 
-use crate::decompile::passes::clight_select::solvers::obligations::Obligations;
+use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::clight_select::query::FunctionData;
 use crate::decompile::passes::clight_select::select::ProgramSelectionState;
-use crate::decompile::elevator::DecompileDB;
+use crate::decompile::passes::clight_select::solvers::obligations::Obligations;
+use crate::decompile::passes::clight_select::solvers::{self, Checker, Solver};
 use crate::x86::types::{ClightStmt, Ident, Node, RTLReg, XType};
 use c_types::TypeDt;
 use constraints::{ConstraintSink, SolveBackend};
-use crate::decompile::passes::clight_select::solvers::{self, Checker, Solver};
 
 pub(crate) struct DeclarationContext<'a> {
     pub types: &'a TypeDt,
@@ -213,10 +213,7 @@ fn semantic_admission_ablated(function: &FunctionData) -> bool {
 }
 
 impl<'a> Stack<'a> {
-    pub(crate) fn new(
-        solvers: &'a [&'a dyn Solver],
-        components: &'a [&'a dyn Component],
-    ) -> Self {
+    pub(crate) fn new(solvers: &'a [&'a dyn Solver], components: &'a [&'a dyn Component]) -> Self {
         let mut names = std::collections::BTreeSet::new();
         for name in solvers
             .iter()
@@ -315,10 +312,11 @@ impl<'a> Stack<'a> {
                 Box::new(profiles) as Box<dyn Checker>,
             ));
         }
-        result.extend(
-            self.solvers()
-                .filter_map(|solver| solver.checker(cx, opt).map(|checker| (solver.name(), checker))),
-        );
+        result.extend(self.solvers().filter_map(|solver| {
+            solver
+                .checker(cx, opt)
+                .map(|checker| (solver.name(), checker))
+        }));
         result
     }
 

@@ -68,7 +68,9 @@ pub fn node_address(node: Node) -> u64 {
 // Share C's integer promotions and usual arithmetic conversions with ctyping.
 // An unsigned subword promotes to int; signed long can represent uint32.
 fn compare_class(lhs: &ClightExpr, rhs: &ClightExpr) -> Option<CmpClass> {
-    use crate::decompile::passes::clight_select::syntax::ctyping::{classify_binarith, BinarithCase};
+    use crate::decompile::passes::clight_select::syntax::ctyping::{
+        classify_binarith, BinarithCase,
+    };
     match classify_binarith(expr_type(lhs), expr_type(rhs)) {
         BinarithCase::I(sign) | BinarithCase::L(sign) => Some(match sign {
             ClightSignedness::Signed => CmpClass::Signed,

@@ -5,8 +5,8 @@
 //! a matching byte count at the wrong offset fails. This module does not
 //! establish initialization, dominance, or control-flow equivalence.
 
-use crate::decompile::passes::clight_select::query::FunctionData;
 use crate::decompile::elevator::DecompileDB;
+use crate::decompile::passes::clight_select::query::FunctionData;
 use crate::decompile::passes::semantic_counterexample::ledger::{self, ObjectId};
 use crate::x86::types::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -388,7 +388,9 @@ fn lvalue(expr: &ClightExpr, root: RTLReg, function: &FunctionData) -> Option<i6
         ClightExpr::Evar(id, _) | ClightExpr::Etempvar(id, _) if *id as RTLReg == root => Some(0),
         ClightExpr::Ederef(pointer, _) => address(pointer, root, function),
         ClightExpr::Efield(base, field, _) => {
-            let ClightType::Tstruct(id, _) = crate::decompile::passes::clight_select::syntax::solve::clight_expr_type(base) else {
+            let ClightType::Tstruct(id, _) =
+                crate::decompile::passes::clight_select::syntax::solve::clight_expr_type(base)
+            else {
                 return None;
             };
             let offsets: BTreeSet<_> = function
@@ -427,8 +429,10 @@ pub(crate) fn read_operand<'a>(
 ) -> Option<&'a ClightExpr> {
     let operand = single_read_operand(rhs)?;
     (lvalue(operand, contract.root, function) == Some(contract.offset)
-        && size(crate::decompile::passes::clight_select::syntax::solve::clight_expr_type(operand), function.ptr64)
-            == Some(contract.width as i64))
+        && size(
+            crate::decompile::passes::clight_select::syntax::solve::clight_expr_type(operand),
+            function.ptr64,
+        ) == Some(contract.width as i64))
     .then_some(operand)
 }
 
@@ -470,7 +474,10 @@ pub(crate) fn check(stmt: &ClightStmt, contract: &WriteContract, function: &Func
             let Some(offset) = lvalue(lhs, contract.root, function) else {
                 return Check::Unknown;
             };
-            let Some(width) = size(crate::decompile::passes::clight_select::syntax::solve::clight_expr_type(lhs), function.ptr64) else {
+            let Some(width) = size(
+                crate::decompile::passes::clight_select::syntax::solve::clight_expr_type(lhs),
+                function.ptr64,
+            ) else {
                 return Check::Unknown;
             };
             if offset == contract.offset && width == contract.width as i64 {
@@ -531,8 +538,10 @@ mod tests {
     fn fixture() -> (FunctionData, WriteContract) {
         let mut f = FunctionData::new(1, "targets".into(), vec![], vec![], None, 32, 30, true);
         f.used_regs.insert(10);
-        f.var_type_candidates
-            .insert(10, vec![crate::decompile::passes::clight_select::candtype::CandType::PtrChar]);
+        f.var_type_candidates.insert(
+            10,
+            vec![crate::decompile::passes::clight_select::candtype::CandType::PtrChar],
+        );
         let w = WriteContract {
             object: ObjectId {
                 function: 1,
@@ -636,7 +645,12 @@ mod tests {
             30,
             vec![store(1, ClightIntSize::I8), store(4, ClightIntSize::I8)],
         );
-        let outcome = crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(&f, &HashMap::new(), &[]).unwrap();
+        let outcome = crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(
+            &f,
+            &HashMap::new(),
+            &[],
+        )
+        .unwrap();
         assert_eq!(outcome.0[&30], Some(1));
     }
 
@@ -733,9 +747,15 @@ mod tests {
                     })
                 ));
             }
-            crate::decompile::passes::clight_select::solvers::storage::PROBLEMS.insert(&mut function.analysis_facts, pending);
+            crate::decompile::passes::clight_select::solvers::storage::PROBLEMS
+                .insert(&mut function.analysis_facts, pending);
             let outcome =
-                crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(&function, &HashMap::new(), &[]).unwrap();
+                crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(
+                    &function,
+                    &HashMap::new(),
+                    &[],
+                )
+                .unwrap();
             assert_eq!(outcome.0[&30], Some(0));
             let decisions = crate::decompile::passes::clight_select::solvers::storage::DECISIONS
                 .get(&outcome.5)

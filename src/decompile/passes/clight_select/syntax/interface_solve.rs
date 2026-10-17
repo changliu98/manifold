@@ -12,9 +12,7 @@ use z3::{Optimize, SatResult};
 
 use crate::decompile::elevator::config;
 use crate::decompile::passes::c_pass::types::{CType, TypeQualifiers};
-use crate::decompile::passes::clight_select::syntax::type_evidence::COMMITMENTS;
 use crate::decompile::passes::clight_select::candtype::{CandType, Sign};
-use crate::decompile::passes::clight_select::syntax::ctyping::{self, Severity};
 use crate::decompile::passes::clight_select::query::{
     CalleeSignature, CommittedInterfaces, FunctionData, InterfaceAuthority, InterfaceClass,
     InterfaceVar, InterfaceVarId, InterfaceVars, KnownGlobalTypes,
@@ -22,6 +20,8 @@ use crate::decompile::passes::clight_select::query::{
 use crate::decompile::passes::clight_select::select::{
     callee_ident_from_expr, ProgramSelectionState,
 };
+use crate::decompile::passes::clight_select::syntax::ctyping::{self, Severity};
+use crate::decompile::passes::clight_select::syntax::type_evidence::COMMITMENTS;
 use crate::decompile::passes::clight_select::type_graph::TypeTerm;
 use crate::decompile::passes::clight_select::wt_audit::{self, AuditEnv};
 use crate::x86::types::{
@@ -1171,12 +1171,15 @@ pub(crate) fn solve_with_global_feedback(
                 .collect()
         })
         .collect();
-    let (choices, declaration_choices, solve_result, no_model) =
-        z3::with_z3_config(&z3::Config::new(), || {
+    let (choices, declaration_choices, solve_result, no_model) = z3::with_z3_config(
+        &z3::Config::new(),
+        || {
             let opt = Optimize::new();
-            opt.set_params(&crate::decompile::passes::clight_select::solvers::refinement::work_allowance(
-                config::CONFIG.solve.rlimit,
-            ));
+            opt.set_params(
+                &crate::decompile::passes::clight_select::solvers::refinement::work_allowance(
+                    config::CONFIG.solve.rlimit,
+                ),
+            );
             let zvars: Vec<Int> = vars
                 .vars
                 .iter()
@@ -1427,7 +1430,8 @@ pub(crate) fn solve_with_global_feedback(
                 })
                 .collect();
             (choices, declaration_choices, result, false)
-        });
+        },
+    );
     let fell_back = solve_result != SatResult::Sat || no_model;
     if fell_back {
         eprintln!(
@@ -1621,10 +1625,10 @@ pub(crate) fn solve_with_global_feedback(
 
 #[cfg(test)]
 mod tests {
-    use crate::decompile::passes::clight_select::syntax::interface_solve::*;
     use crate::decompile::passes::clight_select::query::{
         CommittedFunctionInterface, InterfaceAlternative, InterfaceAuthority,
     };
+    use crate::decompile::passes::clight_select::syntax::interface_solve::*;
     use crate::x86::types::{CallConv, ClightAttr, ClightFloatSize, ClightIntSize};
     use std::sync::Arc;
 

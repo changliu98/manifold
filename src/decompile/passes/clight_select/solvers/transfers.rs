@@ -2,9 +2,12 @@
 //!
 //! A load-transport proof preserves the fetched word through C conversion.
 //! It deliberately makes no address, aliasing, initialization or lifetime claim.
-use crate::decompile::passes::clight_select::syntax::{ArtifactKey, Artifacts};
 use crate::decompile::elevator::DecompileDB;
-use crate::decompile::passes::clight_select::{solvers::integer_semantics::{CopyValue, LoadValue}, query::FunctionData};
+use crate::decompile::passes::clight_select::syntax::{ArtifactKey, Artifacts};
+use crate::decompile::passes::clight_select::{
+    query::FunctionData,
+    solvers::integer_semantics::{CopyValue, LoadValue},
+};
 use crate::mreg::Mreg;
 use crate::x86::types::*;
 use std::collections::{BTreeMap, BTreeSet};

@@ -185,5 +185,8 @@ pub(crate) fn extend_candidates(function: &mut FunctionData) {
         }
     }
     grammar.run();
-    crate::decompile::passes::clight_select::syntax::candidates::inherit(function, grammar.candidate.into_iter().collect());
+    crate::decompile::passes::clight_select::syntax::candidates::inherit(
+        function,
+        grammar.candidate.into_iter().collect(),
+    );
 }

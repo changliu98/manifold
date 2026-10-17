@@ -2,14 +2,19 @@
 //!
 //! This is a scoped contract, not a whole-function proof. Opaque or missing
 //! carriers cannot become successful executable output via solver fallback.
-use crate::decompile::passes::clight_select::{solvers::integer_semantics::Validator, solvers::obligations::{Check, Verdict}, query::FunctionData, select::ProgramSelectionState};
+use crate::decompile::effects::flags::FlagSelect;
+use crate::decompile::effects::{self, ArtifactId, EffectId, Outcome, Receipt, Stage};
+use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::clight_select::syntax::constraints::ConstraintSink;
 use crate::decompile::passes::clight_select::syntax::{
     ArtifactKey, Candidate, CandidateAnalysis, FunctionContext, PreparedAnalysis,
 };
-use crate::decompile::effects::flags::FlagSelect;
-use crate::decompile::effects::{self, ArtifactId, EffectId, Outcome, Receipt, Stage};
-use crate::decompile::elevator::DecompileDB;
+use crate::decompile::passes::clight_select::{
+    query::FunctionData,
+    select::ProgramSelectionState,
+    solvers::integer_semantics::Validator,
+    solvers::obligations::{Check, Verdict},
+};
 use crate::mreg::Mreg;
 use crate::x86::{
     op::{Addressing, Operation},
@@ -171,7 +176,8 @@ fn checked_value(
     function: &FunctionData,
     validator: &Validator,
 ) -> Check {
-    let mut declarations = crate::decompile::passes::clight_select::solvers::semantics::integer_declarations(function);
+    let mut declarations =
+        crate::decompile::passes::clight_select::solvers::semantics::integer_declarations(function);
     if let (RTLInst::Iop(_, _, dst), ClightStmt::Sreturn(Some(rhs))) = (inst, primitive(stmt)) {
         declarations.insert(
             *dst,
@@ -667,8 +673,13 @@ mod read_tests {
     }
     #[test]
     fn effect_contract_and_candidates_share_binding_projection() {
-        use crate::decompile::passes::clight_select::syntax::{bindings::BindingPlan, c_types::CTypes, Stack};
-        use crate::decompile::passes::clight_select::{candtype::{CandType, Sign}, syntax::solve::solve_function_z3_with_stack};
+        use crate::decompile::passes::clight_select::syntax::{
+            bindings::BindingPlan, c_types::CTypes, Stack,
+        };
+        use crate::decompile::passes::clight_select::{
+            candtype::{CandType, Sign},
+            syntax::solve::solve_function_z3_with_stack,
+        };
         use crate::decompile::passes::{clight_pass, cminor_pass};
         use std::sync::Arc;
         let spec = FlagSelect {

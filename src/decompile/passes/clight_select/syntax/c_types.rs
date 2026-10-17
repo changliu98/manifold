@@ -3,11 +3,17 @@
 //! This is one selection analysis; recursive C rules do not own solver policy.
 
 use crate::decompile::passes::clight_select::candtype::{CandClass, CandType, Sign};
-use crate::decompile::passes::clight_select::query::{FunctionData, InterfaceClass, KnownGlobalTypes};
+use crate::decompile::passes::clight_select::query::{
+    FunctionData, InterfaceClass, KnownGlobalTypes,
+};
 use crate::decompile::passes::clight_select::select::callee_ident_from_expr;
-use crate::decompile::passes::clight_select::syntax::constraints::{ConstraintSink, ModelView, SolveBackend};
+use crate::decompile::passes::clight_select::syntax::constraints::{
+    ConstraintSink, ModelView, SolveBackend,
+};
 use crate::decompile::passes::clight_select::syntax::interfaces::{self, InterfaceTerms};
-use crate::decompile::passes::clight_select::syntax::{Candidate, CandidateAnalysis, DeclarationContext, FunctionContext};
+use crate::decompile::passes::clight_select::syntax::{
+    Candidate, CandidateAnalysis, DeclarationContext, FunctionContext,
+};
 use crate::x86::types::XType;
 use crate::x86::types::{ClightBinaryOp, ClightExpr, ClightStmt, ClightType, Ident, RTLReg};
 use std::cell::RefCell;
@@ -47,9 +53,14 @@ impl crate::decompile::passes::clight_select::syntax::Component for CTypes {
         // chosen class would as a pin.
         let open = own_parameter(cx, reg);
         if func.must_pointer_regs.contains(&reg) && !pinned_non_pointer {
-            match open.filter(|alts| alts.iter().any(|(x, _)| !InterfaceClass::from_xtype(x).is_pointer())) {
+            match open.filter(|alts| {
+                alts.iter()
+                    .any(|(x, _)| !InterfaceClass::from_xtype(x).is_pointer())
+            }) {
                 Some(alternatives) => {
-                    let non_pointer = interfaces::chooses(alternatives, |x| !InterfaceClass::from_xtype(x).is_pointer());
+                    let non_pointer = interfaces::chooses(alternatives, |x| {
+                        !InterfaceClass::from_xtype(x).is_pointer()
+                    });
                     backend.assert_hard(&Bool::or(&[non_pointer, t.is_ptr(tv)]));
                 }
                 None => backend.assert_hard(&t.is_ptr(tv)),
@@ -109,7 +120,8 @@ impl crate::decompile::passes::clight_select::syntax::Component for CTypes {
         // An open own parameter is the C parameter object itself: its
         // declaration takes the chosen alternative's class.
         for reg in &cx.function.param_regs {
-            if let (Some(variable), Some(alternatives)) = (tyvar.get(reg), own_parameter(cx, *reg)) {
+            if let (Some(variable), Some(alternatives)) = (tyvar.get(reg), own_parameter(cx, *reg))
+            {
                 for (xtype, selected) in alternatives {
                     backend.assert_hard(&selected.implies(matches(reg, variable, xtype)));
                 }
@@ -217,20 +229,29 @@ impl CandidateAnalysis for CTypes {
             .into_iter()
             .filter_map(|symbol| cx.interfaces.global(symbol).map(|alts| (symbol, alts)))
             .collect();
-        let mut cases: Vec<(Vec<Bool>, HashMap<Ident, ClightType>)> = vec![(Vec::new(), HashMap::new())];
+        let mut cases: Vec<(Vec<Bool>, HashMap<Ident, ClightType>)> =
+            vec![(Vec::new(), HashMap::new())];
         for (symbol, alternatives) in &open {
             cases = cases
                 .into_iter()
                 .flat_map(|(selectors, globals)| {
-                    alternatives.iter().enumerate().map(move |(index, (_, selected))| {
-                        let mut selectors = selectors.clone();
-                        selectors.push(selected.clone());
-                        let mut globals = globals.clone();
-                        if let Some(ty) = interfaces::global_declaration(cx.function, *symbol, alternatives, index) {
-                            globals.insert(*symbol, ty);
-                        }
-                        (selectors, globals)
-                    })
+                    alternatives
+                        .iter()
+                        .enumerate()
+                        .map(move |(index, (_, selected))| {
+                            let mut selectors = selectors.clone();
+                            selectors.push(selected.clone());
+                            let mut globals = globals.clone();
+                            if let Some(ty) = interfaces::global_declaration(
+                                cx.function,
+                                *symbol,
+                                alternatives,
+                                index,
+                            ) {
+                                globals.insert(*symbol, ty);
+                            }
+                            (selectors, globals)
+                        })
                 })
                 .collect();
         }
@@ -284,7 +305,8 @@ impl RuleSink<'_, '_> {
         }
     }
     fn assert_soft_tagged(&self, guard: Option<&Bool>, cond: &Bool, w: u64, tag: &'static str) {
-        self.common.assert_soft_tagged(guard, &self.within(cond), w, tag);
+        self.common
+            .assert_soft_tagged(guard, &self.within(cond), w, tag);
     }
     fn assert_structural(&self, guard: Option<&Bool>, cond: &Bool) {
         self.common.assert_structural(guard, &self.within(cond));
@@ -309,7 +331,11 @@ impl RuleSink<'_, '_> {
         self.common.penalize_candidate_when(&cond, w);
     }
     /// A global's declaration in this pass, if it has one.
-    fn known_global<'f>(&'f self, known: &'f KnownGlobalTypes, e: &ClightExpr) -> Option<&'f ClightType> {
+    fn known_global<'f>(
+        &'f self,
+        known: &'f KnownGlobalTypes,
+        e: &ClightExpr,
+    ) -> Option<&'f ClightType> {
         match e {
             ClightExpr::Evar(id, _) => self.globals.get(id).or_else(|| known.by_ident.get(id)),
             _ => None,
@@ -318,7 +344,10 @@ impl RuleSink<'_, '_> {
 }
 
 /// The open choice of `reg`'s own-parameter interface, if `reg` is one.
-fn own_parameter<'a>(cx: &'a DeclarationContext<'_>, reg: RTLReg) -> Option<&'a interfaces::Alternatives> {
+fn own_parameter<'a>(
+    cx: &'a DeclarationContext<'_>,
+    reg: RTLReg,
+) -> Option<&'a interfaces::Alternatives> {
     let position = cx.function.param_regs.iter().position(|r| *r == reg)?;
     cx.interfaces.param(cx.function.address as Ident, position)
 }
@@ -516,7 +545,10 @@ pub(crate) fn cand_to_ty(t: &TypeDt, candidate: CandType) -> Dynamic {
 
 /// The C-class theory is a projection of an exact structural declaration,
 /// never a second authority for its width, signedness or pointer depth.
-pub(crate) fn term_to_ty(t: &TypeDt, term: &crate::decompile::passes::clight_select::type_graph::TypeTerm) -> Dynamic {
+pub(crate) fn term_to_ty(
+    t: &TypeDt,
+    term: &crate::decompile::passes::clight_select::type_graph::TypeTerm,
+) -> Dynamic {
     use crate::decompile::passes::clight_select::type_graph::TypeTerm;
     match term {
         TypeTerm::Void => t.void(),
@@ -811,7 +843,10 @@ fn type_of(
                 let tgt = clight_to_ty(t, ct);
                 sink.prefer(&wt_cast_term(t, &itm, &tgt), 8);
                 // The weight-1 SEL-AGREE cast-level pointerness nudge was retired as subsumed; the Sset-level and Etempvar class-match preferences are not subsumed and stay.
-            } else if sink.known_global(func.known_global_types.as_ref(), inner).is_some() {
+            } else if sink
+                .known_global(func.known_global_types.as_ref(), inner)
+                .is_some()
+            {
                 // Concrete known globals carry an authoritative declaration
                 // type. Unlike ordinary concrete annotations, a mismatch here
                 // is actionable: ClightPass supplies a definition-local,
@@ -1043,9 +1078,15 @@ fn constrain_stmt(
             if let (Some(_), Some(sig)) = (ret, sig) {
                 match open_return {
                     Some(alternatives) => {
-                        if let Some(g) = guard.filter(|_| alternatives.iter().any(|(x, _)| matches!(x, XType::Xvoid))) {
-                            let void = interfaces::chooses(alternatives, |x| matches!(x, XType::Xvoid));
-                            sink.assert_soft_raw(&Bool::and(&[g.clone(), void.clone()]).not(), compat_w);
+                        if let Some(g) = guard
+                            .filter(|_| alternatives.iter().any(|(x, _)| matches!(x, XType::Xvoid)))
+                        {
+                            let void =
+                                interfaces::chooses(alternatives, |x| matches!(x, XType::Xvoid));
+                            sink.assert_soft_raw(
+                                &Bool::and(&[g.clone(), void.clone()]).not(),
+                                compat_w,
+                            );
                             sink.penalize_candidate_when(&void, compat_w);
                         }
                     }
@@ -1070,9 +1111,14 @@ fn constrain_stmt(
             let penalize_mismatch = |valued: bool| match open_return {
                 Some(alternatives) => {
                     let mismatching = |x: &XType| matches!(x, XType::Xvoid) == valued;
-                    if let Some(g) = guard.filter(|_| alternatives.iter().any(|(x, _)| mismatching(x))) {
+                    if let Some(g) =
+                        guard.filter(|_| alternatives.iter().any(|(x, _)| mismatching(x)))
+                    {
                         let mismatch = interfaces::chooses(alternatives, mismatching);
-                        sink.assert_soft_raw(&Bool::and(&[g.clone(), mismatch.clone()]).not(), compat_w);
+                        sink.assert_soft_raw(
+                            &Bool::and(&[g.clone(), mismatch.clone()]).not(),
+                            compat_w,
+                        );
                         sink.penalize_candidate_when(&mismatch, compat_w);
                     }
                 }
@@ -1308,8 +1354,8 @@ pub(crate) fn anchor_index(
 
 #[cfg(test)]
 mod interface_class_tests {
-    use crate::decompile::passes::clight_select::syntax::c_types::*;
     use crate::abi::DataModel;
+    use crate::decompile::passes::clight_select::syntax::c_types::*;
     use crate::decompile::passes::clight_select::type_graph::TypeTerm;
     use z3::ast::Ast;
 

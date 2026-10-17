@@ -41,7 +41,8 @@ pub(crate) const CHOICES: ArtifactKey<BTreeMap<InterfaceVarId, usize>> =
 
 /// The objective cost of a solve's model: the total weight of the soft clauses
 /// it violates, and the number violated per weight.
-pub(crate) const COST: ArtifactKey<(u64, BTreeMap<u64, usize>)> = ArtifactKey::new("objective-cost");
+pub(crate) const COST: ArtifactKey<(u64, BTreeMap<u64, usize>)> =
+    ArtifactKey::new("objective-cost");
 
 /// One open variable's alternatives, each with its selector.
 pub(crate) type Alternatives = [(XType, Bool)];
@@ -54,7 +55,11 @@ impl InterfaceTerms {
     pub(crate) fn build(free: &FreeInterfaces, backend: &dyn SolveBackend) -> Self {
         let mut terms = BTreeMap::new();
         for (id, (domain, pin)) in &free.0 {
-            assert!(!domain.is_empty(), "interface {} has an empty domain", id.label());
+            assert!(
+                !domain.is_empty(),
+                "interface {} has an empty domain",
+                id.label()
+            );
             let selectors: Vec<(XType, Bool)> = domain
                 .iter()
                 .map(|alternative| (alternative.xtype, Bool::fresh_const("interface")))
@@ -110,13 +115,10 @@ pub(crate) fn term(t: &TypeDt, alternatives: &Alternatives) -> Dynamic {
 /// The chosen alternative's term, each alternative's given by `of`.
 fn term_of(alternatives: &Alternatives, of: impl Fn(usize, &XType) -> Dynamic) -> Dynamic {
     let last = alternatives.len() - 1;
-    alternatives[..last]
-        .iter()
-        .enumerate()
-        .rev()
-        .fold(of(last, &alternatives[last].0), |chosen, (index, (xtype, selected))| {
-            selected.ite(&of(index, xtype), &chosen)
-        })
+    alternatives[..last].iter().enumerate().rev().fold(
+        of(last, &alternatives[last].0),
+        |chosen, (index, (xtype, selected))| selected.ite(&of(index, xtype), &chosen),
+    )
 }
 
 /// The alternative `FunctionData` already commits: the one of `committed`'s
@@ -134,7 +136,11 @@ fn committed_index(alternatives: &Alternatives, committed: Option<&ClightType>) 
 
 /// The function's own return type. The committed alternative keeps
 /// `FunctionData::return_type`; another is the declaration it would commit.
-pub(crate) fn own_return_term(t: &TypeDt, func: &FunctionData, alternatives: &Alternatives) -> Dynamic {
+pub(crate) fn own_return_term(
+    t: &TypeDt,
+    func: &FunctionData,
+    alternatives: &Alternatives,
+) -> Dynamic {
     let committed = committed_index(alternatives, Some(&func.return_type));
     term_of(alternatives, |index, xtype| {
         if index == committed {
@@ -240,7 +246,9 @@ mod tests {
     use crate::decompile::passes::clight_select::candtype::{CandType, Sign};
     use crate::decompile::passes::clight_select::query::{CalleeSignature, KnownGlobalTypes};
     use crate::decompile::passes::clight_select::syntax::solve::solve_function_z3;
-    use crate::x86::types::{ClightAttr, ClightFloatSize, ClightIntSize, ClightSignedness, ParamType};
+    use crate::x86::types::{
+        ClightAttr, ClightFloatSize, ClightIntSize, ClightSignedness, ParamType,
+    };
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -250,7 +258,11 @@ mod tests {
 
     fn pointer() -> ClightType {
         ClightType::Tpointer(
-            Arc::new(ClightType::Tint(ClightIntSize::I8, ClightSignedness::Signed, ClightAttr::default())),
+            Arc::new(ClightType::Tint(
+                ClightIntSize::I8,
+                ClightSignedness::Signed,
+                ClightAttr::default(),
+            )),
             ClightAttr::default(),
         )
     }
@@ -258,7 +270,11 @@ mod tests {
         ClightType::Tfloat(ClightFloatSize::F64, ClightAttr::default())
     }
     fn int() -> ClightType {
-        ClightType::Tint(ClightIntSize::I32, ClightSignedness::Signed, ClightAttr::default())
+        ClightType::Tint(
+            ClightIntSize::I32,
+            ClightSignedness::Signed,
+            ClightAttr::default(),
+        )
     }
 
     /// A function at node 20 whose register 5 holds a pointer.
@@ -273,15 +289,28 @@ mod tests {
     fn callee(f: &mut FunctionData, return_type: XType, param_types: Vec<XType>) {
         f.callee_signatures.insert(
             G,
-            CalleeSignature { param_count: param_types.len(), return_type, param_types, is_varargs: false },
+            CalleeSignature {
+                param_count: param_types.len(),
+                return_type,
+                param_types,
+                is_varargs: false,
+            },
         );
     }
 
-    fn open(f: &FunctionData, id: &InterfaceVarId, domain: &[XType], pin: Option<usize>) -> FunctionData {
+    fn open(
+        f: &FunctionData,
+        id: &InterfaceVarId,
+        domain: &[XType],
+        pin: Option<usize>,
+    ) -> FunctionData {
         let mut f = f.clone();
         let domain = domain
             .iter()
-            .map(|xtype| InterfaceAlternative { class: InterfaceClass::from_xtype(xtype), xtype: *xtype })
+            .map(|xtype| InterfaceAlternative {
+                class: InterfaceClass::from_xtype(xtype),
+                xtype: *xtype,
+            })
             .collect();
         f.free_interfaces.0.insert(id.clone(), (domain, pin));
         f
@@ -292,7 +321,11 @@ mod tests {
         let (candidates, _, _, _, _, results) =
             solve_function_z3(f, &HashMap::new(), &[]).expect("a model");
         let choices = CHOICES.get(&results).cloned().unwrap_or_default();
-        (choices, COST.get(&results).expect("a cost").0, candidates.get(&20).copied().flatten())
+        (
+            choices,
+            COST.get(&results).expect("a cost").0,
+            candidates.get(&20).copied().flatten(),
+        )
     }
 
     /// Pinned at the committed alternative the problem is the ordinary one;
@@ -318,24 +351,48 @@ mod tests {
             vec![ClightExpr::Etempvar(5, pointer())],
         )]);
         callee(&mut f, XType::Xvoid, vec![XType::Xfloat]);
-        check_open_choice(&f, InterfaceVarId::Param { function: G, position: 0 }, &[XType::Xfloat, XType::Xptr], 1);
+        check_open_choice(
+            &f,
+            InterfaceVarId::Param {
+                function: G,
+                position: 0,
+            },
+            &[XType::Xfloat, XType::Xptr],
+            1,
+        );
     }
 
     #[test]
     fn an_open_return_type_takes_the_class_the_function_returns() {
-        let mut f = function(vec![ClightStmt::Sreturn(Some(ClightExpr::Etempvar(5, pointer())))]);
+        let mut f = function(vec![ClightStmt::Sreturn(Some(ClightExpr::Etempvar(
+            5,
+            pointer(),
+        )))]);
         f.return_type = double();
-        check_open_choice(&f, InterfaceVarId::Return { function: F }, &[XType::Xfloat, XType::Xptr], 1);
+        check_open_choice(
+            &f,
+            InterfaceVarId::Return { function: F },
+            &[XType::Xfloat, XType::Xptr],
+            1,
+        );
     }
 
     #[test]
     fn an_open_global_takes_the_class_its_accesses_need() {
         // `p = global;` with a pointer p, where the global is committed a double.
-        let mut f = function(vec![ClightStmt::Sset(5, ClightExpr::Evar(GLOBAL, double()))]);
+        let mut f = function(vec![ClightStmt::Sset(
+            5,
+            ClightExpr::Evar(GLOBAL, double()),
+        )]);
         let mut known = KnownGlobalTypes::default();
         known.by_ident.insert(GLOBAL, double());
         f.known_global_types = Arc::new(known);
-        check_open_choice(&f, InterfaceVarId::Global { symbol: GLOBAL }, &[XType::Xfloat, XType::Xptr], 1);
+        check_open_choice(
+            &f,
+            InterfaceVarId::Global { symbol: GLOBAL },
+            &[XType::Xfloat, XType::Xptr],
+            1,
+        );
     }
 
     #[test]
@@ -345,7 +402,8 @@ mod tests {
             ClightStmt::Scall(Some(6), ClightExpr::Evar(G, int()), vec![]),
             ClightStmt::Scall(None, ClightExpr::Evar(G, int()), vec![]),
         ]);
-        f.var_type_candidates.insert(6, vec![CandType::I32(Sign::Signed)]);
+        f.var_type_candidates
+            .insert(6, vec![CandType::I32(Sign::Signed)]);
         callee(&mut f, XType::Xint, vec![]);
         let id = InterfaceVarId::Return { function: G };
         let domain = [XType::Xint, XType::Xvoid];
@@ -361,15 +419,32 @@ mod tests {
     fn an_open_own_parameter_is_declared_as_the_chosen_class() {
         // The parameter register is dereferenced, so only a pointer
         // alternative is feasible; its committed type is int.
-        let mut f = FunctionData::new(F as u64, "f".into(), vec![3], vec![ParamType::Typed(XType::Xint)], None, 0, 20, true);
-        f.var_type_candidates.insert(3, vec![CandType::I32(Sign::Signed), CandType::PtrChar]);
-        f.var_type_candidates.insert(5, vec![CandType::I32(Sign::Signed)]);
+        let mut f = FunctionData::new(
+            F as u64,
+            "f".into(),
+            vec![3],
+            vec![ParamType::Typed(XType::Xint)],
+            None,
+            0,
+            20,
+            true,
+        );
+        f.var_type_candidates
+            .insert(3, vec![CandType::I32(Sign::Signed), CandType::PtrChar]);
+        f.var_type_candidates
+            .insert(5, vec![CandType::I32(Sign::Signed)]);
         f.must_pointer_regs.insert(3);
         f.node_statements.insert(
             20,
-            vec![ClightStmt::Sset(5, ClightExpr::Ederef(Box::new(ClightExpr::Etempvar(3, pointer())), int()))],
+            vec![ClightStmt::Sset(
+                5,
+                ClightExpr::Ederef(Box::new(ClightExpr::Etempvar(3, pointer())), int()),
+            )],
         );
-        let id = InterfaceVarId::Param { function: F, position: 0 };
+        let id = InterfaceVarId::Param {
+            function: F,
+            position: 0,
+        };
         let domain = [XType::Xint, XType::Xptr];
         let (choices, _, _) = solve(&open(&f, &id, &domain, None));
         assert_eq!(choices[&id], 1);

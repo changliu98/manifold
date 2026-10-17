@@ -1,6 +1,8 @@
-use crate::decompile::passes::clight_select::solvers::obligations::{Check, Obligation, Obligations, Verdict};
-use crate::decompile::passes::clight_select::syntax::*;
 use crate::decompile::passes::c_pass::types::CType;
+use crate::decompile::passes::clight_select::solvers::obligations::{
+    Check, Obligation, Obligations, Verdict,
+};
+use crate::decompile::passes::clight_select::syntax::*;
 use std::collections::BTreeSet;
 use z3::Model;
 
@@ -59,16 +61,21 @@ fn independent_modules_stack_without_solver_dispatch_changes() {
         forbidden: 1,
     };
     for modules in [
-        vec![&c_types::CTypes as &dyn crate::decompile::passes::clight_select::syntax::Component, &left, &right],
+        vec![
+            &c_types::CTypes as &dyn crate::decompile::passes::clight_select::syntax::Component,
+            &left,
+            &right,
+        ],
         vec![&c_types::CTypes, &right, &left],
     ] {
-        let out = crate::decompile::passes::clight_select::syntax::solve::solve_function_z3_with_stack(
-            &fixture(),
-            &HashMap::new(),
-            &[],
-            &Stack::new(&[], &modules),
-        )
-        .unwrap();
+        let out =
+            crate::decompile::passes::clight_select::syntax::solve::solve_function_z3_with_stack(
+                &fixture(),
+                &HashMap::new(),
+                &[],
+                &Stack::new(&[], &modules),
+            )
+            .unwrap();
         assert_eq!(out.0[&10], Some(1));
         assert_eq!(out.0[&20], Some(0));
     }
@@ -86,7 +93,10 @@ fn module_io_is_aggregated_and_deduplicated() {
         node: 20,
         forbidden: 1,
     };
-    let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[], &[&left, &right]);
+    let (solvers, components): (
+        &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+        &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+    ) = (&[], &[&left, &right]);
     let stack = Stack::new(solvers, components);
     assert_eq!(stack.reads(), ["rtl_inst", "test_evidence"]);
     assert_eq!(stack.writes(), ["test_obligations"]);
@@ -147,14 +157,18 @@ fn new_obligation_uses_shared_refutation_and_repick_guards() {
         (Verdict::Refuted, 0),
     ] {
         let extra = ExtraAnalysis(verdict);
-        let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&extra], &[&c_types::CTypes]);
-        let out = crate::decompile::passes::clight_select::syntax::solve::solve_function_z3_with_stack(
-            &f,
-            &HashMap::new(),
-            &[],
-            &Stack::new(solvers, components),
-        )
-        .unwrap();
+        let (solvers, components): (
+            &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+            &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+        ) = (&[&extra], &[&c_types::CTypes]);
+        let out =
+            crate::decompile::passes::clight_select::syntax::solve::solve_function_z3_with_stack(
+                &f,
+                &HashMap::new(),
+                &[],
+                &Stack::new(solvers, components),
+            )
+            .unwrap();
         assert_eq!(out.0[&10], Some(expected), "{verdict:?}");
     }
 }
@@ -165,7 +179,10 @@ fn semantic_admission_ablation_drops_obligation_vetoes() {
     f.node_statements
         .insert(10, vec![ClightStmt::Sskip, ClightStmt::Sreturn(None)]);
     let extra = ExtraAnalysis(Verdict::Equivalent);
-    let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&extra], &[&c_types::CTypes]);
+    let (solvers, components): (
+        &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+        &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+    ) = (&[&extra], &[&c_types::CTypes]);
     let solve = |f: &FunctionData| {
         crate::decompile::passes::clight_select::syntax::solve::solve_function_z3_with_stack(
             f,
@@ -233,7 +250,10 @@ impl Checker for SearchSession {
             4
         }
     }
-    fn check(&mut self, answer: &Model) -> crate::decompile::passes::clight_select::solvers::Verdict {
+    fn check(
+        &mut self,
+        answer: &Model,
+    ) -> crate::decompile::passes::clight_select::solvers::Verdict {
         self.inspect(answer).into()
     }
     fn coupled_nodes(&self) -> BTreeSet<Node> {
@@ -272,7 +292,10 @@ fn two_refiners_share_the_model_and_protect_joint_selection_from_repick() {
         node: 20,
         behavior: Behavior::Refine,
     };
-    let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&left, &right], &[&c_types::CTypes]);
+    let (solvers, components): (
+        &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+        &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+    ) = (&[&left, &right], &[&c_types::CTypes]);
     let out = crate::decompile::passes::clight_select::syntax::solve::solve_function_z3_with_stack(
         &fixture(),
         &HashMap::new(),
@@ -306,14 +329,18 @@ fn failed_optional_analysis_rolls_back_all_extensions_but_not_base_constraints()
             node: 10,
             behavior,
         };
-        let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&search, &failed], &[&c_types::CTypes, &base]);
-        let out = crate::decompile::passes::clight_select::syntax::solve::solve_function_z3_with_stack(
-            &fixture(),
-            &HashMap::new(),
-            &[],
-            &Stack::new(solvers, components),
-        )
-        .unwrap();
+        let (solvers, components): (
+            &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+            &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+        ) = (&[&search, &failed], &[&c_types::CTypes, &base]);
+        let out =
+            crate::decompile::passes::clight_select::syntax::solve::solve_function_z3_with_stack(
+                &fixture(),
+                &HashMap::new(),
+                &[],
+                &Stack::new(solvers, components),
+            )
+            .unwrap();
         assert_eq!(out.0[&10], Some(0));
         assert_eq!(out.0[&20], Some(1));
         for name in ["search", "failed"] {
@@ -351,7 +378,10 @@ impl CandidateAnalysis for Joint {
 
 #[test]
 fn global_analysis_constraint_cannot_be_bypassed_by_independent_repick() {
-    let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[], &[&c_types::CTypes, &Joint]);
+    let (solvers, components): (
+        &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+        &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+    ) = (&[], &[&c_types::CTypes, &Joint]);
     let out = crate::decompile::passes::clight_select::syntax::solve::solve_function_z3_with_stack(
         &fixture(),
         &HashMap::new(),
@@ -386,7 +416,10 @@ impl CandidateAnalysis for SoftJoint {
 
 #[test]
 fn global_analysis_objective_cannot_be_undone_by_independent_repick() {
-    let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[], &[&c_types::CTypes, &SoftJoint]);
+    let (solvers, components): (
+        &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+        &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+    ) = (&[], &[&c_types::CTypes, &SoftJoint]);
     let out = crate::decompile::passes::clight_select::syntax::solve::solve_function_z3_with_stack(
         &fixture(),
         &HashMap::new(),
@@ -465,7 +498,10 @@ impl PreparedAnalysis for Lifecycle {
 fn prepared_evidence_binds_after_candidate_order_is_final_and_survives_dirty_clone() {
     let mut db = DecompileDB::default();
     let mut functions = vec![fixture()];
-    let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[], &[&Lifecycle, &c_types::CTypes]);
+    let (solvers, components): (
+        &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+        &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+    ) = (&[], &[&Lifecycle, &c_types::CTypes]);
     let stack = Stack::new(solvers, components);
     let mut preparation = stack.prepare(&db, &mut functions);
     // Simulate the selector's deterministic sort. A prepare-time index would

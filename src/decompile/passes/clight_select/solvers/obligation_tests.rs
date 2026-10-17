@@ -1,6 +1,6 @@
-use crate::decompile::passes::clight_select::solvers::obligations::*;
 use crate::abi::DataModel;
 use crate::decompile::passes::clight_select::candtype::{CandType, Sign};
+use crate::decompile::passes::clight_select::solvers::obligations::*;
 use crate::decompile::passes::semantic_counterexample::ledger::ObjectId;
 use crate::x86::op::{Addressing, Operation};
 use crate::x86::types::*;
@@ -109,7 +109,12 @@ fn final_selection_and_repick_respect_the_value_counterexample() {
             ClightStmt::Sassign(cell(4, ClightIntSize::I32, false), constant(7)),
         ],
     );
-    let outcome = crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(&f, &HashMap::new(), &[]).unwrap();
+    let outcome = crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(
+        &f,
+        &HashMap::new(),
+        &[],
+    )
+    .unwrap();
     assert_eq!(outcome.0[&30], Some(1));
 }
 
@@ -170,7 +175,12 @@ fn signed_overflow_is_a_refutation_even_when_written_bits_agree() {
     f.memory_anchors.insert(30, machine);
     f.storage_writes.push(w);
     f.node_statements.insert(30, vec![add(false), add(true)]);
-    let outcome = crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(&f, &HashMap::new(), &[]).unwrap();
+    let outcome = crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(
+        &f,
+        &HashMap::new(),
+        &[],
+    )
+    .unwrap();
     assert_eq!(outcome.0[&30], Some(1));
 }
 
@@ -256,9 +266,13 @@ fn frame_read_compares_extension_of_the_same_symbolic_bytes() {
     f.storage_reads.push(r);
     f.node_statements.insert(40, vec![bad, good]);
     assert_eq!(
-        crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(&f, &HashMap::new(), &[])
-            .unwrap()
-            .0[&40],
+        crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(
+            &f,
+            &HashMap::new(),
+            &[]
+        )
+        .unwrap()
+        .0[&40],
         Some(1)
     );
 }
@@ -434,9 +448,13 @@ fn an_available_producer_connects_an_inlined_constant_to_the_machine_store() {
     f.memory_anchors.insert(30, machine);
     f.node_statements.insert(30, vec![store(6), store(7)]);
     assert_eq!(
-        crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(&f, &HashMap::new(), &[])
-            .unwrap()
-            .0[&30],
+        crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(
+            &f,
+            &HashMap::new(),
+            &[]
+        )
+        .unwrap()
+        .0[&30],
         Some(1)
     );
 }
@@ -606,9 +624,13 @@ fn decoded_zero_upper_word_guides_the_c_load_view_in_final_selection() {
         Verdict::Equivalent
     );
     assert_eq!(
-        crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(&f, &HashMap::new(), &[])
-            .unwrap()
-            .0[&40],
+        crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(
+            &f,
+            &HashMap::new(),
+            &[]
+        )
+        .unwrap()
+        .0[&40],
         Some(1)
     );
     crate::decompile::passes::clight_select::solvers::word_views::extend_candidates(&mut f);
@@ -811,9 +833,13 @@ fn a_signed_carrier_requires_a_word_view_at_its_inlined_64_bit_use() {
         Verdict::Equivalent
     );
     assert_eq!(
-        crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(&f, &HashMap::new(), &[])
-            .unwrap()
-            .0[&40],
+        crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(
+            &f,
+            &HashMap::new(),
+            &[]
+        )
+        .unwrap()
+        .0[&40],
         Some(1)
     );
 }

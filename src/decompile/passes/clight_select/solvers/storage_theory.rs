@@ -266,8 +266,13 @@ impl Encoding {
         let representation = self
             .representation(model)
             .ok_or("layout model unavailable")?;
-        use crate::decompile::passes::clight_select::solvers::obligations::{Verdict as Outcome, Witness};
-        let check = crate::decompile::passes::clight_select::solvers::obligations::check_layout(&self.prepared.problem, &representation);
+        use crate::decompile::passes::clight_select::solvers::obligations::{
+            Verdict as Outcome, Witness,
+        };
+        let check = crate::decompile::passes::clight_select::solvers::obligations::check_layout(
+            &self.prepared.problem,
+            &representation,
+        );
         let witness = match (check.verdict, check.witness) {
             (Outcome::Equivalent, _) => None,
             (Outcome::Refuted, Some(Witness::Storage(witness))) => Some(witness),
@@ -412,9 +417,19 @@ mod tests {
             80,
             true,
         );
-        crate::decompile::passes::clight_select::solvers::storage::PROBLEMS.insert(&mut f.analysis_facts, vec![p]);
-        let result = crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(&f, &HashMap::new(), &[]).unwrap().5;
-        crate::decompile::passes::clight_select::solvers::storage::DECISIONS.get(&result).unwrap()[0].clone()
+        crate::decompile::passes::clight_select::solvers::storage::PROBLEMS
+            .insert(&mut f.analysis_facts, vec![p]);
+        let result = crate::decompile::passes::clight_select::syntax::solve::solve_function_z3(
+            &f,
+            &HashMap::new(),
+            &[],
+        )
+        .unwrap()
+        .5;
+        crate::decompile::passes::clight_select::solvers::storage::DECISIONS
+            .get(&result)
+            .unwrap()[0]
+            .clone()
     }
 
     #[test]

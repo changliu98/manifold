@@ -2,11 +2,11 @@
 //! labels and candidate-ranking policy. A storage access is not an allocation
 //! extent, and a register carrier is not a source-language declaration.
 
-use crate::decompile::passes::clight_select::candtype::{CandType, Sign};
 use crate::abi::DataModel;
 use crate::decompile::passes::c_pass::types::{
     CType, FloatSize, IntSize, Signedness, TypeQualifiers,
 };
+use crate::decompile::passes::clight_select::candtype::{CandType, Sign};
 use crate::x86::types::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

@@ -8,7 +8,9 @@ use crate::decompile::passes::clight_select::syntax::c_types::*;
 use crate::decompile::passes::clight_select::syntax::constraints::{
     ConstraintSink, ModelView, RecordedCond, SolveBackend, SOFT_CLAUSES, SOFT_TAGS,
 };
-use crate::decompile::passes::clight_select::syntax::{self, Artifacts, Candidate, DeclarationContext, FunctionContext, Stack};
+use crate::decompile::passes::clight_select::syntax::{
+    self, Artifacts, Candidate, DeclarationContext, FunctionContext, Stack,
+};
 use z3::ast::{Bool, Dynamic};
 use z3::{Optimize, SatResult};
 
@@ -16,11 +18,13 @@ mod audit;
 
 use crate::decompile::elevator::config::CONFIG;
 use crate::decompile::passes::clight_select::candtype::{CandType, Sign};
-use crate::decompile::passes::clight_select::solvers::in_search::propagator::{RawSolver, Theory, VetoTheory};
 use crate::decompile::passes::clight_select::query::{
     CalleeSignature, CommittedInterfaces, FunctionData, InterfaceClass,
 };
 use crate::decompile::passes::clight_select::select::ProgramSelectionState;
+use crate::decompile::passes::clight_select::solvers::in_search::propagator::{
+    RawSolver, Theory, VetoTheory,
+};
 use crate::x86::types::{
     Address, ClightBinaryOp, ClightExpr, ClightIntSize, ClightStmt, ClightType, Ident, Node,
     ParamType, RTLReg, XType,
@@ -349,13 +353,8 @@ fn build_function_constraints_with_stack(
             }
             tyvar.insert(reg, tv);
         }
-        let concrete_declarations = syntax::declarations::Declarations::build(
-            stack,
-            &declarations,
-            &regs,
-            &tyvar,
-            backend,
-        );
+        let concrete_declarations =
+            syntax::declarations::Declarations::build(stack, &declarations, &regs, &tyvar, backend);
         for module in stack.components() {
             module.constrain_interfaces(&declarations, &tyvar, &concrete_declarations, backend);
         }
@@ -904,7 +903,11 @@ pub(crate) fn solve_function_z3_with_stack(
         let t = TypeDt::build();
         let opt = Optimize::new();
         // Bounds every check on its own, including each refinement round.
-        opt.set_params(&crate::decompile::passes::clight_select::solvers::refinement::work_allowance(CONFIG.solve.rlimit));
+        opt.set_params(
+            &crate::decompile::passes::clight_select::solvers::refinement::work_allowance(
+                CONFIG.solve.rlimit,
+            ),
+        );
 
         let (mut built, softs) = {
             let backend = OptimizeBackend::new(&opt);
@@ -933,7 +936,11 @@ pub(crate) fn solve_function_z3_with_stack(
             std::sync::atomic::Ordering::Relaxed,
         );
         let mut refinements =
-            crate::decompile::passes::clight_select::solvers::refinement::Session::start(stack, &built.context(func, name_to_ident), &opt);
+            crate::decompile::passes::clight_select::solvers::refinement::Session::start(
+                stack,
+                &built.context(func, name_to_ident),
+                &opt,
+            );
         loop {
             if refinements.spent_work(&opt, CONFIG.solve.refinement_rlimit) {
                 eprintln!(
@@ -944,7 +951,8 @@ pub(crate) fn solve_function_z3_with_stack(
                     continue;
                 }
             }
-            let work_before = crate::decompile::passes::clight_select::solvers::refinement::resource_count(&opt);
+            let work_before =
+                crate::decompile::passes::clight_select::solvers::refinement::resource_count(&opt);
             let check_t0 = std::time::Instant::now();
             let check_result = opt.check(&[]);
             CHECK_NS.fetch_add(
@@ -1194,11 +1202,15 @@ fn solve_function_propagator_attempt(
         // tags keep their statistics apart. The flow theory then rides on the
         // same propagator, its selection literals registered after the veto
         // terms so the index split tells them apart.
-        let mut tags: Vec<&'static str> =
-            vec![crate::decompile::passes::clight_select::solvers::in_search::branch_theory::TAG; branch_vetoes.len()];
+        let mut tags: Vec<&'static str> = vec![
+                crate::decompile::passes::clight_select::solvers::in_search::branch_theory::TAG;
+                branch_vetoes.len()
+            ];
         tags.extend(
-            std::iter::repeat(crate::decompile::passes::clight_select::solvers::in_search::class_theory::TAG)
-                .take(class_vetoes.len()),
+            std::iter::repeat(
+                crate::decompile::passes::clight_select::solvers::in_search::class_theory::TAG,
+            )
+            .take(class_vetoes.len()),
         );
         let mut terms = branch_vetoes;
         terms.extend(class_vetoes);
@@ -1264,15 +1276,19 @@ fn solve_function_propagator_attempt(
         {
             let t = theory.borrow();
             let v = t.veto();
-            stats.vetoes_fired =
-                v.fired_for(crate::decompile::passes::clight_select::solvers::in_search::branch_theory::TAG);
-            stats.conflicts_injected =
-                v.conflicts_for(crate::decompile::passes::clight_select::solvers::in_search::branch_theory::TAG);
+            stats.vetoes_fired = v.fired_for(
+                crate::decompile::passes::clight_select::solvers::in_search::branch_theory::TAG,
+            );
+            stats.conflicts_injected = v.conflicts_for(
+                crate::decompile::passes::clight_select::solvers::in_search::branch_theory::TAG,
+            );
             let mut cstats = class_stats;
-            cstats.vetoes_fired =
-                v.fired_for(crate::decompile::passes::clight_select::solvers::in_search::class_theory::TAG);
-            cstats.conflicts_injected =
-                v.conflicts_for(crate::decompile::passes::clight_select::solvers::in_search::class_theory::TAG);
+            cstats.vetoes_fired = v.fired_for(
+                crate::decompile::passes::clight_select::solvers::in_search::class_theory::TAG,
+            );
+            cstats.conflicts_injected = v.conflicts_for(
+                crate::decompile::passes::clight_select::solvers::in_search::class_theory::TAG,
+            );
             CLASS_STATS.lock().unwrap().merge(&cstats);
             FLOW_STATS.lock().unwrap().merge(&t.stats);
             flow_named = t.named_by_flow.clone();
@@ -1467,10 +1483,14 @@ static SOLVER_CHECKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 static ENGINE_OPTIMIZE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ENGINE_PROPAGATOR_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BRANCH_STATS: std::sync::LazyLock<
-    std::sync::Mutex<crate::decompile::passes::clight_select::solvers::in_search::branch_theory::BranchStats>,
+    std::sync::Mutex<
+        crate::decompile::passes::clight_select::solvers::in_search::branch_theory::BranchStats,
+    >,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
 static CLASS_STATS: std::sync::LazyLock<
-    std::sync::Mutex<crate::decompile::passes::clight_select::solvers::in_search::class_theory::ClassStats>,
+    std::sync::Mutex<
+        crate::decompile::passes::clight_select::solvers::in_search::class_theory::ClassStats,
+    >,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
 /// Flow-theory counters accumulated across every per-function solve in a run.
 /// The certificate pass adds the block counts afterwards.
@@ -1480,7 +1500,8 @@ static FLOW_STATS: std::sync::LazyLock<
 
 /// Take the in-solve flow counters and reset them, so a second decompilation in
 /// the same process starts clean.
-pub(crate) fn flow_stats_snapshot() -> crate::decompile::passes::clight_select::solvers::flow::FlowStats {
+pub(crate) fn flow_stats_snapshot(
+) -> crate::decompile::passes::clight_select::solvers::flow::FlowStats {
     let mut guard = FLOW_STATS.lock().unwrap();
     let snapshot = *guard;
     *guard = Default::default();
@@ -1975,8 +1996,9 @@ pub(crate) fn resolve_dirty_functions(
             .by_ident
             .iter()
             .filter_map(|(&ident, ty)| {
-                let anchor =
-                    crate::decompile::passes::clight_select::solvers::flow::claim_of_type(ty, func.ptr64);
+                let anchor = crate::decompile::passes::clight_select::solvers::flow::claim_of_type(
+                    ty, func.ptr64,
+                );
                 (!anchor.is_top()).then_some((ident, anchor))
             })
             .collect();

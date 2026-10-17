@@ -1,8 +1,8 @@
-use crate::decompile::passes::clight_select::syntax::solve::*;
-use crate::decompile::passes::clight_select::syntax::ctyping;
 use crate::decompile::passes::clight_select::query::{
     CommittedFunctionInterface, InterfaceAuthority,
 };
+use crate::decompile::passes::clight_select::syntax::ctyping;
+use crate::decompile::passes::clight_select::syntax::solve::*;
 use crate::x86::types::{
     ClightAttr, ClightFloatSize, ClightIntSize, ClightSignedness, ClightUnaryOp,
 };
@@ -325,7 +325,10 @@ fn stage_c_refreshes_flow_global_anchors_even_when_body_is_clean() {
     assert_eq!(stats.dirty_count, 0);
     assert_eq!(
         func.flow_anchors.global[&symbol],
-        crate::decompile::passes::clight_select::solvers::flow::anchor_of_xtype(&XType::Xfloat, true,)
+        crate::decompile::passes::clight_select::solvers::flow::anchor_of_xtype(
+            &XType::Xfloat,
+            true,
+        )
     );
 }
 

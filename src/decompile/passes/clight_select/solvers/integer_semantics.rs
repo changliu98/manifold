@@ -14,9 +14,6 @@ use either::Either;
 use z3::ast::{Ast, Bool, BV};
 use z3::{SatResult, Solver};
 
-use crate::decompile::passes::clight_select::solvers::obligations::Witness;
-pub use crate::decompile::passes::clight_select::solvers::obligations::{Check, Verdict};
-use crate::decompile::passes::clight_select::{solvers::memory_theory, query::FunctionData};
 use crate::abi::DataModel;
 use crate::decompile::passes::c_pass::convert::from_relations::{
     convert_clight_type, convert_expr, ConversionContext,
@@ -25,6 +22,9 @@ use crate::decompile::passes::c_pass::types::{
     BinaryOp, CExpr, CType, IntLiteral, IntLiteralBase, IntLiteralSuffix, IntSize, Signedness,
     UnaryOp,
 };
+use crate::decompile::passes::clight_select::solvers::obligations::Witness;
+pub use crate::decompile::passes::clight_select::solvers::obligations::{Check, Verdict};
+use crate::decompile::passes::clight_select::{query::FunctionData, solvers::memory_theory};
 use crate::x86::op::{Comparison, Condition, Operation};
 use crate::x86::types::{ClightExpr, ClightStmt, MemoryChunk, RTLInst, RTLReg};
 
@@ -1111,7 +1111,12 @@ impl Validator {
                     return None;
                 };
                 let access = IntTy::from_c(
-                    &convert_clight_type(crate::decompile::passes::clight_select::syntax::solve::clight_expr_type(lhs), function.data_model),
+                    &convert_clight_type(
+                        crate::decompile::passes::clight_select::syntax::solve::clight_expr_type(
+                            lhs,
+                        ),
+                        function.data_model,
+                    ),
                     function.data_model,
                 )?;
                 let bits = u32::try_from(contract.width.checked_mul(8)?).ok()?;
@@ -1349,7 +1354,12 @@ impl Validator {
             }
             let operand = read_operand(rhs)?;
             let access = IntTy::from_c(
-                &convert_clight_type(crate::decompile::passes::clight_select::syntax::solve::clight_expr_type(operand), function.data_model),
+                &convert_clight_type(
+                    crate::decompile::passes::clight_select::syntax::solve::clight_expr_type(
+                        operand,
+                    ),
+                    function.data_model,
+                ),
                 function.data_model,
             )?;
             let (bits, mut signed, mut result_bits) = match contract.chunk {
@@ -1566,7 +1576,11 @@ mod tests {
             10,
             true,
         );
-        crate::decompile::passes::clight_select::solvers::observations::set_comparison(&mut function.analysis_facts, 10, 8);
+        crate::decompile::passes::clight_select::solvers::observations::set_comparison(
+            &mut function.analysis_facts,
+            10,
+            8,
+        );
         let native = RTLInst::Icond(
             Condition::Ccompimm(Comparison::Ceq, 0),
             Arc::new(vec![1]),

@@ -2,9 +2,9 @@
 //!
 //! Physical operand widths and transparent CFG edges survive promotion and
 //! branch-threading without borrowing facts from a candidate C expression.
-use crate::decompile::passes::clight_select::syntax::{ArtifactKey, Artifacts};
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::clight_select::query::FunctionData;
+use crate::decompile::passes::clight_select::syntax::{ArtifactKey, Artifacts};
 use crate::x86::types::*;
 use ascent::{ascent, lattice::set::Set};
 use std::collections::{BTreeMap, BTreeSet};

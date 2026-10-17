@@ -12,7 +12,9 @@ use crate::decompile::passes::c_pass::types::CType;
 use crate::decompile::passes::semantic_counterexample as storage;
 use crate::x86::types::{ClightStmt, RTLInst, RTLReg};
 
-use crate::decompile::passes::clight_select::{solvers::integer_semantics, solvers::memory_theory, query::FunctionData};
+use crate::decompile::passes::clight_select::{
+    query::FunctionData, solvers::integer_semantics, solvers::memory_theory,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {

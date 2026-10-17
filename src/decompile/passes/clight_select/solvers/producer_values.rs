@@ -7,8 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::decompile::passes::clight_select::query::FunctionData;
 use crate::decompile::elevator::DecompileDB;
+use crate::decompile::passes::clight_select::query::FunctionData;
 use crate::mreg::Mreg;
 use crate::x86::op::Operation;
 use crate::x86::types::*;
@@ -110,7 +110,13 @@ pub(crate) fn collect(db: &DecompileDB, functions: &mut [FunctionData]) {
             .and_then(|w| w.first())
             .copied()
     };
-    crate::decompile::passes::clight_select::solvers::word_inputs::collect(db, functions, &instructions, &owners, &decoded_bits);
+    crate::decompile::passes::clight_select::solvers::word_inputs::collect(
+        db,
+        functions,
+        &instructions,
+        &owners,
+        &decoded_bits,
+    );
     let mut equalities: BTreeMap<(Address, Node, RTLReg), BTreeSet<Node>> = BTreeMap::new();
     for &(function, usage, register, definition) in
         db.rel_iter::<(Address, Node, RTLReg, Node)>("rtl_available_value")
@@ -251,8 +257,8 @@ pub(crate) fn collect(db: &DecompileDB, functions: &mut [FunctionData]) {
 
 #[cfg(test)]
 mod tests {
-    use crate::decompile::passes::clight_select::solvers::producer_values::*;
     use crate::decompile::passes::clight_select::solvers::memory_theory::WriteContract;
+    use crate::decompile::passes::clight_select::solvers::producer_values::*;
     use crate::decompile::passes::semantic_counterexample::ledger::ObjectId;
     use std::sync::Arc;
 

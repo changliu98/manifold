@@ -7,12 +7,12 @@
 //! and must pass the ordinary declaration/transfer checks. Storage coordinates
 //! belong to native access events, never to every temporary derived from them.
 
+use crate::decompile::elevator::DecompileDB;
+use crate::decompile::passes::clight_select::syntax::ArtifactKey;
 use crate::decompile::passes::clight_select::{
     query::FunctionData,
     type_graph::{Entity, EvidenceGraph, Fact},
 };
-use crate::decompile::passes::clight_select::syntax::ArtifactKey;
-use crate::decompile::elevator::DecompileDB;
 use crate::x86::types::*;
 use ascent::{ascent, lattice::set::Set};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -295,7 +295,9 @@ fn plan_with_reserved(
     entry: Node,
     reserved: &BTreeSet<RTLReg>,
 ) -> BindingPlan {
-    let Some(graph) = crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH.get(&function.analysis_facts) else {
+    let Some(graph) = crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH
+        .get(&function.analysis_facts)
+    else {
         return BindingPlan::default();
     };
     let mut definitions = BTreeMap::<RTLReg, BTreeSet<Node>>::new();
@@ -343,7 +345,10 @@ fn plan_with_reserved(
     let mut queries = BTreeMap::<Node, BTreeSet<RTLReg>>::new();
     for (&node, candidates) in &function.node_statements {
         for statement in candidates {
-            let dependencies = crate::decompile::passes::clight_select::syntax::declarations::dependencies(statement);
+            let dependencies =
+                crate::decompile::passes::clight_select::syntax::declarations::dependencies(
+                    statement,
+                );
             if !flat(statement) {
                 for r in dependencies {
                     eligible.remove(&r);
@@ -353,13 +358,16 @@ fn plan_with_reserved(
             // Native->C coverage above is not enough: an extra C definition
             // without a native producer would otherwise keep the old name
             // while subsequent reads silently switch to a different binding.
-            let destination = match crate::decompile::passes::clight_select::solvers::memory_theory::primitive(statement) {
-                ClightStmt::Sset(r, _) => Some(*r as RTLReg),
-                ClightStmt::Scall(r, _, _) | ClightStmt::Sbuiltin(r, _, _, _) => {
-                    r.map(|r| r as RTLReg)
-                }
-                _ => None,
-            };
+            let destination =
+                match crate::decompile::passes::clight_select::solvers::memory_theory::primitive(
+                    statement,
+                ) {
+                    ClightStmt::Sset(r, _) => Some(*r as RTLReg),
+                    ClightStmt::Scall(r, _, _) | ClightStmt::Sbuiltin(r, _, _, _) => {
+                        r.map(|r| r as RTLReg)
+                    }
+                    _ => None,
+                };
             if let Some(r) = destination {
                 if native
                     .get(&node)
@@ -424,24 +432,21 @@ fn plan_with_reserved(
     program.run();
     let states: BTreeMap<_, _> = program.before.into_iter().collect();
     let mut result = BindingPlan::default();
-    let mut used: BTreeSet<_> = function
-        .used_regs
-        .iter()
-        .copied()
-        .chain(function.var_type_candidates.keys().copied())
-        .chain(function.var_types.keys().copied())
-        .chain(native.values().flat_map(|i| {
-            let (d, u) = crate::decompile::passes::rtl_optimize_pass::inst_def_use(i);
-            d.into_iter().chain(u).collect::<Vec<_>>()
-        }))
-        .chain(
-            function
-                .node_statements
-                .values()
-                .flatten()
-                .flat_map(crate::decompile::passes::clight_select::syntax::declarations::dependencies),
-        )
-        .collect();
+    let mut used: BTreeSet<_> =
+        function
+            .used_regs
+            .iter()
+            .copied()
+            .chain(function.var_type_candidates.keys().copied())
+            .chain(function.var_types.keys().copied())
+            .chain(native.values().flat_map(|i| {
+                let (d, u) = crate::decompile::passes::rtl_optimize_pass::inst_def_use(i);
+                d.into_iter().chain(u).collect::<Vec<_>>()
+            }))
+            .chain(function.node_statements.values().flatten().flat_map(
+                crate::decompile::passes::clight_select::syntax::declarations::dependencies,
+            ))
+            .collect();
     used.extend(reserved);
     let mut next_name = RTLReg::MAX.min(Ident::MAX as RTLReg);
     for reg in eligible {
@@ -712,12 +717,9 @@ pub(super) fn prepare(db: &DecompileDB, functions: &mut [FunctionData]) {
                 .copied()
                 .chain(f.var_types.keys().copied())
                 .chain(f.var_type_candidates.keys().copied())
-                .chain(
-                    f.node_statements
-                        .values()
-                        .flatten()
-                        .flat_map(crate::decompile::passes::clight_select::syntax::declarations::dependencies),
-                )
+                .chain(f.node_statements.values().flatten().flat_map(
+                    crate::decompile::passes::clight_select::syntax::declarations::dependencies,
+                ))
         })
         .chain(native.values().flatten().flat_map(|i| {
             let (d, u) = crate::decompile::passes::rtl_optimize_pass::inst_def_use(i);
@@ -782,9 +784,13 @@ pub(super) fn publish(db: &mut DecompileDB, functions: &[FunctionData]) {
 
 #[cfg(test)]
 mod tests {
-    use crate::decompile::passes::clight_select::{candtype::{CandType, Sign}, solvers::integer_semantics, type_graph::TypeTerm};
-    use crate::decompile::passes::clight_select::syntax::bindings::*;
     use crate::decompile::passes::c_pass::types::CType;
+    use crate::decompile::passes::clight_select::syntax::bindings::*;
+    use crate::decompile::passes::clight_select::{
+        candtype::{CandType, Sign},
+        solvers::integer_semantics,
+        type_graph::TypeTerm,
+    };
     use crate::x86::op::Operation;
 
     fn long() -> ClightType {
@@ -858,7 +864,8 @@ mod tests {
                 chunk: MemoryChunk::MInt32,
             },
         ]);
-        crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH.insert(&mut f.analysis_facts, graph);
+        crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH
+            .insert(&mut f.analysis_facts, graph);
         (f, instructions, vec![(90, 10), (10, 20), (20, 30)])
     }
 
@@ -993,7 +1000,8 @@ mod tests {
             .unwrap()
             .clone();
         graph.fixed.insert(3);
-        crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH.rebind(&mut f.analysis_facts, graph);
+        crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH
+            .rebind(&mut f.analysis_facts, graph);
         assert!(plan(&f, &instructions, &edges, 90).bindings.is_empty());
     }
 
@@ -1055,16 +1063,20 @@ mod tests {
         let original = f.clone();
         let p = plan(&f, &instructions, &edges, 90);
         apply(&mut f, p);
-        assert!(crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH
-            .get(&original.analysis_facts)
-            .unwrap()
-            .hypotheses
-            .contains_key(&3));
-        assert!(!crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH
-            .get(&f.analysis_facts)
-            .unwrap()
-            .hypotheses
-            .contains_key(&3));
+        assert!(
+            crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH
+                .get(&original.analysis_facts)
+                .unwrap()
+                .hypotheses
+                .contains_key(&3)
+        );
+        assert!(
+            !crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH
+                .get(&f.analysis_facts)
+                .unwrap()
+                .hypotheses
+                .contains_key(&3)
+        );
         assert!(matches!(
             &original.node_statements[&90][0],
             ClightStmt::Sset(3, _)
@@ -1090,8 +1102,11 @@ mod tests {
 
     #[test]
     fn type_flow_is_recomputed_after_separating_an_unrelated_writer() {
-        use crate::decompile::passes::clight_select::{syntax::{type_evidence, type_flow, Component}, solvers::transfers};
         use crate::decompile::passes::clight_select::solvers::integer_semantics::CopyValue;
+        use crate::decompile::passes::clight_select::{
+            solvers::transfers,
+            syntax::{type_evidence, type_flow, Component},
+        };
         let (mut f, mut instructions, edges) = fixture();
         // Start from raw relation evidence, not the fixture's prepared graph.
         f.analysis_facts = Default::default();
@@ -1161,7 +1176,8 @@ mod tests {
             .iter()
             .any(|h| h.value == 4));
 
-        crate::decompile::passes::clight_select::syntax::type_recovery::TypeRecovery.prepare(&db, std::slice::from_mut(&mut f));
+        crate::decompile::passes::clight_select::syntax::type_recovery::TypeRecovery
+            .prepare(&db, std::slice::from_mut(&mut f));
         let p = PLAN.get(&f.analysis_facts).unwrap();
         let first = p.write(90, 3);
         let second = p.write(20, 3);

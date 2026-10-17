@@ -6,11 +6,13 @@
 //! every nonlegacy integer choice still needs complete transfer coverage.
 //! Check the selected profile at every affected native definition/use, cache
 //! by its declaration dependencies, and learn clauses in the same Optimize.
-use crate::decompile::passes::clight_select::solvers::obligations::{Check, Obligations, Validator, Verdict};
-use crate::decompile::passes::clight_select::type_graph::{Fact, TypeTerm};
 use super::Checker;
-use crate::decompile::passes::clight_select::syntax::{ArtifactKey, Artifacts, FunctionContext};
 use crate::decompile::passes::c_pass::types::CType;
+use crate::decompile::passes::clight_select::solvers::obligations::{
+    Check, Obligations, Validator, Verdict,
+};
+use crate::decompile::passes::clight_select::syntax::{ArtifactKey, Artifacts, FunctionContext};
+use crate::decompile::passes::clight_select::type_graph::{Fact, TypeTerm};
 use crate::x86::types::{Node, RTLReg};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use z3::ast::{Ast, Bool};
@@ -73,14 +75,17 @@ impl<'a> Profiles<'a> {
         }
         let mut sites = BTreeMap::<Node, BTreeSet<RTLReg>>::new();
         for (&node, candidates) in &cx.function.node_statements {
-            sites.entry(node).or_default().extend(
-                candidates
-                    .iter()
-                    .flat_map(crate::decompile::passes::clight_select::syntax::declarations::dependencies),
-            );
+            sites
+                .entry(node)
+                .or_default()
+                .extend(candidates.iter().flat_map(
+                    crate::decompile::passes::clight_select::syntax::declarations::dependencies,
+                ));
         }
         let mut native_definitions = BTreeMap::<Node, BTreeSet<RTLReg>>::new();
-        if let Some(graph) = crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH.get(&cx.function.analysis_facts) {
+        if let Some(graph) = crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH
+            .get(&cx.function.analysis_facts)
+        {
             for fact in &graph.facts {
                 if let Fact::Definition { node, value } = fact {
                     sites.entry(*node).or_default().insert(*value);
@@ -124,7 +129,10 @@ impl<'a> Profiles<'a> {
     }
 
     fn declarations(&self, model: &Model) -> HashMap<RTLReg, CType> {
-        let mut result = crate::decompile::passes::clight_select::solvers::semantics::integer_declarations(self.cx.function);
+        let mut result =
+            crate::decompile::passes::clight_select::solvers::semantics::integer_declarations(
+                self.cx.function,
+            );
         let fixed = crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH
             .get(&self.cx.function.analysis_facts)
             .map(|g| &g.fixed_storage);
@@ -225,9 +233,7 @@ impl Checker for Profiles<'_> {
     }
 
     fn check(&mut self, answer: &Model) -> super::Verdict {
-
         self.inspect(answer).into()
-
     }
 
     fn coupled_nodes(&self) -> BTreeSet<Node> {
@@ -347,7 +353,6 @@ impl Checker for Profiles<'_> {
 }
 
 impl Profiles<'_> {
-
     fn inspect(&mut self, model: &Model) -> Result<Vec<Bool>, &'static str> {
         let declarations = self.declarations(model);
         let changed = self.changed(model);
@@ -600,7 +605,9 @@ impl Profiles<'_> {
                     // declaration's implicit assignment conversion too.
                     let mut bindings = vec![reg];
                     if let crate::x86::types::ClightStmt::Sset(destination, _) =
-                        crate::decompile::passes::clight_select::solvers::memory_theory::primitive(statement)
+                        crate::decompile::passes::clight_select::solvers::memory_theory::primitive(
+                            statement,
+                        )
                     {
                         bindings.push(*destination as RTLReg);
                     }

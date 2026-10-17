@@ -6,13 +6,13 @@
 //! than one source. An unknown writer, conversion, or conflicting type joins
 //! to Top, never a majority vote. This is a per-value type lattice, not a claim
 //! that one definition reaches a particular use.
+use crate::decompile::passes::c_pass::convert::from_relations::convert_param_type_from_param;
+use crate::decompile::passes::clight_select::syntax::{ArtifactKey, DeclarationContext};
 use crate::decompile::passes::clight_select::{
     candtype::CandType,
     query::FunctionData,
     type_graph::{EvidenceGraph, TypeTerm},
 };
-use crate::decompile::passes::clight_select::syntax::{ArtifactKey, DeclarationContext};
-use crate::decompile::passes::c_pass::convert::from_relations::convert_param_type_from_param;
 use crate::x86::types::*;
 use ascent::{
     ascent,
@@ -179,7 +179,9 @@ pub(super) fn apply(
         let mut calls = BTreeSet::new();
         let complete = candidates.iter().all(|statement| {
             let ClightStmt::Scall(Some(dst), callee, _) =
-                crate::decompile::passes::clight_select::solvers::memory_theory::primitive(statement)
+                crate::decompile::passes::clight_select::solvers::memory_theory::primitive(
+                    statement,
+                )
             else {
                 return false;
             };
@@ -328,8 +330,8 @@ pub(super) fn supported(cx: &DeclarationContext<'_>, reg: RTLReg) -> Vec<TypeTer
 
 #[cfg(test)]
 mod tests {
-    use crate::decompile::passes::clight_select::syntax::type_flow::*;
     use crate::decompile::passes::clight_select::solvers::integer_semantics::CopyValue;
+    use crate::decompile::passes::clight_select::syntax::type_flow::*;
     use crate::x86::op::Operation;
     use std::sync::Arc;
 
@@ -440,7 +442,8 @@ mod tests {
             );
         }
         definitions.entry(8).or_default().insert(50);
-        crate::decompile::passes::clight_select::solvers::transfers::COPIES.insert(&mut f.analysis_facts, contracts);
+        crate::decompile::passes::clight_select::solvers::transfers::COPIES
+            .insert(&mut f.analysis_facts, contracts);
         let mut graph = EvidenceGraph::default();
         apply(
             &mut f,
@@ -509,7 +512,8 @@ mod tests {
             );
             definitions.entry(6).or_default().insert(20);
         }
-        crate::decompile::passes::clight_select::solvers::transfers::COPIES.insert(&mut function.analysis_facts, contracts);
+        crate::decompile::passes::clight_select::solvers::transfers::COPIES
+            .insert(&mut function.analysis_facts, contracts);
         let nodes = native.keys().copied().collect();
         let mut graph = EvidenceGraph::default();
         apply(&mut function, &mut graph, &nodes, &definitions, &native);

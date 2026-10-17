@@ -63,7 +63,8 @@ fn superset_provenance_priority(
 
 #[derive(Clone, Default)]
 pub(crate) struct ProgramSelectionState {
-    pub(crate) analysis_results: BTreeMap<Address, crate::decompile::passes::clight_select::syntax::Artifacts>,
+    pub(crate) analysis_results:
+        BTreeMap<Address, crate::decompile::passes::clight_select::syntax::Artifacts>,
     /// (func_addr, node) -> candidate index
     pub(crate) candidate_idx: HashMap<(Address, Node), Option<usize>>,
     /// One atomic CFG/structure interpretation per function.
@@ -112,7 +113,8 @@ pub struct SelectedFunction {
     pub var_decl_idx: HashMap<RTLReg, usize>,
     /// Exact selection-owned declarations; legacy candidate indices are only
     /// compatibility projections for types outside the old finite vocabulary.
-    pub concrete_declarations: BTreeMap<RTLReg, crate::decompile::passes::clight_select::type_graph::TypeTerm>,
+    pub concrete_declarations:
+        BTreeMap<RTLReg, crate::decompile::passes::clight_select::type_graph::TypeTerm>,
     /// CFG-certified native definition webs behind the selected C bindings.
     pub(crate) binding_plan: crate::decompile::passes::clight_select::syntax::bindings::BindingPlan,
 
@@ -128,7 +130,8 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
     let data_model = db.data_model();
     let (mut functions, id_to_name, mut committed_interfaces, interface_vars) =
         extract_functions(db)?;
-    let mut analyses = crate::decompile::passes::clight_select::syntax::Stack::production().prepare(db, &mut functions);
+    let mut analyses = crate::decompile::passes::clight_select::syntax::Stack::production()
+        .prepare(db, &mut functions);
     // Reversing Stacking turns a physical frame-cell write into `Sset` of the
     // cell's canonical local.  Retain that structural identity for the width
     // audit; an arbitrary SSA temporary at the same node is not memory-write
@@ -350,11 +353,12 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
     }
 
     // Statement-form + type selection is done entirely by the Z3/SMT inference model; the clang-in-the-loop greedy search has been removed (full migration to Z3).
-    let mut best_state = crate::decompile::passes::clight_select::syntax::solve::infer_select_program(
-        &functions,
-        &name_to_ident,
-        db.ablate_flow_max_certification,
-    );
+    let mut best_state =
+        crate::decompile::passes::clight_select::syntax::solve::infer_select_program(
+            &functions,
+            &name_to_ident,
+            db.ablate_flow_max_certification,
+        );
 
     if !db.ablate_scope_function {
         let stage_b_input_globals = committed_interfaces.globals.clone();
@@ -692,7 +696,9 @@ fn committed_global_flow_feedback(
     functions: &[FunctionData],
     state: &ProgramSelectionState,
 ) -> Vec<crate::decompile::passes::clight_select::syntax::interface_solve::GlobalFlowDisagreement> {
-    use crate::decompile::passes::clight_select::{solvers::flow, solvers::in_search::flow_theory, syntax::interface_solve};
+    use crate::decompile::passes::clight_select::{
+        solvers::flow, solvers::in_search::flow_theory, syntax::interface_solve,
+    };
 
     let mut feedback = BTreeSet::new();
     for func in functions {
@@ -1012,13 +1018,25 @@ fn build_selected_function_from_program_state(
         }
     }
 
-    let concrete_declarations = program_state.analysis_results.get(&addr)
-        .and_then(|results| crate::decompile::passes::clight_select::syntax::type_evidence::COMMITMENTS.get(results))
-        .cloned().unwrap_or_default();
+    let concrete_declarations = program_state
+        .analysis_results
+        .get(&addr)
+        .and_then(|results| {
+            crate::decompile::passes::clight_select::syntax::type_evidence::COMMITMENTS.get(results)
+        })
+        .cloned()
+        .unwrap_or_default();
     let mut stack_var_types = HashMap::new();
-    let binding_plan = crate::decompile::passes::clight_select::syntax::bindings::PLAN.get(&func.analysis_facts).cloned().unwrap_or_default();
-    let storage_registers: HashSet<_> = stack_vars.into_iter().flatten().copied()
-        .chain(binding_plan.storage.iter().map(|(_, _, binding)| *binding)).collect();
+    let binding_plan = crate::decompile::passes::clight_select::syntax::bindings::PLAN
+        .get(&func.analysis_facts)
+        .cloned()
+        .unwrap_or_default();
+    let storage_registers: HashSet<_> = stack_vars
+        .into_iter()
+        .flatten()
+        .copied()
+        .chain(binding_plan.storage.iter().map(|(_, _, binding)| *binding))
+        .collect();
     for reg in storage_registers {
         if let Some(term) = concrete_declarations.get(&reg) {
             stack_var_types.insert(reg as Ident, term.to_clight(func.data_model));

@@ -1,14 +1,14 @@
 pub mod adequacy;
 pub mod candtype;
-pub mod type_graph;
 pub mod decl_solve;
 pub mod query;
 pub mod select;
+/// Solvers layered on the syntax check: they check its answer.
+pub mod solvers;
 /// The syntax check: candidate structure, C legality, declarations,
 /// preferences, and the selection solves.
 pub mod syntax;
-/// Solvers layered on the syntax check: they check its answer.
-pub mod solvers;
+pub mod type_graph;
 pub mod wt_audit;
 
 pub fn derive_canonical_path(path_str: &str) -> String {

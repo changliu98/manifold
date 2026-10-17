@@ -211,14 +211,32 @@ mod budget_tests {
             for pair in xs.windows(2) {
                 opt.assert(&Bool::or(&[pair[0].not(), pair[1].not()]));
             }
-            opt.set_params(&crate::decompile::passes::clight_select::solvers::refinement::work_allowance(1));
-            let before = crate::decompile::passes::clight_select::solvers::refinement::resource_count(&opt);
+            opt.set_params(
+                &crate::decompile::passes::clight_select::solvers::refinement::work_allowance(1),
+            );
+            let before =
+                crate::decompile::passes::clight_select::solvers::refinement::resource_count(&opt);
             assert_eq!(opt.check(&[]), z3::SatResult::Unknown);
-            assert!(crate::decompile::passes::clight_select::solvers::refinement::exhausted(&opt, before, 1));
-            opt.set_params(&crate::decompile::passes::clight_select::solvers::refinement::work_allowance(u32::MAX));
-            let before = crate::decompile::passes::clight_select::solvers::refinement::resource_count(&opt);
+            assert!(
+                crate::decompile::passes::clight_select::solvers::refinement::exhausted(
+                    &opt, before, 1
+                )
+            );
+            opt.set_params(
+                &crate::decompile::passes::clight_select::solvers::refinement::work_allowance(
+                    u32::MAX,
+                ),
+            );
+            let before =
+                crate::decompile::passes::clight_select::solvers::refinement::resource_count(&opt);
             assert_eq!(opt.check(&[]), z3::SatResult::Sat);
-            assert!(!crate::decompile::passes::clight_select::solvers::refinement::exhausted(&opt, before, u32::MAX));
+            assert!(
+                !crate::decompile::passes::clight_select::solvers::refinement::exhausted(
+                    &opt,
+                    before,
+                    u32::MAX
+                )
+            );
         });
     }
 

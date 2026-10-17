@@ -4,13 +4,15 @@
 //! original source type. Representation changes require the shared semantic checks or the
 //! explicit-cast pointer transport check. Fixed interfaces/layouts stay fixed.
 
-use crate::decompile::passes::clight_select::{query::FunctionData, select::ProgramSelectionState, type_graph::TypeTerm};
+use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::clight_select::syntax::constraints::ConstraintSink;
 use crate::decompile::passes::clight_select::syntax::type_evidence::{self, COMMITMENTS, GRAPH};
 use crate::decompile::passes::clight_select::syntax::{
     Candidate, CandidateAnalysis, Component, DeclarationContext, FunctionContext, PreparedAnalysis,
 };
-use crate::decompile::elevator::DecompileDB;
+use crate::decompile::passes::clight_select::{
+    query::FunctionData, select::ProgramSelectionState, type_graph::TypeTerm,
+};
 use crate::x86::types::{Address, Node, RTLReg};
 use std::collections::BTreeMap;
 use z3::ast::Bool;
@@ -23,8 +25,12 @@ impl crate::decompile::passes::clight_select::syntax::Component for TypeRecovery
     fn reads(&self) -> &'static [&'static str] {
         static READS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
             let mut reads = type_evidence::INPUTS.to_vec();
-            reads.extend_from_slice(crate::decompile::passes::clight_select::solvers::producer_values::INPUTS);
-            reads.extend_from_slice(crate::decompile::passes::clight_select::syntax::bindings::INPUTS);
+            reads.extend_from_slice(
+                crate::decompile::passes::clight_select::solvers::producer_values::INPUTS,
+            );
+            reads.extend_from_slice(
+                crate::decompile::passes::clight_select::syntax::bindings::INPUTS,
+            );
             reads.sort_unstable();
             reads.dedup();
             reads
@@ -51,8 +57,12 @@ impl crate::decompile::passes::clight_select::syntax::Component for TypeRecovery
         // the machine model must never borrow its width from a C declaration.
         crate::decompile::passes::clight_select::solvers::producer_values::collect(db, functions);
         for function in functions.iter_mut() {
-            crate::decompile::passes::clight_select::solvers::word_views::extend_candidates(function);
-            crate::decompile::passes::clight_select::solvers::type_projection::extend_candidates(function);
+            crate::decompile::passes::clight_select::solvers::word_views::extend_candidates(
+                function,
+            );
+            crate::decompile::passes::clight_select::solvers::type_projection::extend_candidates(
+                function,
+            );
         }
         Some(Box::new(TypeRecovery))
     }
@@ -92,7 +102,8 @@ impl crate::decompile::passes::clight_select::syntax::Component for TypeRecovery
                     .collect()
             })
             .unwrap_or_default();
-        supported.extend(crate::decompile::passes::clight_select::syntax::type_flow::supported(cx, reg));
+        supported
+            .extend(crate::decompile::passes::clight_select::syntax::type_flow::supported(cx, reg));
         supported
     }
     fn build(&self, cx: &FunctionContext<'_>) -> Option<Box<dyn CandidateAnalysis>> {
@@ -126,10 +137,11 @@ impl crate::decompile::passes::clight_select::syntax::Component for TypeRecovery
         let mut conditions = BTreeMap::new();
         let mut families = BTreeMap::<(Node, usize), std::collections::BTreeSet<usize>>::new();
         let mut projection_types = BTreeMap::<(Node, usize), Vec<Bool>>::new();
-        for projection in crate::decompile::passes::clight_select::solvers::type_projection::PROJECTIONS
-            .get(&cx.function.analysis_facts)
-            .into_iter()
-            .flatten()
+        for projection in
+            crate::decompile::passes::clight_select::solvers::type_projection::PROJECTIONS
+                .get(&cx.function.analysis_facts)
+                .into_iter()
+                .flatten()
         {
             let statements = &cx.function.node_statements[&projection.node];
             let parent = statements
@@ -163,7 +175,11 @@ impl crate::decompile::passes::clight_select::syntax::Component for TypeRecovery
         let mut uses = BTreeMap::<RTLReg, BTreeMap<(Node, usize), _>>::new();
         for (&node, statements) in &cx.function.node_statements {
             for (index, statement) in statements.iter().enumerate() {
-                for reg in crate::decompile::passes::clight_select::syntax::declarations::dependencies(statement) {
+                for reg in
+                    crate::decompile::passes::clight_select::syntax::declarations::dependencies(
+                        statement,
+                    )
+                {
                     if cx.concrete_declarations.0.contains_key(&reg) {
                         uses.entry(reg)
                             .or_default()
@@ -173,7 +189,11 @@ impl crate::decompile::passes::clight_select::syntax::Component for TypeRecovery
             }
         }
         for fact in &graph.facts {
-            if let crate::decompile::passes::clight_select::type_graph::Fact::Definition { node, value } = fact {
+            if let crate::decompile::passes::clight_select::type_graph::Fact::Definition {
+                node,
+                value,
+            } = fact
+            {
                 if !cx.concrete_declarations.0.contains_key(value) {
                     continue;
                 }
@@ -300,11 +320,16 @@ impl crate::decompile::passes::clight_select::syntax::Component for TypeRecovery
             for (index, statement) in cx.function.node_statements[&node].iter().enumerate() {
                 use crate::x86::types::ClightStmt;
                 let ClightStmt::Scall(dst, callee, arguments) =
-                    crate::decompile::passes::clight_select::solvers::memory_theory::primitive(statement)
+                    crate::decompile::passes::clight_select::solvers::memory_theory::primitive(
+                        statement,
+                    )
                 else {
                     continue;
                 };
-                let Some(ident) = crate::decompile::passes::clight_select::select::callee_ident_from_expr(callee, cx.names)
+                let Some(ident) =
+                    crate::decompile::passes::clight_select::select::callee_ident_from_expr(
+                        callee, cx.names,
+                    )
                 else {
                     continue;
                 };
@@ -338,7 +363,11 @@ impl crate::decompile::passes::clight_select::syntax::Component for TypeRecovery
                 };
                 // An open callee interface is evidence for each alternative
                 // under its selector.
-                let mut add_interface = |reg, committed: crate::x86::types::XType, open: Option<&crate::decompile::passes::clight_select::syntax::interfaces::Alternatives>| match open {
+                let mut add_interface = |reg,
+                                         committed: crate::x86::types::XType,
+                                         open: Option<
+                    &crate::decompile::passes::clight_select::syntax::interfaces::Alternatives,
+                >| match open {
                     Some(alternatives) => {
                         for (xtype, selected) in alternatives {
                             add(reg, *xtype, Bool::and(&[guard.clone(), selected.clone()]));
@@ -347,9 +376,15 @@ impl crate::decompile::passes::clight_select::syntax::Component for TypeRecovery
                     None => add(reg, committed, guard.clone()),
                 };
                 if let Some(dst) = dst {
-                    add_interface(*dst as RTLReg, signature.return_type, cx.interfaces.ret(ident));
+                    add_interface(
+                        *dst as RTLReg,
+                        signature.return_type,
+                        cx.interfaces.ret(ident),
+                    );
                 }
-                for (position, (argument, xtype)) in arguments.iter().zip(&signature.param_types).enumerate() {
+                for (position, (argument, xtype)) in
+                    arguments.iter().zip(&signature.param_types).enumerate()
+                {
                     if let Some(reg) = interface_argument(argument) {
                         add_interface(reg, *xtype, cx.interfaces.param(ident, position));
                     }
@@ -404,12 +439,15 @@ fn interface_argument(expression: &crate::x86::types::ClightExpr) -> Option<RTLR
 }
 #[cfg(test)]
 mod tests {
-    use crate::decompile::passes::clight_select::{syntax::{c_types::CTypes, Stack}, solvers::semantics::Semantics};
-    use crate::decompile::passes::clight_select::syntax::type_recovery::*;
     use crate::decompile::passes::clight_select::syntax::solve::solve_function_z3_with_stack;
+    use crate::decompile::passes::clight_select::syntax::type_recovery::*;
     use crate::decompile::passes::clight_select::{
         candtype::{CandType, Sign},
         type_graph::{EvidenceGraph, Fact},
+    };
+    use crate::decompile::passes::clight_select::{
+        solvers::semantics::Semantics,
+        syntax::{c_types::CTypes, Stack},
     };
     use crate::x86::op::Operation;
     use crate::x86::types::*;
@@ -476,14 +514,19 @@ mod tests {
         )
     }
     fn selected(function: &FunctionData, with_recovery: bool) -> (usize, usize) {
-        let components: Vec<&dyn crate::decompile::passes::clight_select::syntax::Component> = if with_recovery {
-            vec![&TypeRecovery, &CTypes]
-        } else {
-            vec![&CTypes]
-        };
-        let outcome =
-            solve_function_z3_with_stack(function, &HashMap::new(), &[], &Stack::new(&[&Semantics], &components))
-                .unwrap();
+        let components: Vec<&dyn crate::decompile::passes::clight_select::syntax::Component> =
+            if with_recovery {
+                vec![&TypeRecovery, &CTypes]
+            } else {
+                vec![&CTypes]
+            };
+        let outcome = solve_function_z3_with_stack(
+            function,
+            &HashMap::new(),
+            &[],
+            &Stack::new(&[&Semantics], &components),
+        )
+        .unwrap();
         assert!(
             outcome.2.is_empty(),
             "unexpected class escape: {:?}",
@@ -558,13 +601,14 @@ mod tests {
         let variable = types.fresh();
         let variables = HashMap::from([(3, variable.clone())]);
         CTypes.constrain_declaration(&cx, 3, &variable, &sink);
-        let declarations = crate::decompile::passes::clight_select::syntax::declarations::Declarations::build(
-            &Stack::new(&[], &[&TypeRecovery, &CTypes]),
-            &cx,
-            &[3],
-            &variables,
-            &sink,
-        );
+        let declarations =
+            crate::decompile::passes::clight_select::syntax::declarations::Declarations::build(
+                &Stack::new(&[], &[&TypeRecovery, &CTypes]),
+                &cx,
+                &[3],
+                &variables,
+                &sink,
+            );
         CTypes.constrain_interfaces(&cx, &variables, &declarations, &sink);
         let (_, selected) = declarations
             .options(3)
@@ -673,9 +717,17 @@ mod tests {
             10,
             RTLInst::Iop(Operation::Ointconst(42), Arc::new(vec![]), 3),
         );
-        let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&Semantics], &[&TypeRecovery, &CTypes, &BindType]);
-        let out =
-            solve_function_z3_with_stack(&f, &HashMap::new(), &[], &Stack::new(solvers, components)).unwrap();
+        let (solvers, components): (
+            &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+            &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+        ) = (&[&Semantics], &[&TypeRecovery, &CTypes, &BindType]);
+        let out = solve_function_z3_with_stack(
+            &f,
+            &HashMap::new(),
+            &[],
+            &Stack::new(solvers, components),
+        )
+        .unwrap();
         assert_eq!(out.0[&10], Some(1));
         assert_eq!(
             out.1[&3], 1,
@@ -844,9 +896,17 @@ mod tests {
                 ),
             )],
         );
-        let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
-        let out =
-            solve_function_z3_with_stack(&f, &HashMap::new(), &[], &Stack::new(solvers, components)).unwrap();
+        let (solvers, components): (
+            &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+            &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+        ) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
+        let out = solve_function_z3_with_stack(
+            &f,
+            &HashMap::new(),
+            &[],
+            &Stack::new(solvers, components),
+        )
+        .unwrap();
         assert_eq!(out.1[&3], 0);
         assert!(
             GRAPH.get(&f.analysis_facts).unwrap().hypotheses[&3].contains(
@@ -861,10 +921,12 @@ mod tests {
             !COMMITMENTS.get(&out.5).unwrap().contains_key(&3),
             "a proposal must not become an unvalidated representation commitment"
         );
-        assert!(!crate::decompile::passes::clight_select::solvers::profiles::VALIDATED
-            .get(&out.5)
-            .unwrap()
-            .contains(&3));
+        assert!(
+            !crate::decompile::passes::clight_select::solvers::profiles::VALIDATED
+                .get(&out.5)
+                .unwrap()
+                .contains(&3)
+        );
     }
 
     #[test]
@@ -901,9 +963,17 @@ mod tests {
                 },
             )]),
         );
-        let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
-        let out =
-            solve_function_z3_with_stack(&f, &HashMap::new(), &[], &Stack::new(solvers, components)).unwrap();
+        let (solvers, components): (
+            &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+            &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+        ) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
+        let out = solve_function_z3_with_stack(
+            &f,
+            &HashMap::new(),
+            &[],
+            &Stack::new(solvers, components),
+        )
+        .unwrap();
         assert_eq!(
             out.1[&3], 0,
             "a later wide definition must retain all loaded bits"
@@ -990,17 +1060,27 @@ mod tests {
             10,
             RTLInst::Iop(Operation::Ocast32unsigned, Arc::new(vec![1]), 3),
         );
-        let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
-        let out =
-            solve_function_z3_with_stack(&f, &HashMap::new(), &[], &Stack::new(solvers, components)).unwrap();
+        let (solvers, components): (
+            &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+            &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+        ) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
+        let out = solve_function_z3_with_stack(
+            &f,
+            &HashMap::new(),
+            &[],
+            &Stack::new(solvers, components),
+        )
+        .unwrap();
         assert_eq!(
             out.1[&1], 0,
             "a use cannot establish its own input representation invariant"
         );
-        assert!(!crate::decompile::passes::clight_select::solvers::profiles::VALIDATED
-            .get(&out.5)
-            .unwrap()
-            .contains(&1));
+        assert!(
+            !crate::decompile::passes::clight_select::solvers::profiles::VALIDATED
+                .get(&out.5)
+                .unwrap()
+                .contains(&1)
+        );
     }
 
     #[test]
@@ -1014,7 +1094,8 @@ mod tests {
                 &self,
                 _: &FunctionContext<'a>,
                 _: &z3::Optimize,
-            ) -> Option<Box<dyn crate::decompile::passes::clight_select::solvers::Checker + 'a>> {
+            ) -> Option<Box<dyn crate::decompile::passes::clight_select::solvers::Checker + 'a>>
+            {
                 Some(Box::new(Stop))
             }
         }
@@ -1022,8 +1103,13 @@ mod tests {
             fn round_limit(&self) -> usize {
                 0
             }
-            fn check(&mut self, _: &z3::Model) -> crate::decompile::passes::clight_select::solvers::Verdict {
-                crate::decompile::passes::clight_select::solvers::Verdict::Unknown("test unsupported")
+            fn check(
+                &mut self,
+                _: &z3::Model,
+            ) -> crate::decompile::passes::clight_select::solvers::Verdict {
+                crate::decompile::passes::clight_select::solvers::Verdict::Unknown(
+                    "test unsupported",
+                )
             }
             fn coupled_nodes(&self) -> BTreeSet<Node> {
                 BTreeSet::new()
@@ -1036,7 +1122,10 @@ mod tests {
             ) {
             }
         }
-        let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&Semantics, &Stop], &[&TypeRecovery, &CTypes]);
+        let (solvers, components): (
+            &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+            &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+        ) = (&[&Semantics, &Stop], &[&TypeRecovery, &CTypes]);
         for supported in [false, true] {
             let mut f = proposed_fixture(supported);
             f.node_statements.insert(10, vec![constant(42)]);
@@ -1044,12 +1133,22 @@ mod tests {
                 10,
                 RTLInst::Iop(Operation::Ointconst(42), Arc::new(vec![]), 3),
             );
-            let out = solve_function_z3_with_stack(&f, &HashMap::new(), &[], &Stack::new(solvers, components))
-                .unwrap();
+            let out = solve_function_z3_with_stack(
+                &f,
+                &HashMap::new(),
+                &[],
+                &Stack::new(solvers, components),
+            )
+            .unwrap();
             if supported {
                 assert_eq!(out.1[&3], 1, "an unrelated failed analysis must not discard a complete guarded transfer proof");
                 assert!(COMMITMENTS.get(&out.5).unwrap().contains_key(&3));
-                assert!(crate::decompile::passes::clight_select::solvers::profiles::VALIDATED.get(&out.5).unwrap().contains(&3));
+                assert!(
+                    crate::decompile::passes::clight_select::solvers::profiles::VALIDATED
+                        .get(&out.5)
+                        .unwrap()
+                        .contains(&3)
+                );
             } else {
                 assert_eq!(out.1[&3], 0, "proof availability is not positive evidence for an unsupported source type");
                 assert!(!COMMITMENTS.get(&out.5).unwrap().contains_key(&3));
@@ -1094,8 +1193,13 @@ mod tests {
                 ClightExpr::EvarSymbol("opaque".into(), word),
             )],
         );
-        let out =
-            solve_function_z3_with_stack(&f, &HashMap::new(), &[], &Stack::new(solvers, components)).unwrap();
+        let out = solve_function_z3_with_stack(
+            &f,
+            &HashMap::new(),
+            &[],
+            &Stack::new(solvers, components),
+        )
+        .unwrap();
         assert_eq!(
             out.1[&3], 0,
             "retained refutation forbids losing the high bit"
@@ -1104,10 +1208,12 @@ mod tests {
             out.1[&4], 0,
             "the fallback cannot emit another unchecked narrow profile"
         );
-        assert!(!crate::decompile::passes::clight_select::solvers::profiles::VALIDATED
-            .get(&out.5)
-            .unwrap()
-            .contains(&4));
+        assert!(
+            !crate::decompile::passes::clight_select::solvers::profiles::VALIDATED
+                .get(&out.5)
+                .unwrap()
+                .contains(&4)
+        );
     }
 
     #[test]
@@ -1115,30 +1221,84 @@ mod tests {
         struct ChangeChoice;
         struct RejectFirst(z3::ast::Bool);
         impl crate::decompile::passes::clight_select::solvers::Solver for ChangeChoice {
-            fn name(&self) -> &'static str { "change-choice" }
-            fn checker<'a>(&self, cx: &FunctionContext<'a>, _: &z3::Optimize)
-                -> Option<Box<dyn crate::decompile::passes::clight_select::solvers::Checker + 'a>> {
+            fn name(&self) -> &'static str {
+                "change-choice"
+            }
+            fn checker<'a>(
+                &self,
+                cx: &FunctionContext<'a>,
+                _: &z3::Optimize,
+            ) -> Option<Box<dyn crate::decompile::passes::clight_select::solvers::Checker + 'a>>
+            {
                 Some(Box::new(RejectFirst(cx.selections[&10][0].not())))
             }
         }
         impl crate::decompile::passes::clight_select::solvers::Checker for RejectFirst {
-            fn round_limit(&self) -> usize { 0 }
-            fn check(&mut self, _: &z3::Model) -> crate::decompile::passes::clight_select::solvers::Verdict { crate::decompile::passes::clight_select::solvers::Verdict::Unknown("test fallback") }
-            fn coupled_nodes(&self) -> BTreeSet<Node> { BTreeSet::from([10]) }
-            fn fallback_constraints(&self) -> Vec<z3::ast::Bool> { vec![self.0.clone()] }
-            fn finish(self: Box<Self>, _: Option<&z3::Model>, _: &'static str, _: &mut crate::decompile::passes::clight_select::syntax::Artifacts) {}
+            fn round_limit(&self) -> usize {
+                0
+            }
+            fn check(
+                &mut self,
+                _: &z3::Model,
+            ) -> crate::decompile::passes::clight_select::solvers::Verdict {
+                crate::decompile::passes::clight_select::solvers::Verdict::Unknown("test fallback")
+            }
+            fn coupled_nodes(&self) -> BTreeSet<Node> {
+                BTreeSet::from([10])
+            }
+            fn fallback_constraints(&self) -> Vec<z3::ast::Bool> {
+                vec![self.0.clone()]
+            }
+            fn finish(
+                self: Box<Self>,
+                _: Option<&z3::Model>,
+                _: &'static str,
+                _: &mut crate::decompile::passes::clight_select::syntax::Artifacts,
+            ) {
+            }
         }
         let mut f = precise_fixture();
-        let second = ClightStmt::Sset(3, ClightExpr::Ecast(
-            Box::new(ClightExpr::EconstInt(42,ClightType::Tint(ClightIntSize::I32,ClightSignedness::Signed,ClightAttr::default()))),
-            ClightType::Tlong(ClightSignedness::Unsigned,ClightAttr::default())));
-        f.node_statements.insert(10,vec![constant(42),second]);
-        f.integer_anchors.insert(10,RTLInst::Iop(Operation::Ointconst(42),Arc::new(vec![]),3));
-        let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&Semantics, &ChangeChoice], &[&TypeRecovery, &CTypes]);
-        let out = solve_function_z3_with_stack(&f,&HashMap::new(),&[],&Stack::new(solvers, components)).unwrap();
-        assert_eq!(out.0[&10],Some(1));
-        assert_eq!(out.1[&3],0,"a proof of candidate0 cannot certify candidate1");
-        assert!(!crate::decompile::passes::clight_select::solvers::profiles::VALIDATED.get(&out.5).unwrap().contains(&3));
+        let second = ClightStmt::Sset(
+            3,
+            ClightExpr::Ecast(
+                Box::new(ClightExpr::EconstInt(
+                    42,
+                    ClightType::Tint(
+                        ClightIntSize::I32,
+                        ClightSignedness::Signed,
+                        ClightAttr::default(),
+                    ),
+                )),
+                ClightType::Tlong(ClightSignedness::Unsigned, ClightAttr::default()),
+            ),
+        );
+        f.node_statements.insert(10, vec![constant(42), second]);
+        f.integer_anchors.insert(
+            10,
+            RTLInst::Iop(Operation::Ointconst(42), Arc::new(vec![]), 3),
+        );
+        let (solvers, components): (
+            &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+            &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+        ) = (&[&Semantics, &ChangeChoice], &[&TypeRecovery, &CTypes]);
+        let out = solve_function_z3_with_stack(
+            &f,
+            &HashMap::new(),
+            &[],
+            &Stack::new(solvers, components),
+        )
+        .unwrap();
+        assert_eq!(out.0[&10], Some(1));
+        assert_eq!(
+            out.1[&3], 0,
+            "a proof of candidate0 cannot certify candidate1"
+        );
+        assert!(
+            !crate::decompile::passes::clight_select::solvers::profiles::VALIDATED
+                .get(&out.5)
+                .unwrap()
+                .contains(&3)
+        );
     }
 
     #[test]
@@ -1201,9 +1361,17 @@ mod tests {
             .insert(20, vec![BTreeSet::from([1])]);
         f.candidate_structure_worlds
             .insert(30, vec![BTreeSet::from([0])]);
-        let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
-        let out =
-            solve_function_z3_with_stack(&f, &HashMap::new(), &[], &Stack::new(solvers, components)).unwrap();
+        let (solvers, components): (
+            &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+            &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+        ) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
+        let out = solve_function_z3_with_stack(
+            &f,
+            &HashMap::new(),
+            &[],
+            &Stack::new(solvers, components),
+        )
+        .unwrap();
         assert_eq!(out.3, 0);
         assert_eq!(out.1[&3], 1);
         assert_eq!(out.0[&20], None);
@@ -1268,7 +1436,10 @@ mod tests {
                     ..Default::default()
                 },
             );
-            let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
+            let (solvers, components): (
+                &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+                &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+            ) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
             let out = solve_function_z3_with_stack(
                 &f,
                 &HashMap::from([(name.into(), 90)]),
@@ -1334,9 +1505,17 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
-        let out =
-            solve_function_z3_with_stack(&f, &HashMap::new(), &[], &Stack::new(solvers, components)).unwrap();
+        let (solvers, components): (
+            &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+            &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+        ) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
+        let out = solve_function_z3_with_stack(
+            &f,
+            &HashMap::new(),
+            &[],
+            &Stack::new(solvers, components),
+        )
+        .unwrap();
         assert_eq!(out.1[&3], 1);
     }
 
@@ -1433,9 +1612,17 @@ mod tests {
             10,
             RTLInst::Iop(Operation::Ointconst(42), Arc::new(vec![]), 3),
         );
-        let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
-        let out =
-            solve_function_z3_with_stack(&f, &HashMap::new(), &[], &Stack::new(solvers, components)).unwrap();
+        let (solvers, components): (
+            &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+            &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+        ) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
+        let out = solve_function_z3_with_stack(
+            &f,
+            &HashMap::new(),
+            &[],
+            &Stack::new(solvers, components),
+        )
+        .unwrap();
         assert_eq!(
             COMMITMENTS.get(&out.5).unwrap()[&3],
             TypeTerm::from_candidate(CandType::I32(Sign::Unsigned), f.data_model)
@@ -1471,9 +1658,17 @@ mod tests {
         );
         f.integer_anchors
             .insert(10, RTLInst::Iop(Operation::Oadd, Arc::new(vec![1, 2]), 3));
-        let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
-        let out =
-            solve_function_z3_with_stack(&f, &HashMap::new(), &[], &Stack::new(solvers, components)).unwrap();
+        let (solvers, components): (
+            &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+            &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+        ) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
+        let out = solve_function_z3_with_stack(
+            &f,
+            &HashMap::new(),
+            &[],
+            &Stack::new(solvers, components),
+        )
+        .unwrap();
         let declarations = COMMITMENTS.get(&out.5).unwrap();
         assert_eq!(
             declarations[&3],
@@ -1527,9 +1722,17 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
-        let out =
-            solve_function_z3_with_stack(&f, &HashMap::new(), &[], &Stack::new(solvers, components)).unwrap();
+        let (solvers, components): (
+            &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+            &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+        ) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
+        let out = solve_function_z3_with_stack(
+            &f,
+            &HashMap::new(),
+            &[],
+            &Stack::new(solvers, components),
+        )
+        .unwrap();
         assert_eq!(COMMITMENTS.get(&out.5).unwrap()[&3], term);
         assert!(term.legacy_candidate(f.data_model).is_none());
         assert_eq!(
@@ -1577,11 +1780,21 @@ mod tests {
                 ..Default::default()
             },
         );
-        crate::decompile::passes::clight_select::solvers::type_projection::extend_candidates(&mut f);
+        crate::decompile::passes::clight_select::solvers::type_projection::extend_candidates(
+            &mut f,
+        );
         assert_eq!(f.node_statements[&10].len(), 2);
-        let (solvers, components): (&[&dyn crate::decompile::passes::clight_select::solvers::Solver], &[&dyn crate::decompile::passes::clight_select::syntax::Component]) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
-        let out =
-            solve_function_z3_with_stack(&f, &HashMap::new(), &[], &Stack::new(solvers, components)).unwrap();
+        let (solvers, components): (
+            &[&dyn crate::decompile::passes::clight_select::solvers::Solver],
+            &[&dyn crate::decompile::passes::clight_select::syntax::Component],
+        ) = (&[&Semantics], &[&TypeRecovery, &CTypes]);
+        let out = solve_function_z3_with_stack(
+            &f,
+            &HashMap::new(),
+            &[],
+            &Stack::new(solvers, components),
+        )
+        .unwrap();
         assert_eq!(
             out.0[&10],
             Some(1),

@@ -6,8 +6,8 @@
 //! SAT in a snapshot means feasibility in the recorded formula, not validation
 //! of semantic obligations that were never visited by the production search.
 
-use crate::decompile::passes::clight_select::syntax::solve::{BuiltFunction, FunctionData};
 use crate::decompile::passes::c_pass::print::Printer;
+use crate::decompile::passes::clight_select::syntax::solve::{BuiltFunction, FunctionData};
 use crate::decompile::passes::clight_select::type_graph::TypeTerm;
 use serde_json::{json, Value};
 use std::fmt::Write as _;
@@ -102,7 +102,8 @@ fn describe(
         printer.into_string()
     };
     let mut registers = Vec::new();
-    let graph = crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH.get(&function.analysis_facts);
+    let graph = crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH
+        .get(&function.analysis_facts);
     for &reg in &built.regs {
         let choice = built.concrete_declarations.0.get(&reg);
         let alternatives: Vec<_> = choice
@@ -161,7 +162,11 @@ fn describe(
 #[cfg(test)]
 mod tests {
     use crate::decompile::passes::clight_select::syntax::solve::audit::*;
-    use crate::decompile::passes::clight_select::{syntax::{c_types::CTypes, type_evidence::GRAPH, type_recovery::TypeRecovery, Stack}, candtype::{CandType, Sign}, type_graph::{EvidenceGraph, Fact}};
+    use crate::decompile::passes::clight_select::{
+        candtype::{CandType, Sign},
+        syntax::{c_types::CTypes, type_evidence::GRAPH, type_recovery::TypeRecovery, Stack},
+        type_graph::{EvidenceGraph, Fact},
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -180,7 +185,9 @@ mod tests {
         });
         GRAPH.insert(&mut function.analysis_facts, graph);
         let optimizer = Optimize::new();
-        let backend = crate::decompile::passes::clight_select::syntax::solve::OptimizeBackend::new(&optimizer);
+        let backend = crate::decompile::passes::clight_select::syntax::solve::OptimizeBackend::new(
+            &optimizer,
+        );
         let built = crate::decompile::passes::clight_select::syntax::solve::build_function_constraints_with_stack(
             crate::decompile::passes::clight_select::syntax::solve::TypeDt::build(),
             &function,

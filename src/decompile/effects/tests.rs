@@ -1,7 +1,9 @@
 use super::flags::*;
 use super::*;
 use crate::decompile::passes::c_pass::types::CType;
-use crate::decompile::passes::clight_select::{solvers::integer_semantics::Validator, solvers::obligations::Verdict};
+use crate::decompile::passes::clight_select::{
+    solvers::integer_semantics::Validator, solvers::obligations::Verdict,
+};
 use crate::decompile::passes::{clight_pass, cminor_pass};
 use crate::x86::op::Operation;
 use crate::x86::types::*;

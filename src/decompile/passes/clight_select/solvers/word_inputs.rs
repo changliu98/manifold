@@ -7,8 +7,8 @@
 //! function. Calls and unknown effects conservatively kill it. Storage reads
 //! and selection-owned narrow type hypotheses share this representation fact.
 
-use crate::decompile::passes::clight_select::query::FunctionData;
 use crate::decompile::elevator::DecompileDB;
+use crate::decompile::passes::clight_select::query::FunctionData;
 use crate::x86::types::*;
 use ascent::{
     ascent,
@@ -77,7 +77,9 @@ pub(crate) fn collect(
             .iter()
             .map(|r| r.destination)
             .collect();
-        if let Some(graph) = crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH.get(&function.analysis_facts) {
+        if let Some(graph) = crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH
+            .get(&function.analysis_facts)
+        {
             let mut extended = tracked.clone();
             extended.extend(graph.hypotheses.iter().filter_map(|(&reg, terms)|
                 terms.iter().any(|t| t.is_integer() && t.object_bytes(function.data_model).is_some_and(|bytes| bytes < 8)).then_some(reg)));
@@ -101,12 +103,14 @@ pub(crate) fn collect(
             let mut uses = BTreeSet::new();
             for candidate in candidates {
                 uses.extend(
-                        crate::decompile::passes::cminor_pass::extract_var_reads_from_stmt(
-                            crate::decompile::passes::clight_select::solvers::memory_theory::primitive(candidate),
-                        )
-                        .into_iter()
-                        .map(|r| r as RTLReg),
-                    );
+                    crate::decompile::passes::cminor_pass::extract_var_reads_from_stmt(
+                        crate::decompile::passes::clight_select::solvers::memory_theory::primitive(
+                            candidate,
+                        ),
+                    )
+                    .into_iter()
+                    .map(|r| r as RTLReg),
+                );
             }
             for register in uses.intersection(&tracked) {
                 program.query.push((function.address, node, *register));
@@ -176,8 +180,8 @@ mod tests {
 
     #[test]
     fn type_hypotheses_demand_cfg_representation_facts_without_a_frame_contract() {
-        use crate::decompile::passes::clight_select::type_graph::{EvidenceGraph, TypeTerm};
         use crate::decompile::passes::clight_select::candtype::Sign;
+        use crate::decompile::passes::clight_select::type_graph::{EvidenceGraph, TypeTerm};
         let mut db = DecompileDB::default();
         db.rel_push("rtl_function_entry", (1_u64, 1_u64));
         db.rel_push("rtl_succ", (1_u64, 90_u64));
@@ -189,12 +193,33 @@ mod tests {
         ]);
         let owners = [1, 90, 30].into_iter().map(|n| (n, BTreeSet::from([1]))).collect();
         let mut f = FunctionData::new(1, "not_a_frame".into(), vec![], vec![], None, 0, 1, true);
-        f.node_statements.insert(30, vec![ClightStmt::Sset(14, ClightExpr::Etempvar(13, ClightType::Tlong(ClightSignedness::Signed, ClightAttr::default())))]);
-        crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH.insert(&mut f.analysis_facts, EvidenceGraph {
-            hypotheses: BTreeMap::from([(13, BTreeSet::from([TypeTerm::integer(32, Sign::Signed, f.data_model).unwrap()]))]),
-            ..Default::default()
-        });
-        collect(&db, std::slice::from_mut(&mut f), &instructions, &owners, &|n| (n == 90).then_some(32));
+        f.node_statements.insert(
+            30,
+            vec![ClightStmt::Sset(
+                14,
+                ClightExpr::Etempvar(
+                    13,
+                    ClightType::Tlong(ClightSignedness::Signed, ClightAttr::default()),
+                ),
+            )],
+        );
+        crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH.insert(
+            &mut f.analysis_facts,
+            EvidenceGraph {
+                hypotheses: BTreeMap::from([(
+                    13,
+                    BTreeSet::from([TypeTerm::integer(32, Sign::Signed, f.data_model).unwrap()]),
+                )]),
+                ..Default::default()
+            },
+        );
+        collect(
+            &db,
+            std::slice::from_mut(&mut f),
+            &instructions,
+            &owners,
+            &|n| (n == 90).then_some(32),
+        );
         assert_eq!(f.word_inputs[&30], BTreeSet::from([13]));
         assert!(f.integer_anchors.contains_key(&30));
     }

@@ -10,13 +10,13 @@
 //! This proves independence from a declaration spelling, not source-type
 //! uniqueness, allocation lifetime, or whole-program binary equivalence.
 
-use crate::decompile::passes::clight_select::type_graph::TypeTerm;
 use crate::abi::DataModel;
 use crate::decompile::passes::c_pass::{
     convert::from_relations::{convert_stmt, ConversionContext},
     helpers::param_name_for_reg,
     types::*,
 };
+use crate::decompile::passes::clight_select::type_graph::TypeTerm;
 use crate::x86::types::{ClightStmt, RTLReg};
 use std::collections::HashMap;
 
@@ -28,8 +28,11 @@ pub(crate) struct Projection {
     pub reg: RTLReg,
     pub ty: TypeTerm,
 }
-pub(crate) const PROJECTIONS: crate::decompile::passes::clight_select::syntax::ArtifactKey<Vec<Projection>> =
-    crate::decompile::passes::clight_select::syntax::ArtifactKey::projected("declaration-projections", |projections, plan| {
+pub(crate) const PROJECTIONS: crate::decompile::passes::clight_select::syntax::ArtifactKey<
+    Vec<Projection>,
+> = crate::decompile::passes::clight_select::syntax::ArtifactKey::projected(
+    "declaration-projections",
+    |projections, plan| {
         projections
             .iter()
             .map(|p| Projection {
@@ -40,13 +43,16 @@ pub(crate) const PROJECTIONS: crate::decompile::passes::clight_select::syntax::A
                 ty: p.ty.clone(),
             })
             .collect()
-    });
+    },
+);
 
 /// Instantiate the declaration grammar at its C conversion boundary. A new
 /// pointee type needs an explicit assignment cast, not an emitter repair.
 /// Construction preserves parent/world provenance; admission remains joint
 /// with the exact declaration and the pointer transport theorem below.
-pub(crate) fn extend_candidates(function: &mut crate::decompile::passes::clight_select::query::FunctionData) {
+pub(crate) fn extend_candidates(
+    function: &mut crate::decompile::passes::clight_select::query::FunctionData,
+) {
     use crate::x86::types::{ClightExpr, ClightType};
     fn instantiate(
         statement: &ClightStmt,
@@ -110,7 +116,9 @@ pub(crate) fn extend_candidates(function: &mut crate::decompile::passes::clight_
     )
     .unwrap()
     .to_clight(function.data_model);
-    if let Some(graph) = crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH.get(&function.analysis_facts) {
+    if let Some(graph) = crate::decompile::passes::clight_select::syntax::type_evidence::GRAPH
+        .get(&function.analysis_facts)
+    {
         for (&reg, terms) in &graph.hypotheses {
             for term in terms
                 .iter()
@@ -274,7 +282,10 @@ pub(super) fn integer_view_use(
             if !observe(callee, None) {
                 return false;
             }
-            let signature = crate::decompile::passes::clight_select::select::callee_ident_from_expr(callee, names)
+            let signature =
+                crate::decompile::passes::clight_select::select::callee_ident_from_expr(
+                    callee, names,
+                )
                 .and_then(|id| function.callee_signatures.get(&id));
             arguments.iter().enumerate().all(|(i, argument)| {
                 let formal = signature.and_then(|s| s.param_types.get(i)).map(|ty| {
@@ -287,7 +298,10 @@ pub(super) fn integer_view_use(
                 observe(argument, formal)
             })
         }
-        _ => !crate::decompile::passes::clight_select::syntax::declarations::dependencies(statement).contains(&reg),
+        _ => {
+            !crate::decompile::passes::clight_select::syntax::declarations::dependencies(statement)
+                .contains(&reg)
+        }
     }
 }
 

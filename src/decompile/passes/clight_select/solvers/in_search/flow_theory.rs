@@ -26,8 +26,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::decompile::passes::clight_select::solvers::flow::{self, Contradiction, FlowStats, LocKey};
-use crate::decompile::passes::clight_select::solvers::in_search::propagator::{PropCb, Theory, VetoTheory};
+use crate::decompile::passes::clight_select::solvers::flow::{
+    self, Contradiction, FlowStats, LocKey,
+};
+use crate::decompile::passes::clight_select::solvers::in_search::propagator::{
+    PropCb, Theory, VetoTheory,
+};
 use crate::x86::types::{ClightStmt, Node};
 
 /// Per-function ceiling on final-check rounds.

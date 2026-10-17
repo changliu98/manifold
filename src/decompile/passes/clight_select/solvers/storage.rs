@@ -1,8 +1,13 @@
 //! Storage preparation and layout search plugged into final selection.
-use crate::decompile::passes::clight_select::{solvers::memory_theory, query::FunctionData, select::ProgramSelectionState, solvers::storage_theory};
 use super::{Checker, Verdict};
-use crate::decompile::passes::clight_select::syntax::{ArtifactKey, Artifacts, FunctionContext, PreparedAnalysis};
 use crate::decompile::elevator::DecompileDB;
+use crate::decompile::passes::clight_select::syntax::{
+    ArtifactKey, Artifacts, FunctionContext, PreparedAnalysis,
+};
+use crate::decompile::passes::clight_select::{
+    query::FunctionData, select::ProgramSelectionState, solvers::memory_theory,
+    solvers::storage_theory,
+};
 use crate::decompile::passes::semantic_counterexample as storage;
 use crate::x86::types::Node;
 use std::collections::BTreeSet;

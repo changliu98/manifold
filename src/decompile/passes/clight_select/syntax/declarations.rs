@@ -4,7 +4,9 @@
 //! is a projection of that domain, not a second authority for its spelling.
 //! Legacy representatives remain explicit alternatives when proof is missing.
 
-use crate::decompile::passes::clight_select::syntax::c_types::{anchor_index, render_type, term_to_ty, TypeDt};
+use crate::decompile::passes::clight_select::syntax::c_types::{
+    anchor_index, render_type, term_to_ty, TypeDt,
+};
 use crate::decompile::passes::clight_select::syntax::constraints::{ModelView, SolveBackend};
 use crate::decompile::passes::clight_select::syntax::{DeclarationContext, Stack};
 use crate::decompile::passes::clight_select::type_graph::{
@@ -307,7 +309,8 @@ impl Declarations {
         statements: &HashMap<crate::x86::types::Node, Option<usize>>,
         results: &crate::decompile::passes::clight_select::syntax::Artifacts,
     ) -> BTreeMap<RTLReg, TypeTerm> {
-        let validated = crate::decompile::passes::clight_select::solvers::profiles::VALIDATED.get(results);
+        let validated =
+            crate::decompile::passes::clight_select::solvers::profiles::VALIDATED.get(results);
         let admissions = self.admissions(model);
         // Preservation is not a whole-variable equivalence certificate. Freeze
         // evidence-selected changes and the exact bindings needed by accepted
@@ -322,7 +325,9 @@ impl Declarations {
             })
             .filter_map(|(&reg, _)| self.selected(model, reg).map(|ty| (reg, ty.clone())))
             .collect();
-        if let Some(bindings) = crate::decompile::passes::clight_select::solvers::profiles::PRESERVED.get(results) {
+        if let Some(bindings) =
+            crate::decompile::passes::clight_select::solvers::profiles::PRESERVED.get(results)
+        {
             committed.extend(bindings.iter().map(|(&reg, ty)| (reg, ty.clone())));
         }
         for &reg in crate::decompile::passes::clight_select::solvers::profiles::FALLBACK_PRESERVED
@@ -415,10 +420,10 @@ impl Declarations {
 
 #[cfg(test)]
 mod tests {
-    use crate::decompile::passes::clight_select::candtype::Sign;
-    use crate::decompile::passes::clight_select::syntax::declarations::*;
     use crate::abi::DataModel;
     use crate::decompile::passes::c_pass::types::CType;
+    use crate::decompile::passes::clight_select::candtype::Sign;
+    use crate::decompile::passes::clight_select::syntax::declarations::*;
 
     #[test]
     fn commitments_use_the_final_candidate_and_exact_checked_inputs() {
@@ -450,7 +455,8 @@ mod tests {
         assert_eq!(solver.check(), z3::SatResult::Sat);
         let model = solver.get_model().unwrap();
         let mut results = crate::decompile::passes::clight_select::syntax::Artifacts::default();
-        crate::decompile::passes::clight_select::solvers::profiles::VALIDATED.insert(&mut results, BTreeSet::from([3]));
+        crate::decompile::passes::clight_select::solvers::profiles::VALIDATED
+            .insert(&mut results, BTreeSet::from([3]));
         let declarations = choices.commitments(&model, &HashMap::from([(10, Some(1))]), &results);
         assert_eq!(declarations[&3], word);
         assert!(declarations.contains_key(&1));
