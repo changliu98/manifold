@@ -135,7 +135,7 @@ pub mod config {
         pub alt_cap: usize,
         /// Master rounds of the program selection solve (`syntax::program`). Each round evaluates every function whose interface choice is new; at the cap the best fully evaluated choice is kept.
         pub max_rounds: usize,
-        /// The most Z3 work (rlimit units) those rounds spend, as a multiple of the work of the open solves that bound each function. Each solve is predicted to cost its function's open solve: a round runs only if its exact solves fit, and its partial solves are taken cheapest first while they fit. Work, unlike time, is deterministic.
+        /// The most Z3 work (rlimit units) those rounds spend, as a multiple of the work of the open solves that bound each function. Each solve is predicted to cost its function's open solve: a round runs only if its exact solves fit, and its partial solves are taken cheapest first while they fit. Work, unlike time, is deterministic. The default of `DecompileDB::max_round_work`, which `--max-round-work` sets.
         pub max_round_work: u64,
         /// Most combinations of open-global alternatives one statement is typed under; the globals of a statement beyond it stay committed program-wide.
         pub max_global_cases: usize,
@@ -247,7 +247,7 @@ pub mod config {
         interface: InterfaceConfig {
             alt_cap: 4,
             max_rounds: 8,
-            max_round_work: 3,
+            max_round_work: 6,
             max_global_cases: 64,
             legality_weight: 1_000_000_000_000,
             structural_weight: 1_000_000,
@@ -456,6 +456,10 @@ pub struct DecompileDB {
     /// UNSAT by exempting only the audited contradiction sites.
     pub ablate_flow_max_certification: bool,
     pub semantic_ablations: SemanticAblations,
+    /// The program selection solve's round work budget, as a multiple of its
+    /// open solves' work (`--max-round-work`, default
+    /// `CONFIG.interface.max_round_work`).
+    pub max_round_work: u64,
     /// Diagnostic CLI output; never changes decompilation behavior.
     pub dump_interface_vars: bool,
     pub dump_interface_instance: bool,
@@ -499,6 +503,7 @@ impl Default for DecompileDB {
             ablate_flow_anchor_reopen: false,
             ablate_flow_max_certification: false,
             semantic_ablations: SemanticAblations::default(),
+            max_round_work: config::CONFIG.interface.max_round_work,
             dump_interface_vars: false,
             dump_interface_instance: false,
             skip_function_names: HashSet::new(),
@@ -1027,6 +1032,7 @@ impl DecompileDB {
                         sub_db.ablate_flow_anchor_reopen = self.ablate_flow_anchor_reopen;
                         sub_db.ablate_flow_max_certification = self.ablate_flow_max_certification;
                         sub_db.semantic_ablations = self.semantic_ablations;
+                        sub_db.max_round_work = self.max_round_work;
                         sub_db.effect_epoch = self.effect_epoch;
                         sub_db.dump_interface_vars = self.dump_interface_vars;
                         sub_db.dump_interface_instance = self.dump_interface_instance;

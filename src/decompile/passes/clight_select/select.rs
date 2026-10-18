@@ -376,10 +376,11 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
             &name_to_ident,
             &bodiless,
             data_model,
+            db.max_round_work,
         );
         let stats = &outcome.stats;
         eprintln!(
-            "[program-solve] functions={} open-vars={} contested={} rounds={} proven={} pinned-solves={} partial-solves={} no-model={} changed-vs-rank0={} bound={:?}/{} cost={:?}/{} relaxed={}ms pinned={}ms master={}ms checked={}ms work={}/{} exhausted={}",
+            "[program-solve] functions={} open-vars={} contested={} rounds={} proven={} pinned-solves={} partial-solves={} no-model={} changed-vs-rank0={} bound={:?}/{} cost={:?}/{} relaxed={}ms pinned={}ms master={}ms checked={}ms work={}/{} exhausted={} max-round-work={}",
             stats.functions,
             stats.open_variables,
             stats.contested,
@@ -400,6 +401,7 @@ pub fn select_clight_stmts(db: &mut DecompileDB) -> Result<Vec<SelectedFunction>
             stats.relaxed_work,
             stats.round_work,
             stats.exhausted,
+            db.max_round_work,
         );
         best_state = outcome.state;
         committed_interfaces = outcome.committed;

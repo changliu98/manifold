@@ -150,6 +150,7 @@ pub(crate) struct ProgramSolveStats {
 /// `bodiless` lists the functions emitted without a C body (imports,
 /// skip-listed library functions): what lifting saw of them decides nothing
 /// about their own interface, which only their callers' typing shapes.
+/// The rounds spend at most `max_round_work` times the open solves' work.
 pub(crate) fn solve(
     functions: &mut Vec<FunctionData>,
     vars: &InterfaceVars,
@@ -157,6 +158,7 @@ pub(crate) fn solve(
     names: &HashMap<String, Ident>,
     bodiless: &BTreeSet<Address>,
     model: crate::abi::DataModel,
+    max_round_work: u64,
 ) -> ProgramSolve {
     let by_id: BTreeMap<&InterfaceVarId, &InterfaceVar> =
         vars.vars.iter().map(|var| (&var.id, var)).collect();
@@ -200,9 +202,7 @@ pub(crate) fn solve(
         .unzip();
     stats.relaxed_work = predicted.iter().sum();
     stats.relaxed_ms = started.elapsed().as_millis();
-    let budget = stats
-        .relaxed_work
-        .saturating_mul(CONFIG.interface.max_round_work);
+    let budget = stats.relaxed_work.saturating_mul(max_round_work);
     if trace {
         for (function, table) in functions.iter().zip(&tables) {
             let off: Vec<String> = table
@@ -1182,6 +1182,14 @@ mod tests {
     }
 
     fn run(functions: &mut Vec<FunctionData>, vars: &InterfaceVars) -> ProgramSolve {
+        run_with_budget(functions, vars, CONFIG.interface.max_round_work)
+    }
+
+    fn run_with_budget(
+        functions: &mut Vec<FunctionData>,
+        vars: &InterfaceVars,
+        max_round_work: u64,
+    ) -> ProgramSolve {
         solve(
             functions,
             vars,
@@ -1189,6 +1197,7 @@ mod tests {
             &HashMap::new(),
             &BTreeSet::new(),
             crate::abi::DataModel::Lp64,
+            max_round_work,
         )
     }
 
@@ -1224,8 +1233,7 @@ mod tests {
     /// converted to a double in g's body and lifting proposed no type for its
     /// register (ln's force_linkat). The caller may pass p as it is or
     /// converted; the body needs an integer, and only g's own problem sees it.
-    #[test]
-    fn a_parameter_lifting_typed_nothing_for_is_chosen_by_its_body_too() {
+    fn untyped_parameter_program() -> (Vec<FunctionData>, InterfaceVars) {
         let (mut functions, mut vars) = program(true, false);
         let long = || ClightType::Tlong(ClightSignedness::Signed, ClightAttr::default());
         let double = || ClightType::Tfloat(ClightFloatSize::F64, ClightAttr::default());
@@ -1255,6 +1263,12 @@ mod tests {
                 )],
             ));
         vars.vars[0].domain = alternatives(&[XType::Xptr, XType::Xlong]);
+        (functions, vars)
+    }
+
+    #[test]
+    fn a_parameter_lifting_typed_nothing_for_is_chosen_by_its_body_too() {
+        let (mut functions, vars) = untyped_parameter_program();
         let outcome = run(&mut functions, &vars);
         assert_eq!(outcome.stats.changed_from_rank0, 1, "{:?}", outcome.stats);
         assert_eq!(
@@ -1264,6 +1278,22 @@ mod tests {
         assert_eq!(
             functions[0].callee_signatures[&G].param_types,
             vec![XType::Xlong]
+        );
+    }
+
+    /// The same program under a budget that pays for no round after the
+    /// first: round one's choice, the contested parameter's rank zero, is
+    /// committed, and the solve reports that it stopped at the budget.
+    #[test]
+    fn a_round_the_work_budget_cannot_pay_for_does_not_run() {
+        let (mut functions, vars) = untyped_parameter_program();
+        let outcome = run_with_budget(&mut functions, &vars, 0);
+        assert!(outcome.stats.exhausted, "{:?}", outcome.stats);
+        assert_eq!(outcome.stats.rounds, 1, "{:?}", outcome.stats);
+        assert_eq!(outcome.stats.changed_from_rank0, 0, "{:?}", outcome.stats);
+        assert_eq!(
+            functions[1].param_types,
+            vec![ParamType::Typed(XType::Xptr)]
         );
     }
 }

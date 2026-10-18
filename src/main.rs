@@ -31,11 +31,24 @@ fn print_usage_and_exit() -> ! {
         \t--ablate-scope=function disable program-scope interface commitment and dirty re-solves\n\
         \t--ablate-flow-anchor-reopen price committed-global disagreements and re-open Stage B\n\
         \t--ablate-flow-max-certification enable propagator; retry UNSAT with audited flow gaps exempted\n\
+        \t--max-round-work=N bound the program selection rounds to N times the open solves' Z3 work (default {default_round_work})\n\
         	--measure-rule-times  dump per-pass Ascent rule timing to debug/rule_times/\n\
-        	--dump-deps          dump pipeline dependency graph as Graphviz DOT to pipeline.dot"
+        	--dump-deps          dump pipeline dependency graph as Graphviz DOT to pipeline.dot",
+        default_round_work = decompile::elevator::config::CONFIG.interface.max_round_work,
     );
     eprintln!("Experiment controls: --ablate-storage-search, --ablate-existing-storage-views, --ablate-call-observer-isolation");
     std::process::exit(1);
+}
+
+/// The value of `--max-round-work`: a non-negative integer multiple.
+fn parse_max_round_work(value: Option<&str>) -> u64 {
+    match value.map(str::parse::<u64>) {
+        Some(Ok(multiple)) => multiple,
+        _ => {
+            eprintln!("--max-round-work takes a non-negative integer, as in --max-round-work=6");
+            print_usage_and_exit();
+        }
+    }
 }
 
 fn main() {
@@ -68,6 +81,7 @@ fn main() {
     let mut ablate_flow_anchor_reopen = false;
     let mut ablate_flow_max_certification = false;
     let mut semantic_ablations = decompile::elevator::SemanticAblations::default();
+    let mut max_round_work = decompile::elevator::config::CONFIG.interface.max_round_work;
 
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -89,6 +103,12 @@ fn main() {
             "--ablate-semantic-admission" => semantic_ablations.disable_semantic_admission = true,
             "--dump-deps" => dump_deps = true,
             "--dump-dead-rels" => dump_dead_rels = true,
+            "--max-round-work" => {
+                max_round_work = parse_max_round_work(iter.next().map(String::as_str))
+            }
+            s if s.starts_with("--max-round-work=") => {
+                max_round_work = parse_max_round_work(s.strip_prefix("--max-round-work="))
+            }
             s if s.starts_with('-') => {
                 eprintln!("Unknown option: {}", s);
             }
@@ -148,6 +168,7 @@ fn main() {
     prog.ablate_flow_anchor_reopen = ablate_flow_anchor_reopen;
     prog.ablate_flow_max_certification = ablate_flow_max_certification;
     prog.semantic_ablations = semantic_ablations;
+    prog.max_round_work = max_round_work;
     if semantic_ablations != Default::default() { eprintln!("[semantic-ablations] {semantic_ablations:?}"); }
 
     if !input_path.is_file() {
