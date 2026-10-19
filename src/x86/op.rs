@@ -65,7 +65,6 @@ pub enum Comparison {
     Cle,
     Cgt,
     Cge,
-    #[allow(dead_code)]
     Unknown,
 }
 

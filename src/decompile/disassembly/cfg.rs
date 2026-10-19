@@ -673,7 +673,6 @@ pub struct DataLookupTableInfo {
     pub entry_scale: i64,               // 4 or 8 (byte width per entry)
     pub values: Vec<i64>,               // the actual data values from the table
     pub mov_addr: u64,                  // address of the MOV instruction
-    pub bounds_check_addr: Option<u64>, // address of CMP/AND instruction
     pub index_reg: Option<String>,
 }
 
@@ -1980,7 +1979,6 @@ pub fn analyze_data_lookup_tables(
         // AND). Distance and address order are not evidence that a check
         // reaches this load, so there is intentionally no instruction cap.
         let mut bounds_count: Option<usize> = None;
-        let mut bounds_addr: Option<u64> = None;
         let mut index_reg: Option<String> = None;
 
         for idx in linear_predecessors(&dataflow, i as u32).map(|idx| idx as usize) {
@@ -1998,7 +1996,6 @@ pub fn analyze_data_lookup_tables(
                     if let Some(&val) = imm {
                         if val > 0 && val < CONFIG.jump_table.max_bounds_immediate {
                             bounds_count = Some((val + 1) as usize);
-                            bounds_addr = Some(prev.address);
                             let reg_op = if op_imm_map.contains_key(prev_op1) {
                                 prev_op2
                             } else {
@@ -2021,7 +2018,6 @@ pub fn analyze_data_lookup_tables(
                             && (val & (val + 1)) == 0
                         {
                             bounds_count = Some((val + 1) as usize);
-                            bounds_addr = Some(prev.address);
                             let reg_op = if op_imm_map.contains_key(prev_op1) {
                                 prev_op2
                             } else {
@@ -2090,7 +2086,6 @@ pub fn analyze_data_lookup_tables(
                 entry_scale: scale,
                 values,
                 mov_addr: insn.address,
-                bounds_check_addr: bounds_addr,
                 index_reg,
             });
         }

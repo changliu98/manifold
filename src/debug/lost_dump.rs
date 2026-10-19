@@ -54,7 +54,7 @@ pub struct FunctionLostInfo {
 fn is_default_stmt(stmt: &ClightStmt) -> bool {
     match stmt {
         ClightStmt::Sskip => true,
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => is_default_stmt(inner),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner) => is_default_stmt(inner),
         _ => false,
     }
 }

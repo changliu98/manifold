@@ -2276,7 +2276,7 @@ mod tests {
         let real = 0x4510;
         let synthetic = real | super::ARITH_LOAD_SYNTH_NODE_BIT;
         let result = 0x9100;
-        let mut prog = CshminorPassProgram::default();
+        let prog = CshminorPassProgram::default();
         prog.abi_pointer_size.push((8,));
         prog.arith_load_op.push((
             real,
@@ -2732,7 +2732,7 @@ mod tests {
     const SIBLING_ENTRY: u64 = 0x5000;
 
     fn abort_candidate() -> CshminorPassProgram {
-        let mut prog = CshminorPassProgram::default();
+        let prog = CshminorPassProgram::default();
         prog.loop_body_core.push((FUNC, HEADER, CORE_EXIT));
         prog.loop_abort_candidate.push((FUNC, HEADER, ABORT_ENTRY));
         prog.loop_abort_candidate.push((FUNC, HEADER, ABORT_SINK));

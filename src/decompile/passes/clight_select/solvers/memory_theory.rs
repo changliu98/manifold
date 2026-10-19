@@ -37,7 +37,6 @@ pub(crate) struct WriteContract {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReadContract {
-    pub object: ObjectId,
     pub node: Node,
     pub root: RTLReg,
     pub offset: i64,
@@ -314,7 +313,6 @@ pub(crate) fn collect(db: &DecompileDB, functions: &mut [FunctionData]) {
                 continue;
             }
             function.storage_reads.push(ReadContract {
-                object,
                 node,
                 root,
                 offset: offset - base,
@@ -413,7 +411,7 @@ fn lvalue(expr: &ClightExpr, root: RTLReg, function: &FunctionData) -> Option<i6
 /// matching write inside a sequence cannot establish the other effects agree.
 pub(crate) fn primitive(stmt: &ClightStmt) -> &ClightStmt {
     match stmt {
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => primitive(inner),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner) => primitive(inner),
         ClightStmt::Ssequence(items) if items.len() == 1 => primitive(&items[0]),
         _ => stmt,
     }

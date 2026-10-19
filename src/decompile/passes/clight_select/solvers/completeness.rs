@@ -3,7 +3,7 @@
 //! This is a scoped contract, not a whole-function proof. Opaque or missing
 //! carriers cannot become successful executable output via solver fallback.
 use crate::decompile::effects::flags::FlagSelect;
-use crate::decompile::effects::{self, ArtifactId, EffectId, Outcome, Receipt, Stage};
+use crate::decompile::effects::{self, ArtifactId, Outcome, Receipt, Stage};
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::clight_select::syntax::constraints::ConstraintSink;
 use crate::decompile::passes::clight_select::syntax::{
@@ -56,12 +56,6 @@ const FACTS: ArtifactKey<Facts> = ArtifactKey::projected("effect-completeness", 
     result
 });
 
-pub(super) fn has_contracts(function: &FunctionData) -> bool {
-    FACTS
-        .get(&function.analysis_facts)
-        .is_some_and(|facts| !facts.problems.is_empty())
-}
-
 fn value_inputs(expr: &ClightExpr, out: &mut BTreeSet<RTLReg>) {
     match expr {
         ClightExpr::Etempvar(reg, _) => {
@@ -82,7 +76,7 @@ fn value_inputs(expr: &ClightExpr, out: &mut BTreeSet<RTLReg>) {
 }
 fn primitive(stmt: &ClightStmt) -> &ClightStmt {
     match stmt {
-        (ClightStmt::Slabel(_, s) | ClightStmt::Seffect(_, s)) => primitive(s),
+        ClightStmt::Slabel(_, s) | ClightStmt::Seffect(_, s) => primitive(s),
         ClightStmt::Ssequence(s) if s.len() == 1 => primitive(&s[0]),
         _ => stmt,
     }
@@ -212,6 +206,7 @@ pub(crate) struct SelectedContract {
 }
 
 impl SelectedContract {
+    #[cfg(test)]
     pub(crate) fn site(&self, node: Node) -> effects::EffectSite {
         effects::EffectSite {
             function: self.function,

@@ -8,11 +8,11 @@
 
 use std::collections::BTreeMap;
 
-use z3::ast::{Ast, Bool, Int};
+use z3::ast::{Bool, Int};
 use z3::{Model, Optimize};
 
 use crate::decompile::passes::semantic_counterexample::{
-    self as storage, Counterexample, FailureKind, Prepared, Representation, StorageId, Verdict,
+    self as storage, Counterexample, FailureKind, Prepared, Representation, StorageId,
     View,
 };
 use crate::x86::types::{Address, Node};

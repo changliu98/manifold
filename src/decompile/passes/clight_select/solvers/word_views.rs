@@ -10,7 +10,6 @@ use crate::decompile::passes::clight_select::query::FunctionData;
 use crate::x86::types::*;
 use ascent::ascent;
 use ascent::lattice::set::Set;
-use std::collections::BTreeSet;
 
 fn integer(ty: &ClightType) -> bool {
     matches!(ty, ClightType::Tint(_, _, a) | ClightType::Tlong(_, a) if !a.attr_volatile)

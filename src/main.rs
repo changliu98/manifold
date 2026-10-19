@@ -1,4 +1,3 @@
-#![allow(warnings)]
 use manifold::{debug, decompile};
 use std::path::PathBuf;
 use std::time::Instant;

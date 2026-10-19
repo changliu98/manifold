@@ -19,6 +19,7 @@ pub(crate) struct EffectId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum Stage {
     Machine,
+    #[allow(dead_code)]
     Rtl,
     Selection,
     Emission,

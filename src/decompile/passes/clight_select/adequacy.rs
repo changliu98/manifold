@@ -20,7 +20,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use crate::decompile::passes::clight_select::candtype::CandType;
 use crate::decompile::passes::clight_select::query::FunctionData;
 use crate::x86::types::{ClightExpr, ClightStmt, ClightType, Ident, Node, RTLReg};
 
@@ -99,7 +98,7 @@ fn stmt_reg_types(s: &ClightStmt, out: &mut Vec<(Ident, ClightType)>) {
             stmt_reg_types(b, out);
         }
         ClightStmt::Ssequence(items) => items.iter().for_each(|i| stmt_reg_types(i, out)),
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => stmt_reg_types(inner, out),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner) => stmt_reg_types(inner, out),
         ClightStmt::Sloop(a, b) => {
             stmt_reg_types(a, out);
             stmt_reg_types(b, out);

@@ -354,7 +354,7 @@ fn collect_goto_targets_inner(stmt: &CStmt, targets: &mut Vec<String>) {
             collect_gotos_from_expr(e, targets);
             collect_goto_targets_inner(inner, targets);
         }
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_goto_targets_inner(inner, targets),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => collect_goto_targets_inner(inner, targets),
         CStmt::Sequence(stmts) => {
             for s in stmts {
                 collect_goto_targets_inner(s, targets);
@@ -998,13 +998,6 @@ pub fn is_char_pointer_type(ty: &CType) -> bool {
     )
 }
 
-pub fn extract_named_label(stmt: &CStmt) -> Option<String> {
-    match stmt {
-        CStmt::Labeled(Label::Named(name), _) => Some(name.clone()),
-        _ => None,
-    }
-}
-
 // Collect EVERY named label in a statement tree: extract_named_label sees only a top-level Labeled, so a label past a leading Sskip would build no goto edge and leave the node disconnected.
 pub fn collect_defined_labels(stmt: &CStmt, out: &mut Vec<String>) {
     match stmt {
@@ -1012,7 +1005,7 @@ pub fn collect_defined_labels(stmt: &CStmt, out: &mut Vec<String>) {
             out.push(name.clone());
             collect_defined_labels(inner, out);
         }
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_defined_labels(inner, out),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => collect_defined_labels(inner, out),
         CStmt::Sequence(stmts) => {
             for s in stmts {
                 collect_defined_labels(s, out);
@@ -1042,7 +1035,7 @@ pub fn collect_defined_labels(stmt: &CStmt, out: &mut Vec<String>) {
 pub fn collect_goto_label_targets(stmt: &CStmt, targets: &mut Vec<String>) {
     match stmt {
         CStmt::Goto(label) => targets.push(label.clone()),
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_goto_label_targets(inner, targets),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => collect_goto_label_targets(inner, targets),
         CStmt::Sequence(stmts) => {
             for s in stmts {
                 collect_goto_label_targets(s, targets);
@@ -1072,7 +1065,7 @@ pub fn is_terminal_cstmt(stmt: &CStmt) -> bool {
         CStmt::Goto(_) => true,
         CStmt::Break => true,
         CStmt::Continue => true,
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => is_terminal_cstmt(inner),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => is_terminal_cstmt(inner),
         // Conversion wraps tail calls as `{ call; return; }`.  Treat the
         // wrapper by its last executable statement; otherwise the optimized
         // CFG invents fallthrough from a shared PLT tail-call node into the

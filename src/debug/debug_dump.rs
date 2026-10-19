@@ -62,11 +62,6 @@ pub fn dump_debug(
         .build()
         .map_err(|e| format!("Failed to create Capstone engine: {}", e))?;
 
-    let node_to_func: HashMap<u64, u64> = db
-        .rel_iter::<(Node, Address)>("instr_in_function")
-        .map(|(n, f)| (*n, *f))
-        .collect();
-
     let mut ltl_map: HashMap<u64, Vec<&LTLInst>> = HashMap::new();
     for (node, inst) in db.rel_iter::<(Node, LTLInst)>("ltl_inst") {
         ltl_map.entry(*node).or_insert_with(Vec::new).push(inst);

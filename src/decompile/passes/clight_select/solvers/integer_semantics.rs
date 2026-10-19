@@ -598,10 +598,6 @@ fn machine_op(eval: &mut Eval<'_>, op: &Operation, args: &[RTLReg]) -> Option<Va
     c_binary(binary, a, b)
 }
 
-fn machine_condition(eval: &mut Eval<'_>, cond: &Condition, args: &[RTLReg]) -> Option<Bool> {
-    machine_condition_at_width(eval, cond, args, None)
-}
-
 fn machine_condition_at_width(
     eval: &mut Eval<'_>,
     cond: &Condition,
@@ -634,7 +630,7 @@ fn machine_condition_at_width(
 
 fn unlabel(stmt: &ClightStmt) -> &ClightStmt {
     match stmt {
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => unlabel(inner),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner) => unlabel(inner),
         _ => stmt,
     }
 }

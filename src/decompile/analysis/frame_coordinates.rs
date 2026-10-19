@@ -8,6 +8,7 @@ use crate::decompile::elevator::DecompileDB;
 use crate::x86::types::{Address, Node, Symbol};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
 pub(crate) const INPUTS: &[&str] = &["instr_in_function", "stack_base_move", "func_stacksz"];
 
 #[derive(Default)]

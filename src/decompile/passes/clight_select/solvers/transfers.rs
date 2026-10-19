@@ -3,7 +3,7 @@
 //! A load-transport proof preserves the fetched word through C conversion.
 //! It deliberately makes no address, aliasing, initialization or lifetime claim.
 use crate::decompile::elevator::DecompileDB;
-use crate::decompile::passes::clight_select::syntax::{ArtifactKey, Artifacts};
+use crate::decompile::passes::clight_select::syntax::ArtifactKey;
 use crate::decompile::passes::clight_select::{
     query::FunctionData,
     solvers::integer_semantics::{CopyValue, LoadValue},
@@ -431,12 +431,6 @@ fn integer_bits(chunk: MemoryChunk) -> Option<u32> {
         MemoryChunk::MInt64 | MemoryChunk::MAny64 => Some(64),
         _ => None,
     }
-}
-
-pub(super) fn contains(facts: &Artifacts, node: Node) -> bool {
-    LOADS
-        .get(facts)
-        .is_some_and(|loads| loads.contains_key(&node))
 }
 
 #[cfg(test)]

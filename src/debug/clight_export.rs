@@ -938,7 +938,7 @@ fn collect_called_functions(stmt: &ClightStmt, names: &mut std::collections::Has
             collect_called_functions(s1, names);
             collect_called_functions(s2, names);
         }
-        (ClightStmt::Slabel(_, s) | ClightStmt::Seffect(_, s)) => collect_called_functions(s, names),
+        ClightStmt::Slabel(_, s) | ClightStmt::Seffect(_, s) => collect_called_functions(s, names),
         ClightStmt::Sswitch(_, cases) => {
             for (_, s) in cases {
                 collect_called_functions(s, names);

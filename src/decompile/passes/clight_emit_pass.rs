@@ -137,7 +137,7 @@ fn count_assignments_to(stmt: &CStmt, destination: &str) -> usize {
         | CStmt::While(_, body)
         | CStmt::DoWhile(body, _)
         | CStmt::For(_, _, _, body)
-        | (CStmt::Labeled(_, body) | CStmt::Effect(_, body)) => count_assignments_to(body, destination),
+        | CStmt::Labeled(_, body) | CStmt::Effect(_, body)  => count_assignments_to(body, destination),
         CStmt::Sequence(statements) => statements
             .iter()
             .map(|stmt| count_assignments_to(stmt, destination))
@@ -181,7 +181,7 @@ fn insert_va_start_after_assignment(
         | CStmt::While(_, body)
         | CStmt::DoWhile(body, _)
         | CStmt::For(_, _, _, body)
-        | (CStmt::Labeled(_, body) | CStmt::Effect(_, body)) => {
+        | CStmt::Labeled(_, body) | CStmt::Effect(_, body)  => {
             insert_va_start_after_assignment(body, destination, va_list_local, last_named)
         }
         CStmt::Sequence(statements) => statements
@@ -398,7 +398,7 @@ fn collect_struct_names_from_stmt(
             collect_struct_names_from_stmt(body, opaque_params, result);
         }
         CStmt::Return(Some(e)) => collect_struct_names_from_expr(e, opaque_params, result),
-        (CStmt::Labeled(_, body) | CStmt::Effect(_, body)) => collect_struct_names_from_stmt(body, opaque_params, result),
+        CStmt::Labeled(_, body) | CStmt::Effect(_, body)  => collect_struct_names_from_stmt(body, opaque_params, result),
         CStmt::Sequence(stmts) => {
             for s in stmts {
                 collect_struct_names_from_stmt(s, opaque_params, result);

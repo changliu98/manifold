@@ -15,7 +15,6 @@ use crate::util::{exec_order_key, semantic_node_address};
 use crate::x86::op::{Addressing, Operation};
 use crate::x86::types as clight;
 use crate::x86::types::*;
-use log::debug;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -1102,7 +1101,7 @@ fn order_globals_for_aggregate_initializers<'a>(
                 }
                 collect_stmt_vars(body, out);
             }
-            (CStmt::Labeled(_, body) | CStmt::Effect(_, body)) => collect_stmt_vars(body, out),
+            CStmt::Labeled(_, body) | CStmt::Effect(_, body)  => collect_stmt_vars(body, out),
             CStmt::Decl(decls) => {
                 for decl in decls {
                     if let Some(init) = &decl.init {
@@ -2075,6 +2074,7 @@ fn rewrite_stack_buffer_aliases_with_access_types(
     })
 }
 
+#[cfg(test)]
 fn rewrite_stack_buffer_aliases(
     body: &CStmt,
     aliases: &HashMap<RTLReg, (RTLReg, usize)>,
@@ -3046,15 +3046,6 @@ pub fn build_translation_unit_with_variable_origins(
             }
             (!items.is_empty()).then_some(Initializer::List(items))
         };
-
-    // Names the emitted functions write or address-take, used to keep a data global defined rather than extern only when this TU owns its storage.
-    let mutated_globals: HashSet<String> = {
-        let mut m = HashSet::new();
-        for stmt in stmt_map.values() {
-            collect_mutated_names_in_stmt(stmt, &mut m);
-        }
-        m
-    };
 
     for global in order_globals_for_aggregate_initializers(globals, &global_aggregate_coalescing) {
         // String literals emit separately. A read-only scalar can be folded
@@ -4522,7 +4513,7 @@ fn drop_void_captures_stmt(stmt: &mut CStmt, void_fns: &HashSet<String>) {
         CStmt::Switch(_, body) => drop_void_captures_stmt(body, void_fns),
         CStmt::While(_, body) | CStmt::DoWhile(body, _) => drop_void_captures_stmt(body, void_fns),
         CStmt::For(_, _, _, body) => drop_void_captures_stmt(body, void_fns),
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => drop_void_captures_stmt(inner, void_fns),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => drop_void_captures_stmt(inner, void_fns),
         CStmt::Block(items) => {
             for item in items.iter_mut() {
                 if let CBlockItem::Stmt(s) = item {
@@ -4670,7 +4661,7 @@ fn collect_var_origins_stmt(stmt: &CStmt, out: &mut HashSet<String>) {
                 collect_var_origins_stmt(s, out);
             }
         }
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_var_origins_stmt(inner, out),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => collect_var_origins_stmt(inner, out),
         _ => {}
     }
 }
@@ -4733,7 +4724,7 @@ fn collect_var_names_from_stmt(stmt: &CStmt, vars: &mut HashSet<String>) {
             }
             collect_var_names_from_stmt(body, vars);
         }
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_var_names_from_stmt(inner, vars),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => collect_var_names_from_stmt(inner, vars),
         CStmt::Block(items) => {
             for item in items {
                 match item {
@@ -4850,7 +4841,7 @@ fn collect_mutated_names_in_stmt(stmt: &CStmt, out: &mut HashSet<String>) {
             }
             collect_mutated_names_in_stmt(body, out);
         }
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_mutated_names_in_stmt(inner, out),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => collect_mutated_names_in_stmt(inner, out),
         CStmt::Block(items) => {
             for item in items {
                 if let CBlockItem::Stmt(s) = item {
@@ -4912,7 +4903,7 @@ fn infer_var_types_from_usage(
             infer_types_from_expr(e, fixed, var_types, extern_return_types);
             infer_var_types_from_usage(body, fixed, var_types, extern_return_types);
         }
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => {
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => {
             infer_var_types_from_usage(inner, fixed, var_types, extern_return_types)
         }
         CStmt::Sequence(stmts) => {
@@ -5334,7 +5325,7 @@ fn collect_bool_evidence<'a>(
             collect_bool_evidence_expr(e, evidence, false);
             collect_bool_evidence(body, evidence, false);
         }
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_bool_evidence(inner, evidence, false),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => collect_bool_evidence(inner, evidence, false),
         CStmt::Sequence(stmts) => {
             for s in stmts {
                 collect_bool_evidence(s, evidence, false);
@@ -5580,7 +5571,7 @@ fn last_toplevel_return_expr(body: &CStmt) -> Option<CExpr> {
             match s {
                 CStmt::Return(Some(e)) => found = Some(e.clone()),
                 // A labeled block whose inner directly returns also exposes a tail return.
-                (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => {
+                CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => {
                     if let CStmt::Return(Some(e)) = &**inner {
                         found = Some(e.clone());
                     }
@@ -5649,7 +5640,7 @@ fn fix_bare_returns_in_stmt(stmt: &mut CStmt) {
         CStmt::While(_, body) | CStmt::DoWhile(body, _) => fix_bare_returns_in_stmt(body),
         CStmt::For(_, _, _, body) => fix_bare_returns_in_stmt(body),
         CStmt::Switch(_, body) => fix_bare_returns_in_stmt(body),
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => fix_bare_returns_in_stmt(inner),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => fix_bare_returns_in_stmt(inner),
         CStmt::Sequence(stmts) => {
             for s in stmts {
                 fix_bare_returns_in_stmt(s);
@@ -5680,7 +5671,7 @@ fn strip_return_values_in_stmt(stmt: &mut CStmt) {
         CStmt::While(_, body) | CStmt::DoWhile(body, _) => strip_return_values_in_stmt(body),
         CStmt::For(_, _, _, body) => strip_return_values_in_stmt(body),
         CStmt::Switch(_, body) => strip_return_values_in_stmt(body),
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => strip_return_values_in_stmt(inner),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => strip_return_values_in_stmt(inner),
         CStmt::Sequence(stmts) => {
             for s in stmts {
                 strip_return_values_in_stmt(s);
@@ -5958,11 +5949,7 @@ pub struct ConversionContext {
     /// follow statement provenance, not the printable spelling of its lvalue.
     pub source_post_effects: HashMap<Node, CStmt>,
     pub applied_source_effects: HashSet<Node>,
-    #[allow(dead_code)]
-    pub global_names: HashSet<String>,
     pub string_globals: HashSet<usize>,
-    #[allow(dead_code)]
-    name_counter: usize,
     temp_names: HashMap<usize, String>,
     pub var_types: HashMap<String, CType>,
     pub string_label_to_content: HashMap<String, String>,
@@ -5976,7 +5963,6 @@ pub struct ConversionContext {
 
 impl ConversionContext {
     pub fn new(id_to_name: HashMap<usize, String>, data_model: crate::abi::DataModel) -> Self {
-        let global_names = id_to_name.values().cloned().collect();
         let label_disambig = Self::build_label_disambig(&id_to_name);
         Self {
             id_to_name,
@@ -5984,9 +5970,7 @@ impl ConversionContext {
             data_model,
             source_post_effects: HashMap::new(),
             applied_source_effects: HashSet::new(),
-            global_names,
             string_globals: HashSet::new(),
-            name_counter: 0,
             temp_names: HashMap::new(),
             var_types: HashMap::new(),
             string_label_to_content: HashMap::new(),
@@ -8337,7 +8321,7 @@ fn is_control_flow_construct(stmt: &CStmt) -> bool {
         | CStmt::DoWhile(_, _)
         | CStmt::For(_, _, _, _)
         | CStmt::Switch(_, _) => true,
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => is_control_flow_construct(inner),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => is_control_flow_construct(inner),
         _ => false,
     }
 }
@@ -8347,7 +8331,7 @@ fn is_unconditional_exit(stmt: &CStmt) -> bool {
     match stmt {
         CStmt::Return(_) | CStmt::Goto(_) | CStmt::Break | CStmt::Continue => true,
         // Labeled stmt exit status depends on inner stmt (subsequent code still dead if inner exits).
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => is_unconditional_exit(inner),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => is_unconditional_exit(inner),
         CStmt::Block(items) => {
             // A block exits if its last statement exits
             items
@@ -8383,7 +8367,7 @@ fn is_unconditional_exit(stmt: &CStmt) -> bool {
 fn contains_goto_target(stmt: &CStmt) -> bool {
     match stmt {
         CStmt::Labeled(Label::Named(_), _) => true,
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => contains_goto_target(inner),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => contains_goto_target(inner),
         CStmt::Block(items) => items.iter().any(|item| match item {
             CBlockItem::Stmt(s) => contains_goto_target(s),
             _ => false,
@@ -8406,7 +8390,7 @@ fn contains_named_label(stmt: &CStmt) -> bool {
     match stmt {
         CStmt::Labeled(Label::Named(_), _) => true,
         CStmt::Labeled(Label::Case(_), _) | CStmt::Labeled(Label::Default, _) => true,
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => contains_named_label(inner),
+        CStmt::Effect(_, inner) => contains_named_label(inner),
         CStmt::Block(items) => items.iter().any(|item| match item {
             CBlockItem::Stmt(s) => contains_named_label(s),
             _ => false,
@@ -8802,7 +8786,7 @@ fn convert_switch_cases(
 fn switch_body_exits(stmt: &CStmt) -> bool {
     match stmt {
         CStmt::Goto(_) | CStmt::Break | CStmt::Continue | CStmt::Return(_) => true,
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => switch_body_exits(inner),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => switch_body_exits(inner),
         CStmt::Sequence(stmts) => stmts.last().map_or(false, switch_body_exits),
         CStmt::Block(items) => items
             .iter()
@@ -8941,7 +8925,7 @@ fn clight_stmt_exits(stmt: &clight::ClightStmt) -> bool {
         | clight::ClightStmt::Sbreak
         | clight::ClightStmt::Scontinue
         | clight::ClightStmt::Sreturn(_) => true,
-        (clight::ClightStmt::Slabel(_, inner) | clight::ClightStmt::Seffect(_, inner)) => clight_stmt_exits(inner),
+        clight::ClightStmt::Slabel(_, inner) | clight::ClightStmt::Seffect(_, inner)  => clight_stmt_exits(inner),
         clight::ClightStmt::Ssequence(stmts) => stmts.last().map_or(false, clight_stmt_exits),
         _ => false,
     }
@@ -8973,7 +8957,7 @@ fn collect_clight_goto_targets(
                 collect_clight_goto_targets(stmt, targets);
             }
         }
-        (clight::ClightStmt::Slabel(_, inner) | clight::ClightStmt::Seffect(_, inner)) => {
+        clight::ClightStmt::Slabel(_, inner) | clight::ClightStmt::Seffect(_, inner)  => {
             collect_clight_goto_targets(inner, targets);
         }
         _ => {}
@@ -9018,7 +9002,7 @@ fn contains_structured_clight_loop(stmt: &clight::ClightStmt) -> bool {
         clight::ClightStmt::Sswitch(_, cases) => cases
             .iter()
             .any(|(_, stmt)| contains_structured_clight_loop(stmt)),
-        (clight::ClightStmt::Slabel(_, inner) | clight::ClightStmt::Seffect(_, inner)) => contains_structured_clight_loop(inner),
+        clight::ClightStmt::Slabel(_, inner) | clight::ClightStmt::Seffect(_, inner)  => contains_structured_clight_loop(inner),
         _ => false,
     }
 }
@@ -11538,7 +11522,7 @@ mod ordering_tests {
                 | CStmt::DoWhile(body, _)
                 | CStmt::For(_, _, _, body)
                 | CStmt::Switch(_, body)
-                | (CStmt::Labeled(_, body) | CStmt::Effect(_, body)) => contains_return(body),
+                | CStmt::Labeled(_, body) | CStmt::Effect(_, body)  => contains_return(body),
                 _ => false,
             }
         }
@@ -11654,7 +11638,7 @@ fn simplify_xor_self_in_stmt(stmt: &mut CStmt) {
                 simplify_xor_self_in_stmt(s);
             }
         }
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => simplify_xor_self_in_stmt(inner),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => simplify_xor_self_in_stmt(inner),
         _ => {}
     }
 }
@@ -11694,7 +11678,7 @@ fn strip_dead_expr_stmts(stmt: &mut CStmt) {
         CStmt::While(_, body) | CStmt::DoWhile(body, _) => strip_dead_expr_stmts(body),
         CStmt::For(_, _, _, body) => strip_dead_expr_stmts(body),
         CStmt::Switch(_, body) => strip_dead_expr_stmts(body),
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => strip_dead_expr_stmts(inner),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => strip_dead_expr_stmts(inner),
         _ => {}
     }
 }
@@ -11937,7 +11921,7 @@ fn count_leaf_stmts(stmt: &CStmt) -> usize {
             count_leaf_stmts(body)
         }
         CStmt::Switch(_, body) => count_leaf_stmts(body),
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => count_leaf_stmts(inner),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => count_leaf_stmts(inner),
         CStmt::Empty => 0,
         _ => 1,
     }
@@ -12009,7 +11993,7 @@ fn rewrite_tailcall_gotos_in_stmt(
                 }
             }
         }
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => rewrite_tailcall_gotos_in_stmt(inner, func_names, current_func),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => rewrite_tailcall_gotos_in_stmt(inner, func_names, current_func),
         _ => {}
     }
 }
@@ -12055,7 +12039,7 @@ fn collect_called_names_in_stmt(stmt: &CStmt, names: &mut HashSet<String>) {
                 }
             }
         }
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_called_names_in_stmt(inner, names),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => collect_called_names_in_stmt(inner, names),
         _ => {}
     }
 }
@@ -12179,6 +12163,7 @@ impl ArgEvidence {
     }
 }
 
+#[cfg(test)]
 fn ctype_involves_function(ty: &CType) -> bool {
     match ty {
         CType::Function(_, _, _, _) => true,
@@ -12189,272 +12174,9 @@ fn ctype_involves_function(ty: &CType) -> bool {
     }
 }
 
+#[cfg(test)]
 fn ctype_opt_involves_function(ty: &Option<CType>) -> bool {
     ty.as_ref().map_or(false, ctype_involves_function)
-}
-
-/// Classify a declared C type as argument evidence.
-#[cfg(test)]
-fn arg_evidence_of_ctype(ty: &CType) -> ArgEvidence {
-    use crate::decompile::passes::c_pass::types::{FloatSize, IntSize};
-    match ty {
-        CType::Int(sz, s) => {
-            let w = match sz {
-                IntSize::Char => 8,
-                IntSize::Short => 16,
-                IntSize::Int => 32,
-                IntSize::Long | IntSize::LongLong => 64,
-                IntSize::Int128 => 128,
-            };
-            ArgEvidence::Int(w, *s)
-        }
-        CType::Bool => ArgEvidence::Int(8, Signedness::Unsigned),
-        CType::Enum(_) => ArgEvidence::Int(32, Signedness::Signed),
-        CType::Float(FloatSize::Float) => ArgEvidence::Float(32),
-        CType::Float(_) => ArgEvidence::Float(64),
-        CType::Pointer(_, _) => ArgEvidence::Ptr(Some(ty.clone())),
-        // Arrays and function designators decay to pointers in argument position.
-        CType::Array(inner, _) => ArgEvidence::Ptr(Some(CType::ptr(inner.as_ref().clone()))),
-        CType::Function(_, _, _, _) => ArgEvidence::Ptr(Some(CType::ptr(ty.clone()))),
-        CType::Qualified(inner, _) => arg_evidence_of_ctype(inner),
-        // void/struct/union/typedef: not a scalar class we can safely type a parameter from.
-        _ => ArgEvidence::Poison,
-    }
-}
-
-/// Type environment for classifying call arguments: exactly the declarations the C compiler sees; locals shadow globals.
-#[cfg(test)]
-struct ArgEvidenceEnv<'a> {
-    local_types: HashMap<String, CType>,
-    global_types: &'a HashMap<String, CType>,
-    callee_ret: &'a HashMap<String, CType>,
-}
-
-#[cfg(test)]
-impl ArgEvidenceEnv<'_> {
-    fn var_type(&self, name: &str) -> Option<&CType> {
-        self.local_types
-            .get(name)
-            .or_else(|| self.global_types.get(name))
-    }
-}
-
-/// Classify one call-site argument expression; returns `Poison` when the declared type cannot be determined.
-#[cfg(test)]
-fn arg_evidence_of_expr(expr: &CExpr, env: &ArgEvidenceEnv) -> ArgEvidence {
-    use crate::decompile::passes::c_pass::types::UnaryOp;
-    match expr {
-        CExpr::Cast(ty, _) => arg_evidence_of_ctype(ty),
-        CExpr::StringLit(_) => ArgEvidence::Ptr(Some(CType::ptr(CType::char_signed()))),
-        // A literal 0 is a valid int, float, and null pointer constant.
-        CExpr::IntLit(l) if l.value == 0 => ArgEvidence::Bottom,
-        CExpr::IntLit(l) => {
-            use crate::decompile::passes::c_pass::types::IntLiteralSuffix as S;
-            let (suffix_wide, unsigned) = match l.suffix {
-                S::None => (false, false),
-                S::U => (false, true),
-                S::L | S::LL => (true, false),
-                _ => (true, true),
-            };
-            let fits32 = l.value >= i32::MIN as i128 && l.value <= u32::MAX as i128;
-            let w = if suffix_wide || !fits32 { 64 } else { 32 };
-            let s = if unsigned {
-                Signedness::Unsigned
-            } else {
-                Signedness::Signed
-            };
-            ArgEvidence::Int(w, s)
-        }
-        CExpr::FloatLit(l) => {
-            use crate::decompile::passes::c_pass::types::FloatLiteralSuffix as F;
-            ArgEvidence::Float(if matches!(l.suffix, F::F) { 32 } else { 64 })
-        }
-        // A C character literal has type int.
-        CExpr::CharLit(_) => ArgEvidence::Int(32, Signedness::Signed),
-        CExpr::Var(name) => env
-            .var_type(name)
-            .map(arg_evidence_of_ctype)
-            .unwrap_or(ArgEvidence::Poison),
-        CExpr::Paren(inner) => arg_evidence_of_expr(inner, env),
-        CExpr::Unary(UnaryOp::AddrOf, _) => ArgEvidence::Ptr(None),
-        CExpr::Unary(UnaryOp::Deref, inner) => match arg_evidence_of_expr(inner, env) {
-            ArgEvidence::Ptr(Some(CType::Pointer(p, _))) => arg_evidence_of_ctype(&p),
-            _ => ArgEvidence::Poison,
-        },
-        CExpr::Unary(UnaryOp::Not, _) => ArgEvidence::Int(32, Signedness::Signed),
-        CExpr::Unary(UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot, inner) => {
-            match arg_evidence_of_expr(inner, env) {
-                ev @ (ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom) => ev,
-                _ => ArgEvidence::Poison,
-            }
-        }
-        CExpr::Unary(_, _) => ArgEvidence::Poison,
-        CExpr::Binary(op, l, r) => {
-            use crate::decompile::passes::c_pass::types::BinaryOp as B;
-            match op {
-                // Comparisons and logical connectives have type int.
-                B::Eq | B::Ne | B::Lt | B::Le | B::Gt | B::Ge | B::And | B::Or => {
-                    ArgEvidence::Int(32, Signedness::Signed)
-                }
-                B::Shl | B::Shr => match arg_evidence_of_expr(l, env) {
-                    ev @ (ArgEvidence::Int(_, _) | ArgEvidence::Bottom) => ev,
-                    _ => ArgEvidence::Poison,
-                },
-                B::Add | B::Sub => {
-                    let le = arg_evidence_of_expr(l, env);
-                    let re = arg_evidence_of_expr(r, env);
-                    match (le, re) {
-                        // ptr - ptr is ptrdiff_t; ptr +/- int keeps the pointer type.
-                        (ArgEvidence::Ptr(_), ArgEvidence::Ptr(_)) if matches!(op, B::Sub) => {
-                            ArgEvidence::Int(64, Signedness::Signed)
-                        }
-                        (p @ ArgEvidence::Ptr(_), ArgEvidence::Int(_, _) | ArgEvidence::Bottom)
-                        | (ArgEvidence::Int(_, _) | ArgEvidence::Bottom, p @ ArgEvidence::Ptr(_)) => {
-                            p
-                        }
-                        (
-                            le @ (ArgEvidence::Int(_, _)
-                            | ArgEvidence::Float(_)
-                            | ArgEvidence::Bottom),
-                            re @ (ArgEvidence::Int(_, _)
-                            | ArgEvidence::Float(_)
-                            | ArgEvidence::Bottom),
-                        ) => le.join(re),
-                        _ => ArgEvidence::Poison,
-                    }
-                }
-                B::Mul | B::Div | B::Mod | B::BitAnd | B::BitOr | B::BitXor => {
-                    let le = arg_evidence_of_expr(l, env);
-                    let re = arg_evidence_of_expr(r, env);
-                    match (&le, &re) {
-                        (
-                            ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom,
-                            ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom,
-                        ) => le.join(re),
-                        _ => ArgEvidence::Poison,
-                    }
-                }
-                _ => ArgEvidence::Poison,
-            }
-        }
-        CExpr::Ternary(_, t, e) => {
-            let te = arg_evidence_of_expr(t, env);
-            let ee = arg_evidence_of_expr(e, env);
-            match (&te, &ee) {
-                // int/ptr-mixed ternary is not valid C; poison so the callee keeps the K&R decl rather than laundering it through TopIntPtr.
-                (ArgEvidence::Ptr(_), ArgEvidence::Int(_, _))
-                | (ArgEvidence::Int(_, _), ArgEvidence::Ptr(_)) => ArgEvidence::Poison,
-                _ => te.join(ee),
-            }
-        }
-        CExpr::Call(callee, _) => match callee.as_ref() {
-            CExpr::Var(name) => env
-                .callee_ret
-                .get(name)
-                .map(arg_evidence_of_ctype)
-                .unwrap_or(ArgEvidence::Poison),
-            _ => ArgEvidence::Poison,
-        },
-        CExpr::SizeofType(_) | CExpr::SizeofExpr(_) | CExpr::AlignofType(_) => {
-            // size_t.
-            ArgEvidence::Int(64, Signedness::Unsigned)
-        }
-        _ => ArgEvidence::Poison,
-    }
-}
-
-/// Collect per-call-site argument evidence vectors keyed by callee name (deterministic TU walk order).
-#[cfg(test)]
-fn collect_call_arg_evidence_in_stmt(
-    stmt: &CStmt,
-    env: &ArgEvidenceEnv,
-    sites: &mut HashMap<String, Vec<Vec<ArgEvidence>>>,
-) {
-    match stmt {
-        CStmt::Expr(expr) => collect_call_arg_evidence_in_expr(expr, env, sites),
-        CStmt::Return(Some(expr)) => collect_call_arg_evidence_in_expr(expr, env, sites),
-        CStmt::If(cond, then_s, else_s) => {
-            collect_call_arg_evidence_in_expr(cond, env, sites);
-            collect_call_arg_evidence_in_stmt(then_s, env, sites);
-            if let Some(e) = else_s {
-                collect_call_arg_evidence_in_stmt(e, env, sites);
-            }
-        }
-        CStmt::While(cond, body) | CStmt::DoWhile(body, cond) => {
-            collect_call_arg_evidence_in_expr(cond, env, sites);
-            collect_call_arg_evidence_in_stmt(body, env, sites);
-        }
-        CStmt::For(_, cond, update, body) => {
-            if let Some(c) = cond {
-                collect_call_arg_evidence_in_expr(c, env, sites);
-            }
-            if let Some(u) = update {
-                collect_call_arg_evidence_in_expr(u, env, sites);
-            }
-            collect_call_arg_evidence_in_stmt(body, env, sites);
-        }
-        CStmt::Switch(expr, body) => {
-            collect_call_arg_evidence_in_expr(expr, env, sites);
-            collect_call_arg_evidence_in_stmt(body, env, sites);
-        }
-        CStmt::Sequence(stmts) => {
-            for s in stmts {
-                collect_call_arg_evidence_in_stmt(s, env, sites);
-            }
-        }
-        CStmt::Block(items) => {
-            for item in items {
-                if let CBlockItem::Stmt(s) = item {
-                    collect_call_arg_evidence_in_stmt(s, env, sites);
-                }
-            }
-        }
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_call_arg_evidence_in_stmt(inner, env, sites),
-        _ => {}
-    }
-}
-
-#[cfg(test)]
-fn collect_call_arg_evidence_in_expr(
-    expr: &CExpr,
-    env: &ArgEvidenceEnv,
-    sites: &mut HashMap<String, Vec<Vec<ArgEvidence>>>,
-) {
-    match expr {
-        CExpr::Call(callee, args) => {
-            if let CExpr::Var(name) = callee.as_ref() {
-                let evidence: Vec<ArgEvidence> =
-                    args.iter().map(|a| arg_evidence_of_expr(a, env)).collect();
-                sites.entry(name.clone()).or_default().push(evidence);
-            }
-            collect_call_arg_evidence_in_expr(callee, env, sites);
-            for arg in args {
-                collect_call_arg_evidence_in_expr(arg, env, sites);
-            }
-        }
-        CExpr::Assign(_, lhs, rhs) | CExpr::Binary(_, lhs, rhs) => {
-            collect_call_arg_evidence_in_expr(lhs, env, sites);
-            collect_call_arg_evidence_in_expr(rhs, env, sites);
-        }
-        CExpr::Unary(_, inner)
-        | CExpr::Cast(_, inner)
-        | CExpr::Member(inner, _)
-        | CExpr::MemberPtr(inner, _)
-        | CExpr::Paren(inner)
-        | CExpr::SizeofExpr(inner) => {
-            collect_call_arg_evidence_in_expr(inner, env, sites);
-        }
-        CExpr::Index(arr, idx) => {
-            collect_call_arg_evidence_in_expr(arr, env, sites);
-            collect_call_arg_evidence_in_expr(idx, env, sites);
-        }
-        CExpr::Ternary(a, b, c) => {
-            collect_call_arg_evidence_in_expr(a, env, sites);
-            collect_call_arg_evidence_in_expr(b, env, sites);
-            collect_call_arg_evidence_in_expr(c, env, sites);
-        }
-        _ => {}
-    }
 }
 
 /// Join per-site evidence into a parameter type vector per callee; a callee gets a typed prototype only when arity agrees across all sites and no position joins to Poison.

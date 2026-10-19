@@ -2321,12 +2321,6 @@ fn structure_with_memo(
         .map(|(branch, join)| (*branch, *join))
         .collect();
 
-    let scond_nodes: HashMap<Node, (Node, Node)> = prog
-        .scond_node
-        .iter()
-        .map(|(branch, t, f)| (*branch, (*t, *f)))
-        .collect();
-
     let no_join_nodes: HashSet<Node> = prog.scond_no_join.iter().map(|(n,)| *n).collect();
 
     let mut true_bodies: HashMap<Node, Vec<Node>> = HashMap::new();

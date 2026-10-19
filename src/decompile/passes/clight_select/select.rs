@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports, unused_mut)]
-
 use crate::decompile::elevator::config::CONFIG;
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::clight_select::candtype::CandType;
@@ -32,7 +30,7 @@ fn stmt_primary_memory_type(stmt: &ClightStmt) -> Option<&ClightType> {
     match stmt {
         ClightStmt::Sset(_, rhs) => primary_memory_type(rhs),
         ClightStmt::Sassign(lhs, _) => primary_memory_type(lhs),
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => stmt_primary_memory_type(inner),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => stmt_primary_memory_type(inner),
         ClightStmt::Ssequence(statements) if statements.len() == 1 => {
             stmt_primary_memory_type(&statements[0])
         }
@@ -76,7 +74,6 @@ pub(crate) struct ProgramSelectionState {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct SelectedFunction {
     pub address: Address,
     pub name: String,
@@ -85,7 +82,6 @@ pub struct SelectedFunction {
     pub param_regs: Vec<RTLReg>,
     pub param_types: Vec<ParamType>,
     pub stack_size: u64,
-    pub structure_world: u8,
 
     pub statements: HashMap<Node, ClightStmt>,
 
@@ -117,9 +113,6 @@ pub struct SelectedFunction {
         BTreeMap<RTLReg, crate::decompile::passes::clight_select::type_graph::TypeTerm>,
     /// CFG-certified native definition webs behind the selected C bindings.
     pub(crate) binding_plan: crate::decompile::passes::clight_select::syntax::bindings::BindingPlan,
-
-    pub loop_headers: HashSet<Node>,
-    pub switch_heads: HashSet<Node>,
 
     pub reg_struct_ids: HashMap<RTLReg, usize>,
 
@@ -1196,7 +1189,6 @@ fn build_selected_function_from_program_state(
         param_regs: func.param_regs.clone(),
         param_types: func.param_types.clone(),
         stack_size: func.stack_size,
-        structure_world,
         statements,
         selected_candidate_nodes,
         selected_write_bytes,
@@ -1209,16 +1201,6 @@ fn build_selected_function_from_program_state(
         var_decl_idx,
         concrete_declarations,
         binding_plan,
-        loop_headers: if structured_world {
-            func.loop_headers.clone()
-        } else {
-            HashSet::new()
-        },
-        switch_heads: if structured_world {
-            func.switch_heads.clone()
-        } else {
-            HashSet::new()
-        },
         reg_struct_ids: func.reg_struct_ids.clone(),
         loop_info: func_loop_info,
     }
@@ -1292,7 +1274,7 @@ fn stmt_uses_efield(stmt: &ClightStmt) -> bool {
         }
         ClightStmt::Ssequence(ss) => ss.iter().any(stmt_uses_efield),
         ClightStmt::Sloop(a, b) => stmt_uses_efield(a) || stmt_uses_efield(b),
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => stmt_uses_efield(inner),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => stmt_uses_efield(inner),
         ClightStmt::Sswitch(e, cases) => {
             expr_has_efield(e) || cases.iter().any(|(_, s)| stmt_uses_efield(s))
         }
@@ -1388,7 +1370,7 @@ fn walk_stmt_exprs(stmt: &ClightStmt, pred: &dyn Fn(&ClightExpr) -> bool) -> boo
         }
         ClightStmt::Ssequence(ss) => ss.iter().any(|s| walk_stmt_exprs(s, pred)),
         ClightStmt::Sloop(a, b) => walk_stmt_exprs(a, pred) || walk_stmt_exprs(b, pred),
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => walk_stmt_exprs(inner, pred),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => walk_stmt_exprs(inner, pred),
         ClightStmt::Sswitch(e, cases) => {
             pred(e) || cases.iter().any(|(_, s)| walk_stmt_exprs(s, pred))
         }
@@ -1463,7 +1445,7 @@ fn count_integer_float_bridge_casts_stmt(stmt: &ClightStmt) -> usize {
                     .map(|(_, stmt)| count_integer_float_bridge_casts_stmt(stmt))
                     .sum::<usize>()
         }
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => count_integer_float_bridge_casts_stmt(inner),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => count_integer_float_bridge_casts_stmt(inner),
         _ => 0,
     }
 }
@@ -1574,7 +1556,7 @@ fn selected_unique_outside_target(
                     collect(stmt, targets);
                 }
             }
-            (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => collect(inner, targets),
+            ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => collect(inner, targets),
             _ => {}
         }
     }
@@ -2422,7 +2404,7 @@ fn clight_stmt_size(s: &ClightStmt) -> usize {
         ClightStmt::Ssequence(v) => 1 + v.iter().map(clight_stmt_size).sum::<usize>(),
         ClightStmt::Sifthenelse(_, a, b) => 1 + clight_stmt_size(a) + clight_stmt_size(b),
         ClightStmt::Sloop(a, b) => 1 + clight_stmt_size(a) + clight_stmt_size(b),
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => 1 + clight_stmt_size(inner),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => 1 + clight_stmt_size(inner),
         ClightStmt::Sswitch(_, cases) => {
             1 + cases
                 .iter()
@@ -2797,7 +2779,7 @@ fn count_switches(s: &ClightStmt) -> usize {
         ClightStmt::Ssequence(ss) => ss.iter().map(count_switches).sum(),
         ClightStmt::Sifthenelse(_, a, b) => count_switches(a) + count_switches(b),
         ClightStmt::Sloop(a, b) => count_switches(a) + count_switches(b),
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => count_switches(inner),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => count_switches(inner),
         _ => 0,
     }
 }
@@ -2809,7 +2791,7 @@ fn stmt_contains_switch(s: &ClightStmt) -> bool {
         ClightStmt::Ssequence(ss) => ss.iter().any(stmt_contains_switch),
         ClightStmt::Sifthenelse(_, a, b) => stmt_contains_switch(a) || stmt_contains_switch(b),
         ClightStmt::Sloop(a, b) => stmt_contains_switch(a) || stmt_contains_switch(b),
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => stmt_contains_switch(inner),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => stmt_contains_switch(inner),
         _ => false,
     }
 }
@@ -2908,7 +2890,7 @@ fn inline_switch_case_bodies(
                 scan_switches(a, entry_gotos, switch_count);
                 scan_switches(b, entry_gotos, switch_count);
             }
-            (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => scan_switches(inner, entry_gotos, switch_count),
+            ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => scan_switches(inner, entry_gotos, switch_count),
             _ => {}
         }
     }
@@ -2998,7 +2980,7 @@ fn collect_claimable_entry_targets(s: &ClightStmt, out: &mut HashSet<Ident>) {
             collect_claimable_entry_targets(a, out);
             collect_claimable_entry_targets(b, out);
         }
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => collect_claimable_entry_targets(inner, out),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => collect_claimable_entry_targets(inner, out),
         _ => {}
     }
 }
@@ -3303,7 +3285,7 @@ fn contains_loop_level_continue(s: &ClightStmt) -> bool {
         ClightStmt::Sifthenelse(_, t, e) => {
             contains_loop_level_continue(t) || contains_loop_level_continue(e)
         }
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => contains_loop_level_continue(inner),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => contains_loop_level_continue(inner),
         ClightStmt::Sswitch(_, cases) => {
             cases.iter().any(|(_, st)| contains_loop_level_continue(st))
         }
@@ -3320,7 +3302,7 @@ fn contains_escaping_break(s: &ClightStmt) -> bool {
         ClightStmt::Sifthenelse(_, t, e) => {
             contains_escaping_break(t) || contains_escaping_break(e)
         }
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => contains_escaping_break(inner),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => contains_escaping_break(inner),
         ClightStmt::Sloop(..) | ClightStmt::Sswitch(..) => false,
         _ => false,
     }
@@ -3333,7 +3315,7 @@ fn stmt_may_fall_through(s: &ClightStmt) -> bool {
         | ClightStmt::Sgoto(_)
         | ClightStmt::Sbreak
         | ClightStmt::Scontinue => false,
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => stmt_may_fall_through(inner),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => stmt_may_fall_through(inner),
         ClightStmt::Ssequence(ss) => ss.iter().all(stmt_may_fall_through),
         ClightStmt::Sifthenelse(_, t, e) => stmt_may_fall_through(t) || stmt_may_fall_through(e),
         ClightStmt::Sloop(b, _) => contains_escaping_break(b),
@@ -3541,7 +3523,7 @@ fn is_control_flow_stmt(stmt: &ClightStmt) -> bool {
         | ClightStmt::Sbreak
         | ClightStmt::Scontinue
         | ClightStmt::Sswitch(_, _) => true,
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => is_control_flow_stmt(inner),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => is_control_flow_stmt(inner),
         ClightStmt::Ssequence(stmts) => stmts.iter().any(is_control_flow_stmt),
         _ => false,
     }
@@ -3553,7 +3535,7 @@ fn is_value_stmt(stmt: &ClightStmt) -> bool {
         | ClightStmt::Sset(_, _)
         | ClightStmt::Sassign(_, _)
         | ClightStmt::Sbuiltin(_, _, _, _) => true,
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => is_value_stmt(inner),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => is_value_stmt(inner),
         ClightStmt::Ssequence(stmts) => stmts.iter().any(is_value_stmt),
         _ => false,
     }
@@ -3575,7 +3557,7 @@ fn stmt_depth(root: &ClightStmt) -> usize {
                 work.push((a.as_ref(), d + 1));
                 work.push((b.as_ref(), d + 1));
             }
-            (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => work.push((inner.as_ref(), d + 1)),
+            ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => work.push((inner.as_ref(), d + 1)),
             ClightStmt::Sswitch(_, cases) => work.extend(cases.iter().map(|(_, c)| (c, d + 1))),
             _ => {}
         }
@@ -3855,7 +3837,7 @@ fn collect_loop_goto_targets(stmt: &ClightStmt, loop_depth: usize, out: &mut Has
             collect_loop_goto_targets(body, loop_depth + 1, out);
             collect_loop_goto_targets(incr, loop_depth + 1, out);
         }
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => collect_loop_goto_targets(inner, loop_depth, out),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => collect_loop_goto_targets(inner, loop_depth, out),
         ClightStmt::Sswitch(_, cases) => {
             for (_, stmt) in cases {
                 collect_loop_goto_targets(stmt, loop_depth, out);
@@ -4326,7 +4308,7 @@ fn ensure_goto_labels(statements: &mut HashMap<Node, ClightStmt>) {
 #[cfg(test)]
 mod tests {
     use crate::decompile::passes::clight_select::select::*;
-    use std::sync::Arc;
+    
 
     fn synthetic_ids<const N: usize>() -> [u64; N] {
         std::array::from_fn(|index| index as u64 + 1)

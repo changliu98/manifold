@@ -23,7 +23,7 @@ use crate::decompile::passes::clight_select::syntax::solve::clight_expr_type as 
 use crate::util::semantic_node_address;
 use crate::x86::op::{Comparison, Condition};
 use crate::x86::types::{
-    ClightBinaryOp, ClightExpr, ClightSignedness, ClightStmt, ClightType, Node,
+    ClightBinaryOp, ClightExpr, ClightSignedness, ClightStmt, Node,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +111,7 @@ pub fn stmt_cmp_class(stmt: &ClightStmt) -> Option<CmpClass> {
         ClightStmt::Sifthenelse(cond, a, b) => expr_cmp_class(cond)
             .or_else(|| stmt_cmp_class(a))
             .or_else(|| stmt_cmp_class(b)),
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => stmt_cmp_class(inner),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner) => stmt_cmp_class(inner),
         ClightStmt::Ssequence(items) => items.iter().find_map(stmt_cmp_class),
         ClightStmt::Sset(_, rhs) => expr_cmp_class(rhs),
         ClightStmt::Sassign(lhs, rhs) => expr_cmp_class(lhs).or_else(|| expr_cmp_class(rhs)),
@@ -209,7 +209,7 @@ pub fn build_branch_theory(
 #[cfg(test)]
 mod tests {
     use crate::decompile::passes::clight_select::solvers::in_search::branch_theory::*;
-    use crate::x86::types::{ClightAttr, ClightIntSize};
+    use crate::x86::types::{ClightAttr, ClightIntSize, ClightType};
 
     fn attr() -> ClightAttr {
         ClightAttr::default()

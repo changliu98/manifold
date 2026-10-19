@@ -165,7 +165,7 @@ pub(super) fn discover(db: &DecompileDB, out: &mut Refinement) {
     }
     let (accesses, unmapped) = frame_accesses(db);
     let mut attempted = BTreeSet::new();
-    for (function, anchor, base, scale, index, destination, bits) in anchors {
+    for (function, anchor, base, scale, _index, _destination, bits) in anchors {
         let mut event = Event::new(function, anchor, base);
         out.obligations.push(event.clone());
         let reject = |out: &mut Refinement, event: &Event, reason| {

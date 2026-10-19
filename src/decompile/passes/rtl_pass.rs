@@ -23421,7 +23421,7 @@ mod tests {
         let low_store = 0x1020;
         let rebased_read = 0x1030;
         let settled_store = 0x1040;
-        let mut prog = RTLPassProgram::default();
+        let prog = RTLPassProgram::default();
 
         prog.abi_pointer_size.push((8,));
         prog.function_has_ltl_body.push((func,));
@@ -23865,7 +23865,7 @@ mod tests {
     // Builds `cmp byte [rsp+8], 0` / <gap> / `je taken`, with the caller choosing which block each
     // of the three instructions belongs to.
     fn stack_slot_gap_program(cmp_block: Option<u64>, jcc_block: Option<u64>) -> RTLPassProgram {
-        let mut prog = RTLPassProgram::default();
+        let prog = RTLPassProgram::default();
         let func = 0x400;
         let cmp = 0x700;
         let move_addr = 0x705;

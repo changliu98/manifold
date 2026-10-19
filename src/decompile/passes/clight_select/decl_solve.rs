@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::decompile::passes::c_pass::types::{CType, TypeQualifiers};
-use crate::decompile::passes::clight_select::candtype::{CandType, Sign};
+use crate::decompile::passes::clight_select::candtype::CandType;
 use crate::decompile::passes::clight_select::query::CalleeSignature;
 use crate::decompile::passes::clight_select::select::SelectedFunction;
 use crate::x86::types::{
@@ -980,6 +980,7 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
+    use crate::decompile::passes::clight_select::candtype::Sign;
     use crate::decompile::passes::clight_select::decl_solve::*;
     use crate::decompile::passes::clight_select::query::CalleeSignature;
     use crate::x86::types::{ClightAttr, ClightIntSize, ClightSignedness, ParamType};
@@ -1006,8 +1007,6 @@ mod tests {
             param_regs: vec![reg],
             param_types: vec![ParamType::Integer],
             stack_size: 0,
-            structure_world:
-                crate::decompile::analysis::structuring_pass::STRUCTURE_WORLD_STRUCTURED,
             statements: [(0x1010, stmt)].into_iter().collect(),
             selected_candidate_nodes: [0x1010].into_iter().collect(),
             selected_write_bytes: HashMap::new(),
@@ -1022,8 +1021,6 @@ mod tests {
             var_decl_idx: [(reg, 0)].into_iter().collect(),
             concrete_declarations: Default::default(),
             binding_plan: Default::default(),
-            loop_headers: HashSet::new(),
-            switch_heads: HashSet::new(),
             reg_struct_ids: HashMap::new(),
             loop_info: HashMap::new(),
         }

@@ -8,7 +8,7 @@ use capstone::prelude::*;
 use object::{Object, ObjectSection};
 
 use crate::arm32::mach::A32Mreg;
-use crate::decompile::disassembly::branch::{self, PcSource};
+use crate::decompile::disassembly::branch::PcSource;
 use crate::decompile::disassembly::instruction::{is_executable_section, DecodedInsn};
 use crate::decompile::disassembly::operand::*;
 use crate::decompile::elevator::DecompileDB;
@@ -1536,7 +1536,6 @@ fn decode_one(
             cs,
             mode,
             body_addr,
-            &stem,
             &ops,
             is_load,
             mmode,
@@ -1686,7 +1685,6 @@ fn expand_multi_transfer(
     cs: &Capstone,
     isa: IsaMode,
     addr: u64,
-    stem: &str,
     ops: &[ArmOperand],
     is_load: bool,
     mode: MultiMode,
@@ -1757,6 +1755,7 @@ fn expand_multi_transfer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decompile::disassembly::branch;
 
     #[test]
     fn vfp_store_width_follows_the_transferred_register_view() {

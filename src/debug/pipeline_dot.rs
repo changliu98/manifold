@@ -1,7 +1,5 @@
 // Generates Graphviz DOT representations of the pipeline pass dependency graph.
-use crate::decompile::analysis::*;
-use crate::decompile::passes::pass::{IRPass, PassScheduler};
-use crate::decompile::passes::*;
+use crate::decompile::passes::pass::PassScheduler;
 
 /// Generate Graphviz DOT strings (summary and detailed) of the pipeline dependency graph.
 /// The pass list comes straight from `elevator::pipeline_passes`, the list the

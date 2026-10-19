@@ -2,7 +2,7 @@
 
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
-use crate::{declare_io_from, run_pass};
+use crate::declare_io_from;
 
 use crate::mreg::Mreg;
 use crate::util::multi_synth_address_is_encodable;
@@ -18,7 +18,6 @@ use ascent::lattice::set::Set;
 use ascent::Dual;
 use either::Either;
 use log::warn;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 fn shift_stack_offsets(offsets: &Set<i64>, delta: i64) -> Set<i64> {
@@ -15573,7 +15572,7 @@ mod structural_dataflow_tests {
                 prog.instr_in_function.push((node, func));
             }
 
-            let mut add = |node,
+            let add = |node,
                            dst_symbol,
                            dst_name,
                            mem_symbol,
@@ -18530,11 +18529,6 @@ pub enum AddressingError {
     UnsupportedPattern {
         addrmode: Addrmode,
     },
-    #[allow(dead_code)]
-    InvalidRegisterCombination {
-        base: Option<Ireg>,
-        index: Option<(Ireg, i64)>,
-    },
 }
 
 impl std::fmt::Display for AddressingError {
@@ -18549,13 +18543,6 @@ impl std::fmt::Display for AddressingError {
             AddressingError::UnsupportedPattern { addrmode } => {
                 write!(f, "Unsupported addrmode pattern: {:?}", addrmode)
             }
-            AddressingError::InvalidRegisterCombination { base, index } => {
-                write!(
-                    f,
-                    "Invalid register combination: base={:?}, index={:?}",
-                    base, index
-                )
-            }
         }
     }
 }
@@ -18565,29 +18552,6 @@ impl std::fmt::Display for AddressingError {
 // Returns true for valid general-purpose registers (excludes Unknown and RIP).
 fn is_valid_gpr(r: Ireg) -> bool {
     !matches!(r, Ireg::Unknown | Ireg::RIP)
-}
-
-// Map a 64-bit GPR name to its 32-bit alias (RAX->EAX); pass through 32-bit/unknown. Used by mod-synth dividend-holder check to equate EAX with EDI after `MOVSXD rax, edi`.
-pub fn reg_low32_alias(s: &str) -> &str {
-    match s {
-        "RAX" => "EAX",
-        "RBX" => "EBX",
-        "RCX" => "ECX",
-        "RDX" => "EDX",
-        "RDI" => "EDI",
-        "RSI" => "ESI",
-        "RBP" => "EBP",
-        "RSP" => "ESP",
-        "R8" => "R8D",
-        "R9" => "R9D",
-        "R10" => "R10D",
-        "R11" => "R11D",
-        "R12" => "R12D",
-        "R13" => "R13D",
-        "R14" => "R14D",
-        "R15" => "R15D",
-        other => other,
-    }
 }
 
 // Check if register name is an 8-bit GPR.

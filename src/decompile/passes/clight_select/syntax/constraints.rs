@@ -98,10 +98,7 @@ pub(crate) struct ConstraintSink<'a> {
 }
 
 impl<'a> ConstraintSink<'a> {
-    pub(crate) fn new(backend: &'a dyn SolveBackend, compat_w: u64) -> Self {
-        Self::with_secondary(backend, compat_w, 0)
-    }
-
+    #[cfg(test)]
     pub(crate) fn with_secondary(
         backend: &'a dyn SolveBackend,
         compat_w: u64,
@@ -110,6 +107,7 @@ impl<'a> ConstraintSink<'a> {
         Self::with_objectives(backend, compat_w, secondary_count, 0)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_objectives(
         backend: &'a dyn SolveBackend,
         compatibility_bound: u64,

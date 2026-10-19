@@ -55,7 +55,7 @@ fn call_count_to(func: &str, callee: &str) -> usize {
                     CBlockItem::Decl(_) => 0,
                 })
                 .sum(),
-            (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => count_stmt(inner, callee),
+            CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => count_stmt(inner, callee),
             CStmt::Sequence(stmts) => stmts.iter().map(|s| count_stmt(s, callee)).sum(),
             _ => 0,
         }

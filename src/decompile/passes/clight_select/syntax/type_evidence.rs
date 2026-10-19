@@ -143,6 +143,7 @@ pub(crate) fn value_hints(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn collect(db: &DecompileDB, functions: &mut [FunctionData]) {
     collect_raw(db, functions);
     finalize(db, functions);

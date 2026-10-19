@@ -206,7 +206,7 @@ impl Declarations {
             for (candidate, selected) in &alternatives {
                 sink.assert_hard(
                     &selected
-                        .implies(classes[&reg]._eq(term_to_ty(cx.types, result.1.get(*candidate)))),
+                        .implies(classes[&reg].eq(term_to_ty(cx.types, result.1.get(*candidate)))),
                 );
             }
             let fallback = Bool::or(

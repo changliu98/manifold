@@ -143,13 +143,13 @@ fn stack_field_state(base: i64, field: i64, target: Option<Address>) -> Set<Stac
     })
 }
 
-/// Exact relocation points-to analysis over the finalized RTL graph.
-///
-/// Every value origin is a `Known | Unknown` set lattice. A recognized arm can
-/// therefore never become a MUST fact merely because an unrecognized arm was
-/// omitted. Callee effects are summarized at every reachable return, and both
-/// callee and caller memory states are point-keyed `(function, node)` lattices
-/// whose values contain the sparse field facts.
+// Exact relocation points-to analysis over the finalized RTL graph.
+//
+// Every value origin is a `Known | Unknown` set lattice. A recognized arm can
+// therefore never become a MUST fact merely because an unrecognized arm was
+// omitted. Callee effects are summarized at every reachable return, and both
+// callee and caller memory states are point-keyed `(function, node)` lattices
+// whose values contain the sparse field facts.
 ascent_par! {
     #![measure_rule_times]
 
@@ -1031,10 +1031,10 @@ ascent_par! {
         if owner_count == exact_count;
 }
 
-/// Infer a logical array only after the exact points-to facts have settled and
-/// GlobalArrayPass has retained the initialized object image. The Ascent half
-/// derives access-shape candidates; the wrapper below validates physical
-/// ownership with sorted interval indexes before publishing them.
+// Infer a logical array only after the exact points-to facts have settled and
+// GlobalArrayPass has retained the initialized object image. The Ascent half
+// derives access-shape candidates; the wrapper below validates physical
+// ownership with sorted interval indexes before publishing them.
 ascent_par! {
     #![measure_rule_times]
 

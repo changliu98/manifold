@@ -284,7 +284,7 @@ mod tests {
                         .as_deref()
                         .is_some_and(|stmt| contains_goto(stmt, target))
             }
-            (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner))
+            CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)
             | CStmt::While(_, inner)
             | CStmt::DoWhile(inner, _)
             | CStmt::For(_, _, _, inner)
@@ -406,7 +406,7 @@ mod tests {
         let CStmt::Block(elided_items) = &elided else {
             panic!("expected final block layout: {elided:#?}");
         };
-        let CBlockItem::Stmt((CStmt::Labeled(_, branch) | CStmt::Effect(_, branch))) = &elided_items[0] else {
+        let CBlockItem::Stmt(CStmt::Labeled(_, branch) | CStmt::Effect(_, branch)) = &elided_items[0] else {
             panic!("expected labeled branch: {elided:#?}");
         };
         let CStmt::If(CExpr::Unary(UnaryOp::Not, inner_cond), retained_arm, collapsed_else) =
@@ -464,7 +464,7 @@ mod tests {
         let CStmt::Block(items) = &simplified else {
             panic!("expected final block layout: {simplified:#?}");
         };
-        let CBlockItem::Stmt((CStmt::Labeled(_, branch) | CStmt::Effect(_, branch))) = &items[0] else {
+        let CBlockItem::Stmt(CStmt::Labeled(_, branch) | CStmt::Effect(_, branch)) = &items[0] else {
             panic!("expected labeled branch: {simplified:#?}");
         };
         let CStmt::If(actual_condition, retained_arm, None) = branch.as_ref() else {
@@ -502,7 +502,7 @@ mod tests {
         let CStmt::Block(items) = &simplified else {
             panic!("expected final block layout: {simplified:#?}");
         };
-        let CBlockItem::Stmt((CStmt::Labeled(_, branch) | CStmt::Effect(_, branch))) = &items[0] else {
+        let CBlockItem::Stmt(CStmt::Labeled(_, branch) | CStmt::Effect(_, branch)) = &items[0] else {
             panic!("expected labeled branch: {simplified:#?}");
         };
         let CStmt::If(actual_condition, retained_arm, None) = branch.as_ref() else {
@@ -532,7 +532,7 @@ mod tests {
         let CStmt::Block(items) = &simplified else {
             panic!("expected final block layout: {simplified:#?}");
         };
-        let CBlockItem::Stmt((CStmt::Labeled(_, branch) | CStmt::Effect(_, branch))) = &items[0] else {
+        let CBlockItem::Stmt(CStmt::Labeled(_, branch) | CStmt::Effect(_, branch)) = &items[0] else {
             panic!("expected labeled branch: {simplified:#?}");
         };
         assert_eq!(

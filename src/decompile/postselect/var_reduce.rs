@@ -156,7 +156,7 @@ fn stmt_children(s: &CStmt) -> Vec<&CStmt> {
         }
         CStmt::Switch(_, b)
         | CStmt::While(_, b)
-        | (CStmt::Labeled(_, b) | CStmt::Effect(_, b))
+        | CStmt::Labeled(_, b) | CStmt::Effect(_, b)
         | CStmt::DoWhile(b, _) => {
             vec![b.as_ref()]
         }
@@ -1249,7 +1249,7 @@ fn mark_complex_stmt(s: &CStmt, out: &mut HashSet<String>) {
             }),
         }),
         CStmt::Sequence(ss) => ss.iter().for_each(|x| mark_complex_stmt(x, out)),
-        (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => mark_complex_stmt(b, out),
+        CStmt::Labeled(_, b) | CStmt::Effect(_, b) => mark_complex_stmt(b, out),
         CStmt::Decl(ds) => ds.iter().for_each(|d| {
             if let Some(init) = &d.init {
                 mark_complex_initializer(init, out)

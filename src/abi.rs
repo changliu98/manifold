@@ -320,18 +320,13 @@ pub struct AbiConfig {
 
     pub ret_int_reg: Mreg,
 
-    #[allow(dead_code)]
     pub ret_float_reg: Mreg,
 
     pub caller_saved: Vec<Mreg>,
 
     pub callee_saved: Vec<Mreg>,
 
-    #[allow(dead_code)]
     pub stack_alignment: usize,
-
-    #[allow(dead_code)]
-    pub red_zone_size: usize,
 }
 
 impl AbiConfig {
@@ -389,7 +384,6 @@ impl AbiConfig {
                 Mreg::R15,
             ],
             stack_alignment: 16,
-            red_zone_size: 128,
         }
     }
 
@@ -438,7 +432,6 @@ impl AbiConfig {
                 Mreg::X15,
             ],
             stack_alignment: 16,
-            red_zone_size: 0,
         }
     }
 
@@ -470,7 +463,6 @@ impl AbiConfig {
             callee_saved: vec![Mreg::BX, Mreg::BP, Mreg::SI, Mreg::DI],
             // gcc/clang have kept i386 SysV at 16 since gcc 4.5, matching the ABI revision.
             stack_alignment: 16,
-            red_zone_size: 0,
         }
     }
 
@@ -507,7 +499,6 @@ impl AbiConfig {
             // V8-V15 are callee-saved only in their low 64 bits; modelling whole registers is the conservative direction for a saved-reg test.
             callee_saved: (19..=30).map(gp).chain((8..16).map(v)).collect(),
             stack_alignment: 16,
-            red_zone_size: 0,
         }
     }
 
@@ -535,7 +526,6 @@ impl AbiConfig {
             callee_saved: (4..12).map(gp).chain((16..32).map(s)).collect(),
             // AAPCS requires the stack pointer to be 8-byte aligned at every public interface.
             stack_alignment: 8,
-            red_zone_size: 0,
         }
     }
 

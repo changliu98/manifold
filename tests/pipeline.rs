@@ -129,11 +129,6 @@ fn body_from_text(source: &str, func: &str) -> String {
     source[brace..end].to_string()
 }
 
-#[allow(dead_code)]
-fn has_loop(s: &str) -> bool {
-    s.contains("while") || s.contains("for") || s.contains("do")
-}
-
 // AST query helpers
 
 fn func_def<'a>(out: &'a TestOutput, name: &str) -> &'a FuncDef {
@@ -226,7 +221,7 @@ fn stmt_has_expr(stmt: &CStmt, pred: &dyn Fn(&CExpr) -> bool) -> bool {
             CBlockItem::Stmt(s) => stmt_has_expr(s, pred),
             CBlockItem::Decl(_) => false,
         }),
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => stmt_has_expr(inner, pred),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => stmt_has_expr(inner, pred),
         CStmt::Sequence(stmts) => stmts.iter().any(|s| stmt_has_expr(s, pred)),
         _ => false,
     }
@@ -243,7 +238,7 @@ fn stmt_has(stmt: &CStmt, pred: &dyn Fn(&CStmt) -> bool) -> bool {
         | CStmt::DoWhile(b, _)
         | CStmt::For(_, _, _, b)
         | CStmt::Switch(_, b)
-        | (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => stmt_has(b, pred),
+        | CStmt::Labeled(_, b) | CStmt::Effect(_, b)  => stmt_has(b, pred),
         CStmt::Block(items) => items.iter().any(|i| match i {
             CBlockItem::Stmt(s) => stmt_has(s, pred),
             _ => false,
@@ -255,7 +250,6 @@ fn stmt_has(stmt: &CStmt, pred: &dyn Fn(&CStmt) -> bool) -> bool {
 
 // Convenience wrappers
 
-#[allow(dead_code)]
 fn has_binop(out: &TestOutput, func: &str, op: BinaryOp) -> bool {
     let f = func_def(out, func);
     stmt_has_expr(
@@ -264,7 +258,6 @@ fn has_binop(out: &TestOutput, func: &str, op: BinaryOp) -> bool {
     )
 }
 
-#[allow(dead_code)]
 fn has_unop(out: &TestOutput, func: &str, op: UnaryOp) -> bool {
     let f = func_def(out, func);
     stmt_has_expr(&f.body, &|e| matches!(e, CExpr::Unary(o, _) if *o == op))
@@ -294,7 +287,6 @@ fn is_builtin_memcpy_store(expr: &CExpr) -> bool {
     is_builtin_memcpy(expr) && !expr_has(&args[0], &|part| matches!(part, CExpr::CompoundLit(..)))
 }
 
-#[allow(dead_code)]
 fn has_call_to(out: &TestOutput, func: &str, callee: &str) -> bool {
     let f = func_def(out, func);
     stmt_has_expr(
@@ -303,7 +295,6 @@ fn has_call_to(out: &TestOutput, func: &str, callee: &str) -> bool {
     )
 }
 
-#[allow(dead_code)]
 fn has_any_loop(out: &TestOutput, func: &str) -> bool {
     let f = func_def(out, func);
     stmt_has(&f.body, &|s| {
@@ -311,13 +302,11 @@ fn has_any_loop(out: &TestOutput, func: &str) -> bool {
     })
 }
 
-#[allow(dead_code)]
 fn has_if_stmt(out: &TestOutput, func: &str) -> bool {
     let f = func_def(out, func);
     stmt_has(&f.body, &|s| matches!(s, CStmt::If(..)))
 }
 
-#[allow(dead_code)]
 fn count_if(out: &TestOutput, func: &str) -> usize {
     fn count(stmt: &CStmt) -> usize {
         let here = if matches!(stmt, CStmt::If(..)) { 1 } else { 0 };
@@ -327,7 +316,7 @@ fn count_if(out: &TestOutput, func: &str) -> usize {
             | CStmt::DoWhile(b, _)
             | CStmt::For(_, _, _, b)
             | CStmt::Switch(_, b)
-            | (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => count(b),
+            | CStmt::Labeled(_, b) | CStmt::Effect(_, b)  => count(b),
             CStmt::Block(items) => items
                 .iter()
                 .map(|i| match i {
@@ -343,7 +332,6 @@ fn count_if(out: &TestOutput, func: &str) -> usize {
     count(&func_def(out, func).body)
 }
 
-#[allow(dead_code)]
 fn count_loops(out: &TestOutput, func: &str) -> usize {
     fn count(stmt: &CStmt) -> usize {
         let here = if matches!(stmt, CStmt::While(..) | CStmt::DoWhile(..) | CStmt::For(..)) {
@@ -357,7 +345,7 @@ fn count_loops(out: &TestOutput, func: &str) -> usize {
             | CStmt::DoWhile(b, _)
             | CStmt::For(_, _, _, b)
             | CStmt::Switch(_, b)
-            | (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => count(b),
+            | CStmt::Labeled(_, b) | CStmt::Effect(_, b)  => count(b),
             CStmt::Block(items) => items
                 .iter()
                 .map(|i| match i {
@@ -373,13 +361,11 @@ fn count_loops(out: &TestOutput, func: &str) -> usize {
     count(&func_def(out, func).body)
 }
 
-#[allow(dead_code)]
 fn has_var_ref(out: &TestOutput, func: &str, var: &str) -> bool {
     let f = func_def(out, func);
     stmt_has_expr(&f.body, &|e| matches!(e, CExpr::Var(n) if n == var))
 }
 
-#[allow(dead_code)]
 fn has_field_access(out: &TestOutput, func: &str, field: &str) -> bool {
     // No DWARF: decompiler synthesizes field names like "ofs_<N>", "_pad_<N>". Source-level names accept any recovered field; synthetic names require exact match.
     let synthetic = field.starts_with("ofs_")
@@ -401,25 +387,21 @@ fn has_field_access(out: &TestOutput, func: &str, field: &str) -> bool {
     })
 }
 
-#[allow(dead_code)]
 fn has_switch(out: &TestOutput, func: &str) -> bool {
     let f = func_def(out, func);
     stmt_has(&f.body, &|s| matches!(s, CStmt::Switch(..)))
 }
 
-#[allow(dead_code)]
 fn has_break_stmt(out: &TestOutput, func: &str) -> bool {
     let f = func_def(out, func);
     stmt_has(&f.body, &|s| matches!(s, CStmt::Break))
 }
 
-#[allow(dead_code)]
 fn has_continue_stmt(out: &TestOutput, func: &str) -> bool {
     let f = func_def(out, func);
     stmt_has(&f.body, &|s| matches!(s, CStmt::Continue))
 }
 
-#[allow(dead_code)]
 fn has_deref(out: &TestOutput, func: &str) -> bool {
     // Accept `*p`, `p->field`, or the exact-width memcpy form used for
     // potentially unaligned memory. All three represent a pointer dereference.
@@ -431,7 +413,6 @@ fn has_deref(out: &TestOutput, func: &str) -> bool {
     })
 }
 
-#[allow(dead_code)]
 fn has_pointer_store(out: &TestOutput, func: &str) -> bool {
     // Accept direct lvalue assignments and the exact-width memcpy store form.
     let f = func_def(out, func);
@@ -447,7 +428,6 @@ fn has_pointer_store(out: &TestOutput, func: &str) -> bool {
     })
 }
 
-#[allow(dead_code)]
 fn count_memory_accesses(out: &TestOutput, func: &str) -> usize {
     use std::cell::Cell;
 
@@ -468,7 +448,6 @@ fn count_memory_accesses(out: &TestOutput, func: &str) -> usize {
     accesses.get()
 }
 
-#[allow(dead_code)]
 fn count_assignments(out: &TestOutput, func: &str) -> usize {
     use std::cell::Cell;
 
@@ -483,17 +462,14 @@ fn count_assignments(out: &TestOutput, func: &str) -> usize {
     assignments.get()
 }
 
-#[allow(dead_code)]
 fn param_count(out: &TestOutput, func: &str) -> usize {
     func_def(out, func).params.len()
 }
 
-#[allow(dead_code)]
 fn has_assign(out: &TestOutput, func: &str) -> bool {
     count_assignments(out, func) > 0
 }
 
-#[allow(dead_code)]
 fn dump_output_if_env(tag: &str, text: &str) {
     if std::env::var("DUMP_OUTPUT").is_ok() {
         println!("=== {tag} OUTPUT ===\n{text}");

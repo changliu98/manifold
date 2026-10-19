@@ -37,7 +37,6 @@ fn xtype_priority(xtype: &XType) -> u8 {
         XType::Xcharptr | XType::Xcharptrptr => 13,
         XType::Xfuncptr => 14,
         XType::XstructPtr(_) => 15,
-        _ => 0,
     }
 }
 
@@ -45,7 +44,6 @@ fn xtype_priority(xtype: &XType) -> u8 {
 pub struct CalleeSignature {
     pub param_count: usize,
     pub return_type: XType,
-    #[allow(dead_code)]
     pub param_types: Vec<XType>,
     // True when this callee is variadic; param_count is then the fixed-arg count. Drives the ArityTooMany leniency in ctyping (extra args allowed only for variadics).
     pub is_varargs: bool,
@@ -313,7 +311,6 @@ pub struct FunctionData {
     pub data_model: crate::abi::DataModel,
     pub entry_node: Node,
     pub return_type: ClightType,
-    #[allow(dead_code)]
     pub return_reg: Option<RTLReg>,
     pub param_regs: Vec<RTLReg>,
     pub param_types: Vec<ParamType>,
@@ -356,9 +353,6 @@ pub struct FunctionData {
 
     /// Current declaration type index per register (used by clang_refine).
     pub var_decl_idx: HashMap<RTLReg, usize>,
-
-    pub loop_headers: HashSet<Node>,
-    pub switch_heads: HashSet<Node>,
 
     pub reg_struct_ids: HashMap<RTLReg, usize>,
 
@@ -808,8 +802,6 @@ impl FunctionData {
             var_decl_idx: HashMap::new(),
             struct_field_type_candidates: HashMap::new(),
             struct_field_type_idx: HashMap::new(),
-            loop_headers: HashSet::new(),
-            switch_heads: HashSet::new(),
             reg_struct_ids: HashMap::new(),
             reg_to_mreg: HashMap::new(),
             cond_branch_class: HashMap::new(),
@@ -1345,7 +1337,7 @@ fn collect_call_evidence_stmt(
                 collect_call_evidence_stmt(stmt, ident_names, out);
             }
         }
-        (ClightStmt::Slabel(_, stmt) | ClightStmt::Seffect(_, stmt)) => collect_call_evidence_stmt(stmt, ident_names, out),
+        ClightStmt::Slabel(_, stmt) | ClightStmt::Seffect(_, stmt)  => collect_call_evidence_stmt(stmt, ident_names, out),
         _ => {}
     }
 }
@@ -2646,18 +2638,6 @@ pub fn extract_functions(
         );
     }
 
-    for (addr, head, _) in db.rel_iter::<(Address, Node, Node)>("emit_loop_body") {
-        if let Some(func) = func_map.get_mut(addr) {
-            func.loop_headers.insert(*head);
-        }
-    }
-
-    for (addr, head, _) in db.rel_iter::<(Address, Node, RTLReg)>("emit_switch_chain") {
-        if let Some(func) = func_map.get_mut(addr) {
-            func.switch_heads.insert(*head);
-        }
-    }
-
     for (addr, struct_id, fields) in
         db.rel_iter::<(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_struct_fields")
     {
@@ -2753,7 +2733,7 @@ pub fn extract_functions(
         for reg in all_regs {
             let mut candidates: Vec<CandType> =
                 reg_all_type_strs.get(&reg).cloned().unwrap_or_default();
-            let mut push_once = |candidates: &mut Vec<CandType>, candidate: CandType| {
+            let push_once = |candidates: &mut Vec<CandType>, candidate: CandType| {
                 if !candidates.contains(&candidate) {
                     candidates.push(candidate);
                 }
@@ -2821,7 +2801,7 @@ pub fn extract_functions(
             }
             let is_bad = |s: &ClightStmt| -> bool {
                 let inner = match s {
-                    (ClightStmt::Slabel(_, b) | ClightStmt::Seffect(_, b)) => b.as_ref(),
+                    ClightStmt::Slabel(_, b) | ClightStmt::Seffect(_, b)  => b.as_ref(),
                     other => other,
                 };
                 if let ClightStmt::Sset(id, rhs) = inner {
@@ -4203,7 +4183,6 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct PrimaryExitData {
-    #[allow(dead_code)]
     pub exit_node: Node,
     /// Where the loop's primary exit branch lands (the node OUTSIDE the body the break reaches), distinct from exit_node, the in-body condition node.
     pub exit_target: Option<Node>,
@@ -4222,14 +4201,8 @@ pub struct LoopInfo {
     pub exit_returns: HashMap<Node, (Node, Node)>,
 }
 
-// RB-5: pick deterministically among rows by ascending priority: fabricated-operand count, Tvoid-subexpr count, structural node count, then full structural order as a total tiebreak.
-
-use std::cmp::Ordering;
-
-/// Mreg discriminant fresh_xtl_reg packs when the backing Mreg is `Unknown` / "RTEMP"; taken from rtl_pass so the two decodings cannot drift.
-use crate::decompile::passes::rtl_pass::MREG_UNKNOWN_DISCRIMINANT;
-
 /// True for RTL register ids that do not carry a machine-register-backed value (DEFAULT_VAR sentinel or Unknown/RTEMP-backed temporaries).
+#[cfg(test)]
 fn is_fabricated_operand(reg: RTLReg) -> bool {
     if reg == crate::util::DEFAULT_VAR as RTLReg {
         return true;
@@ -4237,7 +4210,7 @@ fn is_fabricated_operand(reg: RTLReg) -> bool {
     // fresh_xtl_reg encoding: bit 63 | optional namespace bits | (node << MREG_DISCRIMINANT_BITS) | mreg id.
     (reg >> 63) == 1
         && ((reg & crate::decompile::passes::rtl_pass::MREG_DISCRIMINANT_MASK)
-            == MREG_UNKNOWN_DISCRIMINANT
+            == crate::decompile::passes::rtl_pass::MREG_UNKNOWN_DISCRIMINANT
             // A register-indirect call with no reaching definition still has
             // a semantic PRE-call input pseudo.  Its low bits retain the
             // architectural register so distinct inputs do not collide, while
@@ -4258,491 +4231,6 @@ mod fabricated_call_input_tests {
         assert!(is_fabricated_operand(fresh_call_input_reg(node, Mreg::AX)));
         assert!(!is_fabricated_operand(fresh_xtl_reg(node, Mreg::AX)));
     }
-}
-
-/// (fabricated-operand count, structural node count) over a Csharpminor expr tree.
-fn csharp_expr_stats(e: &CsharpminorExpr) -> (u32, u32) {
-    match e {
-        CsharpminorExpr::Evar(reg) => (is_fabricated_operand(*reg) as u32, 1),
-        CsharpminorExpr::Eaddrof(_) | CsharpminorExpr::Econst(_) => (0, 1),
-        CsharpminorExpr::Eunop(_, x) => {
-            let (f, s) = csharp_expr_stats(x);
-            (f, s + 1)
-        }
-        CsharpminorExpr::Ebinop(_, l, r) => {
-            let (fl, sl) = csharp_expr_stats(l);
-            let (fr, sr) = csharp_expr_stats(r);
-            (fl + fr, sl + sr + 1)
-        }
-        CsharpminorExpr::Eload(_, x) => {
-            let (f, s) = csharp_expr_stats(x);
-            (f, s + 1)
-        }
-        CsharpminorExpr::Econdition(c, t, f_) => {
-            let (fc, sc) = csharp_expr_stats(c);
-            let (ft, st) = csharp_expr_stats(t);
-            let (ff, sf) = csharp_expr_stats(f_);
-            (fc + ft + ff, sc + st + sf + 1)
-        }
-    }
-}
-
-fn csharp_args_stats(args: &[CsharpminorExpr]) -> (u32, u32) {
-    args.iter()
-        .map(csharp_expr_stats)
-        .fold((0, 0), |(fa, sa), (f, s)| (fa + f, sa + s))
-}
-
-/// (fabricated, void-typed, size) accumulated over a Clight expr tree.
-fn clight_expr_stats(e: &ClightExpr, acc: &mut (u32, u32, u32)) {
-    let node_ty = match e {
-        ClightExpr::EconstInt(_, ty)
-        | ClightExpr::EconstFloat(_, ty)
-        | ClightExpr::EconstSingle(_, ty)
-        | ClightExpr::EconstLong(_, ty)
-        | ClightExpr::Evar(_, ty)
-        | ClightExpr::EvarSymbol(_, ty)
-        | ClightExpr::Etempvar(_, ty)
-        | ClightExpr::Ederef(_, ty)
-        | ClightExpr::Eaddrof(_, ty)
-        | ClightExpr::Eunop(_, _, ty)
-        | ClightExpr::Ebinop(_, _, _, ty)
-        | ClightExpr::Ecast(_, ty)
-        | ClightExpr::Efield(_, _, ty)
-        | ClightExpr::Esizeof(_, ty)
-        | ClightExpr::Ealignof(_, ty)
-        | ClightExpr::Econdition(_, _, _, ty) => ty,
-    };
-    if matches!(node_ty, ClightType::Tvoid) {
-        acc.1 += 1;
-    }
-    acc.2 += 1;
-    match e {
-        ClightExpr::Etempvar(id, _) => {
-            if is_fabricated_operand(*id as RTLReg) {
-                acc.0 += 1;
-            }
-        }
-        ClightExpr::Ederef(x, _)
-        | ClightExpr::Eaddrof(x, _)
-        | ClightExpr::Eunop(_, x, _)
-        | ClightExpr::Ecast(x, _)
-        | ClightExpr::Efield(x, _, _) => clight_expr_stats(x, acc),
-        ClightExpr::Ebinop(_, l, r, _) => {
-            clight_expr_stats(l, acc);
-            clight_expr_stats(r, acc);
-        }
-        ClightExpr::Econdition(c, t, f, _) => {
-            clight_expr_stats(c, acc);
-            clight_expr_stats(t, acc);
-            clight_expr_stats(f, acc);
-        }
-        _ => {}
-    }
-}
-
-/// (fabricated, void-typed, size) accumulated over a Clight stmt tree.
-fn clight_stmt_stats(stmt: &ClightStmt, acc: &mut (u32, u32, u32)) {
-    acc.2 += 1;
-    match stmt {
-        ClightStmt::Sskip | ClightStmt::Sbreak | ClightStmt::Scontinue | ClightStmt::Sgoto(_) => {}
-        ClightStmt::Sassign(l, r) => {
-            clight_expr_stats(l, acc);
-            clight_expr_stats(r, acc);
-        }
-        ClightStmt::Sset(_, e) => clight_expr_stats(e, acc),
-        ClightStmt::Scall(_, f, args) => {
-            clight_expr_stats(f, acc);
-            for a in args {
-                clight_expr_stats(a, acc);
-            }
-        }
-        ClightStmt::Sbuiltin(_, _, _, args) => {
-            for a in args {
-                clight_expr_stats(a, acc);
-            }
-        }
-        ClightStmt::Ssequence(ss) => {
-            for s in ss {
-                clight_stmt_stats(s, acc);
-            }
-        }
-        ClightStmt::Sifthenelse(c, t, f) => {
-            clight_expr_stats(c, acc);
-            clight_stmt_stats(t, acc);
-            clight_stmt_stats(f, acc);
-        }
-        ClightStmt::Sloop(b, s) => {
-            clight_stmt_stats(b, acc);
-            clight_stmt_stats(s, acc);
-        }
-        ClightStmt::Sreturn(e) => {
-            if let Some(e) = e {
-                clight_expr_stats(e, acc);
-            }
-        }
-        ClightStmt::Sswitch(e, cases) => {
-            clight_expr_stats(e, acc);
-            for (_, s) in cases {
-                clight_stmt_stats(s, acc);
-            }
-        }
-        (ClightStmt::Slabel(_, s) | ClightStmt::Seffect(_, s)) => clight_stmt_stats(s, acc),
-    }
-}
-
-/// Length-first lexicographic order over slices with an element comparator.
-fn cmp_slice<T>(a: &[T], b: &[T], f: impl Fn(&T, &T) -> Ordering) -> Ordering {
-    a.len().cmp(&b.len()).then_with(|| {
-        for (x, y) in a.iter().zip(b.iter()) {
-            let o = f(x, y);
-            if o != Ordering::Equal {
-                return o;
-            }
-        }
-        Ordering::Equal
-    })
-}
-
-fn cmp_option<T>(a: &Option<T>, b: &Option<T>, f: impl Fn(&T, &T) -> Ordering) -> Ordering {
-    match (a, b) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (Some(x), Some(y)) => f(x, y),
-    }
-}
-
-fn cmp_constant(a: &Constant, b: &Constant) -> Ordering {
-    use Constant as C;
-    let rank = |c: &C| -> u8 {
-        match c {
-            C::Ointconst(_) => 0,
-            C::Ofloatconst(_) => 1,
-            C::Osingleconst(_) => 2,
-            C::Olongconst(_) => 3,
-            C::Oaddrsymbol(_, _) => 4,
-            C::Oaddrstack(_) => 5,
-        }
-    };
-    rank(a).cmp(&rank(b)).then_with(|| match (a, b) {
-        (C::Ointconst(x), C::Ointconst(y)) => x.cmp(y),
-        (C::Ofloatconst(x), C::Ofloatconst(y)) => x.cmp(y), // F64: Ord via total_cmp
-        (C::Osingleconst(x), C::Osingleconst(y)) => x.cmp(y), // F32: Ord via total_cmp
-        (C::Olongconst(x), C::Olongconst(y)) => x.cmp(y),
-        (C::Oaddrsymbol(ia, oa), C::Oaddrsymbol(ib, ob)) => ia.cmp(ib).then(oa.cmp(ob)),
-        (C::Oaddrstack(x), C::Oaddrstack(y)) => x.cmp(y),
-        _ => Ordering::Equal, // unreachable: equal ranks imply the same variant
-    })
-}
-
-/// Total order key for CminorBinop: (variant rank, comparison payload).
-fn cminor_binop_key(op: &CminorBinop) -> (u8, u8) {
-    use CminorBinop as B;
-    match op {
-        B::Oadd => (0, 0),
-        B::Osub => (1, 0),
-        B::Omul => (2, 0),
-        B::Odiv => (3, 0),
-        B::Odivu => (4, 0),
-        B::Omod => (5, 0),
-        B::Omodu => (6, 0),
-        B::Oand => (7, 0),
-        B::Oor => (8, 0),
-        B::Oxor => (9, 0),
-        B::Oshl => (10, 0),
-        B::Oshr => (11, 0),
-        B::Oshru => (12, 0),
-        B::Oaddf => (13, 0),
-        B::Osubf => (14, 0),
-        B::Omulf => (15, 0),
-        B::Odivf => (16, 0),
-        B::Oaddfs => (17, 0),
-        B::Osubfs => (18, 0),
-        B::Omulfs => (19, 0),
-        B::Odivfs => (20, 0),
-        B::Omaxf => (21, 0),
-        B::Ominf => (22, 0),
-        B::Oaddl => (23, 0),
-        B::Osubl => (24, 0),
-        B::Omull => (25, 0),
-        B::Odivl => (26, 0),
-        B::Odivlu => (27, 0),
-        B::Omodl => (28, 0),
-        B::Omodlu => (29, 0),
-        B::Oandl => (30, 0),
-        B::Oorl => (31, 0),
-        B::Oxorl => (32, 0),
-        B::Oshll => (33, 0),
-        B::Oshrl => (34, 0),
-        B::Oshrlu => (35, 0),
-        B::Omulhs => (36, 0),
-        B::Omulhu => (37, 0),
-        B::Omullhs => (38, 0),
-        B::Omullhu => (39, 0),
-        B::Ocmp(c) => (40, *c as u8),
-        B::Ocmpu(c) => (41, *c as u8),
-        B::Ocmpf(c) => (42, *c as u8),
-        B::Ocmpnotf(c) => (43, *c as u8),
-        B::Ocmpfs(c) => (44, *c as u8),
-        B::Ocmpnotfs(c) => (45, *c as u8),
-        B::Ocmpl(c) => (46, *c as u8),
-        B::Ocmplu(c) => (47, *c as u8),
-    }
-}
-
-fn cmp_csharp_expr(a: &CsharpminorExpr, b: &CsharpminorExpr) -> Ordering {
-    use CsharpminorExpr as E;
-    let rank = |e: &E| -> u8 {
-        match e {
-            E::Evar(_) => 0,
-            E::Eaddrof(_) => 1,
-            E::Econst(_) => 2,
-            E::Eunop(_, _) => 3,
-            E::Ebinop(_, _, _) => 4,
-            E::Eload(_, _) => 5,
-            E::Econdition(_, _, _) => 6,
-        }
-    };
-    rank(a).cmp(&rank(b)).then_with(|| match (a, b) {
-        (E::Evar(x), E::Evar(y)) => x.cmp(y),
-        (E::Eaddrof(x), E::Eaddrof(y)) => x.cmp(y),
-        (E::Econst(x), E::Econst(y)) => cmp_constant(x, y),
-        (E::Eunop(oa, xa), E::Eunop(ob, xb)) => {
-            // CminorUnop is fieldless: the integer cast is its variant rank.
-            (oa.clone() as u8)
-                .cmp(&(ob.clone() as u8))
-                .then_with(|| cmp_csharp_expr(xa, xb))
-        }
-        (E::Ebinop(oa, la, ra), E::Ebinop(ob, lb, rb)) => cminor_binop_key(oa)
-            .cmp(&cminor_binop_key(ob))
-            .then_with(|| cmp_csharp_expr(la, lb))
-            .then_with(|| cmp_csharp_expr(ra, rb)),
-        (E::Eload(ca, xa), E::Eload(cb, xb)) => ca.cmp(cb).then_with(|| cmp_csharp_expr(xa, xb)),
-        (E::Econdition(ca, ta, fa), E::Econdition(cb, tb, fb)) => cmp_csharp_expr(ca, cb)
-            .then_with(|| cmp_csharp_expr(ta, tb))
-            .then_with(|| cmp_csharp_expr(fa, fb)),
-        _ => Ordering::Equal, // unreachable: equal ranks imply the same variant
-    })
-}
-
-fn cmp_clight_attr(a: &ClightAttr, b: &ClightAttr) -> Ordering {
-    a.attr_volatile
-        .cmp(&b.attr_volatile)
-        .then_with(|| a.attr_alignas.cmp(&b.attr_alignas))
-}
-
-fn cmp_clight_type(a: &ClightType, b: &ClightType) -> Ordering {
-    use ClightType as T;
-    let rank = |t: &T| -> u8 {
-        match t {
-            T::Tvoid => 0,
-            T::Tint(_, _, _) => 1,
-            T::Tlong(_, _) => 2,
-            T::Tfloat(_, _) => 3,
-            T::Tpointer(_, _) => 4,
-            T::Tarray(_, _, _) => 5,
-            T::Tfunction(_, _, _) => 6,
-            T::Tstruct(_, _) => 7,
-            T::Tunion(_, _) => 8,
-            T::Tint128(_, _) => 9,
-        }
-    };
-    rank(a).cmp(&rank(b)).then_with(|| match (a, b) {
-        (T::Tint(sa, ga, aa), T::Tint(sb, gb, ab)) => (*sa as u8)
-            .cmp(&(*sb as u8))
-            .then((*ga as u8).cmp(&(*gb as u8)))
-            .then_with(|| cmp_clight_attr(aa, ab)),
-        (T::Tlong(ga, aa), T::Tlong(gb, ab)) => (*ga as u8)
-            .cmp(&(*gb as u8))
-            .then_with(|| cmp_clight_attr(aa, ab)),
-        (T::Tint128(ga, aa), T::Tint128(gb, ab)) => (*ga as u8)
-            .cmp(&(*gb as u8))
-            .then_with(|| cmp_clight_attr(aa, ab)),
-        (T::Tfloat(fa, aa), T::Tfloat(fb, ab)) => (*fa as u8)
-            .cmp(&(*fb as u8))
-            .then_with(|| cmp_clight_attr(aa, ab)),
-        (T::Tpointer(ta, aa), T::Tpointer(tb, ab)) => {
-            cmp_clight_type(ta, tb).then_with(|| cmp_clight_attr(aa, ab))
-        }
-        (T::Tarray(ta, na, aa), T::Tarray(tb, nb, ab)) => cmp_clight_type(ta, tb)
-            .then(na.cmp(nb))
-            .then_with(|| cmp_clight_attr(aa, ab)),
-        (T::Tfunction(pa, ra, ca), T::Tfunction(pb, rb, cb)) => {
-            cmp_slice(pa, pb, cmp_clight_type)
-                .then_with(|| cmp_clight_type(ra, rb))
-                .then_with(|| ca.cmp(cb)) // CallConv: derived Ord
-        }
-        (T::Tstruct(ia, aa), T::Tstruct(ib, ab)) | (T::Tunion(ia, aa), T::Tunion(ib, ab)) => {
-            ia.cmp(ib).then_with(|| cmp_clight_attr(aa, ab))
-        }
-        _ => Ordering::Equal, // unreachable: equal ranks imply the same variant
-    })
-}
-
-fn cmp_clight_expr(a: &ClightExpr, b: &ClightExpr) -> Ordering {
-    use ClightExpr as E;
-    let rank = |e: &E| -> u8 {
-        match e {
-            E::EconstInt(_, _) => 0,
-            E::EconstFloat(_, _) => 1,
-            E::EconstSingle(_, _) => 2,
-            E::EconstLong(_, _) => 3,
-            E::Evar(_, _) => 4,
-            E::EvarSymbol(_, _) => 5,
-            E::Etempvar(_, _) => 6,
-            E::Ederef(_, _) => 7,
-            E::Eaddrof(_, _) => 8,
-            E::Eunop(_, _, _) => 9,
-            E::Ebinop(_, _, _, _) => 10,
-            E::Ecast(_, _) => 11,
-            E::Efield(_, _, _) => 12,
-            E::Esizeof(_, _) => 13,
-            E::Ealignof(_, _) => 14,
-            E::Econdition(_, _, _, _) => 15,
-        }
-    };
-    rank(a).cmp(&rank(b)).then_with(|| match (a, b) {
-        (E::EconstInt(va, ta), E::EconstInt(vb, tb)) => {
-            va.cmp(vb).then_with(|| cmp_clight_type(ta, tb))
-        }
-        (E::EconstFloat(va, ta), E::EconstFloat(vb, tb)) => {
-            va.0.total_cmp(&vb.0).then_with(|| cmp_clight_type(ta, tb))
-        }
-        (E::EconstSingle(va, ta), E::EconstSingle(vb, tb)) => {
-            va.0.total_cmp(&vb.0).then_with(|| cmp_clight_type(ta, tb))
-        }
-        (E::EconstLong(va, ta), E::EconstLong(vb, tb)) => {
-            va.cmp(vb).then_with(|| cmp_clight_type(ta, tb))
-        }
-        (E::Evar(ia, ta), E::Evar(ib, tb)) | (E::Etempvar(ia, ta), E::Etempvar(ib, tb)) => {
-            ia.cmp(ib).then_with(|| cmp_clight_type(ta, tb))
-        }
-        (E::EvarSymbol(sa, ta), E::EvarSymbol(sb, tb)) => {
-            sa.cmp(sb).then_with(|| cmp_clight_type(ta, tb))
-        }
-        (E::Ederef(xa, ta), E::Ederef(xb, tb))
-        | (E::Eaddrof(xa, ta), E::Eaddrof(xb, tb))
-        | (E::Ecast(xa, ta), E::Ecast(xb, tb)) => {
-            cmp_clight_expr(xa, xb).then_with(|| cmp_clight_type(ta, tb))
-        }
-        (E::Eunop(oa, xa, ta), E::Eunop(ob, xb, tb)) => (*oa as u8)
-            .cmp(&(*ob as u8))
-            .then_with(|| cmp_clight_expr(xa, xb))
-            .then_with(|| cmp_clight_type(ta, tb)),
-        (E::Ebinop(oa, la, ra, ta), E::Ebinop(ob, lb, rb, tb)) => (*oa as u8)
-            .cmp(&(*ob as u8))
-            .then_with(|| cmp_clight_expr(la, lb))
-            .then_with(|| cmp_clight_expr(ra, rb))
-            .then_with(|| cmp_clight_type(ta, tb)),
-        (E::Efield(xa, ia, ta), E::Efield(xb, ib, tb)) => cmp_clight_expr(xa, xb)
-            .then(ia.cmp(ib))
-            .then_with(|| cmp_clight_type(ta, tb)),
-        (E::Esizeof(ua, ta), E::Esizeof(ub, tb)) | (E::Ealignof(ua, ta), E::Ealignof(ub, tb)) => {
-            cmp_clight_type(ua, ub).then_with(|| cmp_clight_type(ta, tb))
-        }
-        (E::Econdition(ca, xa, ya, ta), E::Econdition(cb, xb, yb, tb)) => cmp_clight_expr(ca, cb)
-            .then_with(|| cmp_clight_expr(xa, xb))
-            .then_with(|| cmp_clight_expr(ya, yb))
-            .then_with(|| cmp_clight_type(ta, tb)),
-        _ => Ordering::Equal, // unreachable: equal ranks imply the same variant
-    })
-}
-
-fn cmp_external_function(a: &ExternalFunction, b: &ExternalFunction) -> Ordering {
-    use crate::x86::types::ExternalFunction as F;
-    let rank = |f: &F| -> u8 {
-        match f {
-            F::EFExternal(_, _) => 0,
-            F::EFBuiltin(_, _) => 1,
-            F::EFRuntime(_, _) => 2,
-            F::EFVLoad(_) => 3,
-            F::EFVStore(_) => 4,
-            F::EFMalloc => 5,
-            F::EFFree => 6,
-            F::EFMemcpy(_, _) => 7,
-            F::EFAnnot(_, _, _) => 8,
-            F::EFAnnotVal(_, _, _) => 9,
-            F::EFInlineAsm(_, _, _) => 10,
-            F::EFDebug(_, _, _) => 11,
-        }
-    };
-    rank(a).cmp(&rank(b)).then_with(|| match (a, b) {
-        (F::EFExternal(na, sa), F::EFExternal(nb, sb))
-        | (F::EFBuiltin(na, sa), F::EFBuiltin(nb, sb))
-        | (F::EFRuntime(na, sa), F::EFRuntime(nb, sb)) => {
-            na.cmp(nb).then_with(|| sa.cmp(sb)) // Signature: derived Ord
-        }
-        (F::EFVLoad(ca), F::EFVLoad(cb)) | (F::EFVStore(ca), F::EFVStore(cb)) => ca.cmp(cb),
-        (F::EFMemcpy(xa, ya), F::EFMemcpy(xb, yb)) => xa.cmp(xb).then(ya.cmp(yb)),
-        (F::EFAnnot(pa, na, ta), F::EFAnnot(pb, nb, tb)) => {
-            pa.cmp(pb).then_with(|| na.cmp(nb)).then_with(|| ta.cmp(tb)) // Vec<Typ>: derived Ord
-        }
-        (F::EFAnnotVal(pa, na, ta), F::EFAnnotVal(pb, nb, tb)) => {
-            pa.cmp(pb).then_with(|| na.cmp(nb)).then(ta.cmp(tb))
-        }
-        (F::EFInlineAsm(na, sa, ca), F::EFInlineAsm(nb, sb, cb)) => {
-            na.cmp(nb).then_with(|| sa.cmp(sb)).then_with(|| ca.cmp(cb))
-        }
-        (F::EFDebug(pa, ia, ta), F::EFDebug(pb, ib, tb)) => {
-            pa.cmp(pb).then(ia.cmp(ib)).then_with(|| ta.cmp(tb))
-        }
-        _ => Ordering::Equal, // unit variants / unreachable mixed pairs
-    })
-}
-
-fn cmp_clight_stmt(a: &ClightStmt, b: &ClightStmt) -> Ordering {
-    use ClightStmt as S;
-    let rank = |s: &S| -> u8 {
-        match s {
-            S::Sskip => 0,
-            S::Sassign(_, _) => 1,
-            S::Sset(_, _) => 2,
-            S::Scall(_, _, _) => 3,
-            S::Sbuiltin(_, _, _, _) => 4,
-            S::Ssequence(_) => 5,
-            S::Sifthenelse(_, _, _) => 6,
-            S::Sloop(_, _) => 7,
-            S::Sbreak => 8,
-            S::Scontinue => 9,
-            S::Sreturn(_) => 10,
-            S::Sswitch(_, _) => 11,
-            S::Slabel(_, _) => 12,
-            S::Sgoto(_) => 13,
-            S::Seffect(_,_) => 14,
-        }
-    };
-    rank(a).cmp(&rank(b)).then_with(|| match (a, b) {
-        (S::Sassign(la, ra), S::Sassign(lb, rb)) => {
-            cmp_clight_expr(la, lb).then_with(|| cmp_clight_expr(ra, rb))
-        }
-        (S::Sset(ia, ea), S::Sset(ib, eb)) => ia.cmp(ib).then_with(|| cmp_clight_expr(ea, eb)),
-        (S::Scall(ra, fa, aa), S::Scall(rb, fb, ab)) => ra
-            .cmp(rb)
-            .then_with(|| cmp_clight_expr(fa, fb))
-            .then_with(|| cmp_slice(aa, ab, cmp_clight_expr)),
-        (S::Sbuiltin(ra, ea, ta, aa), S::Sbuiltin(rb, eb, tb, ab)) => ra
-            .cmp(rb)
-            .then_with(|| cmp_external_function(ea, eb))
-            .then_with(|| cmp_slice(ta, tb, cmp_clight_type))
-            .then_with(|| cmp_slice(aa, ab, cmp_clight_expr)),
-        (S::Ssequence(sa), S::Ssequence(sb)) => cmp_slice(sa, sb, cmp_clight_stmt),
-        (S::Sifthenelse(ca, ta, fa), S::Sifthenelse(cb, tb, fb)) => cmp_clight_expr(ca, cb)
-            .then_with(|| cmp_clight_stmt(ta, tb))
-            .then_with(|| cmp_clight_stmt(fa, fb)),
-        (S::Sloop(ba, sa), S::Sloop(bb, sb)) => {
-            cmp_clight_stmt(ba, bb).then_with(|| cmp_clight_stmt(sa, sb))
-        }
-        (S::Sreturn(ea), S::Sreturn(eb)) => cmp_option(ea, eb, cmp_clight_expr),
-        (S::Sswitch(ea, ca), S::Sswitch(eb, cb)) => cmp_clight_expr(ea, eb).then_with(|| {
-            cmp_slice(ca, cb, |(la, sa), (lb, sb)| {
-                la.cmp(lb).then_with(|| cmp_clight_stmt(sa, sb))
-            })
-        }),
-        (S::Slabel(ia, sa), S::Slabel(ib, sb)) => ia.cmp(ib).then_with(|| cmp_clight_stmt(sa, sb)),
-        (S::Sgoto(ia), S::Sgoto(ib)) => ia.cmp(ib),
-        _ => Ordering::Equal, // unit variants / unreachable mixed pairs
-    })
 }
 
 pub fn extract_loop_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, LoopInfo>> {
@@ -4973,10 +4461,6 @@ pub fn extract_ite_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, IteI
 #[derive(Debug, Clone)]
 pub struct ExtractedStruct {
     pub struct_id: usize,
-    #[allow(dead_code)]
-    pub layout_hash: u64,
-    #[allow(dead_code)]
-    pub is_canonical: bool,
     pub definition: StructDef,
 }
 
@@ -5240,7 +4724,7 @@ pub fn extract_struct_definitions(db: &DecompileDB) -> Vec<ExtractedStruct> {
             .or_insert((field_name, chunk));
     }
 
-    for (layout_hash, canonical_id, _field_count, _total_size) in
+    for (_layout_hash, canonical_id, _field_count, _total_size) in
         db.rel_iter::<(u64, usize, usize, usize)>("global_struct_catalog")
     {
         if seen_struct_ids.contains(canonical_id) {
@@ -5281,8 +4765,6 @@ pub fn extract_struct_definitions(db: &DecompileDB) -> Vec<ExtractedStruct> {
 
         structs.push(ExtractedStruct {
             struct_id: *canonical_id,
-            layout_hash: *layout_hash,
-            is_canonical: true,
             definition,
         });
     }
@@ -5309,13 +4791,10 @@ pub fn extract_struct_definitions(db: &DecompileDB) -> Vec<ExtractedStruct> {
             let struct_name = format!("struct_{:x}", struct_id);
             let struct_fields = build_fields_with_padding(&field_tuples, data_model);
 
-            let layout_hash = compute_field_hash(&field_tuples);
             let definition = StructDef::new_struct(struct_name, struct_fields);
 
             structs.push(ExtractedStruct {
                 struct_id: *struct_id,
-                layout_hash,
-                is_canonical: true,
                 definition,
             });
         }
@@ -5336,32 +4815,17 @@ pub fn extract_struct_definitions(db: &DecompileDB) -> Vec<ExtractedStruct> {
             .collect();
 
         let struct_fields = build_fields_with_padding(&field_tuples, data_model);
-        let layout_hash = compute_field_hash(&field_tuples);
         let definition = StructDef::new_struct(struct_name, struct_fields);
 
         seen_struct_ids.insert(*struct_id);
         structs.push(ExtractedStruct {
             struct_id: *struct_id,
-            layout_hash,
-            is_canonical: false,
             definition,
         });
     }
 
     structs.sort_by_key(|s| s.struct_id);
     structs
-}
-
-fn compute_field_hash(fields: &[(usize, i64, FieldType, usize)]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    for (idx, offset, ty, _name) in fields {
-        idx.hash(&mut hasher);
-        offset.hash(&mut hasher);
-        ty.to_type_string().hash(&mut hasher);
-    }
-    hasher.finish()
 }
 
 pub fn extract_struct_layout_map(
@@ -5372,11 +4836,6 @@ pub fn extract_struct_layout_map(
     let id_to_name: HashMap<usize, String> = db
         .rel_iter::<(Ident, Symbol)>("ident_to_symbol")
         .map(|(id, name)| (*id, name.to_string()))
-        .collect();
-
-    let canonical_ids: HashSet<usize> = db
-        .rel_iter::<(u64, usize)>("emit_canonical_struct_id")
-        .map(|(_hash, id)| *id)
         .collect();
 
     for (global_ident, struct_id, fields) in db
@@ -5547,7 +5006,7 @@ pub(crate) fn scan_field_ptr_evidence(
                 scan_field_ptr_evidence(s, ptr_regs, callee_sigs, name_to_ident, out);
             }
         }
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => {
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => {
             scan_field_ptr_evidence(inner, ptr_regs, callee_sigs, name_to_ident, out)
         }
         ClightStmt::Sswitch(_, cases) => {
@@ -5600,7 +5059,7 @@ pub(crate) fn widen_float_regs_by_defs<'a>(
                 walk(a, float_regs, grew);
                 walk(b, float_regs, grew);
             }
-            (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => walk(inner, float_regs, grew),
+            ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => walk(inner, float_regs, grew),
             ClightStmt::Sswitch(_, cases) => {
                 for (_, s) in cases {
                     walk(s, float_regs, grew);
@@ -5683,7 +5142,7 @@ pub(crate) fn widen_ptr_regs_by_defs<'a>(
                 walk(a, ptr_regs, evidenced, grew);
                 walk(b, ptr_regs, evidenced, grew);
             }
-            (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => walk(inner, ptr_regs, evidenced, grew),
+            ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => walk(inner, ptr_regs, evidenced, grew),
             ClightStmt::Sswitch(_, cases) => {
                 for (_, s) in cases {
                     walk(s, ptr_regs, evidenced, grew);
@@ -5835,7 +5294,7 @@ pub(crate) fn scan_field_ptr_conflicts(
                 scan_field_ptr_conflicts(s, ptr_regs, float_regs, callee_sigs, name_to_ident, out);
             }
         }
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => {
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => {
             scan_field_ptr_conflicts(inner, ptr_regs, float_regs, callee_sigs, name_to_ident, out)
         }
         ClightStmt::Sswitch(e, cases) => {
@@ -5935,7 +5394,7 @@ fn collect_field_defaults_stmt(
                 collect_field_defaults_stmt(st, out);
             }
         }
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => collect_field_defaults_stmt(inner, out),
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => collect_field_defaults_stmt(inner, out),
         _ => {}
     }
 }
@@ -6110,7 +5569,7 @@ pub fn collect_stmt_regs(stmt: &ClightStmt) -> Vec<RTLReg> {
                 collect_stmt_regs_inner(a, regs);
                 collect_stmt_regs_inner(b, regs);
             }
-            (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => collect_stmt_regs_inner(inner, regs),
+            ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => collect_stmt_regs_inner(inner, regs),
             ClightStmt::Sswitch(e, cases) => {
                 collect_expr_regs(e, regs);
                 for (_, s) in cases {
@@ -6757,8 +6216,6 @@ mod tr3_tests {
         );
         let mut structs = vec![ExtractedStruct {
             struct_id: 1,
-            layout_hash: 0,
-            is_canonical: true,
             definition: def,
         }];
         let patched = apply_struct_field_type_selection(&mut structs, &selection);

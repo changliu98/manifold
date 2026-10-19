@@ -15,7 +15,7 @@ use crate::decompile::passes::clight_select::syntax::{ArtifactKey, Artifacts, Fu
 use crate::decompile::passes::clight_select::type_graph::{Fact, TypeTerm};
 use crate::x86::types::{Node, RTLReg};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use z3::ast::{Ast, Bool};
+use z3::ast::Bool;
 use z3::{Model, Optimize};
 
 pub(crate) const VALIDATED: ArtifactKey<BTreeSet<RTLReg>> =
@@ -212,7 +212,7 @@ impl<'a> Profiles<'a> {
                         self.cx
                             .declarations
                             .get(reg)
-                            .and_then(|v| model.eval(v, true).map(|value| v._eq(value)))
+                            .and_then(|v| model.eval(v, true).map(|value| v.eq(value)))
                     }
                 })
                 .collect::<Vec<_>>(),

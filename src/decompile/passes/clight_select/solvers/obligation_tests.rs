@@ -1,4 +1,3 @@
-use crate::abi::DataModel;
 use crate::decompile::passes::clight_select::candtype::{CandType, Sign};
 use crate::decompile::passes::clight_select::solvers::obligations::*;
 use crate::decompile::passes::semantic_counterexample::ledger::ObjectId;
@@ -223,10 +222,6 @@ fn store_conversion_truncates_only_after_evaluating_the_payload() {
 fn frame_read_compares_extension_of_the_same_symbolic_bytes() {
     let (mut f, _) = fixture();
     let r = memory_theory::ReadContract {
-        object: ObjectId {
-            function: 1,
-            base: 0,
-        },
         node: 40,
         root: 10,
         offset: 4,
@@ -304,10 +299,6 @@ fn extra_writes_and_unrelated_input_names_are_not_certified() {
 fn volatile_float_and_widened_unproven_reads_stay_unsupported() {
     let (f, _) = fixture();
     let r = memory_theory::ReadContract {
-        object: ObjectId {
-            function: 1,
-            base: 0,
-        },
         node: 40,
         root: 10,
         offset: 4,
@@ -575,10 +566,6 @@ fn available_arithmetic_retains_its_operand_dependencies_and_c_definedness() {
 fn decoded_zero_upper_word_guides_the_c_load_view_in_final_selection() {
     let (mut f, _) = fixture();
     let read = memory_theory::ReadContract {
-        object: ObjectId {
-            function: 1,
-            base: 0,
-        },
         node: 40,
         root: 10,
         offset: 4,
@@ -645,10 +632,6 @@ fn decoded_zero_upper_word_guides_the_c_load_view_in_final_selection() {
 fn signed_load_extension_depends_on_the_machine_destination_not_c_signedness() {
     let (f, _) = fixture();
     let mut read = memory_theory::ReadContract {
-        object: ObjectId {
-            function: 1,
-            base: 0,
-        },
         node: 40,
         root: 10,
         offset: 4,
@@ -710,10 +693,6 @@ fn signed_load_extension_depends_on_the_machine_destination_not_c_signedness() {
 fn analysis_candidates_keep_the_parent_structural_world_and_effect_scope() {
     let (mut f, _) = fixture();
     let read = memory_theory::ReadContract {
-        object: ObjectId {
-            function: 1,
-            base: 0,
-        },
         node: 40,
         root: 10,
         offset: 4,

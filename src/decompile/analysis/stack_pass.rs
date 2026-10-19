@@ -370,7 +370,7 @@ mod tests {
     // again inside one switch arm, and read after the loop exits. Both stores define the one
     // variable the guard reads, so both must reach it.
     fn option_loop_program() -> StackAnalysisProgram {
-        let mut prog = StackAnalysisProgram::default();
+        let prog = StackAnalysisProgram::default();
         let func = 0x100;
 
         // B0 0x100 store, 0x104 filler | BH 0x110 header, 0x114 branch

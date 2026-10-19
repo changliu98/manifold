@@ -1,5 +1,3 @@
-#![allow(dead_code)] // consumed incrementally from P2 (wt audit) onward; see CTYPING_PLAN.md
-
 //! Executable CompCert C-frontend type checker over the Clight AST, transcribed from Ctypes.v/Cop.v/Ctyping.v with arm ORDER preserved; two deviations lean toward gcc.
 //!
 //! CompCert's Archi.ptr64 is a module constant; here it is a `ptr64` parameter threaded from the target ABI, so one process can check both widths (cf. DecompileDB::target_abi). Only classify_cast, classify_bool and ptrdiff_t branch on it; classify_sub/classify_cmp do not (their ptr64 uses are in sem_sub/cmp_ptr, the semantics, not the classification).

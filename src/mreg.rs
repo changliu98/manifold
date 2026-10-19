@@ -100,27 +100,6 @@ impl Mreg {
         )
     }
 
-    pub fn as_x86(&self) -> Option<X86Mreg> {
-        match self {
-            Mreg::X86(r) => Some(*r),
-            _ => None,
-        }
-    }
-
-    pub fn as_a64(&self) -> Option<A64Mreg> {
-        match self {
-            Mreg::A64(r) => Some(*r),
-            _ => None,
-        }
-    }
-
-    pub fn as_a32(&self) -> Option<A32Mreg> {
-        match self {
-            Mreg::A32(r) => Some(*r),
-            _ => None,
-        }
-    }
-
     // x86 aliases: expression-position sugar for the existing x86 rules, usable in patterns since all three enums derive Eq.
     pub const AX: Mreg = Mreg::X86(X86Mreg::AX);
     pub const BX: Mreg = Mreg::X86(X86Mreg::BX);

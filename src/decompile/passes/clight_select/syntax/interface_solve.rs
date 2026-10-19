@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use z3::ast::{Ast, Bool, Int};
+use z3::ast::{Bool, Int};
 use z3::{Optimize, SatResult};
 
 use crate::decompile::elevator::config;
@@ -42,7 +42,6 @@ pub(crate) struct InterfaceSolveStats {
 
 pub(crate) struct InterfaceSolveOutcome {
     pub committed: CommittedInterfaces,
-    pub stage_a_preferences: BTreeMap<InterfaceVarId, InterfaceClass>,
     pub assignments: BTreeMap<InterfaceVarId, InterfaceClass>,
     /// Exact domain rank chosen for every interface variable.  Class alone is
     /// not a commitment identity: multiple concrete XTypes may share it.
@@ -335,7 +334,7 @@ fn collect_edges_stmt(
                 collect_edges_stmt(func, state, name_to_ident, node, stmt, out);
             }
         }
-        (ClightStmt::Slabel(_, stmt) | ClightStmt::Seffect(_, stmt)) => {
+        ClightStmt::Slabel(_, stmt) | ClightStmt::Seffect(_, stmt) => {
             collect_edges_stmt(func, state, name_to_ident, node, stmt, out)
         }
         _ => {}
@@ -527,7 +526,7 @@ fn stmt_matches(
                     .iter()
                     .any(|(_, stmt)| stmt_matches(stmt, temp, global, returns))
         }
-        (ClightStmt::Slabel(_, stmt) | ClightStmt::Seffect(_, stmt)) => {
+        ClightStmt::Slabel(_, stmt) | ClightStmt::Seffect(_, stmt) => {
             stmt_matches(stmt, temp, global, returns)
         }
         _ => false,
@@ -816,7 +815,7 @@ fn assert_declaration_vote_clause(
     });
     if let Some(index) = target_index {
         opt.assert_soft(
-            &variable._eq(Int::from_u64(index as u64)),
+            &variable.eq(Int::from_u64(index as u64)),
             config::CONFIG
                 .interface
                 .structural_weight
@@ -1253,25 +1252,25 @@ pub(crate) fn solve_with_global_feedback(
                 opt.assert(&zvar.ge(Int::from_i64(0)));
                 opt.assert(&zvar.lt(Int::from_u64(var.domain.len() as u64)));
                 if var.hard_rank0 {
-                    opt.assert(&zvar._eq(Int::from_i64(0)));
+                    opt.assert(&zvar.eq(Int::from_i64(0)));
                 }
                 if let Some(&previous_rank) = prior_choice_ranks
                     .and_then(|assignments| assignments.get(&var.id))
                     .filter(|_| !reopened.contains(&var.id))
                 {
                     if previous_rank < var.domain.len() {
-                        opt.assert(&zvar._eq(Int::from_u64(previous_rank as u64)));
+                        opt.assert(&zvar.eq(Int::from_u64(previous_rank as u64)));
                     }
                 }
                 opt.assert_soft(
-                    &zvar._eq(Int::from_i64(0)),
+                    &zvar.eq(Int::from_i64(0)),
                     config::CONFIG.interface.prior_weight,
                     None,
                 );
                 for (alternative, (legality, structural)) in costs[index].iter().enumerate() {
                     if *legality > 0 {
                         opt.assert_soft(
-                            &zvar._eq(Int::from_u64(alternative as u64)).not(),
+                            &zvar.eq(Int::from_u64(alternative as u64)).not(),
                             config::CONFIG
                                 .interface
                                 .legality_weight
@@ -1281,7 +1280,7 @@ pub(crate) fn solve_with_global_feedback(
                     }
                     if *structural > 0 {
                         opt.assert_soft(
-                            &zvar._eq(Int::from_u64(alternative as u64)).not(),
+                            &zvar.eq(Int::from_u64(alternative as u64)).not(),
                             config::CONFIG
                                 .interface
                                 .structural_weight
@@ -1304,7 +1303,7 @@ pub(crate) fn solve_with_global_feedback(
                                     )
                                     .compatible(*claim)
                                 })
-                                .map(|(rank, _)| zvar._eq(Int::from_u64(rank as u64)))
+                                .map(|(rank, _)| zvar.eq(Int::from_u64(rank as u64)))
                                 .collect();
                             if !compatible.is_empty() {
                                 let refs: Vec<&Bool> = compatible.iter().collect();
@@ -1323,7 +1322,7 @@ pub(crate) fn solve_with_global_feedback(
                 opt.assert(&zvar.ge(Int::from_i64(0)));
                 opt.assert(&zvar.lt(Int::from_u64(declaration.domain.len() as u64)));
                 opt.assert_soft(
-                    &zvar._eq(Int::from_i64(0)),
+                    &zvar.eq(Int::from_i64(0)),
                     config::CONFIG.interface.prior_weight,
                     None,
                 );
@@ -1359,7 +1358,7 @@ pub(crate) fn solve_with_global_feedback(
                     continue;
                 };
                 opt.assert_soft(
-                    &zvars[index]._eq(Int::from_u64(alternative as u64)),
+                    &zvars[index].eq(Int::from_u64(alternative as u64)),
                     config::CONFIG.interface.structural_weight,
                     None,
                 );
@@ -1401,7 +1400,7 @@ pub(crate) fn solve_with_global_feedback(
                         .position(|candidate| candidate.class == InterfaceClass::PtrFunc)
                     {
                         opt.assert_soft(
-                            &zvars[index]._eq(Int::from_u64(alternative as u64)),
+                            &zvars[index].eq(Int::from_u64(alternative as u64)),
                             config::CONFIG.interface.agreement_weight,
                             None,
                         );
@@ -1421,7 +1420,7 @@ pub(crate) fn solve_with_global_feedback(
                         .position(|candidate| candidate.class == class)
                     {
                         opt.assert_soft(
-                            &zvars[index]._eq(Int::from_u64(alternative as u64)),
+                            &zvars[index].eq(Int::from_u64(alternative as u64)),
                             config::CONFIG.interface.agreement_weight,
                             None,
                         );
@@ -1438,7 +1437,7 @@ pub(crate) fn solve_with_global_feedback(
                             .position(|candidate| candidate.class == class)
                         {
                             opt.assert_soft(
-                                &zvars[index]._eq(Int::from_u64(alternative as u64)),
+                                &zvars[index].eq(Int::from_u64(alternative as u64)),
                                 config::CONFIG.interface.agreement_weight,
                                 None,
                             );
@@ -1636,7 +1635,6 @@ pub(crate) fn solve_with_global_feedback(
 
     InterfaceSolveOutcome {
         committed,
-        stage_a_preferences: preferences,
         assignments,
         choice_ranks,
         declaration_assignments,

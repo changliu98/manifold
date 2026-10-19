@@ -16,10 +16,8 @@ pub(crate) fn majority_usize<'a>(
     inp: impl Iterator<Item = (&'a usize,)>,
 ) -> impl Iterator<Item = usize> {
     let mut counts: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
-    let mut total = 0usize;
     for (&v,) in inp {
         *counts.entry(v).or_insert(0) += 1;
-        total += 1;
     }
     let best = counts
         .into_iter()
@@ -938,8 +936,6 @@ pub enum SignatureConfidence {
 #[derive(Debug, Clone)]
 pub struct FunctionPrototype {
     pub address: Address,
-    #[allow(dead_code)]
-    pub name: Symbol,
     pub param_count: usize,
     pub param_types: Vec<XType>,
     pub return_type: XType,
@@ -2182,7 +2178,6 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                 // Variadic internal function: force known param count to avoid materializing register dumps.
                 prototypes.push(FunctionPrototype {
                     address: func_addr,
-                    name: func_name,
                     param_count: *param_count,
                     param_types: (**param_types).clone(),
                     return_type: *ret_type,
@@ -2208,7 +2203,6 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                 };
                 prototypes.push(FunctionPrototype {
                     address: func_addr,
-                    name: func_name,
                     param_count: main_count,
                     param_types: main_types,
                     return_type: *ret_type,
@@ -2525,7 +2519,6 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         {
             prototypes.push(FunctionPrototype {
                 address: func_addr,
-                name: func_name,
                 param_count: reconciled_count,
                 param_types,
                 return_type,

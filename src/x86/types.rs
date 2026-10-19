@@ -187,33 +187,6 @@ impl FieldType {
             FieldType::Unknown => 4,
         }
     }
-
-    pub fn to_type_string(&self) -> String {
-        match self {
-            FieldType::Scalar(chunk) => match chunk {
-                MemoryChunk::MBool => "int_IBool".to_string(),
-                MemoryChunk::MInt8Signed => "int_I8".to_string(),
-                MemoryChunk::MInt8Unsigned => "int_I8_unsigned".to_string(),
-                MemoryChunk::MInt16Signed => "int_I16".to_string(),
-                MemoryChunk::MInt16Unsigned => "int_I16_unsigned".to_string(),
-                MemoryChunk::MInt32 | MemoryChunk::MAny32 => "int_I32".to_string(),
-                MemoryChunk::MInt64 | MemoryChunk::MAny64 => "int_I64".to_string(),
-                MemoryChunk::MFloat32 => "float_F32".to_string(),
-                MemoryChunk::MFloat64 => "float_F64".to_string(),
-                MemoryChunk::Unknown => "int_I32".to_string(),
-            },
-            FieldType::Pointer(inner) => format!("ptr_{}", inner.to_type_string()),
-            FieldType::StructPointer(struct_id) => format!("ptr_struct_{:x}", struct_id),
-            FieldType::EmbeddedStruct(struct_id) => format!("struct_{:x}", struct_id),
-            FieldType::Array(elem, _) => format!("arr_{}", elem.to_type_string()),
-            FieldType::Union(variants) => variants
-                .first()
-                .map(|v| v.to_type_string())
-                .unwrap_or_else(|| "int_I32".to_string()),
-            FieldType::OpaqueBlob(size) => format!("blob_{}", size),
-            FieldType::Unknown => "int_I32".to_string(),
-        }
-    }
 }
 
 impl Default for FieldType {
@@ -238,7 +211,6 @@ pub enum MemoryChunk {
     MFloat64,
     MAny32,
     MAny64,
-    #[allow(dead_code)]
     Unknown,
 }
 
@@ -655,7 +627,6 @@ pub enum CminorStmt {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CsharpminorExpr {
     Evar(RTLReg),
-    #[allow(dead_code)]
     Eaddrof(Ident),
     Econst(Constant),
     Eunop(CminorUnop, Box<CsharpminorExpr>),
@@ -753,11 +724,9 @@ pub enum ClightType {
     Tint128(ClightSignedness, ClightAttr),
     Tfloat(ClightFloatSize, ClightAttr),
     Tpointer(Arc<ClightType>, ClightAttr),
-    #[allow(dead_code)]
     Tarray(Arc<ClightType>, Z, ClightAttr),
     Tfunction(Arc<Vec<ClightType>>, Arc<ClightType>, CallConv),
     Tstruct(Ident, ClightAttr),
-    #[allow(dead_code)]
     Tunion(Ident, ClightAttr),
 }
 

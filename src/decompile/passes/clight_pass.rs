@@ -4240,6 +4240,7 @@ fn semantic_store_chunk(width: usize, value: &ClightExpr, pointer_bytes: usize) 
 /// The decoded byte width, not a scalar carrier type or guessed struct field,
 /// determines the write. Padding and overlapping field views need no tiling:
 /// they are bytes of the same validated backing object.
+#[cfg(test)]
 fn semantic_frame_projection(db: &DecompileDB) -> SemanticFrameProjection {
     semantic_frame_projection_from(db, &frame_projection_sources(db))
 }
@@ -4793,7 +4794,6 @@ pub(crate) fn xtype_refine_priority(xtype: &XType) -> u8 {
         XType::Xptr | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr => 12,
         XType::XstructPtr(_) => 13,
         XType::Xcharptr | XType::Xcharptrptr => 14,
-        _ => 0,
     }
 }
 
@@ -5416,19 +5416,6 @@ pub(crate) fn convert_csharp_stmt_to_clight(
                 converted_args,
             )
         }
-        CsharpminorStmt::Scond(cond, args, ifso, ifnot) => {
-            let vars_used = extract_vars_from_csharp_exprs(args.as_slice());
-            let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
-            if let Some(condition) =
-                clight_condition_expr_with_types(cond, args.as_slice(), &var_types, ptr_size)
-            {
-                let then_stmt = ClightStmt::Sgoto(ident_from_node(*ifso));
-                let else_stmt = ClightStmt::Sgoto(ident_from_node(*ifnot));
-                ClightStmt::Sifthenelse(condition, Box::new(then_stmt), Box::new(else_stmt))
-            } else {
-                ClightStmt::Sskip
-            }
-        }
         CsharpminorStmt::Sjumptable(expr, targets) => {
             let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]);
             let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
@@ -5528,42 +5515,6 @@ pub(crate) fn extract_self_modifying_reg(dst: &RTLReg, expr: &CminorExpr) -> Opt
         }
         CminorExpr::Eop(_, args) if args.contains(dst) => Some(*dst),
         _ => None,
-    }
-}
-
-pub(crate) fn invert_comparison(comp: &Comparison) -> Comparison {
-    match comp {
-        Comparison::Ceq => Comparison::Cne,
-        Comparison::Cne => Comparison::Ceq,
-        Comparison::Clt => Comparison::Cge,
-        Comparison::Cle => Comparison::Cgt,
-        Comparison::Cgt => Comparison::Cle,
-        Comparison::Cge => Comparison::Clt,
-        Comparison::Unknown => Comparison::Unknown,
-    }
-}
-
-pub(crate) fn invert_condition(cond: &Condition) -> Condition {
-    match cond {
-        Condition::Ccomp(c) => Condition::Ccomp(invert_comparison(c)),
-        Condition::Ccompu(c) => Condition::Ccompu(invert_comparison(c)),
-        Condition::Ccompl(c) => Condition::Ccompl(invert_comparison(c)),
-        Condition::Ccomplu(c) => Condition::Ccomplu(invert_comparison(c)),
-        Condition::Ccompf(c) => Condition::Ccompf(invert_comparison(c)),
-        Condition::Ccompfs(c) => Condition::Ccompfs(invert_comparison(c)),
-        Condition::Ccompimm(c, imm) => Condition::Ccompimm(invert_comparison(c), *imm),
-        Condition::Ccompuimm(c, imm) => Condition::Ccompuimm(invert_comparison(c), *imm),
-        Condition::Ccomplimm(c, imm) => Condition::Ccomplimm(invert_comparison(c), *imm),
-        Condition::Ccompluimm(c, imm) => Condition::Ccompluimm(invert_comparison(c), *imm),
-        Condition::Cmaskzero(m) => Condition::Cmasknotzero(*m),
-        Condition::Cmasknotzero(m) => Condition::Cmaskzero(*m),
-        Condition::Cnotcompf(c) => Condition::Ccompf(*c),
-        Condition::Cnotcompfs(c) => Condition::Ccompfs(*c),
-        // OF-set <-> OF-clear is an exact logical negation (the flag is a single bit).
-        Condition::Coverflow => Condition::Cnotoverflow,
-        Condition::Cnotoverflow => Condition::Coverflow,
-        Condition::Carithoverflow(op, width) => Condition::Cnarithoverflow(*op, *width),
-        Condition::Cnarithoverflow(op, width) => Condition::Carithoverflow(*op, *width),
     }
 }
 
@@ -7255,10 +7206,6 @@ fn force_long_type_for_64bit_cmp(expr: ClightExpr, signed: bool) -> ClightExpr {
     } else {
         expr
     }
-}
-
-fn is_int32_type(ty: &ClightType) -> bool {
-    matches!(ty, ClightType::Tint(ClightIntSize::I32, _, _))
 }
 
 fn overflow_unsigned_type(width: i64) -> Option<ClightType> {

@@ -630,7 +630,7 @@ fn build_function_constraints_with_stack(
         for &reg in &regs {
             if let Some(&c0) = func.var_type_candidates[&reg].first() {
                 let prior = cand_to_ty(&t, c0);
-                sink.assert_soft_raw(&tyvar[&reg]._eq(prior), 1u64);
+                sink.assert_soft_raw(&tyvar[&reg].eq(prior), 1u64);
             }
         }
         let mut sel_nodes: Vec<Node> = selvar.keys().copied().collect();
@@ -1806,7 +1806,7 @@ fn collect_reg_ptr_evidence_stmt(stmt: &ClightStmt, out: &mut BTreeMap<RTLReg, R
             collect_reg_ptr_evidence_stmt(a, out);
             collect_reg_ptr_evidence_stmt(b, out);
         }
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => {
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => {
             collect_reg_ptr_evidence_stmt(inner, out)
         }
         ClightStmt::Sswitch(e, cases) => {
@@ -1900,7 +1900,7 @@ fn count_truncating_casts_stmt(stmt: &ClightStmt) -> u64 {
         ClightStmt::Sreturn(Some(e)) => count_truncating_casts_expr(e),
         ClightStmt::Sifthenelse(c, _, _) => count_truncating_casts_expr(c),
         ClightStmt::Sswitch(e, _) => count_truncating_casts_expr(e),
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => {
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)  => {
             count_truncating_casts_stmt(inner)
         }
         _ => 0,

@@ -7,7 +7,7 @@ use crate::decompile::passes::clight_select::{
 use crate::decompile::passes::{clight_pass, cminor_pass};
 use crate::x86::op::Operation;
 use crate::x86::types::*;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 const CONDITIONS: [&str; 16] = [
@@ -332,7 +332,6 @@ fn emitted_shared_nodes_keep_each_functions_selected_statement_and_identity() {
             param_regs: vec![],
             param_types: vec![],
             stack_size: 0,
-            structure_world: 0,
             statements: HashMap::from([(
                 node,
                 ClightStmt::Sreturn(Some(ClightExpr::EconstLong(
@@ -351,8 +350,6 @@ fn emitted_shared_nodes_keep_each_functions_selected_statement_and_identity() {
             var_decl_idx: Default::default(),
             concrete_declarations: Default::default(),
             binding_plan: Default::default(),
-            loop_headers: Default::default(),
-            switch_heads: Default::default(),
             reg_struct_ids: Default::default(),
             loop_info: Default::default(),
         });

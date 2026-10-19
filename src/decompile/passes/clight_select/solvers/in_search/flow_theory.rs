@@ -27,7 +27,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::decompile::passes::clight_select::solvers::flow::{
-    self, Contradiction, FlowStats, LocKey,
+    self, Contradiction, FlowStats,
 };
 use crate::decompile::passes::clight_select::solvers::in_search::propagator::{
     PropCb, Theory, VetoTheory,
@@ -374,12 +374,6 @@ pub fn describe(c: &Contradiction) -> String {
         flow::aval_label(c.flowing),
         c.kind
     )
-}
-
-/// True when the location is a plain register, which is the only kind the
-/// tie-breaking proxy reports on.
-pub fn is_reg_loc(loc: LocKey) -> bool {
-    matches!(loc, LocKey::Reg(_))
 }
 
 #[cfg(test)]

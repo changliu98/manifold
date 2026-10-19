@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use z3::ast::{Ast, Bool, BV};
+use z3::ast::{Bool, BV};
 use z3::SatResult;
 
 use crate::decompile::analysis::struct_recovery_pass::chunk_byte_size;
@@ -605,7 +605,9 @@ pub(crate) fn existing_byte_objects(db: &DecompileDB) -> Vec<(ledger::ObjectId, 
 
 #[derive(Default)]
 pub(crate) struct Refinement {
+    #[cfg(test)]
     pub objects: Vec<(Address, Node, i64, i64)>,
+    #[cfg(test)]
     pub fields: Vec<(Address, i64, i64, MemoryChunk)>,
     pub counterexamples: Vec<Counterexample>,
     pub records: Vec<RefinementRecord>,

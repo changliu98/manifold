@@ -424,7 +424,7 @@ pub struct DecompileDB {
     /// Compact, stage-separated exact-statement persistence audit.  It keeps
     /// one baseline key set with per-stage multiplicities instead of retaining
     /// a TranslationUnit or full witness map at every post-emit checkpoint.
-    pub cast_post_emit_audit_trail: Option<PostEmitAuditTrail>,
+    pub(crate) cast_post_emit_audit_trail: Option<PostEmitAuditTrail>,
     pub cast_optimized_translation_unit: Option<TranslationUnit>,
 
     // Post-selection field decisions. Function/global interface declarations
@@ -1140,7 +1140,7 @@ impl DecompileDB {
                             Some(RelationCheckpoint { names: snapshot.names.clone(), saved: saved? })
                         })
                     } else { None };
-                    if let (Some(mut next), Some(restart)) = (next, rtl_stage) {
+                    if let (Some(next), Some(restart)) = (next, rtl_stage) {
                         // Keep only explicit hypotheses and proof history from
                         // the rejected epoch. Every other downstream relation
                         // and typed selection is recomputed from original input.

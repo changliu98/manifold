@@ -15,7 +15,7 @@ use crate::decompile::passes::clight_select::syntax::{
     Candidate, CandidateAnalysis, DeclarationContext, FunctionContext,
 };
 use crate::x86::types::XType;
-use crate::x86::types::{ClightBinaryOp, ClightExpr, ClightStmt, ClightType, Ident, RTLReg};
+use crate::x86::types::{ClightBinaryOp, ClightExpr, ClightType, Ident, RTLReg};
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use z3::ast::{Bool, Dynamic, Int};
@@ -109,7 +109,7 @@ impl crate::decompile::passes::clight_select::syntax::Component for CTypes {
                 // The legacy renderer has only class representatives.
                 // Do not let a deeper solver shape satisfy C rules and
                 // then flatten it on output without a concrete owner.
-                variable._eq(xtype_to_ty(t, xtype))
+                variable.eq(xtype_to_ty(t, xtype))
             }
         };
         for (reg, xtype) in interface_pins {
@@ -154,7 +154,7 @@ impl crate::decompile::passes::clight_select::syntax::Component for CTypes {
                 support.push(Bool::or(
                     &proposed
                         .iter()
-                        .map(|ty| cx.declarations[&reg]._eq(ty))
+                        .map(|ty| cx.declarations[&reg].eq(ty))
                         .collect::<Vec<_>>(),
                 ));
             }
@@ -187,7 +187,7 @@ fn interface_class_matches(t: &TypeDt, variable: &Dynamic, class: InterfaceClass
         InterfaceClass::PtrFunc => {
             Bool::and(&[t.is_ptr(variable), t.is_func(&t.pointee(variable))])
         }
-        InterfaceClass::PtrStruct(id) => variable._eq(t.ptr(&t.struct_(id as i64))),
+        InterfaceClass::PtrStruct(id) => variable.eq(t.ptr(&t.struct_(id as i64))),
     }
 }
 
@@ -599,7 +599,7 @@ pub(crate) fn wt_cast_to_reg(t: &TypeDt, from: &Dynamic, lv: &Dynamic) -> Bool {
 
 // "a and b agree on POINTERNESS", the axis the Sset-level SEL-AGREE preference operates on, demoting a crossing whose printed cast gcc rejects.
 fn ptr_class_eq(t: &TypeDt, a: &Dynamic, b: &Dynamic) -> Bool {
-    t.is_ptr(a)._eq(&t.is_ptr(b))
+    t.is_ptr(a).eq(&t.is_ptr(b))
 }
 
 // type_binop legality at the class level, one clause per node; parity with ctyping::type_binop is test-enforced.
@@ -1215,7 +1215,7 @@ fn constrain_stmt(
                 b,
             );
         }
-        (ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner)) => {
+        ClightStmt::Slabel(_, inner) | ClightStmt::Seffect(_, inner) => {
             constrain_stmt(
                 t,
                 tyvar,

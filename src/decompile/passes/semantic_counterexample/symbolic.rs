@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use ascent::lattice::set::Set;
-use z3::ast::{Ast, Bool, BV};
+use z3::ast::{Bool, BV};
 use z3::{SatResult, Solver};
 
 use crate::decompile::elevator::DecompileDB;
@@ -450,6 +450,7 @@ pub(crate) struct Index {
     pub expression: Arc<Expr>,
     pub scale: i64,
     /// Proven maximum displacement, not a sampled or guessed index bound.
+    #[allow(dead_code)]
     pub maximum_delta: i64,
 }
 

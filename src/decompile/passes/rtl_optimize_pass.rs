@@ -277,9 +277,6 @@ fn resolve_next_semantic_node(
     resolved
 }
 
-#[cfg(debug_assertions)]
-use ascent::ascent_par;
-
 /// A fact that remains valid at a CFG point only when every path from the
 /// function entry to that point has passed its introduction without a
 /// relevant redefinition.  Keeping these facts inside one point-keyed lattice
@@ -363,9 +360,9 @@ fn rtl_inline_expr_clobbered_at_use(def_inst: &RTLInst, use_inst: &RTLInst, dst:
     }
 }
 
-/// Small production dataflow used by both imperative RTL optimizer consumers.
-/// Reachability is represented only by the point-keyed lattice; the output
-/// relations materialize queried def/use failures, never all node pairs.
+// Small production dataflow used by both imperative RTL optimizer consumers.
+// Reachability is represented only by the point-keyed lattice; the output
+// relations materialize queried def/use failures, never all node pairs.
 ascent! {
     struct RtlAvailabilityProgram;
 
@@ -441,16 +438,15 @@ struct RtlAvailabilityInfo {
 enum RtlAvailabilityMode {
     Copies,
     InlineExprs,
-    Both,
 }
 
 impl RtlAvailabilityMode {
     fn copies(self) -> bool {
-        matches!(self, Self::Copies | Self::Both)
+        matches!(self, Self::Copies)
     }
 
     fn inline_exprs(self) -> bool {
-        matches!(self, Self::InlineExprs | Self::Both)
+        matches!(self, Self::InlineExprs)
     }
 }
 
@@ -548,322 +544,6 @@ pub(crate) fn available_value_queries(
     queries.iter().copied().filter(|(definition, _, usage)| !unavailable.contains(&(*definition, *usage))).collect()
 }
 
-// Declarative RTL optimizer; _v2 outputs are diffed against the imperative results (debug-only: excluded entirely in release builds where nothing reads them).
-#[cfg(debug_assertions)]
-ascent_par! {
-    #![measure_rule_times]
-
-    pub struct RTLOptimizerProgram;
-
-    // Seeded inputs.
-    relation rtl_opt_inst(Node, RTLInst);
-    relation rtl_opt_succ(Node, Node);
-    relation rtl_opt_func(Node, Address);
-    relation rtl_opt_shared(Node);
-    relation rtl_opt_param(Address, RTLReg);
-    // Mem-indirect call target-load address regs (call node -> address reg), seeded from FunctionCFG::mem_call_addr_uses so the v2 mirror matches the imperative def/use model.
-    relation rtl_opt_mem_call_use(Node, RTLReg);
-    // Exact queried def/use failures from the production point-keyed lattice.
-    relation rtl_opt_copy_unavailable(Node, Node);
-    relation rtl_opt_inline_unavailable(Node, Node);
-
-    // def/use extracted from instructions.
-    relation rtl_def(Address, Node, RTLReg);
-    relation rtl_use(Address, Node, RTLReg);
-
-    // Definitions
-    rtl_def(func, node, *dst) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Iop(_, _, dst));
-
-    rtl_def(func, node, *dst) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Iload(_, _, _, dst));
-
-    rtl_def(func, node, *dst) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Icall(_, _, _, Some(dst), _));
-
-    rtl_def(func, node, *r) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Ibuiltin(_, _, BuiltinArg::BA(r)));
-
-    // Uses
-    rtl_use(func, node, *u) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Iop(_, args, _)),
-        for u in args.iter();
-
-    rtl_use(func, node, *u) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Iload(_, _, args, _)),
-        for u in args.iter();
-
-    rtl_use(func, node, *u) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Istore(_, _, args, _)),
-        for u in args.iter();
-
-    rtl_use(func, node, *src) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Istore(_, _, _, src));
-
-    rtl_use(func, node, *u) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Icall(_, _, args, _, _)),
-        for u in args.iter();
-
-    rtl_use(func, node, *r) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Icall(_, Either::Left(r), _, _, _));
-
-    // A mem-indirect call also uses the regs forming its target-load address.
-    rtl_use(func, node, *r) <--
-        rtl_opt_func(node, func),
-        rtl_opt_mem_call_use(node, r);
-
-    rtl_use(func, node, *u) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Itailcall(_, _, args)),
-        for u in args.iter();
-
-    rtl_use(func, node, *r) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Itailcall(_, Either::Left(r), _));
-
-    rtl_use(func, node, *u) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Icond(_, args, _, _)),
-        for u in args.iter();
-
-    rtl_use(func, node, *r) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Ijumptable(r, _));
-
-    rtl_use(func, node, *r) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Ireturn(r));
-
-    // Ibuiltin uses: flatten BuiltinArg recursively.
-    rtl_use(func, node, reg) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Ibuiltin(_, args, _)),
-        for arg in args.iter(),
-        let regs = flatten_ba_uses(arg),
-        for reg in regs.iter().copied();
-
-    // Live-out via backward dataflow.
-    relation live_out(Node, RTLReg);
-
-    // r live at exit of n if r is used at some successor before being defined there
-    live_out(n, r) <--
-        rtl_opt_succ(n, succ),
-        rtl_use(_, succ, r);
-
-    live_out(n, r) <--
-        rtl_opt_succ(n, succ),
-        live_out(succ, r),
-        !rtl_def(_, succ, r);
-
-    // Single-definition counting.
-    #[local] relation reg_def_count(Address, RTLReg, usize);
-
-    reg_def_count(func, r, count) <--
-        rtl_def(func, _, r),
-        agg count = ascent::aggregators::count() in rtl_def(func, _, r);
-
-    // Self-zero-rewrite: xor r,r or sub r,r where args == dst.
-    relation self_zero_v2(Node);
-    self_zero_v2(*node) <--
-        rtl_opt_inst(node, ?RTLInst::Iop(op, args, dst)),
-        !rtl_opt_shared(node),
-        if matches!(op, Operation::Oxor | Operation::Osub | Operation::Oxorl | Operation::Osubl),
-        if args.len() == 2,
-        if args[0] == args[1],
-        if args[0] == *dst;
-
-    // Copy candidates: Omove with 1 arg and distinct src/dst.
-    #[local] relation copy_candidate(Address, Node, RTLReg, RTLReg); // (func, copy_node, src, dst)
-    copy_candidate(func, node, args[0], *dst) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Iop(Operation::Omove, args, dst)),
-        if args.len() == 1,
-        if args[0] != *dst;
-
-    // dst must be defined exactly once, in this copy_node
-    #[local] relation dst_single_def_at(Address, Node, RTLReg);
-    dst_single_def_at(func, node, *dst) <--
-        copy_candidate(func, node, _, dst),
-        reg_def_count(func, dst, 1),
-        rtl_def(func, node, dst);
-
-    // Every dst use must have the exact copy fact available.  This rejects an
-    // unreachable use, an entry-to-use path bypassing the copy, and any path
-    // that redefines src/dst before the use.
-    #[local] relation copy_use_uncovered(Address, Node, RTLReg); // (func, copy_node, dst)
-    copy_use_uncovered(func, *copy_node, *dst) <--
-        copy_candidate(func, copy_node, _, dst),
-        rtl_use(func, use_node, dst),
-        rtl_opt_copy_unavailable(copy_node, use_node);
-
-    // Unsafe: a use equal to the copy_node itself (dst uses itself at its own def).
-    #[local] relation dst_self_use(Address, Node, RTLReg);
-    dst_self_use(func, node, *dst) <--
-        copy_candidate(func, node, _, dst),
-        rtl_use(func, node, dst);
-
-    // At least one use of dst exists
-    #[local] relation dst_has_use(Address, Node, RTLReg);
-    dst_has_use(func, node, *dst) <--
-        copy_candidate(func, node, _, dst),
-        rtl_use(func, _, dst);
-
-    // A private copy cannot be propagated into a physical shared node: the
-    // other owner contexts may have different reaching definitions.
-    #[local] relation copy_use_shared(Address, Node, RTLReg);
-    copy_use_shared(func, *copy_node, *dst) <--
-        copy_candidate(func, copy_node, _, dst),
-        rtl_use(func, use_node, dst),
-        rtl_opt_shared(use_node);
-
-    // Final substitution: dst -> src
-    relation copy_subst_v2(RTLReg, RTLReg);
-    // Copy-eliminated node (replace with Inop)
-    relation copy_eliminated_v2(Node);
-
-    copy_subst_v2(*dst, *src), copy_eliminated_v2(*copy_node) <--
-        copy_candidate(func, copy_node, src, dst),
-        !rtl_opt_shared(copy_node),
-        !rtl_opt_param(func, dst),
-        !rtl_opt_mem_call_use(_, dst),
-        dst_single_def_at(func, copy_node, dst),
-        dst_has_use(func, copy_node, dst),
-        !dst_self_use(func, copy_node, dst),
-        !copy_use_shared(func, copy_node, dst),
-        !copy_use_uncovered(func, copy_node, dst);
-
-    // Resolved substitutions: follow dst -> src chains until fixpoint.
-    relation copy_subst_resolved_v2(RTLReg, RTLReg);
-    copy_subst_resolved_v2(dst, src) <-- copy_subst_v2(dst, src), !copy_subst_v2(src, _);
-    copy_subst_resolved_v2(dst, resolved) <--
-        copy_subst_v2(dst, src),
-        copy_subst_resolved_v2(src, resolved);
-
-    // Dead store: def not in live_out, is Iop or Iload, not param.
-    #[local] relation effect_contract_point(Node);
-    effect_contract_point(*node), effect_contract_point(spec.capture) <--
-        rtl_opt_inst(node, ?RTLInst::Iop(Operation::Oflagselect(spec), _, _));
-    relation dead_store_v2(Node);
-    dead_store_v2(*node) <--
-        rtl_def(func, node, reg),
-        !effect_contract_point(node),
-        !rtl_opt_shared(node),
-        !rtl_opt_param(func, reg),
-        !live_out(node, reg),
-        rtl_opt_inst(node, inst),
-        if matches!(inst, RTLInst::Iop(_,_,_) | RTLInst::Iload(_,_,_,_));
-
-    // Dead call dst: Icall with dst not live-out; drop the dst, keep the call.
-    relation dead_call_dst_v2(Node);
-    dead_call_dst_v2(*node) <--
-        rtl_opt_func(node, func),
-        rtl_opt_inst(node, ?RTLInst::Icall(_, _, _, Some(dst), _)),
-        !rtl_opt_shared(node),
-        !rtl_opt_param(func, dst),
-        !live_out(node, dst);
-
-    // Inline-temp candidates: single-def single-use Iop whose args are live at the use site.
-    #[local] relation reg_distinct_uses(Address, RTLReg, usize);
-    // Count distinct use-nodes per reg; rtl_use is (func, node, reg) so set semantics apply.
-    reg_distinct_uses(func, r, count) <--
-        rtl_use(func, _, r),
-        agg count = ascent::aggregators::count() in rtl_use(func, _, r);
-
-    #[local] relation inline_temp_def(Address, RTLReg, Node);
-    inline_temp_def(func, *reg, *def_node) <--
-        reg_def_count(func, reg, 1),
-        rtl_def(func, def_node, reg),
-        !rtl_opt_shared(def_node),
-        !rtl_opt_param(func, reg),
-        rtl_opt_inst(def_node, ?RTLInst::Iop(_, _, _));
-
-    #[local] relation inline_temp_use(Address, RTLReg, Node);
-    inline_temp_use(func, *reg, *use_node) <--
-        reg_distinct_uses(func, reg, 1),
-        rtl_use(func, use_node, reg),
-        !rtl_opt_shared(use_node);
-
-    // def_args must be in live_in(use_node); live_in(u) = use(u) | (live_out(u) \ def(u)).
-    #[local] relation live_in(Node, RTLReg);
-    live_in(n, r) <-- rtl_use(_, n, r);
-    live_in(n, r) <--
-        live_out(n, r),
-        !rtl_def(_, n, r);
-
-    #[local] relation def_arg_not_live_at_use(Address, RTLReg);
-    def_arg_not_live_at_use(func, *reg) <--
-        inline_temp_def(func, reg, def_node),
-        inline_temp_use(func, reg, use_node),
-        rtl_opt_inst(def_node, ?RTLInst::Iop(_, args, _)),
-        for a in args.iter(),
-        !live_in(use_node, a);
-
-    #[local] relation inline_temp_unavailable(Address, RTLReg);
-    inline_temp_unavailable(func, *reg) <--
-        inline_temp_def(func, reg, def_node),
-        inline_temp_use(func, reg, use_node),
-        rtl_opt_inline_unavailable(def_node, use_node);
-
-    relation inline_temp_v2(RTLReg);
-    inline_temp_v2(*reg) <--
-        inline_temp_def(func, reg, _),
-        inline_temp_use(func, reg, _),
-        !def_arg_not_live_at_use(func, reg),
-        !inline_temp_unavailable(func, reg);
-}
-
-// Build and run RTLOptimizerProgram over a PassContext; returns the program for inspection.
-#[cfg(debug_assertions)]
-fn run_rtl_optimizer_program(ctx: &PassContext) -> RTLOptimizerProgram {
-    let mut prog = RTLOptimizerProgram::default();
-
-    for (&func_addr, func) in &ctx.functions {
-        let du = DefUseInfo::build(func);
-        let availability = analyze_rtl_availability(func, &du, RtlAvailabilityMode::Both);
-        for (&node, inst) in &func.inst {
-            prog.rtl_opt_inst.push((node, inst.clone()));
-            prog.rtl_opt_func.push((node, func_addr));
-        }
-        for &node in &func.shared_nodes {
-            prog.rtl_opt_shared.push((node,));
-        }
-        for (&src, dsts) in &func.succs {
-            if func.inst.contains_key(&src) {
-                for &dst in dsts {
-                    prog.rtl_opt_succ.push((src, dst));
-                }
-            }
-        }
-        for &reg in &func.params {
-            prog.rtl_opt_param.push((func_addr, reg));
-        }
-        for (&node, regs) in &func.mem_call_addr_uses {
-            for &r in regs {
-                prog.rtl_opt_mem_call_use.push((node, r));
-            }
-        }
-        for &(intro, use_node) in &availability.copy_unavailable {
-            prog.rtl_opt_copy_unavailable.push((intro, use_node));
-        }
-        for &(intro, use_node) in &availability.inline_unavailable {
-            prog.rtl_opt_inline_unavailable.push((intro, use_node));
-        }
-    }
-
-    prog.run();
-    prog
-}
-
 #[derive(Debug, Default, Clone, Copy)]
 struct RtlOptStats {
     copies: usize,
@@ -889,16 +569,6 @@ impl RtlOptStats {
             || self.inline_temps > 0
             || self.zero_rewrites > 0
     }
-}
-
-#[cfg(debug_assertions)]
-struct AscentV2Snapshot {
-    self_zero: HashSet<Node>,
-    dead_store: HashSet<Node>,
-    copy_eliminated: HashSet<Node>,
-    dead_call: HashSet<Node>,
-    copy_subst: HashMap<RTLReg, RTLReg>,
-    inline_temp: HashSet<RTLReg>,
 }
 
 fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
@@ -954,37 +624,6 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
         .map(|&(addr, reg)| (addr, reg))
         .collect();
 
-    // RTLOptimizerProgram is the Ascent v2 of the imperative optimizer. Its outputs are only consumed by the debug-only RTL_V2_DIFF block below, so in release builds we skip it entirely (dominates the RTL pass at ~57s on a 700KB binary).
-    #[cfg(debug_assertions)]
-    let ascent_v2: Option<AscentV2Snapshot> = if std::env::var("RTL_V2_DIFF").is_ok() {
-        let ascent_opt = run_rtl_optimizer_program(&ctx);
-        let self_zero: HashSet<Node> = ascent_opt.self_zero_v2.iter().map(|&(n,)| n).collect();
-        let dead_store: HashSet<Node> = ascent_opt.dead_store_v2.iter().map(|&(n,)| n).collect();
-        let copy_eliminated: HashSet<Node> = ascent_opt
-            .copy_eliminated_v2
-            .iter()
-            .map(|&(n,)| n)
-            .collect();
-        let dead_call: HashSet<Node> = ascent_opt.dead_call_dst_v2.iter().map(|&(n,)| n).collect();
-        let copy_subst: HashMap<RTLReg, RTLReg> = ascent_opt
-            .copy_subst_resolved_v2
-            .iter()
-            .map(|&(d, s)| (d, s))
-            .collect();
-        let inline_temp: HashSet<RTLReg> =
-            ascent_opt.inline_temp_v2.iter().map(|&(r,)| r).collect();
-        Some(AscentV2Snapshot {
-            self_zero,
-            dead_store,
-            copy_eliminated,
-            dead_call,
-            copy_subst,
-            inline_temp,
-        })
-    } else {
-        None
-    };
-
     let results: Vec<_> = ctx
         .functions
         .par_iter_mut()
@@ -1007,42 +646,14 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
                 .flat_map(|node| func.inst.get(&node).into_iter().flat_map(move |inst|
                     inst_def_use(inst).1.into_iter().map(move |r|((node,r),r)))).collect();
 
-            // Track iteration-1 imperative outputs for diffing against Ascent.
-            let imp_self_zero: HashSet<Node> = func
-                .inst
-                .iter()
-                .filter_map(|(&n, inst)| match inst {
-                    RTLInst::Iop(op, args, dst)
-                        if args.len() == 2
-                            && args[0] == args[1]
-                            && args[0] == *dst
-                            && matches!(
-                                op,
-                                Operation::Oxor
-                                    | Operation::Osub
-                                    | Operation::Oxorl
-                                    | Operation::Osubl
-                            ) =>
-                    {
-                        Some(n)
-                    }
-                    _ => None,
-                })
-                .collect();
-
             let folded_static_branch = fold_static_eq_branches(func);
 
             let zero_rewrites = self_zero_rewrite(func);
 
             let mut copies = 0usize;
             let mut dead = 0usize;
-            let mut iter1_copy_subst: HashMap<RTLReg, RTLReg> = HashMap::new();
-            let mut iter1_copy_eliminated_nodes: HashSet<Node> = HashSet::new();
-            let mut iter1_dead_store_nodes: HashSet<Node> = HashSet::new();
-            let mut iter1_dead_call_nodes: HashSet<Node> = HashSet::new();
             let mut copy_eliminated_nodes: HashSet<Node> = HashSet::new();
             let mut dead_store_nodes: HashSet<Node> = HashSet::new();
-            let mut first_iter = true;
             loop {
                 let du = DefUseInfo::build(func);
                 let liveness = LivenessInfo::build(func, &du);
@@ -1051,29 +662,18 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
                 for value in effect_aliases.values_mut() {
                     if let Some(&replacement) = copy_subst.get(value) { *value = replacement; }
                 }
-                if first_iter {
-                    iter1_copy_subst = copy_subst.clone();
-                    iter1_copy_eliminated_nodes = copy_kills.clone();
-                }
                 copy_eliminated_nodes.extend(copy_kills);
                 for (&dst, &src) in &copy_subst {
                     if let Some(&ty) = func_var_types.get(&dst) {
                         func_var_types.entry(src).or_insert(ty);
                     }
                 }
-                let (d, dead_store_kills, dead_call_kills) =
-                    dead_store_elimination(func, &du, &liveness);
-
-                if first_iter {
-                    iter1_dead_store_nodes = dead_store_kills.clone();
-                    iter1_dead_call_nodes = dead_call_kills;
-                }
+                let (d, dead_store_kills) = dead_store_elimination(func, &du, &liveness);
                 dead_store_nodes.extend(dead_store_kills);
 
                 if c == 0 && d == 0 {
                     break;
                 }
-                first_iter = false;
                 copies += c;
                 dead += d;
             }
@@ -1101,13 +701,7 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
                 },
                 inlines,
                 func_var_types,
-                // iteration-1 imperative snapshots for v2 diffing
                 func_addr,
-                imp_self_zero,
-                iter1_copy_subst,
-                iter1_copy_eliminated_nodes,
-                iter1_dead_store_nodes,
-                iter1_dead_call_nodes,
                 copy_eliminated_nodes,
                 dead_store_nodes,
                 became_void,
@@ -1119,11 +713,6 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
     let mut stats = RtlOptStats::default();
     let mut merged_var_types = var_types;
 
-    let mut imp_self_zero_all: HashSet<Node> = HashSet::new();
-    let mut imp_copy_subst_all: HashMap<RTLReg, RTLReg> = HashMap::new();
-    let mut imp_copy_eliminated_all: HashSet<Node> = HashSet::new();
-    let mut imp_dead_store_all: HashSet<Node> = HashSet::new();
-    let mut imp_dead_call_all: HashSet<Node> = HashSet::new();
     let mut copy_eliminated_all: HashSet<Node> = HashSet::new();
     let mut dead_store_all: HashSet<Node> = HashSet::new();
     let mut newly_void: HashSet<Address> = HashSet::new();
@@ -1134,11 +723,6 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
         inlines,
         func_vt,
         fa,
-        isz,
-        icp,
-        icpe,
-        idst,
-        idcl,
         copy_kills,
         dead_store_kills,
         became_void,
@@ -1148,141 +732,12 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
         stats.accumulate(func_stats);
         ctx.inline_temps.extend(inlines);
         merged_var_types.extend(func_vt);
-        imp_self_zero_all.extend(isz);
-        for (d, s) in icp {
-            imp_copy_subst_all.insert(d, s);
-        }
-        imp_copy_eliminated_all.extend(icpe);
-        imp_dead_store_all.extend(idst);
-        imp_dead_call_all.extend(idcl);
         copy_eliminated_all.extend(copy_kills);
         dead_store_all.extend(dead_store_kills);
         effect_aliases_all.extend(effect_aliases.into_iter().filter_map(|((node,original),current)|
             (original!=current).then_some((fa,node,original,current))));
         if became_void {
             newly_void.insert(fa);
-        }
-    }
-
-    // Diff logging: compare Ascent v2 vs imperative iteration-1 outputs (uses eprintln so diffs surface during test runs, where no env_logger is configured).
-    #[cfg(debug_assertions)]
-    if let Some(v2) = &ascent_v2 {
-        let self_zero_missing: Vec<_> = imp_self_zero_all
-            .difference(&v2.self_zero)
-            .copied()
-            .collect();
-        let self_zero_extra: Vec<_> = v2
-            .self_zero
-            .difference(&imp_self_zero_all)
-            .copied()
-            .collect();
-        if !self_zero_missing.is_empty() || !self_zero_extra.is_empty() {
-            eprintln!(
-                "rtl_v2 diff self_zero: imperative={} ascent={} missing_from_ascent={} extra_in_ascent={}",
-                imp_self_zero_all.len(), v2.self_zero.len(),
-                self_zero_missing.len(), self_zero_extra.len()
-            );
-        }
-        let ds_missing: Vec<_> = imp_dead_store_all
-            .difference(&v2.dead_store)
-            .copied()
-            .collect();
-        let ds_extra: Vec<_> = v2
-            .dead_store
-            .difference(&imp_dead_store_all)
-            .copied()
-            .collect();
-        if !ds_missing.is_empty() || !ds_extra.is_empty() {
-            eprintln!(
-                "rtl_v2 diff dead_store (iter1): imperative={} ascent={} missing_from_ascent={} extra_in_ascent={}",
-                imp_dead_store_all.len(), v2.dead_store.len(),
-                ds_missing.len(), ds_extra.len()
-            );
-        }
-        let ce_missing: Vec<_> = imp_copy_eliminated_all
-            .difference(&v2.copy_eliminated)
-            .copied()
-            .collect();
-        let ce_extra: Vec<_> = v2
-            .copy_eliminated
-            .difference(&imp_copy_eliminated_all)
-            .copied()
-            .collect();
-        if !ce_missing.is_empty() || !ce_extra.is_empty() {
-            eprintln!(
-                "rtl_v2 diff copy_eliminated (iter1): imperative={} ascent={} missing_from_ascent={} extra_in_ascent={}",
-                imp_copy_eliminated_all.len(), v2.copy_eliminated.len(),
-                ce_missing.len(), ce_extra.len()
-            );
-        }
-        let dc_missing: Vec<_> = imp_dead_call_all
-            .difference(&v2.dead_call)
-            .copied()
-            .collect();
-        let dc_extra: Vec<_> = v2
-            .dead_call
-            .difference(&imp_dead_call_all)
-            .copied()
-            .collect();
-        if !dc_missing.is_empty() || !dc_extra.is_empty() {
-            eprintln!(
-                "rtl_v2 diff dead_call_dst (iter1): imperative={} ascent={} missing={} extra={}",
-                imp_dead_call_all.len(),
-                v2.dead_call.len(),
-                dc_missing.len(),
-                dc_extra.len()
-            );
-        }
-        // ascent copy_subst is path-conservative; expected subset of imperative.
-        let cp_missing: Vec<_> = imp_copy_subst_all
-            .iter()
-            .filter(|&(d, _)| !v2.copy_subst.contains_key(d))
-            .map(|(&d, &s)| (d, s))
-            .collect();
-        let cp_mismatch: Vec<_> = v2
-            .copy_subst
-            .iter()
-            .filter_map(|(&d, &s_asc)| {
-                imp_copy_subst_all.get(&d).and_then(|&s_imp| {
-                    if s_asc != s_imp {
-                        Some((d, s_imp, s_asc))
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
-        let cp_extra: Vec<_> = v2
-            .copy_subst
-            .iter()
-            .filter(|&(d, _)| !imp_copy_subst_all.contains_key(d))
-            .map(|(&d, &s)| (d, s))
-            .collect();
-        if !cp_missing.is_empty() || !cp_extra.is_empty() || !cp_mismatch.is_empty() {
-            eprintln!(
-                "rtl_v2 diff copy_subst (iter1): imperative={} ascent={} ascent_missing={} ascent_extra={} value_mismatch={}",
-                imp_copy_subst_all.len(), v2.copy_subst.len(),
-                cp_missing.len(), cp_extra.len(), cp_mismatch.len()
-            );
-        }
-        let it_missing: Vec<_> = ctx
-            .inline_temps
-            .difference(&v2.inline_temp)
-            .copied()
-            .collect();
-        let it_extra: Vec<_> = v2
-            .inline_temp
-            .difference(&ctx.inline_temps)
-            .copied()
-            .collect();
-        if !it_missing.is_empty() || !it_extra.is_empty() {
-            eprintln!(
-                "rtl_v2 diff inline_temp: imperative={} ascent={} missing={} extra={}",
-                ctx.inline_temps.len(),
-                v2.inline_temp.len(),
-                it_missing.len(),
-                it_extra.len()
-            );
         }
     }
 
@@ -1866,8 +1321,6 @@ impl IRPass for RTLSupersetPass {
 }
 
 pub(crate) struct FunctionCFG {
-    #[allow(dead_code)]
-    pub(crate) func_addr: Address,
     pub(crate) entry: Node,
     pub(crate) nodes: BTreeSet<Node>,
     pub(crate) inst: BTreeMap<Node, RTLInst>,
@@ -2383,7 +1836,6 @@ impl PassContext {
             );
 
             let mut func = FunctionCFG {
-                func_addr,
                 entry,
                 nodes,
                 inst: insts.clone(),
@@ -3184,7 +2636,7 @@ pub(crate) fn dead_store_elimination(
     func: &mut FunctionCFG,
     du: &DefUseInfo,
     liveness: &LivenessInfo,
-) -> (usize, HashSet<Node>, HashSet<Node>) {
+) -> (usize, HashSet<Node>) {
     // A memory/flag bundle can only be removed by a checked whole-bundle
     // elimination. Register liveness alone is not a memory-read certificate.
     let contract_points: HashSet<Node> = func.inst.iter().flat_map(|(&node, inst)| {
@@ -3261,11 +2713,7 @@ pub(crate) fn dead_store_elimination(
         }
     }
 
-    (
-        count,
-        dead_nodes.into_iter().collect(),
-        dead_call_nodes.into_iter().collect(),
-    )
+    (count, dead_nodes.into_iter().collect())
 }
 
 pub(crate) fn nop_collapse(func: &mut FunctionCFG) -> usize {
@@ -3514,7 +2962,6 @@ mod tests {
             preds.entry(dst).or_default().push(src);
         }
         FunctionCFG {
-            func_addr: 0x1000,
             entry,
             nodes: inst.keys().copied().collect(),
             inst,
@@ -3937,7 +3384,7 @@ mod tests {
         let mut unprotected = make_function();
         let du = DefUseInfo::build(&unprotected);
         let liveness = LivenessInfo::build(&unprotected, &du);
-        let (removed, _, _) = dead_store_elimination(&mut unprotected, &du, &liveness);
+        let (removed, _) = dead_store_elimination(&mut unprotected, &du, &liveness);
         assert_eq!(removed, 1);
 
         let mut protected = make_function();
@@ -3949,7 +3396,7 @@ mod tests {
 
         let du = DefUseInfo::build(&protected);
         let liveness = LivenessInfo::build(&protected, &du);
-        let (removed, _, _) = dead_store_elimination(&mut protected, &du, &liveness);
+        let (removed, _) = dead_store_elimination(&mut protected, &du, &liveness);
         assert_eq!(removed, 0);
         assert_eq!(protected.inst.get(&address_node), Some(&address_inst));
     }
@@ -4603,7 +4050,6 @@ mod tests {
         let callee_temp = 3;
 
         let mut func = FunctionCFG {
-            func_addr: 0x1000,
             entry: copy,
             nodes: BTreeSet::from([copy, call, ret]),
             inst: BTreeMap::from([
@@ -4912,7 +4358,6 @@ mod tests {
     fn a_multi_def_slot_reg_does_not_fold_a_runtime_branch() {
         let [def_a, def_b, branch, taken, untaken, slot_reg, other_reg] = synthetic_ids();
         let build = || FunctionCFG {
-            func_addr: 0x1000,
             entry: def_a,
             nodes: BTreeSet::from([def_a, def_b, branch, taken, untaken]),
             inst: BTreeMap::from([

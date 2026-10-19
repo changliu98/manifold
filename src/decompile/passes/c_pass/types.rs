@@ -25,7 +25,6 @@ pub enum IntSize {
     Short,
     Int,
     Long,
-    #[allow(dead_code)]
     LongLong,
     // __int128 (gcc/clang extension), emitted only for the 64x64->128 high-multiply lowering; never selected.
     Int128,
@@ -56,9 +55,7 @@ impl TypeQualifiers {
 pub enum StorageClass {
     #[default]
     Auto,
-    #[allow(dead_code)]
     Static,
-    #[allow(dead_code)]
     Extern,
     #[allow(dead_code)]
     Register,
@@ -79,10 +76,8 @@ pub enum CType {
     Union(String),
     #[allow(dead_code)]
     Enum(String),
-    #[allow(dead_code)]
     TypedefName(String),
     Bool,
-    #[allow(dead_code)]
     Qualified(Box<CType>, TypeQualifiers),
 }
 
@@ -157,7 +152,6 @@ impl CType {
         }
     }
 
-    #[allow(dead_code)]
     pub fn is_integer(&self) -> bool {
         match self {
             CType::Int(_, _) | CType::Bool => true,
@@ -166,7 +160,6 @@ impl CType {
         }
     }
 
-    #[allow(dead_code)]
     pub fn is_float(&self) -> bool {
         match self {
             CType::Float(_) => true,
@@ -183,7 +176,6 @@ impl CType {
         }
     }
 
-    #[allow(dead_code)]
     pub fn pointee(&self) -> Option<&CType> {
         match self {
             CType::Pointer(inner, _) => Some(inner),
@@ -235,9 +227,7 @@ pub enum BinaryOp {
     Le,
     Gt,
     Ge,
-    #[allow(dead_code)]
     And,
-    #[allow(dead_code)]
     Or,
     Comma,
 }
@@ -342,14 +332,10 @@ pub struct IntLiteral {
 pub enum IntLiteralSuffix {
     #[default]
     None,
-    #[allow(dead_code)]
     U,
     L,
-    #[allow(dead_code)]
     UL,
-    #[allow(dead_code)]
     LL,
-    #[allow(dead_code)]
     ULL,
 }
 
@@ -425,7 +411,6 @@ pub enum CExpr {
     Member(Box<CExpr>, String),
     MemberPtr(Box<CExpr>, String),
 
-    #[allow(dead_code)]
     Index(Box<CExpr>, Box<CExpr>),
 
     SizeofType(CType),
@@ -434,20 +419,17 @@ pub enum CExpr {
 
     AlignofType(CType),
 
-    #[allow(dead_code)]
     CompoundLit(CType, Vec<Initializer>),
 
     #[allow(dead_code)]
     Generic(Box<CExpr>, Vec<(Option<CType>, CExpr)>),
 
-    #[allow(dead_code)]
     Paren(Box<CExpr>),
 
     #[allow(dead_code)]
     StmtExpr(Vec<CStmt>, Box<CExpr>),
 }
 
-#[allow(dead_code)]
 impl CExpr {
     pub fn int(value: i64) -> Self {
         CExpr::IntLit(IntLiteral {
@@ -483,18 +465,6 @@ impl CExpr {
 
     pub fn binary(op: BinaryOp, lhs: CExpr, rhs: CExpr) -> Self {
         CExpr::Binary(op, Box::new(lhs), Box::new(rhs))
-    }
-
-    pub fn index(arr: CExpr, idx: CExpr) -> Self {
-        CExpr::Index(Box::new(arr), Box::new(idx))
-    }
-
-    pub fn member(expr: CExpr, field: impl Into<String>) -> Self {
-        CExpr::Member(Box::new(expr), field.into())
-    }
-
-    pub fn member_ptr(expr: CExpr, field: impl Into<String>) -> Self {
-        CExpr::MemberPtr(Box::new(expr), field.into())
     }
 
     pub fn has_side_effects(&self) -> bool {
@@ -538,9 +508,7 @@ impl CExpr {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Initializer {
-    #[allow(dead_code)]
     Expr(CExpr),
-    #[allow(dead_code)]
     List(Vec<InitItem>),
     #[allow(dead_code)]
     String(StringLiteral),
@@ -587,9 +555,7 @@ pub struct InitItem {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Designator {
-    #[allow(dead_code)]
     Field(String),
-    #[allow(dead_code)]
     Index(CExpr),
     #[allow(dead_code)]
     Range(CExpr, CExpr),
@@ -626,7 +592,6 @@ pub enum CStmt {
 
     Labeled(Label, Box<CStmt>),
 
-    #[allow(dead_code)]
     Decl(Vec<VarDecl>),
 
     Sequence(Vec<CStmt>),
@@ -643,7 +608,6 @@ pub enum ForInit {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CBlockItem {
     Stmt(CStmt),
-    #[allow(dead_code)]
     Decl(Vec<VarDecl>),
 }
 
@@ -664,7 +628,6 @@ pub struct VarDecl {
     pub loc: SourceLoc,
 }
 
-#[allow(dead_code)]
 impl VarDecl {
     pub fn new(name: impl Into<String>, ty: CType) -> Self {
         Self {
@@ -873,22 +836,6 @@ impl TranslationUnit {
         let idx = self.decls.len();
         self.decls.push(TopLevelDecl::VarDecl(var));
         self.symbols.insert(name, idx);
-    }
-
-    /// Rebuild `symbols` from actual `decls` positions. Must be called after any operation that reorders or prepends to `decls`.
-    pub fn rebuild_symbols(&mut self) {
-        self.symbols.clear();
-        for (i, decl) in self.decls.iter().enumerate() {
-            let name = match decl {
-                TopLevelDecl::FuncDef(f) => Some(f.name.clone()),
-                TopLevelDecl::FuncDecl(f) => Some(f.name.clone()),
-                TopLevelDecl::VarDecl(v) => Some(v.name.clone()),
-                _ => None,
-            };
-            if let Some(name) = name {
-                self.symbols.entry(name).or_insert(i);
-            }
-        }
     }
 }
 

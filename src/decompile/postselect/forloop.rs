@@ -12,7 +12,7 @@ fn has_goto_or_label(s: &CStmt) -> bool {
     match s {
         CStmt::Goto(_) => true,
         CStmt::Labeled(Label::Named(_), _) => true,
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => has_goto_or_label(inner),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner) => has_goto_or_label(inner),
         CStmt::Block(items) => items.iter().any(|it| match it {
             CBlockItem::Stmt(st) => has_goto_or_label(st),
             _ => false,
@@ -30,7 +30,7 @@ fn has_goto_or_label(s: &CStmt) -> bool {
 fn count_gotos(s: &CStmt) -> usize {
     match s {
         CStmt::Goto(_) => 1,
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => count_gotos(inner),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner) => count_gotos(inner),
         CStmt::Block(items) => items
             .iter()
             .map(|it| match it {
@@ -49,7 +49,7 @@ fn count_gotos(s: &CStmt) -> usize {
 fn count_loops(s: &CStmt) -> usize {
     let here = matches!(s, CStmt::While(..) | CStmt::For(..) | CStmt::DoWhile(..)) as usize;
     let nested = match s {
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => count_loops(inner),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner) => count_loops(inner),
         CStmt::Block(items) => items
             .iter()
             .map(|it| match it {
@@ -72,7 +72,7 @@ fn collect_labels(s: &CStmt, out: &mut HashSet<String>) {
             out.insert(n.clone());
             collect_labels(inner, out);
         }
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_labels(inner, out),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner) => collect_labels(inner, out),
         CStmt::Block(items) => items.iter().for_each(|it| {
             if let CBlockItem::Stmt(st) = it {
                 collect_labels(st, out)
@@ -96,7 +96,7 @@ fn collect_labels(s: &CStmt, out: &mut HashSet<String>) {
 fn collect_goto_targets(s: &CStmt, out: &mut Vec<String>) {
     match s {
         CStmt::Goto(t) => out.push(t.clone()),
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_goto_targets(inner, out),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner) => collect_goto_targets(inner, out),
         CStmt::Block(items) => items.iter().for_each(|it| {
             if let CBlockItem::Stmt(st) = it {
                 collect_goto_targets(st, out)
@@ -140,7 +140,7 @@ fn stmt_diverges(s: &CStmt) -> bool {
             })
             .map_or(false, stmt_diverges),
         CStmt::Sequence(v) => v.last().map_or(false, stmt_diverges),
-        (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => stmt_diverges(b),
+        CStmt::Labeled(_, b) | CStmt::Effect(_, b) => stmt_diverges(b),
         _ => false,
     }
 }
@@ -159,7 +159,7 @@ fn contains_backedge(s: &CStmt, h: &str) -> bool {
             _ => false,
         }),
         CStmt::Sequence(v) => v.iter().any(|x| contains_backedge(x, h)),
-        (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => contains_backedge(b, h),
+        CStmt::Labeled(_, b) | CStmt::Effect(_, b) => contains_backedge(b, h),
         _ => false,
     }
 }
@@ -178,7 +178,7 @@ fn captures_break_or_continue(s: &CStmt) -> bool {
             _ => false,
         }),
         CStmt::Sequence(v) => v.iter().any(captures_break_or_continue),
-        (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => captures_break_or_continue(b),
+        CStmt::Labeled(_, b) | CStmt::Effect(_, b) => captures_break_or_continue(b),
         _ => false,
     }
 }
@@ -496,7 +496,7 @@ fn stacked_labels(s: &CStmt) -> HashSet<String> {
 fn is_loop_stmt(s: &CStmt) -> bool {
     match s {
         CStmt::While(..) | CStmt::DoWhile(..) | CStmt::For(..) => true,
-        (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => is_loop_stmt(b),
+        CStmt::Labeled(_, b) | CStmt::Effect(_, b) => is_loop_stmt(b),
         _ => false,
     }
 }
@@ -602,7 +602,7 @@ fn wrap_block(v: Vec<CStmt>) -> CStmt {
 fn run_contains_loop_or_switch(s: &CStmt) -> bool {
     match s {
         CStmt::While(..) | CStmt::DoWhile(..) | CStmt::For(..) | CStmt::Switch(..) => true,
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => run_contains_loop_or_switch(inner),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner) => run_contains_loop_or_switch(inner),
         CStmt::Block(items) => items.iter().any(|it| match it {
             CBlockItem::Stmt(st) => run_contains_loop_or_switch(st),
             _ => false,
@@ -650,7 +650,7 @@ fn replace_all_gotos(s: &mut CStmt, l: &str, block: &[CStmt]) -> usize {
                 n += replace_all_gotos(x, l, block);
             }
         }
-        CStmt::Switch(_, b) | CStmt::While(_, b) | CStmt::DoWhile(b, _) | (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => {
+        CStmt::Switch(_, b) | CStmt::While(_, b) | CStmt::DoWhile(b, _) | CStmt::Labeled(_, b) | CStmt::Effect(_, b) => {
             n += replace_all_gotos(b, l, block)
         }
         CStmt::For(_, _, _, b) => n += replace_all_gotos(b, l, block),
@@ -701,7 +701,7 @@ fn stmt_tree_fits_budget(stmt: &CStmt, remaining: &mut usize) -> bool {
         }
         CStmt::Switch(_, body)
         | CStmt::While(_, body)
-        | (CStmt::Labeled(_, body) | CStmt::Effect(_, body))
+        | CStmt::Labeled(_, body) | CStmt::Effect(_, body)
         | CStmt::For(_, _, _, body) => stmt_tree_fits_budget(body, remaining),
         CStmt::DoWhile(body, _) => stmt_tree_fits_budget(body, remaining),
         CStmt::Empty
@@ -762,7 +762,7 @@ fn run_has_decl(run: &[CStmt]) -> bool {
             CStmt::Switch(_, b)
             | CStmt::While(_, b)
             | CStmt::DoWhile(b, _)
-            | (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => has(b),
+            | CStmt::Labeled(_, b) | CStmt::Effect(_, b) => has(b),
             CStmt::For(_, _, _, b) => has(b),
             _ => false,
         }
@@ -851,7 +851,7 @@ fn extract_inlinable(
         CStmt::Sequence(v) => v.iter_mut().find_map(|st| extract_inlinable(st, counts)),
         CStmt::If(_, t, e) => extract_inlinable(t, counts)
             .or_else(|| e.as_mut().and_then(|x| extract_inlinable(x, counts))),
-        CStmt::Switch(_, b) | CStmt::While(_, b) | CStmt::DoWhile(b, _) | (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => {
+        CStmt::Switch(_, b) | CStmt::While(_, b) | CStmt::DoWhile(b, _) | CStmt::Labeled(_, b) | CStmt::Effect(_, b) => {
             extract_inlinable(b, counts)
         }
         CStmt::For(_, _, _, b) => extract_inlinable(b, counts),
@@ -1041,7 +1041,7 @@ mod tests {
             }
             CStmt::Switch(_, body)
             | CStmt::While(_, body)
-            | (CStmt::Labeled(_, body) | CStmt::Effect(_, body))
+            | CStmt::Labeled(_, body) | CStmt::Effect(_, body)
             | CStmt::For(_, _, _, body) => stmt_tree_nodes(body),
             CStmt::DoWhile(body, _) => stmt_tree_nodes(body),
             _ => 0,
@@ -1125,7 +1125,7 @@ mod tests {
     fn count_breaks(s: &CStmt) -> usize {
         match s {
             CStmt::Break => 1,
-            (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => count_breaks(b),
+            CStmt::Labeled(_, b) | CStmt::Effect(_, b) => count_breaks(b),
             CStmt::Block(items) => items
                 .iter()
                 .map(|it| match it {

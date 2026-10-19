@@ -3,7 +3,7 @@ fn rl_diverts(s: &CStmt) -> bool {
     match s {
         CStmt::Return(_) | CStmt::Goto(_) | CStmt::Break | CStmt::Continue => true,
         CStmt::If(_, t, Some(e)) => rl_diverts(t) && rl_diverts(e),
-        (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => rl_diverts(b),
+        CStmt::Labeled(_, b) | CStmt::Effect(_, b) => rl_diverts(b),
         CStmt::Block(items) => items.iter().any(|i| match i {
             CBlockItem::Stmt(st) => rl_diverts(st),
             _ => false,
@@ -19,7 +19,7 @@ fn rl_contains_continue(s: &CStmt) -> bool {
         CStmt::If(_, t, e) => {
             rl_contains_continue(t) || e.as_ref().is_some_and(|x| rl_contains_continue(x))
         }
-        (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => rl_contains_continue(b),
+        CStmt::Labeled(_, b) | CStmt::Effect(_, b) => rl_contains_continue(b),
         CStmt::Block(items) => items.iter().any(|i| match i {
             CBlockItem::Stmt(st) => rl_contains_continue(st),
             _ => false,
@@ -83,7 +83,7 @@ fn rl_count_spin_loops(s: &CStmt) -> usize {
                 children.push(x);
             }
         }
-        CStmt::Switch(_, b) | (CStmt::Labeled(_, b) | CStmt::Effect(_, b)) => children.push(b),
+        CStmt::Switch(_, b) | CStmt::Labeled(_, b) | CStmt::Effect(_, b) => children.push(b),
         CStmt::Block(items) => {
             for i in items {
                 if let CBlockItem::Stmt(st) = i {

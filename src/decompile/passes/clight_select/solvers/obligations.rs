@@ -116,6 +116,7 @@ impl<'a> Obligations<'a> {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct Integer<'a>(pub &'a RTLInst);
 pub(crate) struct IntegerAt<'a>(pub crate::x86::types::Node, pub &'a RTLInst);
 pub(crate) struct WriteTarget<'a>(pub &'a memory_theory::WriteContract);
@@ -130,6 +131,7 @@ fn native_registers(inst: &RTLInst) -> BTreeSet<RTLReg> {
     definition.into_iter().chain(uses).collect()
 }
 
+#[cfg(test)]
 impl Obligation for Integer<'_> {
     fn native_registers(&self) -> BTreeSet<RTLReg> {
         native_registers(self.0)

@@ -4,21 +4,12 @@ use std::fmt::Write;
 #[derive(Debug, Clone)]
 pub struct PrintConfig {
     pub indent_size: usize,
-    #[allow(dead_code)]
-    pub max_line_width: usize,
-    #[allow(dead_code)]
-    pub emit_comments: bool,
-    #[allow(dead_code)]
-    pub compact: bool,
 }
 
 impl Default for PrintConfig {
     fn default() -> Self {
         Self {
             indent_size: 4,
-            max_line_width: 100,
-            emit_comments: true,
-            compact: false,
         }
     }
 }
@@ -634,7 +625,7 @@ impl Printer {
                     if let Some(last) = items.last() {
                         let should_strip = match last {
                             CBlockItem::Stmt(CStmt::Return(None)) => true,
-                            CBlockItem::Stmt((CStmt::Labeled(_, inner) | CStmt::Effect(_, inner))) => {
+                            CBlockItem::Stmt(CStmt::Labeled(_, inner) | CStmt::Effect(_, inner) ) => {
                                 matches!(**inner, CStmt::Return(None))
                             }
                             _ => false,
@@ -680,31 +671,6 @@ impl Printer {
             }
         });
         self.writeln("}");
-    }
-
-    fn print_params(&mut self, params: &[FuncParam], is_variadic: bool) {
-        self.write("(");
-        if params.is_empty() && !is_variadic {
-            self.write("void");
-        } else {
-            for (i, param) in params.iter().enumerate() {
-                if i > 0 {
-                    self.write(", ");
-                }
-                if let Some(ref name) = param.name {
-                    self.print_type_with_name(&param.ty, name);
-                } else {
-                    self.print_type(&param.ty);
-                }
-            }
-            if is_variadic {
-                if !params.is_empty() {
-                    self.write(", ");
-                }
-                self.write("...");
-            }
-        }
-        self.write(")");
     }
 
     pub fn print_struct_def(&mut self, def: &StructDef) {
@@ -1221,7 +1187,7 @@ fn collect_called_names_stmt(stmt: &CStmt, names: &mut CallSites) {
                 }
             }
         }
-        (CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)) => collect_called_names_stmt(inner, names),
+        CStmt::Labeled(_, inner) | CStmt::Effect(_, inner)  => collect_called_names_stmt(inner, names),
         CStmt::Sequence(stmts) => {
             for s in stmts {
                 collect_called_names_stmt(s, names);
