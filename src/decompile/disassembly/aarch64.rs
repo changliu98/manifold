@@ -446,15 +446,15 @@ fn reg_or_none(cs: &Capstone, reg: RegId) -> &'static str {
 fn extender_name(ext: capstone::arch::arm64::Arm64Extender) -> Option<&'static str> {
     use capstone::arch::arm64::Arm64Extender::*;
     match ext {
-        Sxtw => Some("SXTW"),
-        Sxtx => Some("SXTX"),
-        Sxtb => Some("SXTB"),
-        Sxth => Some("SXTH"),
-        Uxtw => Some("UXTW"),
-        Uxtx => Some("UXTX"),
-        Uxtb => Some("UXTB"),
-        Uxth => Some("UXTH"),
-        Invalid => None,
+        ARM64_EXT_SXTW => Some("SXTW"),
+        ARM64_EXT_SXTX => Some("SXTX"),
+        ARM64_EXT_SXTB => Some("SXTB"),
+        ARM64_EXT_SXTH => Some("SXTH"),
+        ARM64_EXT_UXTW => Some("UXTW"),
+        ARM64_EXT_UXTX => Some("UXTX"),
+        ARM64_EXT_UXTB => Some("UXTB"),
+        ARM64_EXT_UXTH => Some("UXTH"),
+        ARM64_EXT_INVALID => None,
     }
 }
 
