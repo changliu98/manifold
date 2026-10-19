@@ -17,25 +17,32 @@ fn fmt_elapsed(d: std::time::Duration) -> String {
 
 fn print_usage_and_exit() -> ! {
     eprintln!(
-        "Usage: manifold <BINARY> [OUTPUT_BASE] [OPTIONS]\n\n\
-            BINARY       - path to an x86 binary (ELF or native AMD64 PE32+)\n\
-        	OUTPUT_BASE  - optional output path (defaults to <BINARY>.light.c)\n\n\
-        Options:\n\
-        	--trace          generate debug trace files (.debug.yaml, .dataflow.yaml)\n\
-        	--dump-ir        dump each IR stage to separate files (.asm, .mach, .linear, etc.)\n\
-        	--dump-clight-json   export selected Clight IR as JSON (.clight.json)\n\
-        \t--dump-recovered-types export final C types and proven frame locations (.types.json)\n\
-        \t--dump-interface-vars write deterministic interface domains (.interfaces.tsv)\n\
-        \t--dump-interface-instance write the deterministic Stage-B instance (.interface-instance.tsv)\n\
-        \t--ablate-scope=function disable program-scope interface commitment and dirty re-solves\n\
-        \t--ablate-flow-anchor-reopen price committed-global disagreements and re-open Stage B\n\
-        \t--ablate-flow-max-certification enable propagator; retry UNSAT with audited flow gaps exempted\n\
-        \t--max-round-work=N bound the program selection rounds to N times the open solves' Z3 work (default {default_round_work})\n\
-        	--measure-rule-times  dump per-pass Ascent rule timing to debug/rule_times/\n\
-        	--dump-deps          dump pipeline dependency graph as Graphviz DOT to pipeline.dot",
+        "Usage: manifold <BINARY> [OUTPUT] [OPTIONS]
+
+  BINARY  path to an x86 binary (ELF or native AMD64 PE32+)
+  OUTPUT  path for the C output (default: <BINARY>.optimized.c); other outputs are named after it
+
+Options:
+  --trace                    also write the raw Clight C (.light.c) and debug traces (.debug.yaml, .dataflow.yaml, .lost.yaml)
+  --dump-ir                  dump each IR stage to its own file (.asm, .mach, .linear, ...)
+  --dump-clight-json         export the selected Clight IR as JSON (.clight.json)
+  --dump-recovered-types     export final C types and proven frame locations (.types.json)
+  --dump-interface-vars      write deterministic interface domains (.interfaces.tsv)
+  --dump-interface-instance  write the deterministic Stage-B instance (.interface-instance.tsv)
+  --measure-rule-times       dump per-pass Ascent rule timing to debug/rule_times/
+  --dump-deps                write the pass dependency graph to pipeline.dot (no BINARY needed)
+  --dump-dead-rels           list relations that no rule body or declared pass read uses (no BINARY needed)
+  --max-round-work=N         bound the program selection rounds to N times the open solves' Z3 work (default {default_round_work})
+
+Ablations:
+  --ablate-scope=function          disable program-scope interface commitment and dirty re-solves
+  --ablate-flow-anchor-reopen      price committed-global disagreements and re-open Stage B
+  --ablate-flow-max-certification  enable propagator; retry UNSAT with audited flow gaps exempted
+  --ablate-type-recovery           select without the TypeRecovery module
+  --ablate-semantic-admission      select without validator-backed admission
+  --ablate-storage-search, --ablate-existing-storage-views, --ablate-call-observer-isolation",
         default_round_work = decompile::elevator::config::CONFIG.interface.max_round_work,
     );
-    eprintln!("Experiment controls: --ablate-storage-search, --ablate-existing-storage-views, --ablate-call-observer-isolation");
     std::process::exit(1);
 }
 
