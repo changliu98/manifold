@@ -164,7 +164,7 @@ pub fn load_preset(db: &mut DecompileDB) {
     db.load_preset_functions();
 }
 
-// Load project-local static CSV data (registers, jump instructions, builtins, mnemonics), embedded at compile time via include_str!.
+// Load the builtin-function table, embedded at compile time via include_str!.
 fn load_static_csv(db: &mut DecompileDB) {
     use crate::util::parse_csv_str;
 

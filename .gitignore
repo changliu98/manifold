@@ -1,0 +1,11 @@
+# Cargo build output (also matches a `target` symlink to an external build directory)
+/target
+
+# Written to the working directory by `manifold --dump-deps` and `--measure-rule-times`
+/pipeline.dot
+/pipeline-detailed.dot
+/debug/rule_times/
+
+# Python bytecode from the test harnesses
+__pycache__/
+*.pyc
